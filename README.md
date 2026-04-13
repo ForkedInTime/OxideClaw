@@ -87,6 +87,7 @@ rustyclaw
 | Model router | No | No | **Auto-route by task complexity** |
 | Parallel agents | No | No | **Git-worktree isolation** |
 | Voice I/O | No | No | **Whisper + XTTS v2 cloning** |
+| Browser automation | External MCP server | No | **8 CDP tools, in the binary** |
 | Auto-fix loop | No | No | **Post-edit lint + tests + retry** |
 | `/undo` · `/redo` | No | Partial (pollutes git log) | **Invisible shadow refs** |
 | OpenAI-compat providers | No | Partial | **9 providers, working tools** |
@@ -135,6 +136,10 @@ Every assistant turn silently snapshots the working tree to `refs/rustyclaw/sess
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 
 Full tool use over Ollama's native format. Other Rust ports have had this broken or partial for months — ours just works. Auto-falls back to prompt-injected JSON on models that don't support native tools.
+
+### 🌐 &nbsp; Built-in browser automation — no extra server
+
+Eight CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_get_text`, `browser_press_key`, `browser_wait` — shipped in the binary and enabled by default. Snapshots return a text tree with stable `@eN` element refs you can pass to click/fill. Works against any Chromium-based browser (Chrome, Chromium, Brave, Edge) you already have installed. No external automation server, no separate install.
 
 ### 🦀 &nbsp; Single 19 MB static binary
 
