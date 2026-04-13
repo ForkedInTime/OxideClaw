@@ -38,6 +38,11 @@ jobs:
             echo "Could not fetch npm version, skipping"
             exit 0
           fi
+          if [ -z "$REVIEWED" ]; then
+            echo "BUILT_AGAINST_CLAUDE_VERSION not found in src/main.rs — skipping comparison"
+            echo "(add 'const BUILT_AGAINST_CLAUDE_VERSION: &str = \"X.Y.Z\";' to enable upstream tracking)"
+            exit 0
+          fi
           if [ "$LATEST" = "$REVIEWED" ]; then
             echo "Claude Code v$LATEST, no change (reviewed: v$REVIEWED)"
             exit 0

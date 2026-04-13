@@ -1,0 +1,43 @@
+name: README stale scan
+
+# Weekly safety net: catches README drift even if a PR bypassed the
+# readme-lint job on CI (branch push without PR, ruleset override, etc.).
+# Runs the same readme-lint.sh script against main; opens a single
+# "readme-drift" issue if anything is off, and dedupes on subsequent runs.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Mondays 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run readme-lint
+        id: lint
+        run: bash scripts/readme-lint.sh 2>&1 | tee /tmp/scan.log
+        continue-on-error: true
+
+      - name: Open issue on drift
+        if: steps.lint.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list --label "readme-drift" --state open \
+            --search "README claims drift" --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            echo "Issue already open (#$EXISTING), skipping"
+            exit 0
+          fi
+          BODY="$(printf '## README claims drift detected\n\nWeekly scan found one or more README claims no longer match source.\n\n### Scan output\n\n```\n%s\n```\n\n### What to do\n\n1. Run `bash scripts/readme-lint.sh` locally to reproduce\n2. Either fix the README claim or update the source so they agree\n3. Close this issue\n\n---\n*Opened automatically by the readme-stale-scan workflow.*' "$(cat /tmp/scan.log)")"
+          gh issue create \
+            --title "README claims drift — weekly scan failed" \
+            --label "readme-drift" \
+            --body "$BODY"

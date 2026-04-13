@@ -24,3 +24,23 @@ jobs:
         run: cargo check --all-targets
       - name: Test
         run: cargo test
+
+  readme-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check README claims against source
+        run: bash scripts/readme-lint.sh
+
+  perf-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install hyperfine
+        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: Build release binary
+        run: cargo build --release --bin rustyclaw
+      - name: Run perf smoke test
+        run: bash scripts/perf-smoke.sh target/release/rustyclaw
