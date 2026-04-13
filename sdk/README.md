@@ -19,7 +19,7 @@ This starts a long-running server that reads JSON requests from stdin and writes
 ```
 
 ```json
-{"type":"health/check","id":"1","status":"ok","version":"0.1.0","active_sessions":0,"uptime_seconds":0}
+{"type":"health/check","id":"1","status":"ok","version":"0.2.0","active_sessions":0,"uptime_seconds":0}
 ```
 
 ### 2. Ask a question
@@ -89,10 +89,12 @@ Your App                    RustyClaw
 | Type | When |
 |------|------|
 | `message/delta` | Text chunk from the model |
+| `thinking/delta` | Reasoning chunk (when `showThinkingSummaries` is on) |
 | `tool/started` | Tool execution began |
 | `tool/approval_needed` | Tool needs host approval |
 | `tool/completed` | Tool finished |
 | `cost/updated` | Token usage + cost after each API call |
+| `model/routed` | Smart router switched models for this turn |
 | `context/health` | Context window usage % |
 | `progress/updated` | Estimated progress through the task |
 | `turn/completed` | Turn finished — final response, total cost, duration |

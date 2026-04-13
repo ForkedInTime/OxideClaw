@@ -4,8 +4,6 @@ pub mod snapshot;
 pub mod actions;
 pub mod element;
 pub mod extraction;
-pub mod planner;
-pub mod loop_detector;
 
 use anyhow::{Result, bail};
 use cdp::CdpClient;

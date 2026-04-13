@@ -25,9 +25,16 @@
 
 ## Install
 
+**Linux / macOS:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash
 ```
+
+**Windows (PowerShell):**
+```powershell
+Invoke-WebRequest https://github.com/ForkedInTime/RustyClaw/releases/latest/download/rustyclaw-windows-x64.exe -OutFile rustyclaw.exe
+```
+Then move `rustyclaw.exe` somewhere on your `PATH` (e.g. `%USERPROFILE%\bin`).
 
 <details>
 <summary>Other install methods</summary>
@@ -39,16 +46,26 @@ cd RustyClaw && cargo build --release
 ./target/release/rustyclaw
 ```
 
-**Specific version:**
+**Specific version (Linux/macOS):**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.2.0
 ```
 
-Pre-built binaries for `x86_64-linux-gnu`, `aarch64-linux-gnu`, and `x86_64-linux-musl` are attached to every [release](https://github.com/ForkedInTime/RustyClaw/releases).
+Pre-built binaries attached to every [release](https://github.com/ForkedInTime/RustyClaw/releases):
+- Linux: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`
+- macOS: `x86_64-apple-darwin` (Intel), `aarch64-apple-darwin` (Apple Silicon)
+- Windows: `rustyclaw-windows-x64.exe`
 </details>
 
+**Linux / macOS:**
 ```bash
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.env
+rustyclaw
+```
+
+**Windows (PowerShell):**
+```powershell
+"ANTHROPIC_API_KEY=sk-ant-..." | Out-File -FilePath $HOME\.env -Encoding utf8 -Append
 rustyclaw
 ```
 
@@ -94,7 +111,7 @@ HAS match "search TOCTOU" — 10 results
 
 ### 💰 &nbsp; Smart model router + live cost dashboard
 
-Simple edits go to Haiku or Ollama. Architecture questions go to Opus. Every token is priced in real time. Cap the bill with `/budget $5` — RustyClaw refuses to go over.
+Simple edits go to Haiku or Ollama. Architecture questions go to Opus. Every token is priced in real time. Cap the bill with `/budget $5` — RustyClaw warns at 80% and stops the loop when the budget is exceeded.
 
 ### 🎭 &nbsp; Parallel agents in git worktrees
 
