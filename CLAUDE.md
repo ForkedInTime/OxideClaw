@@ -35,13 +35,11 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 ### PHASE 2 (shipping now)
 - **Auto-fix loop (2026-04-10)** — Post-edit lint + tests + feedback-driven retries replace the old rollback revert. Anti-cheat protected. `autoFixLoop` in settings.json, `autoRollback` alias kept for backward compat.
 - **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn working-tree snapshots on private shadow refs (`refs/rustyclaw/sessions/<id>`). New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. Other tools with undo pollute history; RustyClaw's shadow refs are invisible to `git log`/`branch`/`status`. No competitor has `/redo`.
+8. **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `rustyclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
 
 ### NEXT UP
 6. **SDK/headless sidecar** — NDJSON stdio binary for editor embedding. Uncontested.
 7. **Phase 2 robustness** — Diff review, self-update, shell completions.
-
-### DEFERRED
-- **Autonomous browser agent** — `/browse <goal>` plan-act-evaluate loop with stagnation detection. Manual `browser_*` CDP tools ship today and cover the common cases. Previous scaffolding (`src/browser/loop_detector.rs`, `src/browser/planner.rs`) was removed 2026-04-12 to keep the codebase honest; re-design from scratch when ready.
 
 ### THE PITCH
 "A single 19 MB static Rust binary that indexes your codebase, routes tasks to the cheapest model, runs parallel agents in worktrees, speaks in your voice, shows you every token spent, and works offline via Ollama. Sub-50ms startup. Zero dependencies. Zero flickering. XDG-compliant. AGENTS.md + CLAUDE.md."

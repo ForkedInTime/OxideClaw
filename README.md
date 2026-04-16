@@ -87,7 +87,8 @@ rustyclaw
 | Model router | No | No | **Auto-route by task complexity** |
 | Parallel agents | No | No | **Git-worktree isolation** |
 | Voice I/O | No | No | **Whisper + XTTS v2 cloning** |
-| Browser automation | External MCP server | No | **8 CDP tools, in the binary** |
+| Browser automation | External MCP server | No | **9 CDP tools, in the binary** |
+| Autonomous browser agent | No | No | **Goal-driven, 50-step cap, safety-gated** |
 | Auto-fix loop | No | No | **Post-edit lint + tests + retry** |
 | `/undo` · `/redo` | No | Partial (pollutes git log) | **Invisible shadow refs** |
 | OpenAI-compat providers | No | Partial | **9 providers, working tools** |
@@ -140,6 +141,10 @@ Full tool use over Ollama's native format. Other Rust ports have had this broken
 ### 🌐 &nbsp; Built-in browser automation — no extra server
 
 Eight CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_get_text`, `browser_press_key`, `browser_wait` — shipped in the binary and enabled by default. Snapshots return a text tree with stable `@eN` element refs you can pass to click/fill. Works against any Chromium-based browser (Chrome, Chromium, Brave, Edge) you already have installed. No external automation server, no separate install.
+
+### 🤖 &nbsp; Autonomous browser mode — `/browse <goal>`
+
+Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July 7` navigates, fills forms, scrolls, reads results, and speaks the answer. 50-step hard cap (configurable), destructive-action approval gate (pauses at payment / delete / OAuth / free-trial-autobill), stagnation detector (escalating nudges when the model is stuck). `rustyclaw browse "<goal>" --json` runs the same loop headless from scripts or CI. `/voice` with prefixes `browse | browser | web | go to | open | shop for | book | order` drives it hands-free with milestone TTS at start, gate trip, and end.
 
 ### 🦀 &nbsp; Single 19 MB static binary
 
