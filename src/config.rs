@@ -316,6 +316,13 @@ pub struct Config {
     /// Default browser action timeout in milliseconds.
     pub browser_timeout_ms: u64,
 
+    /// Default max steps for /browse runs. Configurable per-run.
+    pub browse_max_steps: u32,
+    /// User-appended destructive-action patterns (regex).
+    pub browse_approval_patterns: Vec<String>,
+    /// Default policy: "pattern" (default), "ask", "yolo" (not honored from settings — per-run only).
+    pub browse_default_policy: String,
+
     /// Watch debounce (ms) — coalesces rapid filesystem events.
     pub watch_debounce_ms: u64,
     /// Minimum gap between watch triggers (ms).
@@ -433,6 +440,9 @@ impl Default for Config {
             browser_chrome_path: None,
             browser_cdp_endpoint: None,
             browser_timeout_ms: 30_000,
+            browse_max_steps: 50,
+            browse_approval_patterns: Vec::new(),
+            browse_default_policy: "pattern".to_string(),
             watch_debounce_ms: 500,
             watch_rate_limit_ms: 10_000,
             watch_markers: vec!["AI:".into(), "AGENT:".into()],
@@ -622,6 +632,17 @@ impl Config {
                 cfg.auto_commit.message_prefix = p.clone();
             }
         }
+
+        // Browse agent settings
+        if let Some(s) = settings.browse_max_steps {
+            cfg.browse_max_steps = s;
+        }
+        if let Some(p) = settings.browse_approval_patterns {
+            cfg.browse_approval_patterns = p;
+        }
+        cfg.browse_default_policy = settings
+            .browse_default_policy
+            .unwrap_or_else(|| cfg.browse_default_policy.clone());
 
         // Resolve output style: load name from settings, look up prompt
         if let Some(ref style_name) = settings.output_style
