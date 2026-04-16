@@ -268,6 +268,12 @@ pub enum SdkResponse {
         uptime_seconds: u64,
     },
 
+    #[serde(rename = "browse/started")]
+    BrowseStarted {
+        id: String,
+        session_id: String,
+    },
+
     #[serde(rename = "error")]
     Error {
         id: String,

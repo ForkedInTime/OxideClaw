@@ -11,6 +11,7 @@ pub mod transport;
 
 pub use protocol::*;
 
+use crate::browser::browse_loop::{BrowsePolicy, BrowseProgress, BrowseRequest, run_browse};
 use crate::config::Config;
 use crate::tools::all_tools;
 use anyhow::Result;
@@ -288,13 +289,138 @@ impl SdkServer {
                 }
             }
 
+            // ── Browse Start ────────────────────────────────────────
+            SdkRequest::BrowseStart {
+                id,
+                goal,
+                policy,
+                max_steps,
+                yolo_ack,
+            } => {
+                // Validate yolo_ack requirement
+                if policy == BrowsePolicy::Yolo && !yolo_ack {
+                    transport
+                        .send_response(SdkResponse::Error {
+                            id,
+                            code: "yolo_ack_required".into(),
+                            message: "browse/start with policy=yolo requires yolo_ack=true".into(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
+
+                // Generate a session ID for this browse run
+                let session_id = format!(
+                    "browse-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                );
+
+                // Clone config and build tools
+                let cfg = config.clone();
+                let all_tools_list = all_tools(&cfg);
+
+                // Channels: progress events from browse loop → notif forwarding task
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BrowseProgress>(64);
+                // Channel: approval prompts from browse loop → host
+                let (approval_tx, mut approval_rx) =
+                    tokio::sync::mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(4);
+
+                let current_url = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+                // Respond immediately with session_id
+                transport
+                    .send_response(SdkResponse::BrowseStarted {
+                        id,
+                        session_id: session_id.clone(),
+                    })
+                    .await?;
+
+                active_sessions.fetch_add(1, Ordering::Relaxed);
+
+                // Forward BrowseProgress events as SdkNotification NDJSON
+                let fwd_notif_tx = notif_tx.clone();
+                let fwd_sid = session_id.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = progress_rx.recv().await {
+                        let notif = match event {
+                            BrowseProgress::Step { n, action, target } => {
+                                SdkNotification::BrowseProgress {
+                                    session_id: fwd_sid.clone(),
+                                    step: n,
+                                    action,
+                                    target,
+                                }
+                            }
+                            BrowseProgress::Completed(result) => {
+                                SdkNotification::BrowseCompleted {
+                                    session_id: fwd_sid.clone(),
+                                    result,
+                                }
+                            }
+                            BrowseProgress::Nudge { .. } | BrowseProgress::Started { .. } => {
+                                // Not surfaced as SDK notifications
+                                continue;
+                            }
+                            BrowseProgress::ApprovalNeeded { .. } => {
+                                // Handled via approval_rx below
+                                continue;
+                            }
+                        };
+                        let _ = fwd_notif_tx.send(notif);
+                    }
+                });
+
+                // Forward ApprovalPrompt events as BrowseApprovalNeeded notifications
+                let appr_notif_tx = approval_out_tx.clone();
+                let appr_sid = session_id.clone();
+                tokio::spawn(async move {
+                    while let Some(prompt) = approval_rx.recv().await {
+                        let notif = SdkNotification::BrowseApprovalNeeded {
+                            session_id: appr_sid.clone(),
+                            step: prompt.step,
+                            tool_name: prompt.tool_name,
+                            target_text: prompt.target_text,
+                            url: prompt.url,
+                            reason: prompt.reason,
+                        };
+                        let _ = appr_notif_tx.send(notif);
+                        // Note: prompt.reply is dropped here — the gate will treat
+                        // an unreceived reply as a deny in Phase A. Phase B will
+                        // wire BrowseApprovalReply to fulfill this oneshot.
+                    }
+                });
+
+                // Spawn the browse run
+                let browse_req = BrowseRequest {
+                    goal,
+                    policy,
+                    max_steps: max_steps.unwrap_or(cfg.browse_max_steps),
+                    voice: false,
+                };
+                let session_counter = Arc::clone(active_sessions);
+                tokio::spawn(async move {
+                    let _ = run_browse(
+                        browse_req,
+                        &cfg,
+                        all_tools_list,
+                        current_url,
+                        progress_tx,
+                        approval_tx,
+                    )
+                    .await;
+                    session_counter.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+
             // ── Not yet implemented (Phase A stubs) ─────────────────
             SdkRequest::TurnStart { id, .. }
             | SdkRequest::TurnInterrupt { id, .. }
             | SdkRequest::SessionResume { id, .. }
             | SdkRequest::SessionExport { id, .. }
-            | SdkRequest::CostReport { id, .. }
-            | SdkRequest::BrowseStart { id, .. } => {
+            | SdkRequest::CostReport { id, .. } => {
                 transport
                     .send_response(SdkResponse::Error {
                         id,
