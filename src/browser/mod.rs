@@ -3,6 +3,7 @@ pub mod actions;
 pub mod cdp;
 pub mod element;
 pub mod extraction;
+pub mod loop_detector;
 pub mod middleware;
 pub mod snapshot;
 
