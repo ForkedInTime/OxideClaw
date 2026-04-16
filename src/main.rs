@@ -308,6 +308,20 @@ enum Commands {
     Doctor,
     /// Self-update to the latest release from GitHub
     Update,
+    /// Run the autonomous browser agent
+    Browse {
+        /// Goal for the browser agent
+        goal: Vec<String>,
+        /// Skip all approval prompts (requires prior acknowledgment)
+        #[arg(long)]
+        yolo: bool,
+        /// Prompt for approval on every destructive action
+        #[arg(long)]
+        ask: bool,
+        /// Maximum number of steps (default: 50)
+        #[arg(long, default_value = "50")]
+        max_steps: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -606,6 +620,86 @@ async fn main() -> Result<()> {
             }
             Commands::Update => {
                 return self_update().await;
+            }
+            Commands::Browse { goal, yolo, ask, max_steps } => {
+                use crate::browser::browse_loop::{BrowsePolicy, BrowseRequest, BrowseProgress, run_browse};
+                use tokio::sync::mpsc;
+
+                let goal_str = goal.join(" ");
+                if goal_str.trim().is_empty() {
+                    eprintln!("Error: browse requires a goal argument");
+                    std::process::exit(1);
+                }
+
+                // Determine policy: --yolo > --ask > default (pattern-match)
+                let policy = if *yolo {
+                    // First-time --yolo: write acknowledgment file if not yet present
+                    if !crate::browser::yolo_ack::is_acknowledged() {
+                        eprintln!(
+                            "Warning: --yolo disables all approval prompts. \
+                             The browser agent will execute destructive actions without confirmation.\n\
+                             To proceed, this acknowledgment is recorded in your XDG state directory."
+                        );
+                        if let Err(e) = crate::browser::yolo_ack::acknowledge() {
+                            eprintln!("Warning: could not write yolo-ack file: {e}");
+                        }
+                    }
+                    BrowsePolicy::Yolo
+                } else if *ask {
+                    BrowsePolicy::Ask
+                } else {
+                    BrowsePolicy::Pattern
+                };
+
+                let req = BrowseRequest {
+                    goal: goal_str.clone(),
+                    policy,
+                    max_steps: *max_steps,
+                    voice: false,
+                };
+
+                let config = Config::load()?;
+                let tools = all_tools(&config);
+                let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+
+                let (progress_tx, mut progress_rx) = mpsc::channel::<BrowseProgress>(64);
+                // Approval channel: in CLI mode auto-deny (user must use --yolo or --ask interactively)
+                let (approval_tx, mut approval_rx) = mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(8);
+
+                // Spawn task to handle approval prompts: prompt on stderr, read from stdin
+                let _approval_task = tokio::spawn(async move {
+                    use std::io::Write;
+                    while let Some(prompt) = approval_rx.recv().await {
+                        eprint!(
+                            "Approval needed [step {}]: {} on '{}' at {}\n  Reason: {}\nAllow? [y/N] ",
+                            prompt.step, prompt.tool_name, prompt.target_text, prompt.url, prompt.reason
+                        );
+                        let _ = std::io::stderr().flush();
+                        let mut line = String::new();
+                        let allowed = if std::io::stdin().read_line(&mut line).is_ok() {
+                            matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+                        } else {
+                            false
+                        };
+                        let _ = prompt.reply.send(allowed);
+                    }
+                });
+
+                // Spawn task to print progress as NDJSON
+                let progress_task = tokio::spawn(async move {
+                    while let Some(event) = progress_rx.recv().await {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            println!("{json}");
+                        }
+                    }
+                });
+
+                let result = run_browse(req, &config, tools, current_url, progress_tx, approval_tx).await?;
+                progress_task.await.ok();
+
+                // Print final result as JSON
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
             }
         }
     }
