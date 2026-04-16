@@ -4,7 +4,13 @@
 //! signals, visible prices, and user-defined extension patterns. Read-only
 //! tools always pass; everything else is checked against compiled RegexSets.
 
+use crate::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
+use async_trait::async_trait;
 use regex::{Regex, RegexSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 /// Read-only tools that never require approval.
 const READ_ONLY_TOOLS: &[&str] = &[
@@ -199,5 +205,162 @@ impl ApprovalGate {
                 detail: reasons.join("; "),
             }
         }
+    }
+}
+
+// ── Middleware bridge ─────────────────────────────────────────────────────────
+
+/// Approval prompt sent to the host (TUI/SDK/voice).
+pub struct ApprovalPrompt {
+    pub step: u32,
+    pub tool_name: String,
+    pub target_text: String,
+    pub url: String,
+    pub reason: String,
+    pub reply: oneshot::Sender<bool>,
+}
+
+pub struct ApprovalGateMiddleware {
+    gate: ApprovalGate,
+    policy: crate::browser::browse_loop::BrowsePolicy,
+    current_url: Arc<tokio::sync::Mutex<String>>,
+    approval_tx: mpsc::Sender<ApprovalPrompt>,
+    step_counter: Arc<AtomicU32>,
+    /// Tracks consecutive denial count per action key ("{tool_name}:{target_text}").
+    denial_counts: Mutex<HashMap<String, u32>>,
+    /// Set when the same action is denied twice — triggers session termination.
+    user_denied: AtomicBool,
+}
+
+impl ApprovalGateMiddleware {
+    pub fn new(
+        gate: ApprovalGate,
+        policy: crate::browser::browse_loop::BrowsePolicy,
+        current_url: Arc<tokio::sync::Mutex<String>>,
+        approval_tx: mpsc::Sender<ApprovalPrompt>,
+        step_counter: Arc<AtomicU32>,
+    ) -> Self {
+        Self {
+            gate,
+            policy,
+            current_url,
+            approval_tx,
+            step_counter,
+            denial_counts: Mutex::new(HashMap::new()),
+            user_denied: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns true if the user denied the same action twice, triggering termination.
+    pub fn is_user_denied(&self) -> bool {
+        self.user_denied.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for ApprovalGateMiddleware {
+    async fn before_tool(&self, tool_name: &str, input: &serde_json::Value) -> MiddlewareVerdict {
+        use crate::browser::browse_loop::BrowsePolicy;
+
+        // If user already denied twice, block everything.
+        if self.user_denied.load(Ordering::SeqCst) {
+            return MiddlewareVerdict::Deny {
+                reason: "User denied this action twice. Terminating browse session.".into(),
+            };
+        }
+
+        // Yolo policy: always allow.
+        if self.policy == BrowsePolicy::Yolo {
+            return MiddlewareVerdict::Allow;
+        }
+
+        // Read-only tools always pass, regardless of policy.
+        if READ_ONLY_TOOLS.contains(&tool_name) {
+            return MiddlewareVerdict::Allow;
+        }
+
+        let url = self.current_url.lock().await.clone();
+        let target_text = input["ref"]
+            .as_str()
+            .or_else(|| input["selector"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let gate_ctx = GateContext {
+            tool_name: tool_name.to_string(),
+            url: url.clone(),
+            target_text: target_text.clone(),
+            form_field_signals: Vec::new(),
+            visible_prices: Vec::new(),
+        };
+
+        // Ask policy: force confirmation for every non-read-only tool.
+        let verdict = if self.policy == BrowsePolicy::Ask {
+            GateVerdict::RequireConfirmation {
+                reason: "ask policy".to_string(),
+                detail: format!("{tool_name} on {url}"),
+            }
+        } else {
+            // Pattern policy: delegate to the compiled gate.
+            self.gate.check(&gate_ctx)
+        };
+
+        match verdict {
+            GateVerdict::Allow => {
+                // Clear denial counter on approval for this action key.
+                let key = format!("{tool_name}:{target_text}");
+                self.denial_counts.lock().unwrap().remove(&key);
+                MiddlewareVerdict::Allow
+            }
+            GateVerdict::RequireConfirmation { reason, .. } => {
+                let step = self.step_counter.load(Ordering::Relaxed);
+                let (tx, rx) = oneshot::channel();
+                let prompt = ApprovalPrompt {
+                    step,
+                    tool_name: tool_name.to_string(),
+                    target_text: target_text.clone(),
+                    url,
+                    reason: reason.clone(),
+                    reply: tx,
+                };
+                // If the host receiver is gone, deny by default.
+                if self.approval_tx.send(prompt).await.is_err() {
+                    return MiddlewareVerdict::Deny {
+                        reason: "approval channel closed".to_string(),
+                    };
+                }
+                match rx.await {
+                    Ok(true) => {
+                        // Approved — clear denial counter for this action.
+                        let key = format!("{tool_name}:{target_text}");
+                        self.denial_counts.lock().unwrap().remove(&key);
+                        MiddlewareVerdict::Allow
+                    }
+                    _ => {
+                        // Denied — increment counter; terminate after 2 denials on same action.
+                        let key = format!("{tool_name}:{target_text}");
+                        let count = {
+                            let mut counts = self.denial_counts.lock().unwrap();
+                            let entry = counts.entry(key).or_insert(0);
+                            *entry += 1;
+                            *entry
+                        };
+                        if count >= 2 {
+                            self.user_denied.store(true, Ordering::SeqCst);
+                            return MiddlewareVerdict::Deny {
+                                reason: "User denied this action twice. Terminating browse session."
+                                    .into(),
+                            };
+                        }
+                        MiddlewareVerdict::Deny { reason }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn after_tool(&self, _tool_name: &str, _output: &str) {
+        // Increment step counter after each tool execution.
+        self.step_counter.fetch_add(1, Ordering::Relaxed);
     }
 }

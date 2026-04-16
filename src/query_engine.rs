@@ -28,6 +28,10 @@ pub struct QueryEngine {
     session_id: Option<String>,
     /// Shared Read-tool cache for deduplicating unchanged re-reads (v2.1.86).
     read_cache: crate::tools::ReadCache,
+    /// In-process tool middleware chain (empty by default).
+    middlewares: crate::browser::middleware::MiddlewareChain,
+    /// Turn counter.
+    turns: u32,
 }
 
 impl QueryEngine {
@@ -64,6 +68,8 @@ impl QueryEngine {
             cumulative_cost_usd: 0.0,
             session_id: Some(uuid::Uuid::new_v4().to_string()),
             read_cache: crate::tools::new_read_cache(),
+            middlewares: Vec::new(),
+            turns: 0,
         })
     }
 
@@ -117,6 +123,7 @@ impl QueryEngine {
 
         loop {
             turn += 1;
+            self.turns = turn;
             if turn > max_turns {
                 eprintln!("{}", format!("Stopped after {max_turns} turns.").yellow());
                 break;
@@ -358,6 +365,7 @@ impl QueryEngine {
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
+        ctx.middlewares = self.middlewares.clone();
         let mut results = Vec::new();
 
         for block in content {
@@ -593,6 +601,75 @@ fn truncate_json(v: &serde_json::Value, max_len: usize) -> String {
 }
 
 impl QueryEngine {
+    /// Create a QueryEngine preconfigured for autonomous browse mode.
+    /// Overrides the system prompt and injects the middleware chain.
+    pub fn new_for_browse(
+        config: Config,
+        tools: Vec<DynTool>,
+        system_prompt: String,
+        middlewares: crate::browser::middleware::MiddlewareChain,
+    ) -> Result<Self> {
+        let mut engine = Self::new(config, tools)?;
+        engine.system_prompt = system_prompt;
+        engine.middlewares = middlewares;
+        Ok(engine)
+    }
+
+    /// How many turns the engine has executed since the last `query()` call.
+    pub fn turns_used(&self) -> u32 {
+        self.turns
+    }
+
+    /// Extract the text content from the last assistant message, if any.
+    pub fn last_assistant_text(&self) -> Option<String> {
+        self.messages.iter().rev().find_map(|m| {
+            if m.role == Role::Assistant {
+                let texts: Vec<&str> = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if texts.is_empty() {
+                    None
+                } else {
+                    Some(texts.join(""))
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Extract the text content from the last tool result (user-role message
+    /// containing `ContentBlock::ToolResult`). Tool results are always sent
+    /// in user-role messages per the Anthropic API contract.
+    pub fn last_tool_result_text(&self) -> Option<String> {
+        for msg in self.messages.iter().rev() {
+            if msg.role != Role::User {
+                continue;
+            }
+            for block in msg.content.iter().rev() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    let text: String = content
+                        .iter()
+                        .map(|c| {
+                            let ToolResultContent::Text { text } = c;
+                            text.as_str()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn replay_user_messages(&self) -> bool {
         self.config.replay_user_messages
     }

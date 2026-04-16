@@ -1,5 +1,10 @@
+use crate::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 const WINDOW_SIZE: usize = 10;
 const REPEAT_THRESHOLD: usize = 3;
@@ -92,4 +97,62 @@ fn hash_string(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+// ── Middleware bridge ─────────────────────────────────────────────────────────
+
+pub struct LoopDetectorMiddleware {
+    inner: Mutex<LoopDetector>,
+    nudge_tx: mpsc::Sender<String>,
+    stopped: AtomicBool,
+}
+
+impl LoopDetectorMiddleware {
+    pub fn new(nudge_tx: mpsc::Sender<String>) -> Self {
+        Self {
+            inner: Mutex::new(LoopDetector::new()),
+            nudge_tx,
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns true if the loop detector reached terminal stagnation (level 3).
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for LoopDetectorMiddleware {
+    async fn before_tool(&self, _tool_name: &str, _input: &serde_json::Value) -> MiddlewareVerdict {
+        if self.stopped.load(Ordering::SeqCst) {
+            return MiddlewareVerdict::Deny {
+                reason: "Stagnation detected: the browser agent has been stopped after \
+                         repeating the same action with no effect."
+                    .into(),
+            };
+        }
+        MiddlewareVerdict::Allow
+    }
+
+    async fn after_tool(&self, tool_name: &str, output: &str) {
+        // browser_navigate resets the detector (new page = fresh state).
+        if tool_name == "browser_navigate" {
+            self.inner.lock().unwrap().reset();
+            return;
+        }
+        let nudge = {
+            let mut ld = self.inner.lock().unwrap();
+            ld.record_action(tool_name, "", output);
+            ld.check_stagnation()
+        };
+        if let Some(nudge) = nudge {
+            // If this is the terminal nudge (level 3 — contains "Stopping"),
+            // set the stopped flag so before_tool denies subsequent calls.
+            if nudge.contains("Stopping") {
+                self.stopped.store(true, Ordering::SeqCst);
+            }
+            let _ = self.nudge_tx.send(nudge).await;
+        }
+    }
 }
