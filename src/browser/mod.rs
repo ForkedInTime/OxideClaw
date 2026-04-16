@@ -1,5 +1,6 @@
 //! Browser automation via Chrome DevTools Protocol.
 pub mod actions;
+pub mod approval_gate;
 pub mod cdp;
 pub mod element;
 pub mod extraction;
