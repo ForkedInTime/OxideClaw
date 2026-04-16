@@ -1378,6 +1378,12 @@ impl App {
                 self.voice_task = None;
                 self.voice_stop_tx = None;
             }
+            AppEvent::VoiceBrowse(_goal) => {
+                // Recording state cleared here; run.rs handles the Browse dispatch.
+                self.voice_recording = false;
+                self.voice_task = None;
+                self.voice_stop_tx = None;
+            }
             AppEvent::PluginInstallDone { success, message } => {
                 if success {
                     self.entries.push(ChatEntry::system(message));

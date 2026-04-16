@@ -1107,6 +1107,39 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                                 summary_len,
                             });
                         }
+                        AppEvent::VoiceBrowse(ref goal) => {
+                            // Voice always uses Pattern policy — never Yolo (too easy
+                            // to mis-transcribe destructive commands).
+                            let goal_str = goal.clone();
+                            app.apply(ev);
+                            let max = config.browse_max_steps;
+                            app.entries.push(ChatEntry::system(format!(
+                                "🌐 /browse (voice) — goal: {goal_str} (max {max} steps, policy: Pattern)"
+                            )));
+                            app.scroll_to_bottom();
+                            app.start_loading();
+                            let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
+                            let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
+                            app.browse_progress_rx = Some(progress_rx);
+                            app.browse_approval_rx = Some(approval_rx);
+                            let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+                            let cfg = config.clone();
+                            let all_tools = tools.to_vec();
+                            let browse_req = crate::browser::browse_loop::BrowseRequest {
+                                goal: goal_str,
+                                policy: crate::browser::browse_loop::BrowsePolicy::Pattern,
+                                max_steps: max,
+                                voice: true,
+                            };
+                            tokio::spawn(async move {
+                                let result = crate::browser::browse_loop::run_browse(
+                                    browse_req, &cfg, all_tools, current_url, progress_tx, approval_tx,
+                                ).await;
+                                if let Err(e) = result {
+                                    eprintln!("Voice browse error: {e}");
+                                }
+                            });
+                        }
                         other => app.apply(other),
                     }
                     match rx.try_recv() {
@@ -1719,7 +1752,12 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 ));
                             }
                             Ok(text) => {
-                                let _ = tx2.send(AppEvent::VoiceTranscription(text));
+                                if crate::voice::voice_routes_to_browse(&text) {
+                                    let goal = crate::voice::strip_browse_prefix(&text);
+                                    let _ = tx2.send(AppEvent::VoiceBrowse(goal));
+                                } else {
+                                    let _ = tx2.send(AppEvent::VoiceTranscription(text));
+                                }
                             }
                             Err(e) => {
                                 let _ =

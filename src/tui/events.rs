@@ -50,6 +50,8 @@ pub enum AppEvent {
     // through the AppEvent channel.
     /// Voice transcription completed — insert text into input buffer
     VoiceTranscription(String),
+    /// Voice transcription matched a browse prefix — dispatch as /browse
+    VoiceBrowse(String),
     /// Plugin install completed (success or failure)
     PluginInstallDone { success: bool, message: String },
     /// GitHub upgrade check completed
