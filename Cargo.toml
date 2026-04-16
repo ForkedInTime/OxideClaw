@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
 
 # Async runtime (replaces Node.js event loop)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "time", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "time", "io-util", "io-std", "signal"] }
 
 # Async fn in trait objects (required for dyn Tool)
 async-trait = "0.1"

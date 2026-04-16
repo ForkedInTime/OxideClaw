@@ -864,17 +864,21 @@ pub async fn await_voice_approval(timeout_secs: u64) -> bool {
     let _ = stop_tx.send(());
     let _ = record_task.await;
 
-    // Transcribe and check for affirmative keywords.
-    match transcribe(None, None).await {
-        Ok(text) => {
-            let lower = text.trim().to_lowercase();
-            lower.contains("confirm")
-                || lower.contains("yes")
-                || lower.contains("approve")
-                || lower.contains("ok")
-        }
-        Err(_) => false,
-    }
+    // Transcribe with a 30s timeout and check for affirmative keywords.
+    let transcribe_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        transcribe(None, None),
+    )
+    .await;
+    let transcript = match transcribe_result {
+        Ok(Ok(text)) => text,
+        _ => return false, // timeout or transcription error = deny
+    };
+    let lower = transcript.trim().to_lowercase();
+    lower.contains("confirm")
+        || lower.contains("yes")
+        || lower.contains("approve")
+        || lower.contains("ok")
 }
 
 // ── Status display ────────────────────────────────────────────────────────────

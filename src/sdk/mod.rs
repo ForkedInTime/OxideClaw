@@ -400,6 +400,7 @@ impl SdkServer {
                     max_steps: max_steps.unwrap_or(cfg.browse_max_steps),
                     voice: false,
                 };
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let session_counter = Arc::clone(active_sessions);
                 tokio::spawn(async move {
                     let _ = run_browse(
@@ -409,6 +410,7 @@ impl SdkServer {
                         current_url,
                         progress_tx,
                         approval_tx,
+                        cancel,
                     )
                     .await;
                     session_counter.fetch_sub(1, Ordering::Relaxed);

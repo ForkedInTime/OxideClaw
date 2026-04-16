@@ -659,6 +659,12 @@ async fn main() -> Result<()> {
                 };
 
                 let config = Config::load()?;
+                let is_non_anthropic = crate::api::is_ollama_model(&config.model)
+                    || crate::api::is_openai_compat_model(&config.model);
+                if !is_non_anthropic && config.api_key.is_empty() {
+                    eprintln!("Error: ANTHROPIC_API_KEY not set for model: {}", config.model);
+                    std::process::exit(1);
+                }
                 let tools = all_tools(&config);
                 let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
 
@@ -694,7 +700,13 @@ async fn main() -> Result<()> {
                     }
                 });
 
-                let result = run_browse(req, &config, tools, current_url, progress_tx, approval_tx).await?;
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let cancel_clone = cancel.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    cancel_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                let result = run_browse(req, &config, tools, current_url, progress_tx, approval_tx, cancel).await?;
                 progress_task.await.ok();
 
                 // Print final result as JSON

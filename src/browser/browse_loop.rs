@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -118,6 +118,7 @@ pub async fn run_browse(
     current_url: Arc<tokio::sync::Mutex<String>>,
     progress_tx: mpsc::Sender<BrowseProgress>,
     approval_tx: mpsc::Sender<ApprovalPrompt>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<BrowseResult> {
     // 1. Emit Started event.
     let _ = progress_tx
@@ -166,24 +167,37 @@ pub async fn run_browse(
 
     // 10. Spawn a task to forward nudges as BrowseProgress events.
     let progress_tx_nudge = progress_tx.clone();
-    let step_counter_nudge = step_counter.clone();
     let nudge_handle = tokio::spawn(async move {
         let mut level: u8 = 0;
         while let Some(text) = nudge_rx.recv().await {
             level = level.saturating_add(1);
-            // Update step counter from the nudge level for progress reporting.
-            let _ = step_counter_nudge.load(std::sync::atomic::Ordering::Relaxed);
             let _ = progress_tx_nudge
                 .send(BrowseProgress::Nudge { level, text })
                 .await;
         }
     });
 
-    // 11. Run the agentic loop.
-    let query_result = engine.query(&req.goal).await;
+    // 11. Check for early cancellation before starting the loop.
+    if cancel.load(Ordering::SeqCst) {
+        drop(engine); // drop engine (and its middleware chain) to shut down nudge_tx
+        let _ = nudge_handle.await;
+        let final_url = {
+            let url = current_url.lock().await;
+            if url.is_empty() { None } else { Some(url.clone()) }
+        };
+        let result = BrowseResult {
+            achieved: false,
+            summary: "Browse cancelled before starting".to_string(),
+            reason: BrowseReason::Cancelled,
+            steps_used: 0,
+            final_url,
+        };
+        let _ = progress_tx.send(BrowseProgress::Completed(result.clone())).await;
+        return Ok(result);
+    }
 
-    // 12. Shut down the nudge forwarder.
-    nudge_handle.abort();
+    // 12. Run the agentic loop.
+    let query_result = engine.query(&req.goal).await;
 
     // 13. Determine the result.
     let steps_used = engine.turns_used();
@@ -192,8 +206,13 @@ pub async fn run_browse(
         if url.is_empty() { None } else { Some(url.clone()) }
     };
 
+    // Check cancellation flag — if set during run, override the result.
+    let cancelled = cancel.load(Ordering::SeqCst);
+
     // Check middleware termination flags first — they override sentinel parsing.
-    let middleware_reason = if loop_mw.is_stopped() {
+    let middleware_reason = if cancelled {
+        Some(BrowseReason::Cancelled)
+    } else if loop_mw.is_stopped() {
         Some(BrowseReason::Stagnation)
     } else if gate_mw.is_user_denied() {
         Some(BrowseReason::UserDenied)
@@ -240,6 +259,9 @@ pub async fn run_browse(
                         BrowseReason::UserDenied => {
                             "Agent terminated: user denied the action twice".to_string()
                         }
+                        BrowseReason::Cancelled => {
+                            "Agent terminated: cancelled by user".to_string()
+                        }
                         _ => "Agent terminated by middleware".to_string(),
                     },
                     reason,
@@ -276,11 +298,13 @@ pub async fn run_browse(
             let reason = middleware_reason.unwrap_or_else(|| {
                 if msg.contains("budget") || msg.contains("Budget") {
                     BrowseReason::Budget
-                } else if msg.contains("browser") || msg.contains("CDP") || msg.contains("Chrome")
-                {
-                    BrowseReason::BrowserCrashed
                 } else {
-                    BrowseReason::Bailed
+                    let crash_keywords = ["browser", "CDP", "Chrome", "WebSocket", "connection", "disconnected", "tungstenite"];
+                    if crash_keywords.iter().any(|kw| msg.to_lowercase().contains(&kw.to_lowercase())) {
+                        BrowseReason::BrowserCrashed
+                    } else {
+                        BrowseReason::Bailed
+                    }
                 }
             });
             BrowseResult {
