@@ -8,6 +8,7 @@ pub mod extraction;
 pub mod loop_detector;
 pub mod middleware;
 pub mod snapshot;
+pub mod yolo_ack;
 
 use anyhow::{Result, bail};
 use cdp::CdpClient;
