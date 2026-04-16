@@ -871,6 +871,61 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
             });
         }
 
+        // ── Poll browse progress events ──────────────────────────────────────
+        if let Some(mut rx) = app.browse_progress_rx.take() {
+            let mut done = false;
+            while let Ok(event) = rx.try_recv() {
+                use crate::browser::browse_loop::BrowseProgress;
+                match event {
+                    BrowseProgress::Started { .. } => {
+                        // Already shown at dispatch time
+                    }
+                    BrowseProgress::Step { n, action, target } => {
+                        app.entries.push(ChatEntry::system(format!(
+                            "  Step {n}: {action} {target}"
+                        )));
+                        app.scroll_to_bottom();
+                    }
+                    BrowseProgress::Nudge { level, text } => {
+                        app.entries.push(ChatEntry::system(format!(
+                            "  ⚠ Nudge L{level}: {text}"
+                        )));
+                        app.scroll_to_bottom();
+                    }
+                    BrowseProgress::ApprovalNeeded { .. } => {
+                        // Handled via approval_rx below
+                    }
+                    BrowseProgress::Completed(result) => {
+                        let icon = if result.achieved { "✅" } else { "⚠" };
+                        app.entries.push(ChatEntry::system(format!(
+                            "{icon} /browse done ({:?}): {}", result.reason, result.summary
+                        )));
+                        app.scroll_to_bottom();
+                        app.finish_loading();
+                        // Clean up approval channel too
+                        app.browse_approval_rx = None;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if !done {
+                // Put the receiver back — run is still in progress
+                app.browse_progress_rx = Some(rx);
+            }
+        }
+
+        // Poll browse approval prompts
+        if let Some(mut rx) = app.browse_approval_rx.take() {
+            if let Ok(prompt) = rx.try_recv() {
+                app.browse_approval = Some(prompt);
+            }
+            // Put back if browse is still running
+            if app.browse_progress_rx.is_some() || app.browse_approval.is_some() {
+                app.browse_approval_rx = Some(rx);
+            }
+        }
+
         // Uses cached term size — no syscall per frame; updated on Resize events.
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
@@ -1050,6 +1105,39 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                             app.apply(AppEvent::Compacted {
                                 replacement: replacement.clone(),
                                 summary_len,
+                            });
+                        }
+                        AppEvent::VoiceBrowse(ref goal) => {
+                            // Voice always uses Pattern policy — never Yolo (too easy
+                            // to mis-transcribe destructive commands).
+                            let goal_str = goal.clone();
+                            app.apply(ev);
+                            let max = config.browse_max_steps;
+                            app.entries.push(ChatEntry::system(format!(
+                                "🌐 /browse (voice) — goal: {goal_str} (max {max} steps, policy: Pattern)"
+                            )));
+                            app.scroll_to_bottom();
+                            app.start_loading();
+                            let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
+                            let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
+                            app.browse_progress_rx = Some(progress_rx);
+                            app.browse_approval_rx = Some(approval_rx);
+                            let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+                            let cfg = config.clone();
+                            let all_tools = tools.to_vec();
+                            let browse_req = crate::browser::browse_loop::BrowseRequest {
+                                goal: goal_str,
+                                policy: crate::browser::browse_loop::BrowsePolicy::Pattern,
+                                max_steps: max,
+                                voice: true,
+                            };
+                            tokio::spawn(async move {
+                                let result = crate::browser::browse_loop::run_browse(
+                                    browse_req, &cfg, all_tools, current_url, progress_tx, approval_tx,
+                                ).await;
+                                if let Err(e) = result {
+                                    eprintln!("Voice browse error: {e}");
+                                }
                             });
                         }
                         other => app.apply(other),
@@ -1524,6 +1612,28 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         return Ok(());
     }
 
+    // Browse approval dialog takes priority after permission dialog
+    if app.browse_approval.is_some() {
+        match key.code {
+            Char('a') | Char('A') => {
+                if let Some(prompt) = app.browse_approval.take() {
+                    let _ = prompt.reply.send(true);
+                    app.entries.push(ChatEntry::system("  ✓ Approved"));
+                    app.scroll_to_bottom();
+                }
+            }
+            Char('d') | Char('D') => {
+                if let Some(prompt) = app.browse_approval.take() {
+                    let _ = prompt.reply.send(false);
+                    app.entries.push(ChatEntry::system("  ✗ Denied"));
+                    app.scroll_to_bottom();
+                }
+            }
+            _ => {} // ignore other keys while prompt is active
+        }
+        return Ok(());
+    }
+
     // AskUser dialog takes priority after permission dialog
     if let Some(ref mut q) = app.pending_user_question {
         match key.code {
@@ -1642,7 +1752,12 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 ));
                             }
                             Ok(text) => {
-                                let _ = tx2.send(AppEvent::VoiceTranscription(text));
+                                if crate::voice::voice_routes_to_browse(&text) {
+                                    let goal = crate::voice::strip_browse_prefix(&text);
+                                    let _ = tx2.send(AppEvent::VoiceBrowse(goal));
+                                } else {
+                                    let _ = tx2.send(AppEvent::VoiceTranscription(text));
+                                }
                             }
                             Err(e) => {
                                 let _ =
@@ -3863,6 +3978,46 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             config.auto_commit.message_prefix,
                         );
                         app.entries.push(ChatEntry::system(msg));
+                    }
+                    CommandAction::Browse { goal, policy, max_steps } => {
+                        let max = max_steps.unwrap_or(config.browse_max_steps);
+                        app.entries.push(ChatEntry::system(format!(
+                            "🌐 /browse started — goal: {goal} (max {max} steps, policy: {policy:?})"
+                        )));
+                        app.scroll_to_bottom();
+                        app.start_loading();
+
+                        // Create channels for progress events and approval prompts
+                        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
+                        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
+                        app.browse_progress_rx = Some(progress_rx);
+                        app.browse_approval_rx = Some(approval_rx);
+
+                        // Shared current-URL state
+                        let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+
+                        let cfg = config.clone();
+                        let all_tools = tools.to_vec();
+
+                        let browse_req = crate::browser::browse_loop::BrowseRequest {
+                            goal,
+                            policy,
+                            max_steps: max,
+                            voice: false,
+                        };
+                        tokio::spawn(async move {
+                            let result = crate::browser::browse_loop::run_browse(
+                                browse_req,
+                                &cfg,
+                                all_tools,
+                                current_url,
+                                progress_tx,
+                                approval_tx,
+                            ).await;
+                            if let Err(e) = result {
+                                eprintln!("Browse error: {e}");
+                            }
+                        });
                     }
                     CommandAction::BrowseUrl(url) => {
                         // Ship a prompt to the agent loop — it will invoke the shared

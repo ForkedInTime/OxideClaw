@@ -200,6 +200,25 @@ pub enum SdkRequest {
 
     #[serde(rename = "health/check")]
     HealthCheck { id: String },
+
+    #[serde(rename = "browse/start")]
+    BrowseStart {
+        id: String,
+        goal: String,
+        #[serde(default)]
+        policy: crate::browser::browse_loop::BrowsePolicy,
+        #[serde(default)]
+        max_steps: Option<u32>,
+        #[serde(default)]
+        yolo_ack: bool,
+    },
+
+    #[serde(rename = "browse/approval_reply")]
+    BrowseApprovalReply {
+        session_id: String,
+        step: u32,
+        approved: bool,
+    },
 }
 
 // ── Responses (RustyClaw → Host, correlated by ID) ──────────────────────────
@@ -247,6 +266,12 @@ pub enum SdkResponse {
         version: String,
         active_sessions: usize,
         uptime_seconds: u64,
+    },
+
+    #[serde(rename = "browse/started")]
+    BrowseStarted {
+        id: String,
+        session_id: String,
     },
 
     #[serde(rename = "error")]
@@ -354,5 +379,29 @@ pub enum SdkNotification {
         session_id: String,
         code: String,
         message: String,
+    },
+
+    #[serde(rename = "browse/progress")]
+    BrowseProgress {
+        session_id: String,
+        step: u32,
+        action: String,
+        target: String,
+    },
+
+    #[serde(rename = "browse/approval_needed")]
+    BrowseApprovalNeeded {
+        session_id: String,
+        step: u32,
+        tool_name: String,
+        target_text: String,
+        url: String,
+        reason: String,
+    },
+
+    #[serde(rename = "browse/completed")]
+    BrowseCompleted {
+        session_id: String,
+        result: crate::browser::browse_loop::BrowseResult,
     },
 }

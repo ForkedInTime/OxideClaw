@@ -49,6 +49,14 @@ else
   err "  fix: edit README.md (table row + /model line) to say \"${provider_count} providers\""
 fi
 
+# ── 4. Autonomous browser claim ──────────────────────────────────────────────
+if grep -qF "Autonomous browser agent" README.md; then
+  ok "README.md has 'Autonomous browser agent' row"
+else
+  err "README.md missing 'Autonomous browser agent' row (expected after /browse ship)"
+  err "  fix: add '| Autonomous browser agent | No | No | ...' to the comparison table"
+fi
+
 # ── Result ───────────────────────────────────────────────────────────────────
 if [ "$fail" -eq 0 ]; then
   echo ""

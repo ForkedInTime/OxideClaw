@@ -253,6 +253,15 @@ pub struct Settings {
     /// (`refs/rustyclaw/sessions/<id>`) navigable via `/undo` and `/redo`.
     #[serde(rename = "autoCommit")]
     pub auto_commit: Option<AutoCommitSettings>,
+
+    #[serde(rename = "browseMaxSteps")]
+    pub browse_max_steps: Option<u32>,
+
+    #[serde(rename = "browseApprovalPatterns")]
+    pub browse_approval_patterns: Option<Vec<String>>,
+
+    #[serde(rename = "browseDefaultPolicy")]
+    pub browse_default_policy: Option<String>,
 }
 
 /// Settings for phase-declarative model routing.
@@ -489,6 +498,11 @@ impl Settings {
             phase_router: other.phase_router.or(self.phase_router),
             auto_fix: other.auto_fix.or(self.auto_fix),
             auto_commit: other.auto_commit.or(self.auto_commit),
+            browse_max_steps: other.browse_max_steps.or(self.browse_max_steps),
+            browse_approval_patterns: other
+                .browse_approval_patterns
+                .or(self.browse_approval_patterns),
+            browse_default_policy: other.browse_default_policy.or(self.browse_default_policy),
             permissions: PermissionsConfig {
                 // Union both lists — project additions stack on top of global
                 allow: {

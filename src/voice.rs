@@ -770,6 +770,113 @@ async fn play_wav(
     Ok(())
 }
 
+// ── Browse prefix routing ─────────────────────────────────────────────────────
+
+/// Decide whether a voice transcript should enter autonomous browse mode.
+/// Only unambiguous prefixes route to /browse; "find" is deliberately excluded
+/// to avoid collisions with codebase/chat "find" intent.
+pub fn voice_routes_to_browse(transcript: &str) -> bool {
+    let t = transcript.trim().to_lowercase();
+    t.starts_with("browse ")
+        || t.starts_with("browser ")
+        || t.starts_with("web ")
+        || t.starts_with("go to ")
+        || t.starts_with("open ")
+        || t.starts_with("shop for ")
+        || t.starts_with("book ")
+        || t.starts_with("order ")
+}
+
+/// Strip the browse prefix, leaving the goal text.
+pub fn strip_browse_prefix(transcript: &str) -> String {
+    let t = transcript.trim();
+    let lower = t.to_lowercase();
+    for prefix in &[
+        "browse ", "browser ", "web ", "go to ", "open ", "shop for ", "book ", "order ",
+    ] {
+        if lower.starts_with(prefix) {
+            return t[prefix.len()..].to_string();
+        }
+    }
+    t.to_string()
+}
+
+// ── Browse milestone TTS ──────────────────────────────────────────────────────
+
+pub enum BrowseMilestone {
+    Start,
+    GateTrip,
+    End,
+}
+
+/// Speak one of the three browse milestones via TTS.
+/// Only called when voice == true. Fire-and-forget: errors are silently ignored
+/// so a missing TTS engine never blocks the browse loop.
+pub async fn speak_browse_milestone(milestone: BrowseMilestone, text: &str) {
+    let phrase = match milestone {
+        BrowseMilestone::Start => format!("Searching for {text}"),
+        BrowseMilestone::GateTrip => text.to_string(),
+        BrowseMilestone::End => text.to_string(),
+    };
+    // Create a dummy stop channel — milestone phrases are short; we never need
+    // to cancel them mid-word.
+    let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = speak(&phrase, None, stop_rx).await;
+}
+
+// ── Voice approval listener ───────────────────────────────────────────────────
+
+/// Listen for a voice approve/deny reply during an approval prompt.
+/// Returns true if the user said "confirm"/"yes"/"approve"/"ok", false otherwise.
+/// Times out after `timeout_secs`, returning false on timeout.
+pub async fn await_voice_approval(timeout_secs: u64) -> bool {
+    // Requires a recorder to be available; return deny if none found.
+    let backend = match find_recorder() {
+        Some(b) => b,
+        None => return false,
+    };
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Record for at most timeout_secs then stop automatically.
+    let record_task = tokio::spawn(async move {
+        match start_recording(&backend).await {
+            Ok(mut child) => {
+                tokio::select! {
+                    _ = stop_rx => {
+                        if let Some(pid) = child.id() {
+                            let _ = tokio::process::Command::new("kill")
+                                .args(["-2", &pid.to_string()])
+                                .status()
+                                .await;
+                        }
+                        let _ = child.wait().await;
+                    }
+                    _ = child.wait() => {}
+                }
+            }
+            Err(_) => {}
+        }
+    });
+
+    // Wait for the timeout then signal the recorder to stop.
+    tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
+    let _ = stop_tx.send(());
+    let _ = record_task.await;
+
+    // Transcribe and check for affirmative keywords.
+    match transcribe(None, None).await {
+        Ok(text) => {
+            let lower = text.trim().to_lowercase();
+            lower.contains("confirm")
+                || lower.contains("yes")
+                || lower.contains("approve")
+                || lower.contains("ok")
+        }
+        Err(_) => false,
+    }
+}
+
 // ── Status display ────────────────────────────────────────────────────────────
 
 pub fn voice_status(enabled: bool, tts_enabled: bool) -> String {

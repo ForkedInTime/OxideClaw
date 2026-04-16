@@ -139,6 +139,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.overlay.is_some() {
         draw_overlay(f, area, app, tc);
+    } else if app.browse_approval.is_some() {
+        draw_browse_approval(f, area, app, tc);
     } else if app.pending_permission.is_some() {
         draw_permission(f, area, app, tc);
     } else if app.pending_user_question.is_some() {
@@ -877,6 +879,87 @@ fn context_window_for_model(model: &str) -> u64 {
         // Conservative default for unknown models — assumes modern Claude-class.
         200_000
     }
+}
+
+// ── Browse approval dialog ────────────────────────────────────────────────────
+
+fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
+    let Some(prompt) = &app.browse_approval else {
+        return;
+    };
+
+    let popup_w = (area.width * 6 / 10).max(50).min(area.width);
+    let popup_h = 12_u16.max(8).min(area.height);
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Browse Approval ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  ⚠ Browse approval required",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("  Action:  {}", prompt.tool_name),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  Target:  {}", prompt.target_text),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  URL:     {}", prompt.url),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  Reason:  {}", prompt.reason),
+            Style::default().fg(Color::White),
+        )),
+        Line::raw(""),
+    ];
+    lines.push(Line::from(vec![
+        Span::styled("  [", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "A",
+            Style::default()
+                .fg(tc.assistant)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("]pprove   [", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "D",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("]eny", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 // ── Permission dialog ─────────────────────────────────────────────────────────

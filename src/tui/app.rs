@@ -678,6 +678,13 @@ pub struct App {
     /// Active file-watch state. `None` when no watcher is running.
     /// Dropping this stops watching.
     pub watcher: Option<WatcherHandle>,
+
+    /// Active browse approval prompt awaiting user input (A=approve, D=deny).
+    pub browse_approval: Option<crate::browser::approval_gate::ApprovalPrompt>,
+    /// Receiver for browse progress events (active during a /browse run).
+    pub browse_progress_rx: Option<tokio::sync::mpsc::Receiver<crate::browser::browse_loop::BrowseProgress>>,
+    /// Receiver for browse approval prompts.
+    pub browse_approval_rx: Option<tokio::sync::mpsc::Receiver<crate::browser::approval_gate::ApprovalPrompt>>,
 }
 
 /// Format a raw model ID into a human-readable name like "Sonnet 4.6".
@@ -808,6 +815,9 @@ impl App {
             cost_tracker: crate::cost::CostTracker::new(),
             browser_session: None,
             watcher: None,
+            browse_approval: None,
+            browse_progress_rx: None,
+            browse_approval_rx: None,
         }
     }
 
@@ -1364,6 +1374,12 @@ impl App {
                 for ch in text.chars() {
                     self.insert_char(ch);
                 }
+                self.voice_recording = false;
+                self.voice_task = None;
+                self.voice_stop_tx = None;
+            }
+            AppEvent::VoiceBrowse(_goal) => {
+                // Recording state cleared here; run.rs handles the Browse dispatch.
                 self.voice_recording = false;
                 self.voice_task = None;
                 self.voice_stop_tx = None;

@@ -294,6 +294,12 @@ pub enum CommandAction {
     Redo { n: Option<u32> },
     /// `/autocommit [status]` — print auto-commit state to the chat. v1 only supports `status`.
     AutoCommitStatus,
+    /// Start an autonomous browser run.
+    Browse {
+        goal: String,
+        policy: crate::browser::browse_loop::BrowsePolicy,
+        max_steps: Option<u32>,
+    },
     /// Launch browser and optionally navigate to URL
     BrowseUrl(String),
     /// Take a screenshot of the current browser page
@@ -386,7 +392,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "undo" => cmd_undo(args),
         "redo" => cmd_redo(args),
         "autocommit" => cmd_autocommit(args),
-        "browser" | "browse" => {
+        "browser" => {
             let url = args.trim().to_string();
             if url == "close" {
                 CommandAction::BrowserClose
@@ -396,6 +402,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
                 CommandAction::BrowseUrl(url)
             }
         }
+        "browse" => parse_browse_command(args.trim()),
         "screenshot" => CommandAction::BrowserScreenshot,
         "branch" => cmd_branch(ctx),
         "summary" => CommandAction::SendPrompt(
@@ -525,6 +532,45 @@ fn split_first_word(s: &str) -> (&str, &str) {
         Some(i) => (&s[..i], s[i..].trim()),
         None => (s, ""),
     }
+}
+
+/// Parse `/browse` arguments into a `CommandAction::Browse` variant.
+///
+/// Supported flags (all optional, may appear in any order before the goal):
+/// - `--yolo`             → `BrowsePolicy::Yolo`
+/// - `--ask`              → `BrowsePolicy::Ask`
+/// - `--max-steps <N>`    → `max_steps = Some(N)`
+///
+/// Remaining tokens after flag removal form the `goal` string.
+pub fn parse_browse_command(input: &str) -> CommandAction {
+    use crate::browser::browse_loop::BrowsePolicy;
+    let mut policy = BrowsePolicy::Pattern;
+    let mut max_steps: Option<u32> = None;
+    let mut tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--yolo" => {
+                policy = BrowsePolicy::Yolo;
+                tokens.remove(i);
+            }
+            "--ask" => {
+                policy = BrowsePolicy::Ask;
+                tokens.remove(i);
+            }
+            "--max-steps" if i + 1 < tokens.len() => {
+                if let Ok(n) = tokens[i + 1].parse() {
+                    max_steps = Some(n);
+                }
+                tokens.drain(i..=i + 1);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    let goal = tokens.join(" ").trim().to_string();
+    CommandAction::Browse { goal, policy, max_steps }
 }
 
 // ── Individual commands ───────────────────────────────────────────────────────
@@ -2186,6 +2232,18 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/spawn merge <id>", "merge agent's changes"),
             ("/spawn kill <id>", "cancel a running agent"),
             ("/spawn discard <id>", "discard agent's worktree"),
+        ],
+    ),
+    (
+        "Browser",
+        "Autonomous browser agent",
+        &[
+            ("/browse <goal>", "run autonomous browser agent towards a goal"),
+            ("/browse --yolo <goal>", "yolo mode: no approval prompts"),
+            ("/browse --ask <goal>", "ask before every action"),
+            ("/browse --max-steps N <goal>", "cap the run at N steps"),
+            ("/browser <url>", "open URL in managed browser session"),
+            ("/screenshot", "take a screenshot of the current page"),
         ],
     ),
     (
