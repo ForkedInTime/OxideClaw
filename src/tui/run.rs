@@ -3864,6 +3864,65 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         );
                         app.entries.push(ChatEntry::system(msg));
                     }
+                    CommandAction::Browse { goal, policy, max_steps } => {
+                        use crate::browser::browse_loop::BrowsePolicy;
+                        let policy_label = match policy {
+                            BrowsePolicy::Yolo => " [yolo]",
+                            BrowsePolicy::Ask => " [ask]",
+                            BrowsePolicy::Pattern => "",
+                        };
+                        let steps_note = match max_steps {
+                            Some(n) => format!("Limit yourself to at most {n} browser steps.\n"),
+                            None => String::new(),
+                        };
+                        let steps_label = match max_steps {
+                            Some(n) => format!(", max {n} steps"),
+                            None => String::new(),
+                        };
+                        app.entries.push(ChatEntry::system(format!(
+                            "Browser agent{policy_label} starting{steps_label}: {goal}"
+                        )));
+                        app.entries.push(ChatEntry::user(input.clone()));
+                        app.scroll_to_bottom();
+                        app.start_loading();
+                        let prompt = format!(
+                            "You are an autonomous browser agent.\n\
+                             Goal: {goal}\n\
+                             Policy:{policy_label}\n\
+                             {steps_note}\
+                             Use browser_navigate, browser_click, browser_fill_form, \
+                             browser_snapshot, and related browser tools to accomplish the goal. \
+                             Report your progress and final result."
+                        );
+                        let mut snapshot = messages.clone();
+                        snapshot.push(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text { text: prompt }],
+                        });
+                        let c2 = client.clone();
+                        let tvec = tools.to_vec();
+                        let cfg = config.clone();
+                        let tx2 = tx.clone();
+                        let sp = system_prompt.clone();
+                        let ps = perm_state.clone();
+                        let pm = app.plan_mode;
+                        let sid3 = session.id.clone();
+                        let handle = tokio::spawn(async move {
+                            run_api_task(ApiTask {
+                                client: c2,
+                                tools: tvec,
+                                messages: snapshot,
+                                config: cfg,
+                                perm_state: ps,
+                                system_prompt: sp,
+                                tx: tx2,
+                                plan_mode: pm,
+                                session_id: sid3,
+                            })
+                            .await;
+                        });
+                        app.api_task = Some(handle.abort_handle());
+                    }
                     CommandAction::BrowseUrl(url) => {
                         // Ship a prompt to the agent loop — it will invoke the shared
                         // browser_navigate / browser_snapshot tools (which drive the same
