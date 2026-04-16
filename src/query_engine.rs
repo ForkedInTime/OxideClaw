@@ -97,6 +97,7 @@ impl QueryEngine {
     /// Mirrors the main query() function in query.ts.
     pub async fn query(&mut self, user_input: impl Into<String>) -> Result<()> {
         let user_input = user_input.into();
+        self.turns = 0;
 
         // --replay-user-messages: echo user message in stream-json output
         if self.replay_user_messages() && self.stream_json_output {
