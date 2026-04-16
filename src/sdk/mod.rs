@@ -293,7 +293,8 @@ impl SdkServer {
             | SdkRequest::TurnInterrupt { id, .. }
             | SdkRequest::SessionResume { id, .. }
             | SdkRequest::SessionExport { id, .. }
-            | SdkRequest::CostReport { id, .. } => {
+            | SdkRequest::CostReport { id, .. }
+            | SdkRequest::BrowseStart { id, .. } => {
                 transport
                     .send_response(SdkResponse::Error {
                         id,
@@ -301,6 +302,11 @@ impl SdkServer {
                         message: "This request type is not yet implemented in Phase A.".into(),
                     })
                     .await?;
+            }
+
+            // BrowseApprovalReply has no request id — it's a fire-and-forget host reply.
+            SdkRequest::BrowseApprovalReply { .. } => {
+                // Phase B: route to the waiting browse session's approval channel.
             }
         }
 
