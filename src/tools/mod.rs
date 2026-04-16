@@ -97,6 +97,10 @@ pub struct ToolContext {
     pub live_model: Option<String>,
     pub live_api_key: Option<String>,
     pub live_ollama_host: Option<String>,
+
+    /// Middleware chain: pre/post hooks around every tool call.
+    /// Default empty = no-op (existing behavior unchanged).
+    pub middlewares: crate::browser::middleware::MiddlewareChain,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -126,6 +130,7 @@ impl ToolContext {
             live_model: None,
             live_api_key: None,
             live_ollama_host: None,
+            middlewares: Vec::new(),
         }
     }
 

@@ -1,9 +1,10 @@
 //! Browser automation via Chrome DevTools Protocol.
-pub mod cdp;
-pub mod snapshot;
 pub mod actions;
+pub mod cdp;
 pub mod element;
 pub mod extraction;
+pub mod middleware;
+pub mod snapshot;
 
 use anyhow::{Result, bail};
 use cdp::CdpClient;

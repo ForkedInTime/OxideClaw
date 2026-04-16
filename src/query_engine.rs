@@ -5,6 +5,7 @@ use crate::api::{ApiBackend, MessagesRequest};
 use crate::compact::{CompactNeeded, compact_needed, snip_compact, summarize_compact};
 use crate::config::Config;
 use crate::rag;
+use crate::browser::middleware::MiddlewareVerdict;
 use crate::tools::{DynTool, ToolContext};
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -413,6 +414,40 @@ impl QueryEngine {
                     }
                 }
 
+                // ── Middleware before_tool check ──────────────────────
+                let mut middleware_denied = false;
+                for mw in &ctx.middlewares {
+                    match mw.before_tool(name, input).await {
+                        MiddlewareVerdict::Allow => {}
+                        MiddlewareVerdict::Deny { reason } => {
+                            results.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: vec![ToolResultContent::text(format!(
+                                    "Middleware denied: {reason}"
+                                ))],
+                                is_error: Some(true),
+                            });
+                            middleware_denied = true;
+                            break;
+                        }
+                        MiddlewareVerdict::RequireConfirmation { reason, .. } => {
+                            // Treat as Deny until the approval gate resolves internally.
+                            results.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: vec![ToolResultContent::text(format!(
+                                    "Middleware requires confirmation: {reason}"
+                                ))],
+                                is_error: Some(true),
+                            });
+                            middleware_denied = true;
+                            break;
+                        }
+                    }
+                }
+                if middleware_denied {
+                    continue;
+                }
+
                 let tool = self.tools.iter().find(|t| t.name() == name);
 
                 let output = match tool {
@@ -422,6 +457,20 @@ impl QueryEngine {
                     },
                     None => crate::tools::ToolOutput::error(format!("Unknown tool: {name}")),
                 };
+
+                // ── Middleware after_tool ─────────────────────────────
+                let output_text: String = output
+                    .content
+                    .iter()
+                    .map(|c| {
+                        let ToolResultContent::Text { text } = c;
+                        text.as_str()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for mw in &ctx.middlewares {
+                    mw.after_tool(name, &output_text).await;
+                }
 
                 if output.is_error && !self.stream_json_output {
                     eprintln!(
@@ -441,20 +490,11 @@ impl QueryEngine {
 
                 // Emit tool_result event for stream-json + hook-events mode
                 if self.include_hook_events && self.stream_json_output {
-                    let result_text = output
-                        .content
-                        .iter()
-                        .map(|c| {
-                            let ToolResultContent::Text { text } = c;
-                            text.as_str()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
                     let event = serde_json::json!({
                         "type": "tool_result",
                         "name": name,
                         "is_error": output.is_error,
-                        "content": result_text,
+                        "content": output_text,
                     });
                     println!("{}", event);
                 }
