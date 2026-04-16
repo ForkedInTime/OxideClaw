@@ -871,6 +871,61 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
             });
         }
 
+        // ── Poll browse progress events ──────────────────────────────────────
+        if let Some(mut rx) = app.browse_progress_rx.take() {
+            let mut done = false;
+            while let Ok(event) = rx.try_recv() {
+                use crate::browser::browse_loop::BrowseProgress;
+                match event {
+                    BrowseProgress::Started { .. } => {
+                        // Already shown at dispatch time
+                    }
+                    BrowseProgress::Step { n, action, target } => {
+                        app.entries.push(ChatEntry::system(format!(
+                            "  Step {n}: {action} {target}"
+                        )));
+                        app.scroll_to_bottom();
+                    }
+                    BrowseProgress::Nudge { level, text } => {
+                        app.entries.push(ChatEntry::system(format!(
+                            "  ⚠ Nudge L{level}: {text}"
+                        )));
+                        app.scroll_to_bottom();
+                    }
+                    BrowseProgress::ApprovalNeeded { .. } => {
+                        // Handled via approval_rx below
+                    }
+                    BrowseProgress::Completed(result) => {
+                        let icon = if result.achieved { "✅" } else { "⚠" };
+                        app.entries.push(ChatEntry::system(format!(
+                            "{icon} /browse done ({:?}): {}", result.reason, result.summary
+                        )));
+                        app.scroll_to_bottom();
+                        app.finish_loading();
+                        // Clean up approval channel too
+                        app.browse_approval_rx = None;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if !done {
+                // Put the receiver back — run is still in progress
+                app.browse_progress_rx = Some(rx);
+            }
+        }
+
+        // Poll browse approval prompts
+        if let Some(mut rx) = app.browse_approval_rx.take() {
+            if let Ok(prompt) = rx.try_recv() {
+                app.browse_approval = Some(prompt);
+            }
+            // Put back if browse is still running
+            if app.browse_progress_rx.is_some() || app.browse_approval.is_some() {
+                app.browse_approval_rx = Some(rx);
+            }
+        }
+
         // Uses cached term size — no syscall per frame; updated on Resize events.
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
@@ -1520,6 +1575,28 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 }
             }
             _ => {}
+        }
+        return Ok(());
+    }
+
+    // Browse approval dialog takes priority after permission dialog
+    if app.browse_approval.is_some() {
+        match key.code {
+            Char('a') | Char('A') => {
+                if let Some(prompt) = app.browse_approval.take() {
+                    let _ = prompt.reply.send(true);
+                    app.entries.push(ChatEntry::system("  ✓ Approved"));
+                    app.scroll_to_bottom();
+                }
+            }
+            Char('d') | Char('D') => {
+                if let Some(prompt) = app.browse_approval.take() {
+                    let _ = prompt.reply.send(false);
+                    app.entries.push(ChatEntry::system("  ✗ Denied"));
+                    app.scroll_to_bottom();
+                }
+            }
+            _ => {} // ignore other keys while prompt is active
         }
         return Ok(());
     }
@@ -3865,63 +3942,44 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.entries.push(ChatEntry::system(msg));
                     }
                     CommandAction::Browse { goal, policy, max_steps } => {
-                        use crate::browser::browse_loop::BrowsePolicy;
-                        let policy_label = match policy {
-                            BrowsePolicy::Yolo => " [yolo]",
-                            BrowsePolicy::Ask => " [ask]",
-                            BrowsePolicy::Pattern => "",
-                        };
-                        let steps_note = match max_steps {
-                            Some(n) => format!("Limit yourself to at most {n} browser steps.\n"),
-                            None => String::new(),
-                        };
-                        let steps_label = match max_steps {
-                            Some(n) => format!(", max {n} steps"),
-                            None => String::new(),
-                        };
+                        let max = max_steps.unwrap_or(config.browse_max_steps);
                         app.entries.push(ChatEntry::system(format!(
-                            "Browser agent{policy_label} starting{steps_label}: {goal}"
+                            "🌐 /browse started — goal: {goal} (max {max} steps, policy: {policy:?})"
                         )));
-                        app.entries.push(ChatEntry::user(input.clone()));
                         app.scroll_to_bottom();
                         app.start_loading();
-                        let prompt = format!(
-                            "You are an autonomous browser agent.\n\
-                             Goal: {goal}\n\
-                             Policy:{policy_label}\n\
-                             {steps_note}\
-                             Use browser_navigate, browser_click, browser_fill_form, \
-                             browser_snapshot, and related browser tools to accomplish the goal. \
-                             Report your progress and final result."
-                        );
-                        let mut snapshot = messages.clone();
-                        snapshot.push(Message {
-                            role: Role::User,
-                            content: vec![ContentBlock::Text { text: prompt }],
-                        });
-                        let c2 = client.clone();
-                        let tvec = tools.to_vec();
+
+                        // Create channels for progress events and approval prompts
+                        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
+                        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
+                        app.browse_progress_rx = Some(progress_rx);
+                        app.browse_approval_rx = Some(approval_rx);
+
+                        // Shared current-URL state
+                        let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+
                         let cfg = config.clone();
-                        let tx2 = tx.clone();
-                        let sp = system_prompt.clone();
-                        let ps = perm_state.clone();
-                        let pm = app.plan_mode;
-                        let sid3 = session.id.clone();
-                        let handle = tokio::spawn(async move {
-                            run_api_task(ApiTask {
-                                client: c2,
-                                tools: tvec,
-                                messages: snapshot,
-                                config: cfg,
-                                perm_state: ps,
-                                system_prompt: sp,
-                                tx: tx2,
-                                plan_mode: pm,
-                                session_id: sid3,
-                            })
-                            .await;
+                        let all_tools = tools.to_vec();
+
+                        let browse_req = crate::browser::browse_loop::BrowseRequest {
+                            goal,
+                            policy,
+                            max_steps: max,
+                            voice: false,
+                        };
+                        tokio::spawn(async move {
+                            let result = crate::browser::browse_loop::run_browse(
+                                browse_req,
+                                &cfg,
+                                all_tools,
+                                current_url,
+                                progress_tx,
+                                approval_tx,
+                            ).await;
+                            if let Err(e) = result {
+                                eprintln!("Browse error: {e}");
+                            }
                         });
-                        app.api_task = Some(handle.abort_handle());
                     }
                     CommandAction::BrowseUrl(url) => {
                         // Ship a prompt to the agent loop — it will invoke the shared
