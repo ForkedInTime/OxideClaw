@@ -432,3 +432,52 @@ impl Tool for BrowserWaitTool {
         Ok(ToolOutput::success(result))
     }
 }
+
+// ── browse_done ──────────────────────────────────────────────────────────────
+
+/// Sentinel tool the model calls to signal the end of an autonomous `/browse`
+/// run. Returns a `BROWSE_DONE` string the orchestrator parses to exit the loop.
+pub struct BrowseDoneTool;
+
+impl BrowseDoneTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for BrowseDoneTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for BrowseDoneTool {
+    fn name(&self) -> &str {
+        "browse_done"
+    }
+    fn description(&self) -> &str {
+        "Signal that the browser goal is achieved or that you're stuck."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "summary":  { "type": "string" },
+                "achieved": { "type": "boolean" }
+            },
+            "required": ["summary", "achieved"]
+        })
+    }
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let summary = input["summary"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing required field: summary"))?;
+        let achieved = input["achieved"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("missing required field: achieved"))?;
+        Ok(ToolOutput::success(format!(
+            "BROWSE_DONE achieved={achieved} summary={summary}"
+        )))
+    }
+}
