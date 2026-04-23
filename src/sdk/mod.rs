@@ -404,15 +404,14 @@ impl SdkServer {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let session_counter = Arc::clone(active_sessions);
                 tokio::spawn(async move {
+                    let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
                     let _ = run_browse(
                         browse_req,
                         &cfg,
                         all_tools_list,
                         current_url,
                         browser_session,
-                        progress_tx,
-                        approval_tx,
-                        cancel,
+                        channels,
                     )
                     .await;
                     session_counter.fetch_sub(1, Ordering::Relaxed);

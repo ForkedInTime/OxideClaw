@@ -48,6 +48,22 @@ pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<
     Ok((title, 200))
 }
 
+/// Query the current page URL via `document.location.href`. Returns `None`
+/// on error or if no URL is available (e.g. the page has no window yet).
+pub async fn current_url(client: &CdpClient) -> Option<String> {
+    let resp = client
+        .send(
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.location.href",
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .ok()?;
+    resp["result"]["value"].as_str().map(|s| s.to_string())
+}
+
 /// Click an element by @ref.
 pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<String> {
     let node_id = session.resolve_ref(element_ref)?;

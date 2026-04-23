@@ -14,16 +14,25 @@ use crate::query_engine::QueryEngine;
 use crate::tools::DynTool;
 
 /// Policy for the approval gate during this run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowsePolicy {
+    #[default]
     Pattern,
     Ask,
     Yolo,
 }
 
-impl Default for BrowsePolicy {
-    fn default() -> Self { Self::Pattern }
+impl BrowsePolicy {
+    /// Parse a settings.json-style string ("pattern" / "ask" / "yolo").
+    /// Unknown or empty strings fall back to `Pattern`.
+    pub fn from_settings_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Self::Ask,
+            "yolo" => Self::Yolo,
+            _ => Self::Pattern,
+        }
+    }
 }
 
 /// A single browse-run configuration.
@@ -126,6 +135,13 @@ fn extract_target(input: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Channels and cancellation state the caller must plumb into a browse run.
+pub struct BrowseChannels {
+    pub progress_tx: mpsc::Sender<BrowseProgress>,
+    pub approval_tx: mpsc::Sender<ApprovalPrompt>,
+    pub cancel: Arc<AtomicBool>,
+}
+
 /// Middleware that syncs the browser session's `current_url` into the
 /// shared `Arc<Mutex<String>>` that the approval gate reads from. Runs
 /// in `after_tool` so URL-pattern matching sees the post-navigation URL.
@@ -179,10 +195,9 @@ pub async fn run_browse(
     tools: Vec<DynTool>,
     current_url: Arc<tokio::sync::Mutex<String>>,
     browser_session: Option<Arc<tokio::sync::Mutex<BrowserSession>>>,
-    progress_tx: mpsc::Sender<BrowseProgress>,
-    approval_tx: mpsc::Sender<ApprovalPrompt>,
-    cancel: Arc<AtomicBool>,
+    channels: BrowseChannels,
 ) -> Result<BrowseResult> {
+    let BrowseChannels { progress_tx, approval_tx, cancel } = channels;
     // 1. Emit Started event + speak the goal if voice is enabled.
     let _ = progress_tx
         .send(BrowseProgress::Started {
@@ -209,14 +224,17 @@ pub async fn run_browse(
     // prompt as BrowseProgress::ApprovalNeeded, then forwards it to the caller.
     let gate = ApprovalGate::with_user_patterns(config.browse_approval_patterns.clone());
     let (internal_approval_tx, mut internal_approval_rx) = mpsc::channel::<ApprovalPrompt>(16);
-    let gate_mw = Arc::new(ApprovalGateMiddleware::new(
-        gate,
-        req.policy,
-        current_url.clone(),
-        internal_approval_tx,
-        step_counter.clone(),
-        req.voice,
-    ));
+    let gate_mw = Arc::new(
+        ApprovalGateMiddleware::new(
+            gate,
+            req.policy,
+            current_url.clone(),
+            internal_approval_tx,
+            step_counter.clone(),
+            req.voice,
+        )
+        .with_browser_session(browser_session.clone()),
+    );
 
     // Bridge: internal approvals → progress event + external approval channel.
     let approval_bridge_progress_tx = progress_tx.clone();

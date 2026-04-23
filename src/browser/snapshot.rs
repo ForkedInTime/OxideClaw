@@ -27,21 +27,28 @@ const SKIP_ROLES: &[&str] = &[
     "LineBreak",
 ];
 
-/// Parse CDP Accessibility.getFullAXTree node array into a text representation
-/// and a ref map (ref_string -> backendDOMNodeId as i64).
+/// Parse CDP Accessibility.getFullAXTree node array into a text representation,
+/// a ref map (ref -> backendDOMNodeId), and a parallel name map (ref -> label).
+///
+/// The name map only contains entries where the node has a non-empty accessible
+/// name — it's used by the approval gate to pattern-match real button labels
+/// against destructive-action regexes.
 ///
 /// Note: we store `backendDOMNodeId` (DOM-tree backend ID), NOT `nodeId`
 /// (AX-tree-local ID). Downstream actions (click, fill, etc.) pass this
 /// to CDP DOM.resolveNode / DOM.getBoxModel, which require the backend ID.
 /// Nodes without a `backendDOMNodeId` (synthetic AX nodes) are skipped.
-pub fn parse_ax_nodes(nodes: &serde_json::Value) -> (String, HashMap<String, i64>) {
+pub fn parse_ax_nodes_full(
+    nodes: &serde_json::Value,
+) -> (String, HashMap<String, i64>, HashMap<String, String>) {
     let mut ref_map = HashMap::new();
+    let mut name_map = HashMap::new();
     let mut lines = Vec::new();
     let mut ref_counter = 1u32;
 
     let arr = match nodes.as_array() {
         Some(a) => a,
-        None => return (String::new(), ref_map),
+        None => return (String::new(), ref_map, name_map),
     };
 
     for node in arr {
@@ -71,6 +78,9 @@ pub fn parse_ax_nodes(nodes: &serde_json::Value) -> (String, HashMap<String, i64
 
         let ref_str = format!("@e{ref_counter}");
         ref_map.insert(ref_str.clone(), node_id);
+        if !name.is_empty() {
+            name_map.insert(ref_str.clone(), name.to_string());
+        }
 
         let display_name = if name.is_empty() {
             format!("{ref_str} [{role}]")
@@ -81,16 +91,23 @@ pub fn parse_ax_nodes(nodes: &serde_json::Value) -> (String, HashMap<String, i64
         ref_counter += 1;
     }
 
-    (lines.join("\n"), ref_map)
+    (lines.join("\n"), ref_map, name_map)
 }
 
-/// Take a full accessibility snapshot via CDP.
+/// Back-compat wrapper: returns only the tree + ref map. Used by existing tests.
+#[allow(dead_code)]
+pub fn parse_ax_nodes(nodes: &serde_json::Value) -> (String, HashMap<String, i64>) {
+    let (tree, refs, _) = parse_ax_nodes_full(nodes);
+    (tree, refs)
+}
+
+/// Take a full accessibility snapshot via CDP, including the name map.
 pub async fn take_snapshot(
     client: &super::cdp::CdpClient,
-) -> anyhow::Result<(String, HashMap<String, i64>)> {
+) -> anyhow::Result<(String, HashMap<String, i64>, HashMap<String, String>)> {
     let result = client
         .send("Accessibility.getFullAXTree", serde_json::json!({}))
         .await?;
     let nodes = &result["nodes"];
-    Ok(parse_ax_nodes(nodes))
+    Ok(parse_ax_nodes_full(nodes))
 }

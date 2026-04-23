@@ -631,7 +631,9 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
 
-                // Determine policy: --yolo > --ask > default (pattern-match)
+                let config = Config::load()?;
+
+                // Determine policy: --yolo > --ask > settings.browseDefaultPolicy > Pattern.
                 let policy = if *yolo {
                     // First-time --yolo: write acknowledgment file if not yet present
                     if !crate::browser::yolo_ack::is_acknowledged() {
@@ -648,7 +650,7 @@ async fn main() -> Result<()> {
                 } else if *ask {
                     BrowsePolicy::Ask
                 } else {
-                    BrowsePolicy::Pattern
+                    BrowsePolicy::from_settings_str(&config.browse_default_policy)
                 };
 
                 let req = BrowseRequest {
@@ -658,7 +660,6 @@ async fn main() -> Result<()> {
                     voice: false,
                 };
 
-                let config = Config::load()?;
                 let is_non_anthropic = crate::api::is_ollama_model(&config.model)
                     || crate::api::is_openai_compat_model(&config.model);
                 if !is_non_anthropic && config.api_key.is_empty() {
@@ -707,7 +708,8 @@ async fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                     cancel_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 });
-                let result = run_browse(req, &config, tools, current_url, browser_session, progress_tx, approval_tx, cancel).await?;
+                let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
+                let result = run_browse(req, &config, tools, current_url, browser_session, channels).await?;
                 progress_task.await.ok();
 
                 // Print final result as JSON

@@ -122,12 +122,12 @@ impl Tool for BrowserNavigateTool {
         // Snapshot afterwards. This also uses the client, not the session,
         // so still no session lock held.
         let tree = match browser::snapshot::take_snapshot(&client).await {
-            Ok((tree, refs)) => {
+            Ok((tree, refs, names)) => {
                 // Brief re-lock to publish the post-navigation state.
                 let mut session = self.session.lock().await;
                 session.current_url = url.to_string();
                 session.current_title = title.clone();
-                session.set_refs(refs);
+                session.set_refs_with_names(refs, names);
                 tree
             }
             Err(e) => {
@@ -170,8 +170,8 @@ impl Tool for BrowserSnapshotTool {
     }
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let client = clone_client(&self.session).await?;
-        let (tree, refs) = browser::snapshot::take_snapshot(&client).await?;
-        self.session.lock().await.set_refs(refs);
+        let (tree, refs, names) = browser::snapshot::take_snapshot(&client).await?;
+        self.session.lock().await.set_refs_with_names(refs, names);
         Ok(ToolOutput::success(tree))
     }
 }
@@ -220,12 +220,17 @@ impl Tool for BrowserClickTool {
         // away mid-click), report that as a soft warning rather than
         // losing the successful click result.
         let trailer = match browser::snapshot::take_snapshot(&client).await {
-            Ok((tree, refs)) => {
-                self.session.lock().await.set_refs(refs);
+            Ok((tree, refs, names)) => {
+                self.session.lock().await.set_refs_with_names(refs, names);
                 format!("\n\nUpdated snapshot:\n{tree}")
             }
             Err(e) => format!("\n\n(snapshot unavailable: {e})"),
         };
+
+        // Refresh current_url — clicks can trigger navigation.
+        if let Some(new_url) = browser::actions::current_url(&client).await {
+            self.session.lock().await.current_url = new_url;
+        }
 
         Ok(ToolOutput::success(format!("{result}{trailer}")))
     }
@@ -263,9 +268,16 @@ impl Tool for BrowserFillTool {
         let value = input["value"]
             .as_str()
             .ok_or_else(|| anyhow!("missing required field: value"))?;
-        let mut session = self.session.lock().await;
-        let _ = session.client()?;
-        let result = browser::actions::fill(&mut session, element_ref, value).await?;
+        let (result, client) = {
+            let mut session = self.session.lock().await;
+            let result = browser::actions::fill(&mut session, element_ref, value).await?;
+            let client = session.client()?.clone();
+            (result, client)
+        };
+        // Fill can trigger navigation on some SPAs (e.g. submit-on-change forms).
+        if let Some(new_url) = browser::actions::current_url(&client).await {
+            self.session.lock().await.current_url = new_url;
+        }
         Ok(ToolOutput::success(result))
     }
 }
@@ -387,6 +399,10 @@ impl Tool for BrowserPressKeyTool {
         let key = required_str(&input, "key")?;
         let client = clone_client(&self.session).await?;
         let result = browser::actions::press_key(&client, key).await?;
+        // Enter/Tab can submit a form and trigger navigation.
+        if let Some(new_url) = browser::actions::current_url(&client).await {
+            self.session.lock().await.current_url = new_url;
+        }
         Ok(ToolOutput::success(result))
     }
 }
