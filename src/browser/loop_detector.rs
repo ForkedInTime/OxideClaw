@@ -138,11 +138,11 @@ impl ToolMiddleware for LoopDetectorMiddleware {
     async fn after_tool(&self, tool_name: &str, output: &str) {
         // browser_navigate resets the detector (new page = fresh state).
         if tool_name == "browser_navigate" {
-            self.inner.lock().unwrap().reset();
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).reset();
             return;
         }
         let nudge = {
-            let mut ld = self.inner.lock().unwrap();
+            let mut ld = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             ld.record_action(tool_name, "", output);
             ld.check_stagnation()
         };

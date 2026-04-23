@@ -1851,7 +1851,11 @@ pub fn clipboard_write(text: &str) -> CommandAction {
             .args(args)
             .stdin(std::process::Stdio::piped())
             .spawn()?;
-        child.stdin.as_mut().unwrap().write_all(text.as_bytes())?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin not available"))?
+            .write_all(text.as_bytes())?;
         child.wait()
     };
 

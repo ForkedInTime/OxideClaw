@@ -1131,9 +1131,10 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                                 max_steps: max,
                                 voice: true,
                             };
+                            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             tokio::spawn(async move {
                                 let result = crate::browser::browse_loop::run_browse(
-                                    browse_req, &cfg, all_tools, current_url, progress_tx, approval_tx,
+                                    browse_req, &cfg, all_tools, current_url, progress_tx, approval_tx, cancel,
                                 ).await;
                                 if let Err(e) = result {
                                     eprintln!("Voice browse error: {e}");
@@ -1626,6 +1627,13 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 if let Some(prompt) = app.browse_approval.take() {
                     let _ = prompt.reply.send(false);
                     app.entries.push(ChatEntry::system("  ✗ Denied"));
+                    app.scroll_to_bottom();
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(prompt) = app.browse_approval.take() {
+                    let _ = prompt.reply.send(false);
+                    app.entries.push(ChatEntry::system("  ✗ Cancelled"));
                     app.scroll_to_bottom();
                 }
             }
@@ -4005,6 +4013,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             max_steps: max,
                             voice: false,
                         };
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         tokio::spawn(async move {
                             let result = crate::browser::browse_loop::run_browse(
                                 browse_req,
@@ -4013,6 +4022,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 current_url,
                                 progress_tx,
                                 approval_tx,
+                                cancel,
                             ).await;
                             if let Err(e) = result {
                                 eprintln!("Browse error: {e}");

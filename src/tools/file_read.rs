@@ -98,7 +98,7 @@ impl Tool for FileReadTool {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             content.hash(&mut hasher);
             let hash = hasher.finish();
-            let mut guard = cache.lock().unwrap();
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             if guard.get(&path) == Some(&hash) {
                 return Ok(ToolOutput::success(format!(
                     "(unchanged since last read: {})",

@@ -309,7 +309,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             GateVerdict::Allow => {
                 // Clear denial counter on approval for this action key.
                 let key = format!("{tool_name}:{target_text}");
-                self.denial_counts.lock().unwrap().remove(&key);
+                self.denial_counts.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                 MiddlewareVerdict::Allow
             }
             GateVerdict::RequireConfirmation { reason, .. } => {
@@ -329,18 +329,19 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                         reason: "approval channel closed".to_string(),
                     };
                 }
-                match rx.await {
-                    Ok(true) => {
+                use tokio::time::{timeout, Duration};
+                match timeout(Duration::from_secs(60), rx).await {
+                    Ok(Ok(true)) => {
                         // Approved — clear denial counter for this action.
                         let key = format!("{tool_name}:{target_text}");
-                        self.denial_counts.lock().unwrap().remove(&key);
+                        self.denial_counts.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                         MiddlewareVerdict::Allow
                     }
-                    _ => {
-                        // Denied — increment counter; terminate after 2 denials on same action.
+                    Ok(Ok(false)) => {
+                        // User explicitly denied — increment counter; terminate after 2 denials.
                         let key = format!("{tool_name}:{target_text}");
                         let count = {
-                            let mut counts = self.denial_counts.lock().unwrap();
+                            let mut counts = self.denial_counts.lock().unwrap_or_else(|e| e.into_inner());
                             let entry = counts.entry(key).or_insert(0);
                             *entry += 1;
                             *entry
@@ -354,6 +355,12 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                         }
                         MiddlewareVerdict::Deny { reason }
                     }
+                    Ok(Err(_)) => MiddlewareVerdict::Deny {
+                        reason: "approval channel dropped".into(),
+                    },
+                    Err(_) => MiddlewareVerdict::Deny {
+                        reason: "approval timed out (60s)".into(),
+                    },
                 }
             }
         }

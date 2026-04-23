@@ -1028,11 +1028,15 @@ impl App {
         if self.input_history.is_empty() {
             return;
         }
-        if self.history_idx.is_none() {
-            self.saved_input = self.input.clone();
-            self.history_idx = Some(self.input_history.len() - 1);
-        } else if self.history_idx.unwrap() > 0 {
-            self.history_idx = Some(self.history_idx.unwrap() - 1);
+        match self.history_idx {
+            None => {
+                self.saved_input = self.input.clone();
+                self.history_idx = Some(self.input_history.len() - 1);
+            }
+            Some(i) if i > 0 => {
+                self.history_idx = Some(i - 1);
+            }
+            _ => {}
         }
         if let Some(i) = self.history_idx {
             self.input = self.input_history[i].chars().collect();
@@ -1043,10 +1047,9 @@ impl App {
     pub fn history_down(&mut self) {
         if let Some(i) = self.history_idx {
             if i + 1 < self.input_history.len() {
-                self.history_idx = Some(i + 1);
-                self.input = self.input_history[self.history_idx.unwrap()]
-                    .chars()
-                    .collect();
+                let next = i + 1;
+                self.history_idx = Some(next);
+                self.input = self.input_history[next].chars().collect();
             } else {
                 self.history_idx = None;
                 self.input = self.saved_input.clone();
