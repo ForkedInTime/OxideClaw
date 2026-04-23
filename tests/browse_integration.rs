@@ -114,7 +114,7 @@ async fn approval_middleware_allows_read_tools() {
     let (approval_tx, _) = tokio::sync::mpsc::channel(4);
     let step = Arc::new(AtomicU32::new(0));
 
-    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Pattern, current_url, approval_tx, step);
+    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Pattern, current_url, approval_tx, step, false);
 
     let verdict = mw.before_tool("browser_navigate", &json!({"url": "https://example.com"})).await;
     assert!(matches!(verdict, MiddlewareVerdict::Allow));
@@ -127,7 +127,7 @@ async fn approval_middleware_yolo_allows_everything() {
     let (approval_tx, _) = tokio::sync::mpsc::channel(4);
     let step = Arc::new(AtomicU32::new(0));
 
-    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Yolo, current_url, approval_tx, step);
+    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Yolo, current_url, approval_tx, step, false);
 
     let verdict = mw.before_tool("browser_click", &json!({"ref": "@e1"})).await;
     assert!(matches!(verdict, MiddlewareVerdict::Allow));
@@ -142,7 +142,7 @@ async fn approval_middleware_denies_on_dropped_channel() {
 
     drop(approval_rx);
 
-    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Pattern, current_url, approval_tx, step);
+    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Pattern, current_url, approval_tx, step, false);
 
     let verdict = mw.before_tool("browser_click", &json!({"ref": "@e1"})).await;
     assert!(matches!(verdict, MiddlewareVerdict::Deny { .. }));

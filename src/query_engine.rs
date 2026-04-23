@@ -439,18 +439,6 @@ impl QueryEngine {
                             middleware_denied = true;
                             break;
                         }
-                        MiddlewareVerdict::RequireConfirmation { reason, .. } => {
-                            // Treat as Deny until the approval gate resolves internally.
-                            results.push(ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: vec![ToolResultContent::text(format!(
-                                    "Middleware requires confirmation: {reason}"
-                                ))],
-                                is_error: Some(true),
-                            });
-                            middleware_denied = true;
-                            break;
-                        }
                     }
                 }
                 if middleware_denied {

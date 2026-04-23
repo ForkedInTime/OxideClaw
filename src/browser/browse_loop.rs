@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::browser::approval_gate::{ApprovalGate, ApprovalGateMiddleware, ApprovalPrompt};
 use crate::browser::loop_detector::LoopDetectorMiddleware;
+use crate::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
 use crate::config::Config;
 use crate::query_engine::QueryEngine;
 use crate::tools::DynTool;
@@ -110,6 +112,45 @@ fn parse_browse_done(text: &str) -> Option<(bool, String)> {
     Some((achieved, summary))
 }
 
+/// Extract a human-readable "target" from tool input for Step events.
+/// Prefers `url` → `ref` → `selector` → `key` → empty string.
+fn extract_target(input: &serde_json::Value) -> String {
+    for key in ["url", "ref", "selector", "key"] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Middleware that emits `BrowseProgress::Step` for each allowed tool call.
+/// Placed last in the chain so denied calls (by gate or loop detector) are not
+/// reported as executed steps.
+struct StepEmitterMiddleware {
+    progress_tx: mpsc::Sender<BrowseProgress>,
+    counter: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl ToolMiddleware for StepEmitterMiddleware {
+    async fn before_tool(&self, tool_name: &str, input: &serde_json::Value) -> MiddlewareVerdict {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self
+            .progress_tx
+            .send(BrowseProgress::Step {
+                n,
+                action: tool_name.to_string(),
+                target: extract_target(input),
+            })
+            .await;
+        MiddlewareVerdict::Allow
+    }
+
+    async fn after_tool(&self, _tool_name: &str, _output: &str) {}
+}
+
 /// Orchestrate an autonomous browser agent run.
 pub async fn run_browse(
     req: BrowseRequest,
@@ -120,35 +161,90 @@ pub async fn run_browse(
     approval_tx: mpsc::Sender<ApprovalPrompt>,
     cancel: Arc<AtomicBool>,
 ) -> Result<BrowseResult> {
-    // 1. Emit Started event.
+    // 1. Emit Started event + speak the goal if voice is enabled.
     let _ = progress_tx
         .send(BrowseProgress::Started {
             goal: req.goal.clone(),
             max_steps: req.max_steps,
         })
         .await;
+    if req.voice {
+        let goal = req.goal.clone();
+        tokio::spawn(async move {
+            crate::voice::speak_browse_milestone(
+                crate::voice::BrowseMilestone::Start,
+                &goal,
+            )
+            .await;
+        });
+    }
 
     // 2. Shared step counter for the approval prompt.
     let step_counter = Arc::new(AtomicU32::new(0));
 
     // 3. Build the approval gate from config patterns.
+    // The gate sends prompts to an internal channel; a bridge task mirrors each
+    // prompt as BrowseProgress::ApprovalNeeded, then forwards it to the caller.
     let gate = ApprovalGate::with_user_patterns(config.browse_approval_patterns.clone());
+    let (internal_approval_tx, mut internal_approval_rx) = mpsc::channel::<ApprovalPrompt>(16);
     let gate_mw = Arc::new(ApprovalGateMiddleware::new(
         gate,
         req.policy,
         current_url.clone(),
-        approval_tx,
+        internal_approval_tx,
         step_counter.clone(),
+        req.voice,
     ));
+
+    // Bridge: internal approvals → progress event + external approval channel.
+    let approval_bridge_progress_tx = progress_tx.clone();
+    let voice_on_gate = req.voice;
+    let approval_bridge_handle = tokio::spawn(async move {
+        while let Some(prompt) = internal_approval_rx.recv().await {
+            let _ = approval_bridge_progress_tx
+                .send(BrowseProgress::ApprovalNeeded {
+                    step: prompt.step,
+                    action: prompt.tool_name.clone(),
+                    target_text: prompt.target_text.clone(),
+                    url: prompt.url.clone(),
+                    reason: prompt.reason.clone(),
+                })
+                .await;
+            if voice_on_gate {
+                let phrase = format!(
+                    "Approval needed for {} — {}",
+                    prompt.tool_name, prompt.reason
+                );
+                tokio::spawn(async move {
+                    crate::voice::speak_browse_milestone(
+                        crate::voice::BrowseMilestone::GateTrip,
+                        &phrase,
+                    )
+                    .await;
+                });
+            }
+            if approval_tx.send(prompt).await.is_err() {
+                // Caller dropped the approval channel — stop bridging.
+                break;
+            }
+        }
+    });
 
     // 4. Build the loop detector middleware.
     let (nudge_tx, mut nudge_rx) = mpsc::channel::<String>(16);
     let loop_mw = Arc::new(LoopDetectorMiddleware::new(nudge_tx));
 
-    // 5. Assemble middleware chain (keep Arc refs for post-run inspection).
+    // 5. Build the step-emitter middleware (runs last — only fires for allowed calls).
+    let step_emitter = Arc::new(StepEmitterMiddleware {
+        progress_tx: progress_tx.clone(),
+        counter: step_counter.clone(),
+    });
+
+    // 6. Assemble middleware chain (keep Arc refs for post-run inspection).
     let middlewares: crate::browser::middleware::MiddlewareChain = vec![
-        gate_mw.clone() as Arc<dyn crate::browser::middleware::ToolMiddleware>,
-        loop_mw.clone() as Arc<dyn crate::browser::middleware::ToolMiddleware>,
+        gate_mw.clone() as Arc<dyn ToolMiddleware>,
+        loop_mw.clone() as Arc<dyn ToolMiddleware>,
+        step_emitter as Arc<dyn ToolMiddleware>,
     ];
 
     // 6. Build browse-specific system prompt.
@@ -179,8 +275,9 @@ pub async fn run_browse(
 
     // 11. Check for early cancellation before starting the loop.
     if cancel.load(Ordering::SeqCst) {
-        drop(engine); // drop engine (and its middleware chain) to shut down nudge_tx
+        drop(engine); // drop engine (and its middleware chain) to shut down channels
         let _ = nudge_handle.await;
+        let _ = approval_bridge_handle.await;
         let final_url = {
             let url = current_url.lock().await;
             if url.is_empty() { None } else { Some(url.clone()) }
@@ -317,10 +414,24 @@ pub async fn run_browse(
         }
     };
 
-    // 14. Emit Completed event.
+    // 14. Emit Completed event + speak the final summary if voice is enabled.
     let _ = progress_tx
         .send(BrowseProgress::Completed(result.clone()))
         .await;
+    if req.voice {
+        let phrase = if result.achieved {
+            format!("Done. {}", result.summary)
+        } else {
+            format!("Stopped. {}", result.summary)
+        };
+        tokio::spawn(async move {
+            crate::voice::speak_browse_milestone(
+                crate::voice::BrowseMilestone::End,
+                &phrase,
+            )
+            .await;
+        });
+    }
 
     Ok(result)
 }
