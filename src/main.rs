@@ -665,8 +665,9 @@ async fn main() -> Result<()> {
                     eprintln!("Error: ANTHROPIC_API_KEY not set for model: {}", config.model);
                     std::process::exit(1);
                 }
-                let tools = all_tools(&config);
+                let (tools, shared_state) = crate::tools::all_tools_with_state(&config);
                 let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+                let browser_session = shared_state.browser_session.clone();
 
                 let (progress_tx, mut progress_rx) = mpsc::channel::<BrowseProgress>(64);
                 // Approval channel: in CLI mode auto-deny (user must use --yolo or --ask interactively)
@@ -706,7 +707,7 @@ async fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                     cancel_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 });
-                let result = run_browse(req, &config, tools, current_url, progress_tx, approval_tx, cancel).await?;
+                let result = run_browse(req, &config, tools, current_url, browser_session, progress_tx, approval_tx, cancel).await?;
                 progress_task.await.ok();
 
                 // Print final result as JSON

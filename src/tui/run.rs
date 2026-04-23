@@ -1125,6 +1125,7 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                             let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
                             let cfg = config.clone();
                             let all_tools = tools.to_vec();
+                            let browser_session = app.browser_session.clone();
                             let browse_req = crate::browser::browse_loop::BrowseRequest {
                                 goal: goal_str,
                                 policy: crate::browser::browse_loop::BrowsePolicy::Pattern,
@@ -1134,7 +1135,7 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             tokio::spawn(async move {
                                 let result = crate::browser::browse_loop::run_browse(
-                                    browse_req, &cfg, all_tools, current_url, progress_tx, approval_tx, cancel,
+                                    browse_req, &cfg, all_tools, current_url, browser_session, progress_tx, approval_tx, cancel,
                                 ).await;
                                 if let Err(e) = result {
                                     eprintln!("Voice browse error: {e}");
@@ -4006,6 +4007,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 
                         let cfg = config.clone();
                         let all_tools = tools.to_vec();
+                        let browser_session = app.browser_session.clone();
 
                         let browse_req = crate::browser::browse_loop::BrowseRequest {
                             goal,
@@ -4020,6 +4022,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 &cfg,
                                 all_tools,
                                 current_url,
+                                browser_session,
                                 progress_tx,
                                 approval_tx,
                                 cancel,
