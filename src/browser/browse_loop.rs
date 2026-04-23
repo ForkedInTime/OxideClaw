@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use crate::browser::approval_gate::{ApprovalGate, ApprovalGateMiddleware, ApprovalPrompt};
 use crate::browser::loop_detector::LoopDetectorMiddleware;
 use crate::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
+use crate::browser::BrowserSession;
 use crate::config::Config;
 use crate::query_engine::QueryEngine;
 use crate::tools::DynTool;
@@ -125,6 +126,26 @@ fn extract_target(input: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Middleware that syncs the browser session's `current_url` into the
+/// shared `Arc<Mutex<String>>` that the approval gate reads from. Runs
+/// in `after_tool` so URL-pattern matching sees the post-navigation URL.
+struct UrlSyncMiddleware {
+    session: Arc<tokio::sync::Mutex<BrowserSession>>,
+    shared_url: Arc<tokio::sync::Mutex<String>>,
+}
+
+#[async_trait]
+impl ToolMiddleware for UrlSyncMiddleware {
+    async fn before_tool(&self, _tool_name: &str, _input: &serde_json::Value) -> MiddlewareVerdict {
+        MiddlewareVerdict::Allow
+    }
+
+    async fn after_tool(&self, _tool_name: &str, _output: &str) {
+        let url = self.session.lock().await.current_url.clone();
+        *self.shared_url.lock().await = url;
+    }
+}
+
 /// Middleware that emits `BrowseProgress::Step` for each allowed tool call.
 /// Placed last in the chain so denied calls (by gate or loop detector) are not
 /// reported as executed steps.
@@ -157,6 +178,7 @@ pub async fn run_browse(
     config: &Config,
     tools: Vec<DynTool>,
     current_url: Arc<tokio::sync::Mutex<String>>,
+    browser_session: Option<Arc<tokio::sync::Mutex<BrowserSession>>>,
     progress_tx: mpsc::Sender<BrowseProgress>,
     approval_tx: mpsc::Sender<ApprovalPrompt>,
     cancel: Arc<AtomicBool>,
@@ -241,11 +263,18 @@ pub async fn run_browse(
     });
 
     // 6. Assemble middleware chain (keep Arc refs for post-run inspection).
-    let middlewares: crate::browser::middleware::MiddlewareChain = vec![
-        gate_mw.clone() as Arc<dyn ToolMiddleware>,
-        loop_mw.clone() as Arc<dyn ToolMiddleware>,
-        step_emitter as Arc<dyn ToolMiddleware>,
-    ];
+    // Order matters: url_sync runs first so after_tool fires BEFORE any later
+    // middleware reads the updated URL on the next iteration's before_tool.
+    let mut middlewares: crate::browser::middleware::MiddlewareChain = Vec::new();
+    if let Some(session) = browser_session.as_ref() {
+        middlewares.push(Arc::new(UrlSyncMiddleware {
+            session: session.clone(),
+            shared_url: current_url.clone(),
+        }) as Arc<dyn ToolMiddleware>);
+    }
+    middlewares.push(gate_mw.clone() as Arc<dyn ToolMiddleware>);
+    middlewares.push(loop_mw.clone() as Arc<dyn ToolMiddleware>);
+    middlewares.push(step_emitter as Arc<dyn ToolMiddleware>);
 
     // 6. Build browse-specific system prompt.
     let system_prompt = build_browse_system_prompt(&req.goal, req.max_steps);

@@ -200,19 +200,39 @@ async fn find_free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Poll Chrome's /json/version endpoint until the WebSocket debugger URL is available.
+/// Poll Chrome's /json/list endpoint and return the WebSocket URL for the first
+/// page-type target. Page-level commands like `Page.enable` only work on a
+/// page target; the browser-level WebSocket from /json/version returns
+/// `'Page.enable' wasn't found`. If no page target exists yet, fall back to
+/// creating one via PUT /json/new.
 async fn poll_cdp_endpoint(port: u16) -> Result<String> {
-    let url = format!("http://127.0.0.1:{port}/json/version");
+    let list_url = format!("http://127.0.0.1:{port}/json/list");
+    let new_url = format!("http://127.0.0.1:{port}/json/new?about:blank");
     let client = reqwest::Client::new();
 
-    for _ in 0..30 {
-        // Check first so we don't incur an unnecessary sleep when Chrome is already ready.
-        if let Ok(resp) = client.get(&url).send().await
-            && let Ok(json) = resp.json::<serde_json::Value>().await
-                && let Some(ws) = json["webSocketDebuggerUrl"].as_str() {
-                    return Ok(ws.to_string());
-                }
+    for attempt in 0..30 {
+        if let Ok(resp) = client.get(&list_url).send().await
+            && let Ok(targets) = resp.json::<serde_json::Value>().await
+            && let Some(arr) = targets.as_array()
+        {
+            if let Some(ws) = arr
+                .iter()
+                .find(|t| t["type"].as_str() == Some("page"))
+                .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+            {
+                return Ok(ws.to_string());
+            }
+            // Chrome is up (list responded) but has no page target — create one.
+            // Do this once, on attempt 2+ so we don't race the about:blank launcher arg.
+            if attempt >= 2
+                && let Ok(resp) = client.put(&new_url).send().await
+                && let Ok(target) = resp.json::<serde_json::Value>().await
+                && let Some(ws) = target["webSocketDebuggerUrl"].as_str()
+            {
+                return Ok(ws.to_string());
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    bail!("Chrome did not start within 6 seconds on port {port}")
+    bail!("Chrome did not expose a page target within 6 seconds on port {port}")
 }
