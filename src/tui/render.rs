@@ -304,7 +304,11 @@ fn draw_banner_right(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
                 // Truncate preview to fit: max_w minus the "◆ [id] — " prefix (~16 chars)
                 let avail = max_w.saturating_sub(16);
                 if preview.len() > avail {
-                    format!("{}…", &preview[..avail.saturating_sub(1).max(1)])
+                    let mut end = avail.saturating_sub(1).max(1);
+                    while end > 0 && !preview.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}…", &preview[..end])
                 } else {
                     preview.clone()
                 }

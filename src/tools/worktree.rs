@@ -64,7 +64,7 @@ impl Tool for EnterWorktreeTool {
         let input: EnterInput = serde_json::from_value(input)?;
 
         // Must not already be in a worktree
-        if self.state.lock().unwrap().is_some() {
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
             return Ok(ToolOutput::error(
                 "Already in a worktree session. Use ExitWorktree first.",
             ));
@@ -144,7 +144,7 @@ impl Tool for EnterWorktreeTool {
             branch: slug.clone(),
             original_cwd: ctx.cwd.clone(),
         };
-        *self.state.lock().unwrap() = Some(session);
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
 
         Ok(ToolOutput::success(
             json!({
@@ -179,7 +179,7 @@ impl Tool for ExitWorktreeTool {
     }
 
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        let session = self.state.lock().unwrap().take();
+        let session = self.state.lock().unwrap_or_else(|e| e.into_inner()).take();
 
         match session {
             None => Ok(ToolOutput::error("Not currently in a worktree session.")),

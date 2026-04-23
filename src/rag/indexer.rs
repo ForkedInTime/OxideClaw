@@ -318,7 +318,8 @@ fn collect_symbols(
             // Extract the source text for this node
             let start_byte = child.start_byte();
             let end_byte = child.end_byte();
-            let content = &ctx.full_source[start_byte..end_byte.min(ctx.full_source.len())];
+            let src_len = ctx.full_source.len();
+            let content = &ctx.full_source[start_byte.min(src_len)..end_byte.min(src_len)];
 
             // Cap chunk size at 200 lines — huge functions get truncated
             let content = if end_line - start_line > 200 {
