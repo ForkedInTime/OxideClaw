@@ -14,15 +14,12 @@ pub enum MiddlewareVerdict {
     Allow,
     /// Block the tool with an error reason.
     Deny { reason: String },
-    /// Request confirmation before proceeding.
-    /// Treated as Deny until the approval gate resolves it internally.
-    RequireConfirmation { reason: String, detail: String },
 }
 
 /// Extension point invoked before and after every tool execution.
 #[async_trait]
 pub trait ToolMiddleware: Send + Sync {
-    /// Called before a tool runs. Return `Deny` or `RequireConfirmation` to block.
+    /// Called before a tool runs. Return `Deny` to block.
     async fn before_tool(&self, tool_name: &str, input: &Value) -> MiddlewareVerdict;
 
     /// Called after a tool runs with its output text.
