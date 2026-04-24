@@ -439,18 +439,6 @@ impl QueryEngine {
                             middleware_denied = true;
                             break;
                         }
-                        MiddlewareVerdict::RequireConfirmation { reason, .. } => {
-                            // Treat as Deny until the approval gate resolves internally.
-                            results.push(ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: vec![ToolResultContent::text(format!(
-                                    "Middleware requires confirmation: {reason}"
-                                ))],
-                                is_error: Some(true),
-                            });
-                            middleware_denied = true;
-                            break;
-                        }
                     }
                 }
                 if middleware_denied {
@@ -597,7 +585,11 @@ fn truncate_json(v: &serde_json::Value, max_len: usize) -> String {
     if s.len() <= max_len {
         s
     } else {
-        format!("{}...", &s[..max_len])
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 

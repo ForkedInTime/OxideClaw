@@ -185,7 +185,7 @@ impl Tool for CronCreateTool {
         };
 
         {
-            let mut jobs = self.store.lock().unwrap();
+            let mut jobs = self.store.lock().unwrap_or_else(|e| e.into_inner());
             jobs.push(job);
             save_jobs(&jobs)?;
         }
@@ -231,7 +231,7 @@ impl Tool for CronDeleteTool {
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let input: DeleteInput = serde_json::from_value(input)?;
 
-        let mut jobs = self.store.lock().unwrap();
+        let mut jobs = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let before = jobs.len();
         jobs.retain(|j| j.id != input.id);
 
@@ -271,7 +271,7 @@ impl Tool for CronListTool {
     }
 
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        let jobs = self.store.lock().unwrap().clone();
+        let jobs = self.store.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         if jobs.is_empty() {
             return Ok(ToolOutput::success("No cron jobs scheduled."));

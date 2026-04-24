@@ -84,7 +84,7 @@ impl Tool for TaskCreateTool {
             output: None,
             active_form: input.active_form,
         };
-        self.registry.lock().unwrap().insert(id.clone(), task);
+        self.registry.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), task);
         Ok(ToolOutput::success(
             json!({ "task": { "id": id } }).to_string(),
         ))
@@ -124,7 +124,7 @@ impl Tool for TaskGetTool {
 
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let input: GetInput = serde_json::from_value(input)?;
-        let registry = self.registry.lock().unwrap();
+        let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         match registry.get(&input.task_id) {
             Some(task) => Ok(ToolOutput::success(serde_json::to_string(task)?)),
             None => Ok(ToolOutput::error(format!(
@@ -156,7 +156,7 @@ impl Tool for TaskListTool {
     }
 
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        let registry = self.registry.lock().unwrap();
+        let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         if registry.is_empty() {
             return Ok(ToolOutput::success("No tasks."));
         }
@@ -207,7 +207,7 @@ impl Tool for TaskUpdateTool {
 
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let input: UpdateInput = serde_json::from_value(input)?;
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         match registry.get_mut(&input.task_id) {
             Some(task) => {
                 if let Some(s) = input.status {
@@ -262,7 +262,7 @@ impl Tool for TaskStopTool {
 
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let input: StopInput = serde_json::from_value(input)?;
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         match registry.get_mut(&input.task_id) {
             Some(task) => {
                 task.status = TaskStatus::Stopped;
@@ -324,7 +324,7 @@ impl Tool for TaskOutputTool {
 
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let input: OutputInput = serde_json::from_value(input)?;
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         match registry.get_mut(&input.task_id) {
             Some(task) => {
                 task.output = Some(input.output);

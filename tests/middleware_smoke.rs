@@ -81,35 +81,6 @@ async fn denier_middleware_returns_deny() {
     }
 }
 
-// ── RequireConfirmation ──────────────────────────────────────────────
-
-struct ConfirmationRequester;
-
-#[async_trait]
-impl ToolMiddleware for ConfirmationRequester {
-    async fn before_tool(&self, tool_name: &str, _input: &Value) -> MiddlewareVerdict {
-        MiddlewareVerdict::RequireConfirmation {
-            reason: format!("{tool_name} needs approval"),
-            detail: "destructive action".into(),
-        }
-    }
-
-    async fn after_tool(&self, _tool_name: &str, _output: &str) {}
-}
-
-#[tokio::test]
-async fn require_confirmation_variant() {
-    let mw = ConfirmationRequester;
-    let verdict = mw.before_tool("bash", &serde_json::json!({})).await;
-    match verdict {
-        MiddlewareVerdict::RequireConfirmation { reason, detail } => {
-            assert_eq!(reason, "bash needs approval");
-            assert_eq!(detail, "destructive action");
-        }
-        other => panic!("Expected RequireConfirmation, got {other:?}"),
-    }
-}
-
 // ── Chain ordering ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -128,7 +99,7 @@ async fn middleware_chain_short_circuits_on_deny() {
     for mw in &chain {
         match mw.before_tool("bash", &input).await {
             MiddlewareVerdict::Allow => {}
-            MiddlewareVerdict::Deny { .. } | MiddlewareVerdict::RequireConfirmation { .. } => {
+            MiddlewareVerdict::Deny { .. } => {
                 denied = true;
                 break;
             }

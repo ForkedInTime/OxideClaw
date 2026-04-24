@@ -76,21 +76,12 @@ impl LoopDetector {
         self.window.clear();
         self.nudge_level = 0;
     }
-
-    pub fn window_len(&self) -> usize {
-        self.window.len()
-    }
 }
 
 impl Default for LoopDetector {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Public helper: SHA-256 of "{action_type}:{target}".
-pub fn fingerprint_action(action_type: &str, target: &str, _extra: &str) -> String {
-    hash_string(&format!("{action_type}:{target}"))
 }
 
 fn hash_string(s: &str) -> String {

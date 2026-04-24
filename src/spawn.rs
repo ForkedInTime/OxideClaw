@@ -162,7 +162,7 @@ pub async fn spawn_agent(
         cancel_tx: Some(cancel_tx),
     };
 
-    registry.lock().unwrap().insert(id.clone(), agent);
+    registry.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), agent);
 
     // Build config for the spawned agent
     let mut agent_config = config.clone();
@@ -301,7 +301,7 @@ async fn run_spawned_agent(
 
 /// List all agents with their status.
 pub fn list_agents(registry: &SpawnRegistry) -> String {
-    let reg = registry.lock().unwrap();
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     if reg.is_empty() {
         return "No spawned agents.".to_string();
     }
@@ -327,7 +327,7 @@ pub fn list_agents(registry: &SpawnRegistry) -> String {
 
 /// Get the diff for a completed agent.
 pub fn review_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
-    let reg = registry.lock().unwrap();
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     let agent = find_agent(&reg, id)?;
 
     match &agent.status {
@@ -370,7 +370,7 @@ pub fn review_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
 
 /// Cancel a running agent.
 pub fn kill_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
-    let mut reg = registry.lock().unwrap();
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     let agent = find_agent_mut(&mut reg, id)?;
 
     if agent.status != SpawnStatus::Running {
@@ -396,7 +396,7 @@ pub fn kill_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
 /// Merge a completed agent's worktree changes into the current branch.
 pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf) -> Result<String> {
     let (branch, wt_path) = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let agent = find_agent(&reg, id)?;
         if agent.status != SpawnStatus::Completed {
             anyhow::bail!(
@@ -424,7 +424,7 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
             .await?;
 
         let commit_msg = format!("spawn: {}", {
-            let reg = registry.lock().unwrap();
+            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
             reg.get(id)
                 .map(|a| a.description.clone())
                 .unwrap_or_default()
@@ -490,7 +490,7 @@ pub async fn discard_agent(
     main_cwd: &PathBuf,
 ) -> Result<String> {
     let (branch, wt_path, desc) = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let agent = find_agent(&reg, id)?;
         if agent.status == SpawnStatus::Running {
             anyhow::bail!(

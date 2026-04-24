@@ -230,6 +230,8 @@ pub struct ApprovalGateMiddleware {
     denial_counts: Mutex<HashMap<String, u32>>,
     /// Set when the same action is denied twice — triggers session termination.
     user_denied: AtomicBool,
+    /// When true, also listen for a spoken "yes/approve" alongside the keyboard reply.
+    voice: bool,
 }
 
 impl ApprovalGateMiddleware {
@@ -239,6 +241,7 @@ impl ApprovalGateMiddleware {
         current_url: Arc<tokio::sync::Mutex<String>>,
         approval_tx: mpsc::Sender<ApprovalPrompt>,
         step_counter: Arc<AtomicU32>,
+        voice: bool,
     ) -> Self {
         Self {
             gate,
@@ -248,6 +251,7 @@ impl ApprovalGateMiddleware {
             step_counter,
             denial_counts: Mutex::new(HashMap::new()),
             user_denied: AtomicBool::new(false),
+            voice,
         }
     }
 
@@ -313,7 +317,8 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                 MiddlewareVerdict::Allow
             }
             GateVerdict::RequireConfirmation { reason, .. } => {
-                let step = self.step_counter.load(Ordering::Relaxed);
+                // +1 because the step_emitter middleware increments after the gate runs.
+                let step = self.step_counter.load(Ordering::Relaxed) + 1;
                 let (tx, rx) = oneshot::channel();
                 let prompt = ApprovalPrompt {
                     step,
@@ -330,14 +335,34 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                     };
                 }
                 use tokio::time::{timeout, Duration};
-                match timeout(Duration::from_secs(60), rx).await {
-                    Ok(Ok(true)) => {
+                // If voice is on, race the keyboard reply against a voice-approval
+                // listener. Whichever resolves first wins. Voice only contributes
+                // an Approve vote (false/timeout is ignored unless no keyboard reply
+                // arrives either).
+                let approved_opt: Option<bool> = if self.voice {
+                    tokio::select! {
+                        kb = timeout(Duration::from_secs(60), rx) => match kb {
+                            Ok(Ok(b)) => Some(b),
+                            _ => None,
+                        },
+                        voice_yes = crate::voice::await_voice_approval(60) => {
+                            if voice_yes { Some(true) } else { None }
+                        }
+                    }
+                } else {
+                    match timeout(Duration::from_secs(60), rx).await {
+                        Ok(Ok(b)) => Some(b),
+                        _ => None,
+                    }
+                };
+                match approved_opt {
+                    Some(true) => {
                         // Approved — clear denial counter for this action.
                         let key = format!("{tool_name}:{target_text}");
                         self.denial_counts.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                         MiddlewareVerdict::Allow
                     }
-                    Ok(Ok(false)) => {
+                    Some(false) => {
                         // User explicitly denied — increment counter; terminate after 2 denials.
                         let key = format!("{tool_name}:{target_text}");
                         let count = {
@@ -355,11 +380,8 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                         }
                         MiddlewareVerdict::Deny { reason }
                     }
-                    Ok(Err(_)) => MiddlewareVerdict::Deny {
-                        reason: "approval channel dropped".into(),
-                    },
-                    Err(_) => MiddlewareVerdict::Deny {
-                        reason: "approval timed out (60s)".into(),
+                    None => MiddlewareVerdict::Deny {
+                        reason: "approval timed out or channel dropped".into(),
                     },
                 }
             }
@@ -367,7 +389,6 @@ impl ToolMiddleware for ApprovalGateMiddleware {
     }
 
     async fn after_tool(&self, _tool_name: &str, _output: &str) {
-        // Increment step counter after each tool execution.
-        self.step_counter.fetch_add(1, Ordering::Relaxed);
+        // Step counting is owned by StepEmitterMiddleware (runs after this middleware).
     }
 }
