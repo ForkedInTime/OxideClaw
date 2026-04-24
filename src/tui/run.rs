@@ -1134,8 +1134,9 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                             };
                             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             tokio::spawn(async move {
+                                let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
                                 let result = crate::browser::browse_loop::run_browse(
-                                    browse_req, &cfg, all_tools, current_url, browser_session, progress_tx, approval_tx, cancel,
+                                    browse_req, &cfg, all_tools, current_url, browser_session, channels,
                                 ).await;
                                 if let Err(e) = result {
                                     eprintln!("Voice browse error: {e}");
@@ -3989,6 +3990,13 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.entries.push(ChatEntry::system(msg));
                     }
                     CommandAction::Browse { goal, policy, max_steps } => {
+                        // Pattern is the parser's "no flag given" sentinel — substitute
+                        // the user's configured default unless they explicitly chose a policy.
+                        let policy = if matches!(policy, crate::browser::browse_loop::BrowsePolicy::Pattern) {
+                            crate::browser::browse_loop::BrowsePolicy::from_settings_str(&config.browse_default_policy)
+                        } else {
+                            policy
+                        };
                         let max = max_steps.unwrap_or(config.browse_max_steps);
                         app.entries.push(ChatEntry::system(format!(
                             "🌐 /browse started — goal: {goal} (max {max} steps, policy: {policy:?})"
@@ -4017,15 +4025,14 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         };
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         tokio::spawn(async move {
+                            let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
                             let result = crate::browser::browse_loop::run_browse(
                                 browse_req,
                                 &cfg,
                                 all_tools,
                                 current_url,
                                 browser_session,
-                                progress_tx,
-                                approval_tx,
-                                cancel,
+                                channels,
                             ).await;
                             if let Err(e) = result {
                                 eprintln!("Browse error: {e}");

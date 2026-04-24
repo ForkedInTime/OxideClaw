@@ -893,7 +893,7 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     };
 
     let popup_w = (area.width * 6 / 10).max(50).min(area.width);
-    let popup_h = 12_u16.max(8).min(area.height);
+    let popup_h = 12_u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect {

@@ -27,6 +27,9 @@ pub struct BrowserSession {
     _user_data: Option<TempDir>,
     /// Element ref map: @e1 -> backend DOM node ID
     refs: HashMap<String, i64>,
+    /// Element label map: @e1 -> accessible name (for approval gate pattern matching).
+    /// Parallel to `refs`; may omit entries when a node has no usable accessible name.
+    ref_names: HashMap<String, String>,
     /// Current page URL
     pub current_url: String,
     /// Current page title
@@ -131,13 +134,26 @@ impl BrowserSession {
         // Drop the TempDir now so the profile directory is removed.
         self._user_data = None;
         self.refs.clear();
+        self.ref_names.clear();
         self.current_url.clear();
         self.current_title.clear();
     }
 
-    /// Update ref map (called after each snapshot).
+    /// Update ref map (called after each snapshot). Names are optional — pass
+    /// an empty map to preserve the old behavior.
+    #[allow(dead_code)]
     pub fn set_refs(&mut self, refs: HashMap<String, i64>) {
         self.refs = refs;
+    }
+
+    /// Update both the ref map and the parallel name map (called after each snapshot).
+    pub fn set_refs_with_names(
+        &mut self,
+        refs: HashMap<String, i64>,
+        names: HashMap<String, String>,
+    ) {
+        self.refs = refs;
+        self.ref_names = names;
     }
 
     /// Resolve an @eN ref to a backend node ID.
@@ -146,6 +162,12 @@ impl BrowserSession {
         self.refs.get(&key)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("Element ref '{key}' not found. Run browser_snapshot first."))
+    }
+
+    /// Resolve an @eN ref to its accessible name, if one was captured.
+    pub fn resolve_ref_name(&self, r: &str) -> Option<&str> {
+        let key = if r.starts_with('@') { r.to_string() } else { format!("@{r}") };
+        self.ref_names.get(&key).map(|s| s.as_str())
     }
 }
 

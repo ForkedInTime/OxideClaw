@@ -232,6 +232,10 @@ pub struct ApprovalGateMiddleware {
     user_denied: AtomicBool,
     /// When true, also listen for a spoken "yes/approve" alongside the keyboard reply.
     voice: bool,
+    /// Optional handle to the live browser session — used to resolve an @eN
+    /// ref to its real button label so button-text patterns (e.g. "buy now")
+    /// can actually match. None in tests where no browser is attached.
+    browser_session: Option<Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
 }
 
 impl ApprovalGateMiddleware {
@@ -252,7 +256,18 @@ impl ApprovalGateMiddleware {
             denial_counts: Mutex::new(HashMap::new()),
             user_denied: AtomicBool::new(false),
             voice,
+            browser_session: None,
         }
+    }
+
+    /// Attach a browser session so the gate can resolve @eN refs to button
+    /// labels before applying the pattern set.
+    pub fn with_browser_session(
+        mut self,
+        session: Option<Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
+    ) -> Self {
+        self.browser_session = session;
+        self
     }
 
     /// Returns true if the user denied the same action twice, triggering termination.
@@ -284,11 +299,28 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         }
 
         let url = self.current_url.lock().await.clone();
-        let target_text = input["ref"]
+        // `ref_or_selector` is the raw identifier (e.g. "@e2" or ".btn-submit").
+        // It's what we use for the denial-counter key so the same action is
+        // tracked consistently across retries.
+        let ref_or_selector = input["ref"]
             .as_str()
             .or_else(|| input["selector"].as_str())
             .unwrap_or("")
             .to_string();
+        // `target_text` is what we match against `button_patterns`. For @eN
+        // refs, resolve to the element's accessible name via the browser
+        // session's ref-name map; otherwise fall back to the raw identifier.
+        let target_text = if ref_or_selector.starts_with('@')
+            && let Some(session_arc) = &self.browser_session
+        {
+            let session = session_arc.lock().await;
+            session
+                .resolve_ref_name(&ref_or_selector)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| ref_or_selector.clone())
+        } else {
+            ref_or_selector.clone()
+        };
 
         let gate_ctx = GateContext {
             tool_name: tool_name.to_string(),
