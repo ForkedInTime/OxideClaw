@@ -320,7 +320,8 @@ impl SdkServer {
 
                 // Clone config and build tools
                 let cfg = config.clone();
-                let all_tools_list = all_tools(&cfg);
+                let (all_tools_list, shared_state) = crate::tools::all_tools_with_state(&cfg);
+                let browser_session = shared_state.browser_session.clone();
 
                 // Channels: progress events from browse loop → notif forwarding task
                 let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BrowseProgress>(64);
@@ -408,6 +409,7 @@ impl SdkServer {
                         &cfg,
                         all_tools_list,
                         current_url,
+                        browser_session,
                         progress_tx,
                         approval_tx,
                         cancel,
