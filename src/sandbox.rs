@@ -82,7 +82,7 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 ///   - Uses --unshare-pid for process isolation
 ///   - Uses --die-with-parent so cleanup is automatic
 pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
-    let cwd_str = cwd.display();
+    let cwd_quoted = shell_quote(&cwd.display().to_string());
     let net_flag = if allow_network { "" } else { "--unshare-net " };
 
     format!(
@@ -105,7 +105,7 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
          --unshare-pid \
          --die-with-parent \
          -- /bin/sh -c {shell_quoted}",
-        cwd = cwd_str,
+        cwd = cwd_quoted,
         net_flag = net_flag,
         shell_quoted = shell_quote(command),
     )
@@ -114,10 +114,10 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
 // ── firejail wrapper ──────────────────────────────────────────────────────────
 
 pub fn firejail_wrap(command: &str, cwd: &std::path::Path) -> String {
-    let cwd_str = cwd.display();
+    let cwd_quoted = shell_quote(&cwd.display().to_string());
     format!(
         "firejail --quiet --private-tmp --noroot --chdir={cwd} -- /bin/sh -c {cmd}",
-        cwd = cwd_str,
+        cwd = cwd_quoted,
         cmd = shell_quote(command),
     )
 }

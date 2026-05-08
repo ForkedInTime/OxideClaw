@@ -444,11 +444,16 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "export" => cmd_export(ctx),
         "mcp" => cmd_mcp(args, ctx),
         "login" | "logout" => CommandAction::Message(
-            "Auth management not needed — API key is read from ANTHROPIC_API_KEY.".into(),
+            "Auth is env-driven: set ANTHROPIC_API_KEY for Claude, or set the matching key \
+             (GROQ_API_KEY, OPENROUTER_API_KEY, …) and switch with /model <provider>:<name>. \
+             No login state to manage."
+                .into(),
         ),
         "theme" => cmd_theme(args, ctx),
         "fast" => CommandAction::Message(
-            "Fast mode is not applicable in rustyclaw (streaming is always on).".into(),
+            "Streaming is always on. Use /model haiku for the lowest-latency tier, or /router \
+             to auto-route easy turns to a cheap model."
+                .into(),
         ),
         "plan" => CommandAction::TogglePlanMode,
         "hooks" => cmd_hooks(ctx),

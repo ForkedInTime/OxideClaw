@@ -40,8 +40,8 @@ impl SessionMeta {
 
     async fn save(&self) -> Result<()> {
         let path = Self::path_for(&self.id);
-        fs::write(&path, serde_json::to_string(self)?).await?;
-        Ok(())
+        let body = serde_json::to_string(self)?;
+        atomic_write(&path, body.as_bytes()).await
     }
 
     async fn load(id: &str) -> Result<Self> {
@@ -137,8 +137,7 @@ impl Session {
             content.push_str(&serde_json::to_string(msg)?);
             content.push('\n');
         }
-        fs::write(&self.path, content).await?;
-        Ok(())
+        atomic_write(&self.path, content.as_bytes()).await
     }
 
     /// Rename the session.
@@ -408,6 +407,46 @@ fn human_session_name() -> String {
         .unwrap_or_else(|| "New session".to_string())
 }
 
+/// Atomic file write: write to a sibling temp file, fsync, then rename over
+/// the target. Survives mid-write crashes — the target is either the old
+/// content or the new content, never a truncated splice. Falls back to a
+/// direct write only if the temp-file path can't be constructed.
+async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).await?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("session path has no file name: {}", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        Uuid::new_v4()
+    ));
+
+    {
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .await?;
+        f.write_all(bytes).await?;
+        f.sync_all().await?;
+    }
+
+    // tokio::fs::rename is atomic on POSIX and on Windows when paths are on
+    // the same volume. Both paths are siblings under the sessions dir, so
+    // we always satisfy that constraint.
+    if let Err(e) = fs::rename(&tmp, path).await {
+        // Best-effort cleanup on rename failure.
+        let _ = fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 fn first_user_preview(messages: &[Message]) -> Option<String> {
     for msg in messages {
         if matches!(msg.role, Role::User) {
@@ -458,5 +497,42 @@ mod meta_serde_tests {
         let out = serde_json::to_string(&m).unwrap();
         assert!(out.contains("auto_commits"));
         assert!(out.contains("undo_position"));
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::atomic_write;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn writes_then_replaces() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("session.meta");
+        atomic_write(&target, b"v1").await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "v1");
+        atomic_write(&target, b"v2").await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "v2");
+    }
+
+    #[tokio::test]
+    async fn leaves_no_temp_files_behind() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("session.meta");
+        atomic_write(&target, b"hello").await.unwrap();
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().to_string());
+        }
+        assert_eq!(names, vec!["session.meta"]);
+    }
+
+    #[tokio::test]
+    async fn creates_parent_dir_if_missing() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("nested/sub/session.meta");
+        atomic_write(&target, b"x").await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "x");
     }
 }

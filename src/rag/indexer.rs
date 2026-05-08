@@ -425,6 +425,14 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
         if !entry.file_type().is_file() {
             continue;
         }
+        // Defense in depth: WalkDir's `follow_links(false)` skips traversal
+        // into symlinked dirs but still surfaces symlinked files; `read_to_string`
+        // would then follow them at I/O time. Reject symlinked entries so a
+        // crafted repo can't trick the indexer into pulling in `~/.ssh/id_rsa`.
+        if entry.path_is_symlink() {
+            files_skipped += 1;
+            continue;
+        }
 
         let path = entry.path();
         let ext = match path.extension().and_then(|e| e.to_str()) {

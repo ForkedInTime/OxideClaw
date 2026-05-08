@@ -7,14 +7,42 @@
 //! `&mut BrowserSession` — those are fast, no long awaits.
 use super::cdp::CdpClient;
 use super::BrowserSession;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::json;
+
+/// URL schemes the browser is allowed to navigate to. Anything else
+/// (`javascript:`, `data:`, `file:`, `ftp:`, …) is rejected up front so a
+/// model can't pivot the session into local-file disclosure or in-page
+/// script execution.
+const ALLOWED_SCHEMES: &[&str] = &["http", "https", "about"];
+
+/// Reject URLs that aren't plain HTTP(S) or `about:blank` style. Returns the
+/// validated URL on success.
+fn validate_navigation_url(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        bail!("navigation URL is empty");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let scheme = match lower.split_once(':') {
+        Some((s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') => s.to_string(),
+        // No scheme — treat as relative; reject so callers always pass absolute URLs.
+        _ => bail!("navigation URL '{url}' is missing an http(s):// scheme"),
+    };
+    if !ALLOWED_SCHEMES.contains(&scheme.as_str()) {
+        bail!(
+            "navigation URL scheme '{scheme}:' is not allowed; only http/https/about are permitted"
+        );
+    }
+    Ok(())
+}
 
 /// Navigate to a URL. Returns (title, status). Does NOT mutate session state —
 /// the caller is responsible for updating `current_url` / `current_title`
 /// after this returns, so the session lock can be released while we wait on
 /// the page load event (bounded by `timeout_ms`).
 pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<(String, u16)> {
+    validate_navigation_url(url)?;
     // Subscribe BEFORE navigating so we don't miss Page.loadEventFired on fast loads.
     let mut events = client.subscribe();
 
@@ -182,29 +210,6 @@ pub async fn press_key(client: &CdpClient, key: &str) -> Result<String> {
     Ok(format!("Pressed key: {key}"))
 }
 
-/// Handle a dialog (alert/confirm/prompt).
-/// Not yet exposed as a tool — wired up when we add a `browser_dialog`
-/// tool and subscribe to `Page.javascriptDialogOpening`. Safe to drop
-/// if that feature is abandoned.
-#[allow(dead_code)]
-pub async fn handle_dialog(client: &CdpClient, accept: bool, text: Option<&str>) -> Result<String> {
-    let mut params = json!({"accept": accept});
-    if let Some(t) = text {
-        params["promptText"] = json!(t);
-    }
-    client.send("Page.handleJavaScriptDialog", params).await?;
-    Ok(format!("Dialog {}", if accept { "accepted" } else { "dismissed" }))
-}
-
-/// Get console messages (placeholder — requires a Runtime.consoleAPICalled listener).
-/// Not yet exposed as a tool; kept so the signature is stable once we
-/// wire a persistent console-event subscriber to BrowserSession.
-#[allow(dead_code)]
-pub async fn get_console_messages(_client: &CdpClient) -> Result<Vec<String>> {
-    // Event-based listener not yet wired; return empty for now.
-    Ok(Vec::new())
-}
-
 /// Get text content of an element by @ref.
 pub async fn get_text(session: &mut BrowserSession, element_ref: &str) -> Result<String> {
     let node_id = session.resolve_ref(element_ref)?;
@@ -248,5 +253,44 @@ pub async fn wait_for(
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_accepts_http_and_https() {
+        assert!(validate_navigation_url("http://example.com").is_ok());
+        assert!(validate_navigation_url("https://example.com/path?q=1#x").is_ok());
+        assert!(validate_navigation_url("HTTPS://EXAMPLE.COM").is_ok());
+        assert!(validate_navigation_url("about:blank").is_ok());
+    }
+
+    #[test]
+    fn navigation_rejects_dangerous_schemes() {
+        for url in [
+            "javascript:alert(1)",
+            "JavaScript:void(0)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "chrome://settings",
+            "view-source:http://example.com",
+        ] {
+            assert!(
+                validate_navigation_url(url).is_err(),
+                "should have rejected {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_rejects_relative_or_empty() {
+        assert!(validate_navigation_url("").is_err());
+        assert!(validate_navigation_url("   ").is_err());
+        assert!(validate_navigation_url("/foo/bar").is_err());
+        assert!(validate_navigation_url("example.com").is_err());
     }
 }

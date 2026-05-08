@@ -449,6 +449,41 @@ impl Tool for BrowserWaitTool {
     }
 }
 
+// ── browser_console ─────────────────────────────────────────────────────────
+
+pub struct BrowserConsoleTool {
+    pub session: SharedSession,
+}
+
+#[async_trait]
+impl Tool for BrowserConsoleTool {
+    fn name(&self) -> &str {
+        "browser_console"
+    }
+    fn description(&self) -> &str {
+        "Drain and return console messages and uncaught exceptions captured \
+         since the last call. Each entry is prefixed with [level] or \
+         [exception]. The buffer is cleared after each call."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+    async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let session = self.session.lock().await;
+        let _ = session.client()?;
+        let messages = session.take_console_messages().await;
+        if messages.is_empty() {
+            Ok(ToolOutput::success("(no console messages)".to_string()))
+        } else {
+            Ok(ToolOutput::success(messages.join("\n")))
+        }
+    }
+}
+
 // ── browse_done ──────────────────────────────────────────────────────────────
 
 /// Sentinel tool the model calls to signal the end of an autonomous `/browse`

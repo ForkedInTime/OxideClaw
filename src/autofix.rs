@@ -25,10 +25,12 @@ pub struct AutoFixConfig {
     pub trigger: AutoFixTrigger,
     pub lint_command: Option<String>,
     pub test_command: Option<String>,
-    /// Reserved for a future multi-turn retry loop. The current hook runs
-    /// tests exactly once per turn and does not retry — setting this to
-    /// anything other than the default has no runtime effect today, and
-    /// `Config::load` emits a warning when the user overrides it.
+    /// Maximum number of lint/test → feedback → re-prompt rounds within a
+    /// single user turn. Honored by the TUI agentic loop: on
+    /// `AutoFixAction::Retry`, the failure output is appended as a
+    /// synthetic user message and the model is re-prompted; on
+    /// `AutoFixAction::GiveUp` the working tree is left as-is.
+    /// Clamped to `1..=10` by `Config::load`.
     pub max_retries: u32,
     /// Maximum wall-clock seconds to let the test command run before killing
     /// it and returning `CommandResult::Timeout`. `0` means no timeout.

@@ -87,7 +87,7 @@ rustyclaw
 | Model router | No | No | **Auto-route by task complexity** |
 | Parallel agents | No | No | **Git-worktree isolation** |
 | Voice I/O | No | No | **Whisper + XTTS v2 cloning** |
-| Browser automation | External MCP server | No | **9 CDP tools, in the binary** |
+| Browser automation | External MCP server | No | **10 CDP tools, in the binary** |
 | Autonomous browser agent | No | No | **Goal-driven, 50-step cap, safety-gated** |
 | Auto-fix loop | No | No | **Post-edit lint + tests + retry** |
 | `/undo` · `/redo` | No | Partial (pollutes git log) | **Invisible shadow refs** |

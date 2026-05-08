@@ -1,13 +1,9 @@
 //! Unified diff parsing for the read-only diff overlay (`/diff`).
 //!
-//! Parser-only. Interactive hunk-level accept/reject is not shipped; if it's
-//! ever wired, revive the `HunkState` + `DiffReviewState` machine from git
-//! history (commit e23cc71) rather than re-deriving it.
-//!
-//! The struct fields below are populated by the parser but only the
-//! summary counts (`additions` / `deletions`) are read today — the
-//! overlay renders the raw diff string directly. Fields retained so the
-//! hunk-walker UI can reconnect without a parser change.
+//! The TUI overlay renders the raw diff text and only reads the summary
+//! counts (`additions` / `deletions`) from `FileDiff`. Hunks and lines are
+//! still produced by the parser so unit tests in `tests/diff_tests.rs` can
+//! verify hunk-level correctness.
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]

@@ -503,6 +503,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Respect NO_COLOR (https://no-color.org/) and dumb terminals so piped
+    // output / CI logs / `less` don't get ANSI escape codes.
+    if std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false)
+    {
+        colored::control::set_override(false);
+    }
+
     // Load .env files before anything else so API keys are available
     // to Config::load() and all downstream code.
     load_dotenv_auto();

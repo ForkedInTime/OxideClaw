@@ -153,15 +153,6 @@ impl CdpClient {
         self.event_tx.subscribe()
     }
 
-    /// Returns true if the WebSocket connection is still alive.
-    /// Not yet consulted by any tool — `send()` already surfaces reconnect
-    /// failures on the next call, so live health checks aren't needed today.
-    /// Kept for future /browser status display.
-    #[allow(dead_code)]
-    pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
-    }
-
     /// Background reader loop: dispatches responses to pending waiters, events to broadcast.
     /// On exit, marks alive=false and drains all pending senders so callers get errors fast.
     async fn reader_loop(

@@ -4,7 +4,6 @@ pub mod browse_loop;
 pub mod approval_gate;
 pub mod cdp;
 pub mod element;
-pub mod extraction;
 pub mod loop_detector;
 pub mod middleware;
 pub mod snapshot;
@@ -12,10 +11,16 @@ pub mod yolo_ack;
 
 use anyhow::{Result, bail};
 use cdp::CdpClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Child;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
+
+/// Bounded ring buffer cap for captured console messages.
+const CONSOLE_BUF_CAP: usize = 500;
 
 /// Active browser session — owns the CDP connection, Chrome child process, and page state.
 #[derive(Default)]
@@ -34,6 +39,11 @@ pub struct BrowserSession {
     pub current_url: String,
     /// Current page title
     pub current_title: String,
+    /// Captured console messages (Runtime.consoleAPICalled + Runtime.exceptionThrown).
+    /// Bounded at `CONSOLE_BUF_CAP`; oldest dropped on overflow.
+    console_buf: Arc<AsyncMutex<VecDeque<String>>>,
+    /// Background task that drains CDP events into `console_buf`. Aborted on close.
+    console_task: Option<JoinHandle<()>>,
 }
 
 
@@ -110,6 +120,7 @@ impl BrowserSession {
             }
         };
 
+        self.console_task = Some(spawn_console_listener(&client, self.console_buf.clone()));
         self.client = Some(client);
         self.child = Some(child);
         self._user_data = Some(user_data);
@@ -118,12 +129,20 @@ impl BrowserSession {
 
     /// Connect to an existing CDP endpoint.
     pub async fn connect(&mut self, endpoint: &str) -> Result<()> {
-        self.client = Some(CdpClient::connect(endpoint).await?);
+        let client = CdpClient::connect(endpoint).await?;
+        self.console_task = Some(spawn_console_listener(&client, self.console_buf.clone()));
+        self.client = Some(client);
         Ok(())
     }
 
     /// Close the browser session — kills Chrome and frees the user-data-dir.
     pub async fn close(&mut self) {
+        // Stop the console listener before tearing down the CDP client so it
+        // doesn't observe a half-dead connection.
+        if let Some(task) = self.console_task.take() {
+            task.abort();
+        }
+        self.console_buf.lock().await.clear();
         // Drop the CDP client first to close the WebSocket.
         self.client = None;
         // Kill the Chrome process if we launched it (connect() doesn't set child).
@@ -137,6 +156,15 @@ impl BrowserSession {
         self.ref_names.clear();
         self.current_url.clear();
         self.current_title.clear();
+    }
+
+    /// Drain and return all console messages captured since the last call.
+    /// Includes both `Runtime.consoleAPICalled` events (formatted as
+    /// `[level] text`) and `Runtime.exceptionThrown` events (formatted as
+    /// `[exception] text`). The buffer is cleared on each call.
+    pub async fn take_console_messages(&self) -> Vec<String> {
+        let mut buf = self.console_buf.lock().await;
+        buf.drain(..).collect()
     }
 
     /// Update ref map (called after each snapshot). Names are optional — pass
@@ -214,6 +242,80 @@ pub fn find_chrome() -> Option<PathBuf> {
     None
 }
 
+/// Spawn a background task that subscribes to CDP events and pushes
+/// console + exception messages into `buf`. Bounded at `CONSOLE_BUF_CAP`;
+/// oldest entries are dropped on overflow. The returned handle is aborted
+/// on session close.
+fn spawn_console_listener(
+    client: &CdpClient,
+    buf: Arc<AsyncMutex<VecDeque<String>>>,
+) -> JoinHandle<()> {
+    let mut rx = client.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let formatted = match event.method.as_str() {
+                        "Runtime.consoleAPICalled" => format_console_event(&event.params),
+                        "Runtime.exceptionThrown" => format_exception_event(&event.params),
+                        _ => continue,
+                    };
+                    if let Some(line) = formatted {
+                        let mut guard = buf.lock().await;
+                        if guard.len() >= CONSOLE_BUF_CAP {
+                            guard.pop_front();
+                        }
+                        guard.push_back(line);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // High event rate — drop the lag and keep listening.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn format_console_event(params: &serde_json::Value) -> Option<String> {
+    let level = params.get("type").and_then(|v| v.as_str()).unwrap_or("log");
+    let args = params.get("args").and_then(|v| v.as_array())?;
+    let text: Vec<String> = args
+        .iter()
+        .map(|a| {
+            a.get("value")
+                .map(stringify_arg)
+                .or_else(|| a.get("description").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_else(|| "<unprintable>".into())
+        })
+        .collect();
+    Some(format!("[{level}] {}", text.join(" ")))
+}
+
+fn format_exception_event(params: &serde_json::Value) -> Option<String> {
+    let details = params.get("exceptionDetails")?;
+    let text = details.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let exception_text = details
+        .get("exception")
+        .and_then(|e| e.get("description").and_then(|d| d.as_str()))
+        .or_else(|| details.get("exception").and_then(|e| e.get("value").and_then(|v| v.as_str())))
+        .unwrap_or("");
+    let combined = if exception_text.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text} {exception_text}").trim().to_string()
+    };
+    Some(format!("[exception] {combined}"))
+}
+
+fn stringify_arg(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Find a free TCP port for Chrome's debugging port.
 async fn find_free_port() -> Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -257,4 +359,111 @@ async fn poll_cdp_endpoint(port: u16) -> Result<String> {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     bail!("Chrome did not expose a page target within 6 seconds on port {port}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn console_event_formats_string_args() {
+        let params = json!({
+            "type": "log",
+            "args": [
+                {"type": "string", "value": "hello"},
+                {"type": "number", "value": 42},
+            ]
+        });
+        assert_eq!(
+            format_console_event(&params).as_deref(),
+            Some("[log] hello 42")
+        );
+    }
+
+    #[test]
+    fn console_event_falls_back_to_description_for_objects() {
+        let params = json!({
+            "type": "error",
+            "args": [
+                {"type": "object", "description": "Error: oops"},
+            ]
+        });
+        assert_eq!(
+            format_console_event(&params).as_deref(),
+            Some("[error] Error: oops")
+        );
+    }
+
+    #[test]
+    fn console_event_defaults_level_to_log() {
+        let params = json!({
+            "args": [{"type": "string", "value": "no-level"}]
+        });
+        assert_eq!(
+            format_console_event(&params).as_deref(),
+            Some("[log] no-level")
+        );
+    }
+
+    #[test]
+    fn console_event_returns_none_without_args() {
+        let params = json!({"type": "log"});
+        assert!(format_console_event(&params).is_none());
+    }
+
+    #[test]
+    fn exception_event_formats_text_and_description() {
+        let params = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "TypeError: x is undefined"}
+            }
+        });
+        assert_eq!(
+            format_exception_event(&params).as_deref(),
+            Some("[exception] Uncaught TypeError: x is undefined")
+        );
+    }
+
+    #[test]
+    fn exception_event_handles_missing_exception() {
+        let params = json!({
+            "exceptionDetails": {"text": "Uncaught"}
+        });
+        assert_eq!(
+            format_exception_event(&params).as_deref(),
+            Some("[exception] Uncaught")
+        );
+    }
+
+    #[tokio::test]
+    async fn take_console_messages_drains_and_clears() {
+        let session = BrowserSession::default();
+        {
+            let mut buf = session.console_buf.lock().await;
+            buf.push_back("[log] one".into());
+            buf.push_back("[error] two".into());
+        }
+        let drained = session.take_console_messages().await;
+        assert_eq!(drained, vec!["[log] one", "[error] two"]);
+        assert!(session.take_console_messages().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn console_buf_drops_oldest_on_overflow() {
+        let buf: Arc<AsyncMutex<VecDeque<String>>> = Arc::new(AsyncMutex::new(VecDeque::new()));
+        // Simulate the listener push path with a small synthetic cap.
+        for i in 0..(CONSOLE_BUF_CAP + 5) {
+            let mut g = buf.lock().await;
+            if g.len() >= CONSOLE_BUF_CAP {
+                g.pop_front();
+            }
+            g.push_back(format!("msg {i}"));
+        }
+        let g = buf.lock().await;
+        assert_eq!(g.len(), CONSOLE_BUF_CAP);
+        assert_eq!(g.front().unwrap(), &format!("msg {}", 5));
+        assert_eq!(g.back().unwrap(), &format!("msg {}", CONSOLE_BUF_CAP + 4));
+    }
 }

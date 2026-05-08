@@ -23,10 +23,6 @@ struct AgentInput {
     ///         "rustyclaw-guide", "statusline-setup"
     #[serde(default)]
     subagent_type: Option<String>,
-    /// Whether to run the agent in the background (not yet implemented).
-    #[serde(default)]
-    #[allow(dead_code)] // deserialized from LLM tool call, background agent WIP
-    run_in_background: Option<bool>,
 }
 
 #[async_trait]
@@ -63,10 +59,6 @@ impl Tool for AgentTool {
                     "type": "string",
                     "description": "Specialized agent type. One of: general-purpose, Explore, Plan, verification, rustyclaw-guide, statusline-setup",
                     "enum": ["general-purpose", "Explore", "Plan", "verification", "rustyclaw-guide", "statusline-setup"]
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": "Whether to run the agent in the background"
                 }
             },
             "required": ["prompt"]
