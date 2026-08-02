@@ -128,3 +128,6 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
+# test-util enables `#[tokio::test(start_paused = true)]` so timeout-based tests
+# (e.g. the SSE idle-stall guard) resolve instantly instead of sleeping in real time.
+tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros", "time"] }

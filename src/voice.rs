@@ -840,22 +840,19 @@ pub async fn await_voice_approval(timeout_secs: u64) -> bool {
 
     // Record for at most timeout_secs then stop automatically.
     let record_task = tokio::spawn(async move {
-        match start_recording(&backend).await {
-            Ok(mut child) => {
-                tokio::select! {
-                    _ = stop_rx => {
-                        if let Some(pid) = child.id() {
-                            let _ = tokio::process::Command::new("kill")
-                                .args(["-2", &pid.to_string()])
-                                .status()
-                                .await;
-                        }
-                        let _ = child.wait().await;
+        if let Ok(mut child) = start_recording(&backend).await {
+            tokio::select! {
+                _ = stop_rx => {
+                    if let Some(pid) = child.id() {
+                        let _ = tokio::process::Command::new("kill")
+                            .args(["-2", &pid.to_string()])
+                            .status()
+                            .await;
                     }
-                    _ = child.wait() => {}
+                    let _ = child.wait().await;
                 }
+                _ = child.wait() => {}
             }
-            Err(_) => {}
         }
     });
 

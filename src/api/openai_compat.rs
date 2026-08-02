@@ -21,7 +21,6 @@
 ///   OPENAI_BASE_URL overrides the base URL for the generic `openai-compat:` prefix.
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -417,8 +416,7 @@ pub(crate) async fn parse_oai_stream(
     let mut tool_bufs: HashMap<usize, (String, String, String)> = HashMap::new();
     let mut finish_reason: Option<String> = None;
 
-    while let Some(event) = stream.next().await {
-        let event = event.context("SSE stream error")?;
+    while let Some(event) = super::next_sse_event(&mut stream).await? {
         if event.data == "[DONE]" {
             break;
         }

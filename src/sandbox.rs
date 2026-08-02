@@ -113,10 +113,15 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
 
 // ── firejail wrapper ──────────────────────────────────────────────────────────
 
-pub fn firejail_wrap(command: &str, cwd: &std::path::Path) -> String {
+pub fn firejail_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
     let cwd_quoted = shell_quote(&cwd.display().to_string());
+    // `--net=none` is firejail's equivalent of bwrap's `--unshare-net`. Without
+    // it, firejail mode silently ignored `sandbox_allow_network` and always had
+    // full egress, so the same setting meant different things in the two modes.
+    let net_flag = if allow_network { "" } else { "--net=none " };
     format!(
-        "firejail --quiet --private-tmp --noroot --chdir={cwd} -- /bin/sh -c {cmd}",
+        "firejail --quiet --private-tmp --noroot {net_flag}--chdir={cwd} -- /bin/sh -c {cmd}",
+        net_flag = net_flag,
         cwd = cwd_quoted,
         cmd = shell_quote(command),
     )
@@ -163,9 +168,45 @@ pub fn apply_sandbox(
                         .into(),
                 );
             }
-            Ok(firejail_wrap(command, cwd))
+            Ok(firejail_wrap(command, cwd, allow_network))
         }
-        _ => Ok(command.to_string()),
+        // Fail CLOSED on an unrecognised mode. `ctx.sandbox_mode` is only `Some`
+        // when the sandbox is enabled, so reaching this arm means the configured
+        // mode string is invalid — a typo or a stale value in settings.json,
+        // which (unlike `/sandbox enable`) does not validate the field.
+        //
+        // Returning the command unchanged here used to run it fully unsandboxed
+        // AND skip `strict_check`, while the UI still reported the sandbox as
+        // enabled. A security control that silently does nothing is worse than
+        // one that is off, so refuse the command and name the bad value.
+        other => Err(format!(
+            "Sandbox is enabled but the configured mode '{other}' is not recognised. \
+             Valid modes: strict, bwrap, firejail. Refusing to run the command \
+             unsandboxed — fix `sandboxMode` in settings.json or run: /sandbox enable strict"
+        )),
+    }
+}
+
+/// Sandbox gate for command-executing tools that the namespace wrappers cannot
+/// wrap. `bwrap_wrap` / `firejail_wrap` hard-code `/bin/sh -c`, so routing a
+/// PowerShell command through them would hand the script to `sh` and change its
+/// meaning entirely.
+///
+/// Pattern blocking still applies in every mode. For the namespace modes there
+/// is no correct wrapping, so this fails closed: better to refuse than to run
+/// outside the sandbox the user believes is active.
+pub fn guard_unwrappable_tool(command: &str, mode: &str, tool: &str) -> Result<(), String> {
+    if let Some(reason) = strict_check(command) {
+        return Err(reason);
+    }
+    match mode {
+        "strict" => Ok(()),
+        other => Err(format!(
+            "The {tool} tool cannot be sandboxed under mode '{other}' — the {other} \
+             wrapper executes through /bin/sh, which would not run a PowerShell \
+             script correctly. Refusing rather than running it unsandboxed. \
+             Use /sandbox enable strict, or use the Bash tool instead."
+        )),
     }
 }
 
@@ -213,4 +254,93 @@ pub fn sandbox_status(enabled: bool, mode: &str) -> String {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// An unrecognised mode used to return the command unchanged — running it
+    /// fully unsandboxed, skipping `strict_check`, while the UI still reported
+    /// the sandbox as enabled. Reachable via an unvalidated `sandboxMode` in
+    /// settings.json.
+    #[test]
+    fn unknown_mode_fails_closed() {
+        let err = apply_sandbox("echo hi", "strict-typo", Path::new("/tmp"), false)
+            .expect_err("an unrecognised mode must not run the command unsandboxed");
+        assert!(err.contains("strict-typo"), "error should name the bad mode: {err}");
+        assert!(err.contains("strict"), "error should list valid modes: {err}");
+    }
+
+    #[test]
+    fn known_modes_still_pass_through() {
+        let out = apply_sandbox("echo hi", "strict", Path::new("/tmp"), false)
+            .expect("strict mode is valid");
+        assert_eq!(out, "echo hi");
+    }
+
+    #[test]
+    fn strict_mode_still_blocks_dangerous_patterns() {
+        assert!(apply_sandbox("rm -rf /", "strict", Path::new("/tmp"), false).is_err());
+    }
+
+    /// `firejail_wrap` ignored `allow_network` entirely, so firejail mode always
+    /// had full egress while bwrap mode honoured the setting — the same config
+    /// meaning two different things.
+    #[test]
+    fn firejail_honours_network_setting() {
+        let blocked = firejail_wrap("echo hi", Path::new("/tmp"), false);
+        assert!(blocked.contains("--net=none"), "network must be blocked: {blocked}");
+
+        let allowed = firejail_wrap("echo hi", Path::new("/tmp"), true);
+        assert!(!allowed.contains("--net=none"), "network must be allowed: {allowed}");
+    }
+
+    #[test]
+    fn bwrap_and_firejail_agree_on_network_policy() {
+        let bw = bwrap_wrap("echo hi", Path::new("/tmp"), false);
+        let fj = firejail_wrap("echo hi", Path::new("/tmp"), false);
+        assert!(bw.contains("--unshare-net"));
+        assert!(fj.contains("--net=none"));
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quotes() {
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        let wrapped = firejail_wrap("echo 'pwn'", Path::new("/tmp/a b"), true);
+        assert!(wrapped.contains(r#"'/tmp/a b'"#), "cwd must stay quoted: {wrapped}");
+    }
+
+    /// PowerShell cannot be wrapped by the namespace modes (they exec /bin/sh),
+    /// so the gate must refuse rather than run it outside the active sandbox.
+    #[test]
+    fn unwrappable_tool_gate_fails_closed_on_namespace_modes() {
+        assert!(guard_unwrappable_tool("Get-ChildItem", "strict", "PowerShell").is_ok());
+
+        for mode in ["bwrap", "firejail"] {
+            let err = guard_unwrappable_tool("Get-ChildItem", mode, "PowerShell")
+                .unwrap_err_or_else_msg();
+            assert!(err.contains(mode), "error should name the mode: {err}");
+        }
+    }
+
+    #[test]
+    fn unwrappable_tool_gate_applies_pattern_blocking_in_every_mode() {
+        for mode in ["strict", "bwrap", "firejail"] {
+            assert!(
+                guard_unwrappable_tool("rm -rf /", mode, "PowerShell").is_err(),
+                "dangerous pattern must be blocked under {mode}"
+            );
+        }
+    }
+
+    trait UnwrapErrMsg {
+        fn unwrap_err_or_else_msg(self) -> String;
+    }
+    impl UnwrapErrMsg for Result<(), String> {
+        fn unwrap_err_or_else_msg(self) -> String {
+            self.expect_err("expected the gate to refuse")
+        }
+    }
 }

@@ -419,14 +419,18 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
         || crate::api::is_openai_compat_model(&config.model);
     if !is_non_anthropic && config.api_key.is_empty() {
         return Err(anyhow::anyhow!(
-            "ANTHROPIC_API_KEY is not set.\n\
-             Set it with: export ANTHROPIC_API_KEY=sk-ant-...\n\
-             To use a local model: --model ollama:<name>\n\
-             Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
+            "No Anthropic credential found.\n\
+                 RustyClaw checks, in order:\n\
+                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
+                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
+                   3. apiKeyHelper / RUSTYCLAW_API_KEY_FILE_DESCRIPTOR\n\
+                   4. ant auth login         shared with Claude Code and the official SDKs\n\
+                 To use a local model instead: --model ollama:<name>\n\
+                 Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
         ));
     }
     let mut client: ApiBackend =
-        ApiBackend::new(&config.model, &config.api_key, &config.ollama_host)?;
+        ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
     let settings = crate::settings::Settings::load(&config.cwd);
@@ -801,7 +805,7 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             system_prompt.clear();
             system_prompt.push_str(&config.build_system_prompt());
-            match ApiBackend::new(&config.model, &config.api_key, &config.ollama_host) {
+            match ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host) {
                 Ok(new_client) => {
                     client = new_client;
                 }
@@ -927,6 +931,11 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
         }
 
         // Uses cached term size — no syscall per frame; updated on Resize events.
+        // Bound scrollback before measuring/drawing. Every path that appends to
+        // `app.entries` reaches the renderer through here, so this single call is
+        // sufficient — no need to police ~40 individual push sites.
+        app.trim_entries();
+
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             if needed != current_vp_h {
@@ -1991,7 +2000,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         );
                         *system_prompt = config.build_system_prompt();
                         // Re-create backend when switching between Anthropic ↔ Ollama
-                        match ApiBackend::new(&config.model, &config.api_key, &config.ollama_host) {
+                        match ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host) {
                             Ok(new_client) => {
                                 *client = new_client;
                             }

@@ -49,7 +49,7 @@ impl SdkSession {
         approval_tx: mpsc::UnboundedSender<SdkNotification>,
         approval_rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
     ) -> Result<Self> {
-        let client = ApiBackend::new(&config.model, &config.api_key, &config.ollama_host)
+        let client = ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host)
             .context("Failed to create API client")?;
         let system_prompt = config.build_system_prompt();
         let session_id = uuid::Uuid::new_v4().to_string();

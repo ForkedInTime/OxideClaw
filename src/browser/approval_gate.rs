@@ -177,14 +177,14 @@ impl ApprovalGate {
 
         // 5. Visible prices — skip zero amounts
         for price in &c.visible_prices {
-            if let Some(caps) = self.price_re.captures(price) {
-                if let Some(amount_str) = caps.get(1) {
-                    let normalized = amount_str.as_str().replace(',', ".");
-                    if let Ok(val) = normalized.parse::<f64>() {
-                        if val >= 0.01 {
-                            reasons.push(format!("visible_price: {price}"));
-                        }
-                    }
+            if let Some(caps) = self.price_re.captures(price)
+                && let Some(amount_str) = caps.get(1)
+            {
+                let normalized = amount_str.as_str().replace(',', ".");
+                if let Ok(val) = normalized.parse::<f64>()
+                    && val >= 0.01
+                {
+                    reasons.push(format!("visible_price: {price}"));
                 }
             }
         }

@@ -172,7 +172,11 @@ impl CostTracker {
             lines.push("Per-model breakdown:".into());
 
             let mut models: Vec<_> = self.by_model.iter().collect();
-            models.sort_by(|a, b| b.1.cost_usd.partial_cmp(&a.1.cost_usd).unwrap());
+            // `total_cmp` rather than `partial_cmp().unwrap()`: the release profile
+            // sets `panic = "abort"`, so a NaN cost would take the whole process down
+            // just to render a cost summary. NaN is not reachable today, but a total
+            // order costs nothing and removes the failure mode permanently.
+            models.sort_by(|a, b| b.1.cost_usd.total_cmp(&a.1.cost_usd));
 
             for (model, usage) in models {
                 let short = short_model_name(model);
@@ -281,6 +285,35 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `summary()` sorts per-model costs. With `partial_cmp().unwrap()` a non-finite
+    /// cost aborted the process (release sets `panic = "abort"`); `total_cmp` orders
+    /// it instead. Rendering a cost report must never be able to kill the session.
+    #[test]
+    fn summary_survives_non_finite_costs() {
+        let mut tracker = CostTracker::new();
+        tracker.record("claude-sonnet-4-6", 1_000, 100);
+
+        for (name, cost) in [
+            ("model-nan", f64::NAN),
+            ("model-inf", f64::INFINITY),
+            ("model-neg-inf", f64::NEG_INFINITY),
+        ] {
+            tracker.by_model.insert(
+                name.to_string(),
+                ModelUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    turns: 1,
+                    cost_usd: cost,
+                },
+            );
+        }
+
+        let summary = tracker.summary();
+        assert!(summary.contains("Per-model breakdown:"));
+        assert!(summary.contains("model-nan"), "every model must still render");
+    }
 
     #[test]
     fn test_cost_tracking() {

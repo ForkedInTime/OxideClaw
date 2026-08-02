@@ -53,12 +53,26 @@ impl Tool for PowerShellTool {
         let input: Input = serde_json::from_value(input)?;
         let timeout_ms = input.timeout_ms.min(120_000);
 
+        // This tool executes arbitrary commands exactly like Bash, so it must
+        // honour the sandbox. It previously bypassed it entirely — `apply_sandbox`
+        // was called from bash.rs and nowhere else — so an enabled sandbox had no
+        // effect here at all.
+        if let Some(ref mode) = ctx.sandbox_mode
+            && let Err(reason) =
+                crate::sandbox::guard_unwrappable_tool(&input.command, mode, "PowerShell")
+        {
+            return Ok(ToolOutput::error(reason));
+        }
+
         use tokio::process::Command;
         use tokio::time::{Duration, timeout};
 
         let fut = Command::new("pwsh")
             .args(["-NoProfile", "-NonInteractive", "-Command", &input.command])
             .current_dir(&ctx.cwd)
+            // Same reason as the Bash tool: inherited stdin lets an interactive
+            // prompt fight the TUI for keystrokes.
+            .stdin(std::process::Stdio::null())
             .output();
 
         let result = timeout(Duration::from_millis(timeout_ms), fut).await;

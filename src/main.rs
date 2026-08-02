@@ -1,6 +1,7 @@
 /// rustyclaw — Rust-native AI coding CLI
 /// Entry point
 mod api;
+mod auth;
 mod autofix;
 mod browser;
 mod commands;
@@ -396,8 +397,16 @@ enum McpSubcommand {
 /// If a user legitimately needs one of the blocked vars set, they can export
 /// it in their shell — project `.env` is not the right place.
 const SAFE_ENV_KEYS: &[&str] = &[
-    // Anthropic
+    // Anthropic credentials. The whole documented resolution chain must be
+    // settable from .env, not just the API key — otherwise a project that
+    // authenticates with an OAuth token silently falls back to whatever key
+    // happens to be in the ambient environment.
+    //
+    // ANTHROPIC_BASE_URL is deliberately NOT here: it redirects every API call,
+    // so a hostile .env could point credentials at an attacker-controlled host.
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_PROFILE",
     "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR",
     "ANTHROPIC_MODEL",
     // Verbose logging toggle — no exec side-effects
@@ -1386,6 +1395,35 @@ mod dotenv_allowlist_tests {
                 "{k} is in SAFE_ENV_KEYS but must be forbidden — see threat model in SAFE_ENV_KEYS doc"
             );
         }
+    }
+
+    /// Every source in the documented credential chain must be settable from
+    /// .env. ANTHROPIC_AUTH_TOKEN was missing when OAuth support landed, so a
+    /// project authenticating with a token silently fell back to whatever key
+    /// was in the ambient environment.
+    #[test]
+    fn dotenv_allowlist_covers_the_whole_credential_chain() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_PROFILE",
+            "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR",
+        ] {
+            assert!(
+                SAFE_ENV_KEYS.contains(&key),
+                "{key} must be loadable from .env — it is part of credential resolution"
+            );
+        }
+    }
+
+    /// Redirecting the API base URL from a project .env would let a hostile
+    /// repo point real credentials at an attacker-controlled host.
+    #[test]
+    fn dotenv_allowlist_excludes_base_url_redirect() {
+        assert!(
+            !SAFE_ENV_KEYS.contains(&"ANTHROPIC_BASE_URL"),
+            "ANTHROPIC_BASE_URL must never be settable from .env"
+        );
     }
 
     /// A malicious .env that sets dangerous vars must not leak into the

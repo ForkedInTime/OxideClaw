@@ -22,7 +22,11 @@ pub enum PermissionDecision {
 
 /// Tools that require explicit permission before execution.
 /// Mirrors the hasPermissionsToUseTool logic in permissions.ts.
-pub const SENSITIVE_TOOLS: &[&str] = &["Bash", "Write", "Edit"];
+///
+/// `PowerShell` executes arbitrary commands exactly like `Bash` and must be
+/// gated the same way. It was previously absent, so on any machine with `pwsh`
+/// installed the model could run shell commands with no approval prompt at all.
+pub const SENSITIVE_TOOLS: &[&str] = &["Bash", "PowerShell", "Write", "Edit"];
 
 /// Session-scoped permission state — shared between tool executor and TUI.
 #[derive(Clone, Default)]
@@ -131,7 +135,7 @@ fn rule_matches(rule: &str, tool_name: &str, input: Option<&serde_json::Value>) 
         // Check the input's "command" field for Bash, or "file_path" for file tools
         if let Some(inp) = input {
             let value = match tool_name {
-                "Bash" => inp["command"].as_str().unwrap_or(""),
+                "Bash" | "PowerShell" => inp["command"].as_str().unwrap_or(""),
                 "Write" | "Edit" | "Read" => inp["file_path"].as_str().unwrap_or(""),
                 _ => return false,
             };
@@ -258,6 +262,10 @@ pub fn describe_tool_call(tool_name: &str, input: &serde_json::Value) -> String 
             let cmd = input["command"].as_str().unwrap_or("(unknown)");
             format!("Run shell command:\n  {cmd}")
         }
+        "PowerShell" => {
+            let cmd = input["command"].as_str().unwrap_or("(unknown)");
+            format!("Run PowerShell command:\n  {cmd}")
+        }
         "Write" => {
             let path = input["file_path"].as_str().unwrap_or("(unknown)");
             format!("Write/overwrite file:\n  {path}")
@@ -283,5 +291,82 @@ fn truncate(s: &str, max: usize) -> &str {
             .last()
             .unwrap_or(0);
         &s[..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> PermissionState {
+        PermissionState::new(false, &[], &[])
+    }
+
+    /// `PowerShell` was absent from SENSITIVE_TOOLS, so `check_with_input`
+    /// returned Allow immediately — the model could run arbitrary shell commands
+    /// via `pwsh` with no approval prompt at all.
+    #[test]
+    fn powershell_requires_approval() {
+        let input = serde_json::json!({ "command": "Remove-Item -Recurse -Force C:\\" });
+        assert!(
+            matches!(
+                state().check_with_input("PowerShell", Some(&input)),
+                CheckResult::Ask
+            ),
+            "PowerShell must prompt like Bash, not auto-allow"
+        );
+    }
+
+    #[test]
+    fn every_command_executing_tool_is_gated() {
+        for tool in ["Bash", "PowerShell"] {
+            let input = serde_json::json!({ "command": "whoami" });
+            assert!(
+                matches!(state().check_with_input(tool, Some(&input)), CheckResult::Ask),
+                "{tool} must require approval"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sensitive_tools_still_pass_through() {
+        let input = serde_json::json!({ "file_path": "/tmp/x" });
+        assert!(matches!(
+            state().check_with_input("Read", Some(&input)),
+            CheckResult::Allow
+        ));
+    }
+
+    #[test]
+    fn deny_rules_beat_the_sensitive_list() {
+        let st = PermissionState::new(false, &[], &["PowerShell".to_string()]);
+        let input = serde_json::json!({ "command": "whoami" });
+        assert!(matches!(
+            st.check_with_input("PowerShell", Some(&input)),
+            CheckResult::Deny
+        ));
+    }
+
+    #[test]
+    fn prefix_rules_work_for_powershell() {
+        let st = PermissionState::new(false, &["PowerShell(prefix:Get-)".to_string()], &[]);
+        let allowed = serde_json::json!({ "command": "Get-ChildItem" });
+        let asked = serde_json::json!({ "command": "Remove-Item x" });
+        assert!(matches!(
+            st.check_with_input("PowerShell", Some(&allowed)),
+            CheckResult::Allow
+        ));
+        assert!(matches!(
+            st.check_with_input("PowerShell", Some(&asked)),
+            CheckResult::Ask
+        ));
+    }
+
+    #[test]
+    fn powershell_calls_are_described_for_the_approval_dialog() {
+        let input = serde_json::json!({ "command": "Get-Process" });
+        let desc = describe_tool_call("PowerShell", &input);
+        assert!(desc.contains("PowerShell"), "{desc}");
+        assert!(desc.contains("Get-Process"), "{desc}");
     }
 }

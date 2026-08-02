@@ -537,6 +537,15 @@ impl Drop for WatcherHandle {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+/// Scrollback cap applied while the viewport is following the newest content.
+/// Generous enough that no realistic session scrolls back this far, small enough
+/// that a long-running agent loop cannot exhaust memory.
+pub const MAX_ENTRIES: usize = 2000;
+
+/// Absolute ceiling, enforced even while the user is scrolled up reading history.
+/// Prevents a session parked in scrollback from growing without bound.
+pub const MAX_ENTRIES_HARD: usize = 10_000;
+
 pub struct App {
     pub entries: Vec<ChatEntry>,
     /// Text currently being streamed (incomplete assistant message)
@@ -1237,6 +1246,40 @@ impl App {
         self.follow_bottom = true;
     }
 
+    /// Evict the oldest chat entries once scrollback exceeds its cap.
+    ///
+    /// `entries` is *display* state only — the conversation itself lives in the
+    /// query engine's `messages` and is persisted to the session file — so evicting
+    /// here bounds memory without losing transcript data, exactly like a terminal's
+    /// scrollback buffer.
+    ///
+    /// Two caps, because eviction is only invisible when the viewport is pinned to
+    /// the newest content:
+    /// - Following the bottom → trim at [`MAX_ENTRIES`]; the user never sees it.
+    /// - Scrolled up reading history → defer to [`MAX_ENTRIES_HARD`] so we don't yank
+    ///   content out from under them, but still refuse to grow without bound.
+    pub fn trim_entries(&mut self) {
+        let cap = if self.follow_bottom {
+            MAX_ENTRIES
+        } else {
+            MAX_ENTRIES_HARD
+        };
+        if self.entries.len() <= cap {
+            return;
+        }
+        let excess = self.entries.len() - cap;
+        self.entries.drain(..excess);
+
+        if !self.follow_bottom {
+            // Hard ceiling reached while reading scrollback. `scroll` counts rendered
+            // lines from the top, and the lines it referred to are now gone, so there
+            // is no honest offset to keep. Snap to the newest content instead of
+            // leaving the viewport at an arbitrary position.
+            self.follow_bottom = true;
+            self.scroll = 0;
+        }
+    }
+
     // ── Streaming helpers ─────────────────────────────────────────────────────
 
     pub fn flush_streaming(&mut self) {
@@ -1506,5 +1549,105 @@ fn truncate(s: &str, max: usize) -> String {
             .last()
             .unwrap_or(0);
         format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod trim_entries_tests {
+    use super::*;
+
+    fn app_with(n: usize) -> App {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.entries = (0..n).map(|i| ChatEntry::assistant(i.to_string())).collect();
+        app
+    }
+
+    fn first_last(app: &App) -> (String, String) {
+        (
+            app.entries.first().unwrap().text.clone(),
+            app.entries.last().unwrap().text.clone(),
+        )
+    }
+
+    #[test]
+    fn under_cap_is_left_completely_alone() {
+        let mut app = app_with(MAX_ENTRIES);
+        app.trim_entries();
+        assert_eq!(app.entries.len(), MAX_ENTRIES);
+        assert_eq!(first_last(&app).0, "0", "must not evict while under cap");
+    }
+
+    #[test]
+    fn following_bottom_evicts_oldest_and_keeps_newest() {
+        let mut app = app_with(MAX_ENTRIES + 500);
+        app.follow_bottom = true;
+
+        app.trim_entries();
+
+        assert_eq!(app.entries.len(), MAX_ENTRIES);
+        let (first, last) = first_last(&app);
+        assert_eq!(first, "500", "oldest 500 should have been evicted");
+        assert_eq!(
+            last,
+            (MAX_ENTRIES + 499).to_string(),
+            "newest entry must survive"
+        );
+    }
+
+    /// Reading scrollback must not have content yanked out from under you at the
+    /// soft cap — that would make the viewport jump mid-read.
+    #[test]
+    fn scrolled_up_defers_past_the_soft_cap() {
+        let mut app = app_with(MAX_ENTRIES + 500);
+        app.follow_bottom = false;
+        app.scroll = 42;
+
+        app.trim_entries();
+
+        assert_eq!(app.entries.len(), MAX_ENTRIES + 500, "no eviction yet");
+        assert_eq!(app.scroll, 42, "viewport must not move");
+        assert!(!app.follow_bottom);
+    }
+
+    /// ...but the hard ceiling is absolute, so a session parked in scrollback
+    /// still cannot grow without bound.
+    #[test]
+    fn hard_ceiling_is_enforced_even_when_scrolled_up() {
+        let mut app = app_with(MAX_ENTRIES_HARD + 1);
+        app.follow_bottom = false;
+        app.scroll = 42;
+
+        app.trim_entries();
+
+        assert_eq!(app.entries.len(), MAX_ENTRIES_HARD);
+        assert!(
+            app.follow_bottom,
+            "snapping to bottom is the only honest option once the referenced lines are gone"
+        );
+        assert_eq!(app.scroll, 0);
+    }
+
+    /// The actual regression: an agent loop appending forever must reach a steady
+    /// state rather than growing without bound.
+    #[test]
+    fn repeated_appends_reach_a_steady_state() {
+        let mut app = app_with(0);
+        app.follow_bottom = true;
+
+        for i in 0..(MAX_ENTRIES * 3) {
+            app.entries.push(ChatEntry::assistant(i.to_string()));
+            app.trim_entries();
+            assert!(
+                app.entries.len() <= MAX_ENTRIES,
+                "scrollback exceeded its cap at append {i}"
+            );
+        }
+
+        assert_eq!(app.entries.len(), MAX_ENTRIES);
+        assert_eq!(
+            app.entries.last().unwrap().text,
+            (MAX_ENTRIES * 3 - 1).to_string(),
+            "newest content must always be retained"
+        );
     }
 }

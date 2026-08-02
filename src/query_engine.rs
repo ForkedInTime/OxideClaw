@@ -45,14 +45,18 @@ impl QueryEngine {
             || crate::api::is_openai_compat_model(&config.model);
         if !is_non_anthropic && config.api_key.is_empty() {
             return Err(anyhow::anyhow!(
-                "ANTHROPIC_API_KEY is not set.\n\
-                 Set it with: export ANTHROPIC_API_KEY=sk-ant-...\n\
+                "No Anthropic credential found.\n\
+                 RustyClaw checks, in order:\n\
+                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
+                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
+                   3. apiKeyHelper / RUSTYCLAW_API_KEY_FILE_DESCRIPTOR\n\
+                   4. ant auth login         shared with Claude Code and the official SDKs\n\
                  To use a local model instead: --model ollama:<name>\n\
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
             ));
         }
 
-        let client = ApiBackend::new(&config.model, &config.api_key, &config.ollama_host)
+        let client = ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host)
             .context("Failed to create API client")?;
         let system_prompt = config.build_system_prompt();
         Ok(Self {

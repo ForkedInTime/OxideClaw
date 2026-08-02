@@ -21,20 +21,86 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_MAX_TOKENS: u32 = 8096;
 
+/// Maximum time to wait for the *next* SSE event before declaring the stream dead.
+///
+/// This is deliberately an inter-event budget, not a whole-request timeout: a
+/// legitimate response can stream for many minutes, so `.timeout()` on the request
+/// would truncate valid work. But a healthy connection always delivers *something* —
+/// a content delta, a `ping`, or a keepalive — well inside this window.
+///
+/// Without this bound, a silently dropped TCP connection (NAT idle reaper, laptop
+/// sleep, VPN drop) leaves the read future pending forever: the UI hangs with no
+/// error and no recovery short of killing the process.
+pub(crate) const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Await the next event from an SSE stream, bounded by [`SSE_IDLE_TIMEOUT`].
+///
+/// Returns `Ok(None)` on clean end-of-stream. Shared by the Anthropic backend and
+/// the OpenAI-compatible backend (which also serves Ollama), so every streaming path
+/// gets the same stall detection.
+pub(crate) async fn next_sse_event<S, E>(stream: &mut S) -> Result<Option<eventsource_stream::Event>>
+where
+    S: futures_util::Stream<Item = std::result::Result<eventsource_stream::Event, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+        Err(_) => Err(anyhow!(
+            "SSE stream stalled: no data received for {}s — the connection was likely \
+             dropped upstream. Retry the request.",
+            SSE_IDLE_TIMEOUT.as_secs()
+        )),
+        Ok(None) => Ok(None),
+        Ok(Some(Ok(event))) => Ok(Some(event)),
+        Ok(Some(Err(e))) => Err(anyhow!("SSE stream error: {e}")),
+    }
+}
+
 #[derive(Clone)]
 #[allow(dead_code)] // api_key retained for future authenticated-header injection
 pub struct ClaudeClient {
     client: Client,
     api_key: String,
     base_url: String,
+    /// Betas the credential itself requires, merged into every request's
+    /// `anthropic-beta`. An OAuth bearer token needs `oauth-2025-04-20`.
+    ///
+    /// This is *not* a default header: `RequestBuilder::header` appends rather
+    /// than replaces, so a default `anthropic-beta` plus a per-request one
+    /// would send the field twice. Merging into the single per-request value
+    /// keeps exactly one.
+    credential_betas: Vec<String>,
 }
 
 impl ClaudeClient {
+    /// Construct from a static API key. Retained for callers that already hold
+    /// a raw key; prefer [`ClaudeClient::with_credential`].
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
-        let api_key = api_key.into();
+        Self::with_credential(&crate::auth::Credential::ApiKey(api_key.into()))
+    }
+
+    /// Construct from a resolved credential, selecting the wire format.
+    ///
+    /// A static key authenticates with `x-api-key`; an OAuth access token uses
+    /// `Authorization: Bearer` plus the `oauth-2025-04-20` beta. Sending both
+    /// auth headers is rejected by the API, so exactly one is set.
+    pub fn with_credential(cred: &crate::auth::Credential) -> Result<Self> {
+        let api_key = cred.secret().to_string();
         let mut headers = header::HeaderMap::new();
         headers.insert("anthropic-version", ANTHROPIC_VERSION.parse()?);
-        headers.insert("x-api-key", api_key.parse()?);
+
+        let mut credential_betas = Vec::new();
+        match cred {
+            crate::auth::Credential::ApiKey(k) => {
+                headers.insert("x-api-key", k.parse()?);
+            }
+            crate::auth::Credential::OAuth(token) => {
+                headers.insert(
+                    header::AUTHORIZATION,
+                    format!("Bearer {token}").parse()?,
+                );
+                credential_betas.push(crate::auth::OAUTH_BETA.to_string());
+            }
+        }
         headers.insert(header::CONTENT_TYPE, "application/json".parse()?);
 
         let client = Client::builder()
@@ -52,7 +118,28 @@ impl ClaudeClient {
             client,
             api_key,
             base_url: ANTHROPIC_API_BASE.to_string(),
+            credential_betas,
         })
+    }
+
+    /// Merge the request's betas with any the credential requires.
+    /// Returns `None` when there are none, so the header is omitted entirely.
+    fn beta_header(&self, request_betas: &[String]) -> Option<String> {
+        if request_betas.is_empty() && self.credential_betas.is_empty() {
+            return None;
+        }
+        let mut all: Vec<&str> = Vec::new();
+        for b in request_betas.iter().chain(self.credential_betas.iter()) {
+            let b = b.as_str();
+            if !b.is_empty() && !all.contains(&b) {
+                all.push(b);
+            }
+        }
+        if all.is_empty() {
+            None
+        } else {
+            Some(all.join(","))
+        }
     }
 
     /// Non-streaming API call — mirrors callModel() in services/api/claude.ts
@@ -62,8 +149,8 @@ impl ClaudeClient {
         debug!("POST {url} model={}", request.model);
 
         let mut builder = self.client.post(&url).json(&request);
-        if !request.betas.is_empty() {
-            builder = builder.header("anthropic-beta", request.betas.join(","));
+        if let Some(betas) = self.beta_header(&request.betas) {
+            builder = builder.header("anthropic-beta", betas);
         }
         if let Some(ref sid) = request.session_id {
             builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
@@ -95,8 +182,8 @@ impl ClaudeClient {
         debug!("POST {url} stream=true model={}", request.model);
 
         let mut builder = self.client.post(&url).json(&request);
-        if !request.betas.is_empty() {
-            builder = builder.header("anthropic-beta", request.betas.join(","));
+        if let Some(betas) = self.beta_header(&request.betas) {
+            builder = builder.header("anthropic-beta", betas);
         }
         if let Some(ref sid) = request.session_id {
             builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
@@ -122,8 +209,7 @@ impl ClaudeClient {
         let mut tool_blocks: HashMap<usize, (String, String, String)> = HashMap::with_capacity(4); // id, name, json
         let mut thinking_blocks: HashMap<usize, (String, String)> = HashMap::with_capacity(4); // thinking, sig
 
-        while let Some(event) = stream.next().await {
-            let event = event.context("SSE stream error")?;
+        while let Some(event) = next_sse_event(&mut stream).await? {
             if event.data == "[DONE]" {
                 break;
             }
@@ -271,6 +357,23 @@ pub enum ApiBackend {
 impl ApiBackend {
     /// Create the right backend for `model`.
     /// `api_key` is required for Anthropic; ignored for Ollama/OpenAI-compat.
+    /// `api_key` is the credential secret; `is_oauth` selects the wire format
+    /// (`Authorization: Bearer` + oauth beta, vs `x-api-key`). Ignored for
+    /// Ollama / OpenAI-compat backends, which carry their own auth.
+    pub fn new_with_auth(
+        model: &str,
+        api_key: &str,
+        is_oauth: bool,
+        ollama_host: &str,
+    ) -> Result<Self> {
+        if !is_ollama_model(model) && !is_openai_compat_model(model) && is_oauth {
+            return Ok(Self::Anthropic(ClaudeClient::with_credential(
+                &crate::auth::Credential::OAuth(api_key.to_string()),
+            )?));
+        }
+        Self::new(model, api_key, ollama_host)
+    }
+
     pub fn new(model: &str, api_key: &str, ollama_host: &str) -> Result<Self> {
         if is_ollama_model(model) {
             Ok(Self::Ollama(OllamaClient::new(ollama_host)?))
@@ -356,5 +459,144 @@ impl ApiBackend {
             Self::OpenAiCompat(c) => c.take_tools_notice(),
             Self::Anthropic(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use crate::auth::{Credential, OAUTH_BETA};
+
+    /// An OAuth token must go in `Authorization: Bearer`, never `x-api-key` —
+    /// and the request additionally needs the oauth beta or it is rejected.
+    #[test]
+    fn oauth_credential_adds_the_required_beta() {
+        let c = ClaudeClient::with_credential(&Credential::OAuth("tok".into())).unwrap();
+        assert_eq!(c.beta_header(&[]).as_deref(), Some(OAUTH_BETA));
+    }
+
+    /// A static key needs no extra beta, so the header stays absent when the
+    /// request itself asked for none.
+    #[test]
+    fn api_key_credential_adds_no_beta() {
+        let c = ClaudeClient::with_credential(&Credential::ApiKey("sk-ant-x".into())).unwrap();
+        assert_eq!(c.beta_header(&[]), None);
+    }
+
+    /// The credential beta must be *merged* into the request's betas, not sent
+    /// as a second `anthropic-beta` header — `RequestBuilder::header` appends.
+    #[test]
+    fn request_betas_and_credential_betas_merge_into_one_value() {
+        let c = ClaudeClient::with_credential(&Credential::OAuth("tok".into())).unwrap();
+        let merged = c.beta_header(&["compact-2026-01-12".into()]).unwrap();
+        assert!(merged.contains("compact-2026-01-12"), "{merged}");
+        assert!(merged.contains(OAUTH_BETA), "{merged}");
+        assert_eq!(merged.matches(OAUTH_BETA).count(), 1, "{merged}");
+        assert!(!merged.contains(",,"), "{merged}");
+    }
+
+    #[test]
+    fn duplicate_betas_are_collapsed() {
+        let c = ClaudeClient::with_credential(&Credential::OAuth("tok".into())).unwrap();
+        let merged = c.beta_header(&[OAUTH_BETA.into()]).unwrap();
+        assert_eq!(merged, OAUTH_BETA, "duplicate must collapse: {merged}");
+    }
+
+    #[test]
+    fn api_key_request_betas_pass_through_untouched() {
+        let c = ClaudeClient::with_credential(&Credential::ApiKey("k".into())).unwrap();
+        assert_eq!(c.beta_header(&["a".into(), "b".into()]).as_deref(), Some("a,b"));
+    }
+
+    /// `ClaudeClient::new` is the legacy raw-key entry point — it must stay
+    /// equivalent to an explicit ApiKey credential.
+    #[test]
+    fn legacy_new_is_equivalent_to_an_api_key_credential() {
+        let legacy = ClaudeClient::new("sk-ant-x").unwrap();
+        assert_eq!(legacy.beta_header(&[]), None);
+        assert_eq!(legacy.api_key, "sk-ant-x");
+    }
+}
+
+#[cfg(test)]
+mod sse_idle_tests {
+    use super::*;
+    use eventsource_stream::Event;
+    use std::convert::Infallible;
+
+    fn event(data: &str) -> Event {
+        Event {
+            data: data.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A stream that yields nothing and never terminates — models a TCP connection
+    /// that was silently dropped upstream (NAT reaper, laptop sleep, VPN drop).
+    /// Before the idle-timeout guard this hung the caller forever.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_errors_instead_of_hanging_forever() {
+        let mut stream = futures_util::stream::pending::<Result<Event, Infallible>>();
+
+        let err = next_sse_event(&mut stream)
+            .await
+            .expect_err("a stream that never yields must time out, not hang");
+
+        let msg = err.to_string();
+        assert!(msg.contains("stalled"), "diagnostic should say stalled: {msg}");
+        assert!(
+            msg.contains(&SSE_IDLE_TIMEOUT.as_secs().to_string()),
+            "diagnostic should report the budget that elapsed: {msg}"
+        );
+    }
+
+    /// A stream that goes quiet for less than the budget is healthy and must be
+    /// allowed through — long thinking gaps are legitimate, not a stall.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_period_within_budget_is_not_treated_as_a_stall() {
+        let quiet = SSE_IDLE_TIMEOUT - std::time::Duration::from_secs(1);
+        let mut stream = Box::pin(futures_util::stream::once(async move {
+            tokio::time::sleep(quiet).await;
+            Ok::<_, Infallible>(event("late but valid"))
+        }));
+
+        let got = next_sse_event(&mut stream).await.expect("must not time out");
+        assert_eq!(got.map(|e| e.data).as_deref(), Some("late but valid"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clean_end_of_stream_returns_none() {
+        let mut stream = futures_util::stream::empty::<Result<Event, Infallible>>();
+        assert!(next_sse_event(&mut stream).await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_pass_through_in_order() {
+        let mut stream = futures_util::stream::iter(vec![
+            Ok::<_, Infallible>(event("first")),
+            Ok(event("second")),
+        ]);
+
+        assert_eq!(
+            next_sse_event(&mut stream).await.unwrap().map(|e| e.data),
+            Some("first".into())
+        );
+        assert_eq!(
+            next_sse_event(&mut stream).await.unwrap().map(|e| e.data),
+            Some("second".into())
+        );
+        assert!(next_sse_event(&mut stream).await.unwrap().is_none());
+    }
+
+    /// Transport errors must still surface as errors, not be swallowed by the
+    /// timeout wrapper.
+    #[tokio::test(start_paused = true)]
+    async fn transport_error_is_propagated() {
+        let mut stream = Box::pin(futures_util::stream::once(async {
+            Err::<Event, _>(std::io::Error::other("connection reset"))
+        }));
+
+        let err = next_sse_event(&mut stream).await.unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
     }
 }

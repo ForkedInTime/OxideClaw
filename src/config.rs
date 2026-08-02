@@ -126,6 +126,21 @@ pub struct Config {
     #[serde(skip)]
     pub api_key: String,
 
+    /// True when `api_key` holds an OAuth access token rather than a static
+    /// key. Selects the wire format: `Authorization: Bearer` + the
+    /// `oauth-2025-04-20` beta, instead of `x-api-key`.
+    #[serde(skip)]
+    pub auth_is_oauth: bool,
+
+    /// Human-readable description of which source the credential came from,
+    /// surfaced by /doctor so a shadowed profile is diagnosable.
+    #[serde(skip)]
+    pub auth_source: Option<String>,
+
+    /// Non-fatal credential warnings (e.g. an env var shadowing a profile).
+    #[serde(skip)]
+    pub auth_warnings: Vec<String>,
+
     /// Model to use for the main loop.
     /// Use `ollama:<name>` to route to a local Ollama instance instead.
     pub model: String,
@@ -380,6 +395,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            auth_is_oauth: false,
+            auth_source: None,
+            auth_warnings: Vec::new(),
             model: crate::api::default_model().to_string(),
             max_tokens: crate::api::default_max_tokens(),
             max_tokens_by_model: HashMap::new(),
@@ -670,8 +688,23 @@ impl Config {
         // base defaults in settings and override individual phases in CLAUDE.md.
         Self::apply_phase_routing_from_claudemd(&cfg.claudemd, &mut cfg.phase_router);
 
-        // ── API key from environment (not required for Ollama models)
-        cfg.api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        // ── Credential from the environment (not required for Ollama models).
+        //
+        // Honours the same resolution order as the official SDKs, the `ant` CLI,
+        // and Claude Code, so an existing login works without reconfiguration:
+        //
+        //   ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN → ant auth login profile
+        //
+        // RustyClaw's own explicit mechanisms (RUSTYCLAW_API_KEY_FILE_DESCRIPTOR,
+        // apiKeyHelper) run between the env vars and the profile — see the
+        // `ant`-profile fallback further down. Explicit local configuration
+        // should beat ambient machine state.
+        if let Some(resolved) = crate::auth::resolve_env() {
+            cfg.auth_is_oauth = resolved.credential.is_oauth();
+            cfg.auth_source = Some(resolved.source.describe());
+            cfg.auth_warnings = resolved.warnings;
+            cfg.api_key = resolved.credential.secret().to_string();
+        }
 
         // ── RUSTYCLAW_API_KEY_FILE_DESCRIPTOR: read API key from an open fd.
         //    Unix-only — Windows uses HANDLEs, not POSIX fds, and the
@@ -718,6 +751,20 @@ impl Config {
                     eprintln!("Warning: apiKeyHelper could not run: {e}");
                 }
             }
+        }
+
+        // ── Last resort: the active `ant auth login` profile.
+        //
+        // Runs after the explicit mechanisms above so local configuration always
+        // wins over ambient machine state. `ant auth print-credentials` refreshes
+        // the short-lived token before printing, so there is no refresh flow to
+        // implement here.
+        if cfg.api_key.is_empty()
+            && let Some(resolved) = crate::auth::resolve_profile()
+        {
+            cfg.auth_is_oauth = resolved.credential.is_oauth();
+            cfg.auth_source = Some(resolved.source.describe());
+            cfg.api_key = resolved.credential.secret().to_string();
         }
 
         // ── Optional env var overrides (env wins over settings files)

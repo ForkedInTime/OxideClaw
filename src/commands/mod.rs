@@ -1102,12 +1102,26 @@ fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
 
     // API key
     if ctx.config.api_key.len() >= 4 {
-        checks.push(format!(
-            "✓ ANTHROPIC_API_KEY set ({}...)",
-            &ctx.config.api_key[..4]
-        ));
+        let src = ctx
+            .config
+            .auth_source
+            .as_deref()
+            .unwrap_or("apiKeyHelper / file descriptor");
+        let cred = if ctx.config.auth_is_oauth {
+            crate::auth::Credential::OAuth(ctx.config.api_key.clone())
+        } else {
+            crate::auth::Credential::ApiKey(ctx.config.api_key.clone())
+        };
+        checks.push(format!("✓ Anthropic credential: {} via {src}", cred.redacted()));
+        // Surface the "stale env var shadows your profile" trap, which is
+        // otherwise invisible and sends requests to the wrong org/workspace.
+        for w in &ctx.config.auth_warnings {
+            checks.push(format!("⚠ {w}"));
+        }
     } else {
-        checks.push("✗ ANTHROPIC_API_KEY not set — run: export ANTHROPIC_API_KEY=sk-...".into());
+        checks.push(
+            "✗ No Anthropic credential — set ANTHROPIC_API_KEY, or run `ant auth login`".into(),
+        );
     }
 
     // cwd / git / config

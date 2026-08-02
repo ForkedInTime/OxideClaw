@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::time::{Duration, timeout};
 
@@ -66,6 +66,67 @@ impl Drop for ProcessGroupGuard {
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes, same as TypeScript default
 const MAX_OUTPUT_BYTES: usize = 1_000_000; // 1MB cap
+const CHUNK_SIZE: usize = 8192;
+
+type StreamTx = Option<tokio::sync::mpsc::UnboundedSender<String>>;
+
+/// Append one output line to the captured buffer and forward it to the TUI.
+///
+/// Storage stops at [`MAX_OUTPUT_BYTES`], but the caller keeps *reading* past
+/// that point so the child process never blocks on a full pipe.
+fn emit_line(raw: &str, tx: &StreamTx, combined: &mut String, truncated: &mut bool) {
+    let clean = strip_ansi(raw);
+    if clean.is_empty() {
+        return;
+    }
+    if let Some(tx) = tx {
+        let _ = tx.send(clean.clone());
+    }
+    if combined.len() >= MAX_OUTPUT_BYTES {
+        *truncated = true;
+        return;
+    }
+    // Trim the final line so the buffer never overshoots the cap, however long
+    // a single line happens to be.
+    let room = MAX_OUTPUT_BYTES - combined.len();
+    if clean.len() > room {
+        let cut = (0..=room)
+            .rev()
+            .find(|&i| clean.is_char_boundary(i))
+            .unwrap_or(0);
+        combined.push_str(&clean[..cut]);
+        *truncated = true;
+    } else {
+        combined.push_str(&clean);
+    }
+    combined.push('\n');
+}
+
+/// Split a freshly-read chunk into complete lines, carrying any trailing
+/// partial line over to the next chunk.
+fn absorb(
+    chunk: &[u8],
+    partial: &mut Vec<u8>,
+    tx: &StreamTx,
+    combined: &mut String,
+    truncated: &mut bool,
+) {
+    partial.extend_from_slice(chunk);
+    while let Some(nl) = partial.iter().position(|&b| b == b'\n') {
+        let line = partial.drain(..=nl).collect::<Vec<u8>>();
+        let text = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+        emit_line(&text, tx, combined, truncated);
+    }
+    // A single line longer than the cap would otherwise grow `partial` without
+    // bound — flush it early rather than waiting for a newline that may never
+    // arrive.
+    if partial.len() > MAX_OUTPUT_BYTES {
+        let text = String::from_utf8_lossy(partial).into_owned();
+        emit_line(&text, tx, combined, truncated);
+        partial.clear();
+        *truncated = true;
+    }
+}
 
 /// Strip ANSI escape sequences and carriage returns from terminal output.
 /// Prevents progress-bar output (e.g. from `ollama pull`) from corrupting the TUI.
@@ -173,6 +234,12 @@ impl Tool for BashTool {
             cmd.arg("-c")
                 .arg(&command)
                 .current_dir(&cwd)
+                // stdin defaults to *inherit*, which hands the spawned command the
+                // TUI's own terminal. An interactive command (`sudo`, `ssh`, a bare
+                // `read`) then competes with crossterm for the user's keystrokes and
+                // hangs until the timeout. Nothing here can answer a prompt, so give
+                // it EOF immediately and let the command fail fast instead.
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 // Defense in depth: if our Drop guard somehow doesn't fire,
@@ -190,70 +257,67 @@ impl Tool for BashTool {
             let mut guard = ProcessGroupGuard::new(cmd.spawn()?);
             let child = guard.child_mut();
 
-            let stdout = child
+            let mut stdout = child
                 .stdout
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-            let stderr = child
+            let mut stderr = child
                 .stderr
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
+            // Read in fixed-size chunks rather than by line.
+            //
+            // `BufReader::lines()` accumulates until it sees a newline, so output
+            // with no newlines at all (`yes | tr -d '\n'`) buffered the entire
+            // stream into one String — the MAX_OUTPUT_BYTES check ran per line and
+            // never got a chance to trip.
+            //
+            // Simply capping the reader is not enough either: once we stop reading,
+            // the child blocks on a full pipe and never exits, so every command
+            // over the cap would burn the full timeout instead of finishing.
+            // Chunked reads let us bound what we *keep* while still draining to
+            // EOF, so the child always completes.
             let mut combined = String::new();
-            let mut stdout_reader = BufReader::new(stdout).lines();
-            let mut stderr_reader = BufReader::new(stderr).lines();
+            let mut truncated = false;
+            let mut stdout_buf = vec![0u8; CHUNK_SIZE];
+            let mut stderr_buf = vec![0u8; CHUNK_SIZE];
+            // Partial trailing line per stream, kept as bytes so a multi-byte UTF-8
+            // character split across a chunk boundary is not mangled.
+            let mut stdout_partial: Vec<u8> = Vec::new();
+            let mut stderr_partial: Vec<u8> = Vec::new();
+            let mut stdout_done = false;
+            let mut stderr_done = false;
 
-            // Drain both stdout and stderr concurrently, streaming each line
-            loop {
+            while !(stdout_done && stderr_done) {
                 tokio::select! {
-                    line = stdout_reader.next_line() => {
-                        match line? {
-                            None => break,
-                            Some(l) => {
-                                let clean = strip_ansi(&l);
-                                if !clean.is_empty() {
-                                    if let Some(ref tx) = stream_tx {
-                                        let _ = tx.send(clean.clone());
-                                    }
-                                    if combined.len() < MAX_OUTPUT_BYTES {
-                                        combined.push_str(&clean);
-                                        combined.push('\n');
-                                    }
-                                }
-                            }
+                    r = stdout.read(&mut stdout_buf), if !stdout_done => {
+                        match r? {
+                            0 => stdout_done = true,
+                            n => absorb(
+                                &stdout_buf[..n], &mut stdout_partial,
+                                &stream_tx, &mut combined, &mut truncated,
+                            ),
                         }
                     }
-                    line = stderr_reader.next_line() => {
-                        match line? {
-                            None => {}
-                            Some(l) => {
-                                let clean = strip_ansi(&l);
-                                if !clean.is_empty() {
-                                    if let Some(ref tx) = stream_tx {
-                                        let _ = tx.send(clean.clone());
-                                    }
-                                    if combined.len() < MAX_OUTPUT_BYTES {
-                                        combined.push_str(&clean);
-                                        combined.push('\n');
-                                    }
-                                }
-                            }
+                    r = stderr.read(&mut stderr_buf), if !stderr_done => {
+                        match r? {
+                            0 => stderr_done = true,
+                            n => absorb(
+                                &stderr_buf[..n], &mut stderr_partial,
+                                &stream_tx, &mut combined, &mut truncated,
+                            ),
                         }
                     }
                 }
             }
 
-            // Drain remaining stderr after stdout closes
-            while let Some(l) = stderr_reader.next_line().await? {
-                let clean = strip_ansi(&l);
-                if !clean.is_empty() {
-                    if let Some(ref tx) = stream_tx {
-                        let _ = tx.send(clean.clone());
-                    }
-                    if combined.len() < MAX_OUTPUT_BYTES {
-                        combined.push_str(&clean);
-                        combined.push('\n');
-                    }
+            // Flush any trailing text that never ended in a newline.
+            for partial in [&mut stdout_partial, &mut stderr_partial] {
+                if !partial.is_empty() {
+                    let line = String::from_utf8_lossy(partial).into_owned();
+                    emit_line(&line, &stream_tx, &mut combined, &mut truncated);
+                    partial.clear();
                 }
             }
 
@@ -262,7 +326,7 @@ impl Tool for BashTool {
             // doesn't try to signal a pid that has already been reaped.
             guard.disarm();
 
-            if combined.len() >= MAX_OUTPUT_BYTES {
+            if truncated {
                 combined.push_str("\n... (output truncated)");
             }
 

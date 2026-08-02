@@ -126,10 +126,10 @@ fn parse_browse_done(text: &str) -> Option<(bool, String)> {
 /// Prefers `url` → `ref` → `selector` → `key` → empty string.
 fn extract_target(input: &serde_json::Value) -> String {
     for key in ["url", "ref", "selector", "key"] {
-        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                return s.to_string();
-            }
+        if let Some(s) = input.get(key).and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            return s.to_string();
         }
     }
     String::new()

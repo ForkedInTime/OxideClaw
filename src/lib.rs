@@ -5,6 +5,7 @@
 //! of the `rustyclaw` binary.
 
 pub mod api;
+pub mod auth;
 pub mod autocommit;
 pub mod autofix;
 pub mod browser;
