@@ -197,8 +197,8 @@ impl Tool for TaskUpdateTool {
         json!({
             "type": "object",
             "properties": {
-                "task_id": { "type": "string" },
-                "status":  { "type": "string", "enum": ["pending","in_progress","completed","failed","stopped"] },
+                "task_id": { "type": "string", "description": "The task id returned by TaskCreate" },
+                "status":  { "type": "string", "enum": ["pending","in_progress","completed","failed","stopped"], "description": "New status for the task" },
                 "output":  { "type": "string", "description": "Result or progress message" }
             },
             "required": ["task_id"]
@@ -254,7 +254,7 @@ impl Tool for TaskStopTool {
         json!({
             "type": "object",
             "properties": {
-                "task_id": { "type": "string" }
+                "task_id": { "type": "string", "description": "The task id returned by TaskCreate" }
             },
             "required": ["task_id"]
         })

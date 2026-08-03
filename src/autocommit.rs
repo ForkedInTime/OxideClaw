@@ -26,6 +26,10 @@ pub enum SnapshotOutcome {
     NoChanges,
     /// Auto-commit is disabled (config, non-git dir, etc). Human-readable reason.
     Disabled { reason: String },
+    /// Another writer moved the session's shadow ref while this turn was being
+    /// snapshotted. The turn was NOT recorded, but nothing was destroyed — the
+    /// working tree is untouched and the other instance's history is intact.
+    Conflict { reason: String },
 }
 
 /// Report returned by `restore_to`.
@@ -143,9 +147,19 @@ fn subject_from_prompt(prompt: &str) -> String {
     }
 }
 
-/// Assumes a single writer per `session_id`; concurrent snapshots with the same session id race on the shadow ref and are not supported.
-///
 /// Take a full-tree snapshot of `cwd` as a commit on the session's shadow ref.
+///
+/// **Concurrency.** `parent` comes from this process's in-memory `auto_commits`,
+/// so two instances sharing a `session_id` (a second pane, a resumed session)
+/// each build their own chain and both write the same ref — the later
+/// `update-ref` silently orphans the other's history, which is exactly the
+/// history `/undo` exists to reach.
+///
+/// The ref value is therefore read before the snapshot is built and passed to
+/// `update-ref` as an expected-old value, making the write a compare-and-swap.
+/// Git enforces it atomically under its own ref lock, across processes and
+/// without a lockfile of ours to leak. A concurrent write now fails loudly
+/// ([`SnapshotOutcome::Conflict`]) instead of destroying data quietly.
 pub fn snapshot_turn(
     cwd: &Path,
     config: &AutoCommitConfig,
@@ -165,6 +179,26 @@ pub fn snapshot_turn(
             reason: "not a git repo".to_string(),
         });
     }
+
+    // 0. Work out where *this process* believes the ref should be, so the final
+    //    update-ref can compare-and-swap against it.
+    //
+    //    Reading the ref here instead would be useless: a competing instance
+    //    that wrote between our turns has already landed, and we would happily
+    //    CAS against its value and clobber it. The meaningful expectation is our
+    //    own chain head — anything else means someone moved the ref since we
+    //    last wrote.
+    //
+    //    The expectation is `auto_commits.last()`, NOT the undo position:
+    //    `restore_to` rewrites the working tree but deliberately leaves the ref
+    //    alone, so after an /undo the ref still points at the newest commit we
+    //    wrote while `undo_position` has moved back. Using the undo position
+    //    here manufactures a conflict on the first turn after any undo.
+    //
+    //    An empty expectation (no commits yet) means the ref must not exist,
+    //    which is exactly right for a fresh session.
+    let ref_name = shadow_ref(session_id);
+    let expected_ref = auto_commits.last().cloned();
 
     // 1. Temp index file, isolated via GIT_INDEX_FILE.
     let td = tempfile::TempDir::new()?;
@@ -239,13 +273,24 @@ pub fn snapshot_turn(
     }
     let commit_sha = git_output(&mut commit_cmd)?;
 
-    // 7. Update the shadow ref.
-    let ref_name = shadow_ref(session_id);
+    // 7. Update the shadow ref, compare-and-swap against the value we started
+    //    from. An empty expected-old tells git the ref must not exist yet.
+    let expected_old = expected_ref.as_deref().unwrap_or("");
     let update_status = git_cmd(cwd)
-        .args(["update-ref", &ref_name, &commit_sha])
+        .args(["update-ref", &ref_name, &commit_sha, expected_old])
         .status()?;
     if !update_status.success() {
-        anyhow::bail!("git update-ref {ref_name} failed");
+        // The commit object is already written and reachable by sha, so nothing
+        // the user did is lost — we simply refuse to move the ref over someone
+        // else's work.
+        return Ok(SnapshotOutcome::Conflict {
+            reason: format!(
+                "another rustyclaw instance wrote to this session's history \
+                 while this turn was being snapshotted (session '{session_id}'). \
+                 This turn was not recorded; the working tree is untouched. \
+                 Use a distinct session per instance — /undo history is per-session."
+            ),
+        });
     }
 
     // 8. Discard redo tail if user was in an undone state, then append.
@@ -409,11 +454,20 @@ pub fn restore_to(
 /// and the integration test cannot catch it, because `%(committerdate:unix)`
 /// has one-second granularity and sessions created in a loop all tie.
 ///
-/// Ties are resolved by whatever order git returned (refname-alphabetical),
-/// which is *not* recency. See the review tracker: prune ordering is unreliable
-/// for sessions created within the same second.
+/// `%(committerdate:unix)` has one-second granularity, so sessions created in
+/// quick succession tie. Ties previously fell through to git's output order
+/// (refname-alphabetical), which is unrelated to recency — so prune could keep
+/// an older session and delete a newer one purely because of how the ref was
+/// named.
+///
+/// Ties are now broken by refname *descending*. Shadow ref names embed the
+/// session id, and session ids are monotonic within a run, so this is a strictly
+/// better proxy for recency than ascending-alphabetical and is at minimum
+/// deterministic. It is a heuristic, not a guarantee: two sessions genuinely
+/// created in the same second with unordered ids are still arbitrary — but the
+/// arbitrariness is now stable rather than accidental.
 fn select_refs_to_delete(mut rows: Vec<(i64, String)>, keep: usize) -> Vec<String> {
-    rows.sort_by_key(|e| std::cmp::Reverse(e.0));
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     rows.into_iter().skip(keep).map(|(_, r)| r).collect()
 }
 
@@ -524,13 +578,23 @@ mod prune_selection_tests {
         assert_eq!(deleted.len(), 2);
     }
 
-    /// Documents the known weakness rather than asserting a guarantee we do not
-    /// have: with equal timestamps the survivors are decided by git's output
-    /// order, not by recency.
+    /// With one-second timestamp granularity ties are the norm, not the
+    /// exception. They must resolve deterministically rather than by git's
+    /// output order, which is unrelated to recency.
     #[test]
-    fn tied_timestamps_fall_back_to_input_order() {
-        let deleted = select_refs_to_delete(rows(&[(7, "a"), (7, "b"), (7, "c")]), 1);
-        assert_eq!(deleted, vec!["b".to_string(), "c".to_string()]);
+    fn tied_timestamps_break_deterministically_by_refname_desc() {
+        // Input order deliberately shuffled — the result must not depend on it.
+        let a = select_refs_to_delete(rows(&[(7, "a"), (7, "c"), (7, "b")]), 1);
+        let b = select_refs_to_delete(rows(&[(7, "c"), (7, "b"), (7, "a")]), 1);
+        assert_eq!(a, b, "tie-break must be independent of input order");
+        assert_eq!(a, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    /// Timestamp still dominates — the tie-break only applies within a second.
+    #[test]
+    fn timestamp_beats_refname() {
+        let deleted = select_refs_to_delete(rows(&[(1, "zzz"), (9, "aaa")]), 1);
+        assert_eq!(deleted, vec!["zzz".to_string()], "older loses regardless of name");
     }
 }
 

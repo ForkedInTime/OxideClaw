@@ -213,3 +213,97 @@ fn prune_integration_15_refs_keeps_10() {
     let remaining = String::from_utf8(out.stdout).unwrap();
     assert_eq!(remaining.lines().count(), 10);
 }
+
+/// Two rustyclaw instances sharing a session id each build their own commit
+/// chain in memory and both write the same shadow ref. Before compare-and-swap
+/// the later `update-ref` silently orphaned the other's history — losing exactly
+/// the turns `/undo` exists to reach.
+///
+/// Simulated by moving the ref out from under an in-flight session, which is
+/// what a concurrent writer looks like from this process's point of view.
+#[test]
+fn concurrent_ref_write_is_detected_not_clobbered() {
+    let td = TempDir::new().unwrap();
+    git_init(td.path());
+    commit_initial(td.path());
+
+    let cfg = AutoCommitConfig::default();
+    let mut commits: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+
+    // Our instance records one turn.
+    write(td.path(), "a.txt", "one\n");
+    snapshot_turn(td.path(), &cfg, "shared", "t1", 1, &mut commits, &mut pos).unwrap();
+    let ours = commits.last().cloned().expect("first turn committed");
+
+    // Another instance writes the same ref behind our back.
+    let refname = format!("{SHADOW_REF_PREFIX}shared");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let other = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    assert!(
+        Command::new("git")
+            .args(["update-ref", &refname, &other])
+            .current_dir(td.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Our next turn must refuse rather than overwrite the other writer.
+    write(td.path(), "a.txt", "two\n");
+    let outcome =
+        snapshot_turn(td.path(), &cfg, "shared", "t2", 2, &mut commits, &mut pos).unwrap();
+    assert!(
+        matches!(outcome, SnapshotOutcome::Conflict { .. }),
+        "expected Conflict, got {outcome:?}"
+    );
+
+    // The other writer's value survived — we did not clobber it.
+    let now = Command::new("git")
+        .args(["rev-parse", &refname])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let now = String::from_utf8(now.stdout).unwrap().trim().to_string();
+    assert_eq!(now, other, "the concurrent writer's ref must be intact");
+    assert_ne!(now, ours);
+}
+
+/// A conflict must not damage the working tree — the user's files are theirs,
+/// and a bookkeeping failure is not a reason to touch them.
+#[test]
+fn conflict_leaves_the_working_tree_untouched() {
+    let td = TempDir::new().unwrap();
+    git_init(td.path());
+    commit_initial(td.path());
+
+    let cfg = AutoCommitConfig::default();
+    let mut commits: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+
+    write(td.path(), "w.txt", "v1\n");
+    snapshot_turn(td.path(), &cfg, "s", "t1", 1, &mut commits, &mut pos).unwrap();
+
+    let refname = format!("{SHADOW_REF_PREFIX}s");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let other = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    Command::new("git")
+        .args(["update-ref", &refname, &other])
+        .current_dir(td.path())
+        .status()
+        .unwrap();
+
+    write(td.path(), "w.txt", "v2-user-edit\n");
+    let _ = snapshot_turn(td.path(), &cfg, "s", "t2", 2, &mut commits, &mut pos).unwrap();
+
+    let on_disk = std::fs::read_to_string(td.path().join("w.txt")).unwrap();
+    assert_eq!(on_disk, "v2-user-edit\n", "working tree must be untouched");
+}

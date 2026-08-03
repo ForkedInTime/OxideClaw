@@ -9,6 +9,10 @@ use std::collections::HashMap;
 struct ModelPrice {
     input: f64,
     output: f64,
+    /// True when this is a guess for an unrecognised model rather than a known
+    /// published rate. Surfaced in `/cost` so a wrong number is never presented
+    /// as an authoritative one.
+    estimated: bool,
 }
 
 /// Get pricing for a model.  Returns (input_price, output_price) per million tokens.
@@ -17,50 +21,62 @@ fn model_price(model: &str) -> ModelPrice {
         ModelPrice {
             input: 15.0,
             output: 75.0,
+            estimated: false,
         }
     } else if model.contains("haiku") {
         ModelPrice {
             input: 0.25,
             output: 1.25,
+            estimated: false,
         }
     } else if model.contains("sonnet") {
         ModelPrice {
             input: 3.0,
             output: 15.0,
+            estimated: false,
         }
     } else if model.starts_with("ollama:") {
         // Local models are free
         ModelPrice {
             input: 0.0,
             output: 0.0,
+            estimated: false,
         }
     } else if model.contains("groq:") || model.contains("together:") {
         // Rough estimate for hosted open-source models
         ModelPrice {
             input: 0.5,
             output: 1.0,
+            estimated: false,
         }
     } else if model.contains("deepseek:") {
         ModelPrice {
             input: 0.27,
             output: 1.10,
+            estimated: false,
         }
     } else if model.contains("mistral:") {
         ModelPrice {
             input: 2.0,
             output: 6.0,
+            estimated: false,
         }
     } else if model.contains("oai:") || model.contains("openai:") {
         // GPT-4o class pricing
         ModelPrice {
             input: 2.5,
             output: 10.0,
+            estimated: false,
         }
     } else {
-        // Unknown — assume Sonnet-tier pricing
+        // Unknown model — fall back to Sonnet-tier rates so a budget still
+        // functions, but flag it: an unrecognised model may be an order of
+        // magnitude cheaper or dearer, and silently reporting a guess as fact
+        // is how a /budget cap gets trusted when it should not be.
         ModelPrice {
             input: 3.0,
             output: 15.0,
+            estimated: true,
         }
     }
 }
@@ -74,6 +90,8 @@ pub struct ModelUsage {
     pub output_tokens: u64,
     pub turns: u32,
     pub cost_usd: f64,
+    /// Cost for this model is based on fallback rates, not published ones.
+    pub estimated: bool,
 }
 
 /// Session-wide cost tracker.
@@ -122,6 +140,13 @@ impl CostTracker {
             + (output_tokens as f64 / 1_000_000.0) * price.output;
 
         let entry = self.by_model.entry(model.to_string()).or_default();
+        if price.estimated && !entry.estimated {
+            entry.estimated = true;
+            tracing::warn!(
+                "cost: '{model}' is not a recognised model — pricing it at Sonnet-tier \
+                 rates. Reported cost and any /budget cap are estimates for this model."
+            );
+        }
         entry.input_tokens += input_tokens;
         entry.output_tokens += output_tokens;
         entry.turns += 1;
@@ -178,15 +203,26 @@ impl CostTracker {
             // order costs nothing and removes the failure mode permanently.
             models.sort_by(|a, b| b.1.cost_usd.total_cmp(&a.1.cost_usd));
 
+            let mut any_estimated = false;
             for (model, usage) in models {
                 let short = short_model_name(model);
+                if usage.estimated {
+                    any_estimated = true;
+                }
                 lines.push(format!(
-                    "  {short}: {turns} turns, {in_tok} in / {out_tok} out, ${cost:.4}",
+                    "  {short}: {turns} turns, {in_tok} in / {out_tok} out, {approx}${cost:.4}",
                     turns = usage.turns,
                     in_tok = format_tokens(usage.input_tokens),
                     out_tok = format_tokens(usage.output_tokens),
+                    approx = if usage.estimated { "~" } else { "" },
                     cost = usage.cost_usd,
                 ));
+            }
+            if any_estimated {
+                lines.push(String::new());
+                lines.push(
+                    "  ~ estimated — model not recognised, priced at Sonnet-tier rates.".into(),
+                );
             }
         }
 
@@ -306,6 +342,7 @@ mod tests {
                     output_tokens: 1,
                     turns: 1,
                     cost_usd: cost,
+                    estimated: false,
                 },
             );
         }
@@ -313,6 +350,42 @@ mod tests {
         let summary = tracker.summary();
         assert!(summary.contains("Per-model breakdown:"));
         assert!(summary.contains("model-nan"), "every model must still render");
+    }
+
+    /// An unrecognised model is priced at Sonnet-tier rates so a budget still
+    /// functions — but reporting that guess as fact is how a /budget cap gets
+    /// trusted when it should not be.
+    #[test]
+    fn unknown_model_cost_is_marked_as_estimated() {
+        let mut t = CostTracker::new();
+        t.record("some-new-provider:mystery-model", 1_000_000, 0);
+        assert!(
+            t.by_model["some-new-provider:mystery-model"].estimated,
+            "unrecognised model must be flagged"
+        );
+        let s = t.summary();
+        assert!(s.contains('~'), "estimate must be marked in the report: {s}");
+        assert!(s.contains("not recognised"), "and explained: {s}");
+    }
+
+    #[test]
+    fn known_models_are_not_marked_as_estimated() {
+        let mut t = CostTracker::new();
+        for m in ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5", "ollama:llama3"] {
+            t.record(m, 1000, 100);
+            assert!(!t.by_model[m].estimated, "{m} has published rates");
+        }
+        let s = t.summary();
+        assert!(!s.contains("not recognised"), "no footnote expected: {s}");
+    }
+
+    /// Local models are free — pricing them at Sonnet rates would invent spend.
+    #[test]
+    fn ollama_models_are_free_and_not_estimated() {
+        let mut t = CostTracker::new();
+        t.record("ollama:llama3", 5_000_000, 5_000_000);
+        assert_eq!(t.total_cost_usd, 0.0);
+        assert!(!t.by_model["ollama:llama3"].estimated);
     }
 
     #[test]

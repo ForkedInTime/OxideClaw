@@ -514,8 +514,8 @@ impl Tool for BrowseDoneTool {
         json!({
             "type": "object",
             "properties": {
-                "summary":  { "type": "string" },
-                "achieved": { "type": "boolean" }
+                "summary":  { "type": "string", "description": "Short summary of what was found or done during browsing" },
+                "achieved": { "type": "boolean", "description": "True if the browsing goal was accomplished, false if it could not be" }
             },
             "required": ["summary", "achieved"]
         })

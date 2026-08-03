@@ -807,3 +807,100 @@ mod sensitive_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+
+    /// Every tool's advertised schema must be internally consistent.
+    ///
+    /// This is the standing form of a one-off sweep: a tool that advertises a
+    /// parameter it does not implement (or requires one it never declares)
+    /// silently misleads the model, which then sends inputs that are ignored.
+    /// One such bug — `run_in_background` on the Agent tool — was found and
+    /// removed in a previous audit; this stops the class returning rather than
+    /// catching them one at a time.
+    #[test]
+    fn every_tool_schema_is_self_consistent() {
+        // The full registry, not `default_tools()` — that is a subset, and a
+        // schema bug in a tool only reachable via the full set is exactly the
+        // kind this is meant to catch.
+        let cfg = crate::config::Config::default();
+        let tools = all_tools(&cfg);
+        assert!(
+            tools.len() > 30,
+            "expected the full registry, got {} tools",
+            tools.len()
+        );
+
+        let mut problems: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+
+        for t in &tools {
+            let name = t.name().to_string();
+
+            if name.trim().is_empty() {
+                problems.push("a tool has an empty name".into());
+            }
+            if seen.contains(&name) {
+                problems.push(format!("{name}: duplicate tool name in the registry"));
+            }
+            seen.push(name.clone());
+
+            if t.description().trim().is_empty() {
+                problems.push(format!("{name}: empty description — the model selects on this"));
+            }
+
+            let schema = t.input_schema();
+            if schema.get("type").and_then(|v| v.as_str()) != Some("object") {
+                problems.push(format!("{name}: input_schema must be type=object"));
+                continue;
+            }
+
+            let props = match schema.get("properties").and_then(|v| v.as_object()) {
+                Some(p) => p,
+                None => {
+                    // A tool taking no input is legitimate, but then it must not
+                    // declare anything required either.
+                    if schema.get("required").is_some() {
+                        problems.push(format!("{name}: has `required` but no `properties`"));
+                    }
+                    continue;
+                }
+            };
+
+            for (prop, def) in props {
+                if def.get("type").is_none() && def.get("enum").is_none() {
+                    problems.push(format!("{name}.{prop}: property has neither `type` nor `enum`"));
+                }
+                if def.get("description").and_then(|d| d.as_str()).is_none_or(str::is_empty) {
+                    problems.push(format!(
+                        "{name}.{prop}: no description — the model has to guess what it means"
+                    ));
+                }
+            }
+
+            // Anything required must actually be advertised.
+            if let Some(req) = schema.get("required").and_then(|v| v.as_array()) {
+                for r in req {
+                    let Some(r) = r.as_str() else {
+                        problems.push(format!("{name}: non-string entry in `required`"));
+                        continue;
+                    };
+                    if !props.contains_key(r) {
+                        problems.push(format!(
+                            "{name}: `{r}` is required but never declared in properties"
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "tool schema contract violations ({}):\n  {}",
+            problems.len(),
+            problems.join("\n  ")
+        );
+    }
+}

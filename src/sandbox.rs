@@ -152,6 +152,12 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 ///   - Binds /tmp as read-write (tmpfs)
 ///   - Uses --unshare-net to block network (configurable)
 ///   - Uses --unshare-pid for process isolation
+///   - Uses --new-session to detach from the controlling terminal. Without it
+///     the sandboxed process shares our tty and can push characters back into
+///     it with TIOCSTI, which the parent shell then executes as if the user had
+///     typed them — an escape straight out of the sandbox. Modern kernels
+///     default `dev.tty.legacy_tiocsti=0`, but that is a host setting we do not
+///     control, so bwrap's own guard is the right place to rely on.
 ///   - Uses --die-with-parent so cleanup is automatic
 pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
     let cwd_quoted = shell_quote(&cwd.display().to_string());
@@ -175,6 +181,7 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
          --chdir {cwd} \
          {net_flag}\
          --unshare-pid \
+         --new-session \
          --die-with-parent \
          -- /bin/sh -c {shell_quoted}",
         cwd = cwd_quoted,

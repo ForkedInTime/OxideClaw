@@ -1097,6 +1097,15 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                                     Ok(rustyclaw::autocommit::SnapshotOutcome::Disabled { reason }) => {
                                         tracing::debug!("autoCommit: disabled ({reason})");
                                     }
+                                    Ok(rustyclaw::autocommit::SnapshotOutcome::Conflict { reason }) => {
+                                        // Must be visible, not just logged: this turn is absent
+                                        // from the undo history, so /undo will silently skip it
+                                        // if the user is never told.
+                                        tracing::warn!("autoCommit: {reason}");
+                                        app.entries.push(crate::tui::app::ChatEntry::error(
+                                            format!("⚠ Auto-commit conflict — this turn was not added to /undo history.\n{reason}"),
+                                        ));
+                                    }
                                     Err(e) => {
                                         tracing::warn!("autoCommit: snapshot failed: {e}");
                                     }
