@@ -543,6 +543,9 @@ mod tests {
         }
     }
 
+    /// Only used by the signal-termination test, which is unix-only — so this
+    /// helper is dead code on Windows and trips `-D warnings` there.
+    #[cfg(unix)]
     fn cfg_post(command: &str) -> HooksConfig {
         HooksConfig {
             post_tool_use: vec![entry(command)],

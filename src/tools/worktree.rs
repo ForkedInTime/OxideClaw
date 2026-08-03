@@ -117,7 +117,7 @@ impl Tool for EnterWorktreeTool {
             .join(format!(
                 "{}-{}",
                 git_root.split('/').next_back().unwrap_or("repo"),
-                &slug
+                slug
             ));
 
         // Create worktree + branch

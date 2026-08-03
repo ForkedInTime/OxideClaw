@@ -402,6 +402,9 @@ impl Settings {
     /// warn. Windows has no POSIX permission bits so this is a no-op there;
     /// the threat model (multi-user shared settings) is primarily a unix
     /// concern anyway.
+    // `parsed` is only mutated on unix (where the ownership/permission check
+    // runs), so `mut` is unused on Windows and trips `-D warnings` there.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     fn sanitize_unsafe_helper(mut parsed: Self, path: &Path) -> Self {
         if parsed.api_key_helper.is_none() {
             return parsed;

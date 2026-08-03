@@ -501,7 +501,7 @@ async fn list_sessions(limit: Option<usize>) -> Result<Vec<SessionInfo>> {
     }
 
     // Sort by created_at descending (most recent first)
-    sessions.sort_by(|a, b| b.0.cmp(&a.0));
+    sessions.sort_by_key(|e| std::cmp::Reverse(e.0));
 
     let limit = limit.unwrap_or(50);
     let infos: Vec<SessionInfo> = sessions.into_iter().take(limit).map(|(_, s)| s).collect();

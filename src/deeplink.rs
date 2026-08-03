@@ -137,14 +137,15 @@ fn hex_val(b: u8) -> Option<u8> {
 ///
 /// Requires xdg-utils to be installed (standard on most desktops).
 /// On non-Linux platforms, prints a notice and returns Ok(()).
+#[cfg(not(target_os = "linux"))]
 pub fn register_protocol() -> anyhow::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("Deep link protocol registration is only supported on Linux.");
-        return Ok(());
-    }
+    eprintln!("Deep link protocol registration is only supported on Linux.");
+    Ok(())
+}
 
-    #[cfg(target_os = "linux")]
+/// Register the deep link protocol handler on Linux.
+#[cfg(target_os = "linux")]
+pub fn register_protocol() -> anyhow::Result<()> {
     {
         let scheme = protocol_name();
         let binary = std::env::current_exe()

@@ -98,7 +98,7 @@ impl Tool for GlobTool {
             .collect();
 
         // Sort by modification time, most recent first
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
 
         if entries.is_empty() {
             return Ok(ToolOutput::success("No files matched the pattern."));

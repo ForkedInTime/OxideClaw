@@ -728,7 +728,7 @@ fn cmd_cost(ctx: &CommandContext) -> CommandAction {
 fn cmd_context(ctx: &CommandContext) -> CommandAction {
     let limit: u64 = 200_000;
     let used = ctx.tokens_in;
-    let pct = if limit > 0 { used * 100 / limit } else { 0 };
+    let pct = (used * 100).checked_div(limit).unwrap_or(0);
     let bar_len = 30usize;
     let filled = (pct as usize * bar_len / 100).min(bar_len);
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
@@ -2608,7 +2608,7 @@ fn cmd_btw(args: &str) -> CommandAction {
 fn cmd_ctx_viz(ctx: &CommandContext) -> CommandAction {
     let limit: u64 = 200_000;
     let used = ctx.tokens_in;
-    let pct = if limit > 0 { used * 100 / limit } else { 0 };
+    let pct = (used * 100).checked_div(limit).unwrap_or(0);
 
     // Build a visual histogram of context usage
     let bar_width = 40usize;

@@ -74,7 +74,7 @@ impl Tool for ToolSearchTool {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|e| std::cmp::Reverse(e.0));
         scored.truncate(input.max_results);
 
         if scored.is_empty() {

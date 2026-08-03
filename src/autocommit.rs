@@ -402,6 +402,21 @@ pub fn restore_to(
 /// Delete old `refs/rustyclaw/sessions/*` refs, keeping the `keep` newest by
 /// committer date. `keep == 0` disables pruning. Non-fatal: any error is
 /// logged via `tracing::warn!` and the function returns 0.
+/// Choose which shadow refs to delete: keep the `keep` newest, delete the rest.
+///
+/// Extracted so the *direction* is testable. An inversion here deletes the
+/// newest sessions instead of the oldest — silent, unrecoverable data loss —
+/// and the integration test cannot catch it, because `%(committerdate:unix)`
+/// has one-second granularity and sessions created in a loop all tie.
+///
+/// Ties are resolved by whatever order git returned (refname-alphabetical),
+/// which is *not* recency. See the review tracker: prune ordering is unreliable
+/// for sessions created within the same second.
+fn select_refs_to_delete(mut rows: Vec<(i64, String)>, keep: usize) -> Vec<String> {
+    rows.sort_by_key(|e| std::cmp::Reverse(e.0));
+    rows.into_iter().skip(keep).map(|(_, r)| r).collect()
+}
+
 pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
     if keep == 0 || !is_git_repo(cwd) {
         return Ok(0);
@@ -420,7 +435,7 @@ pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
         return Ok(0);
     }
     let s = String::from_utf8(out.stdout)?;
-    let mut rows: Vec<(i64, String)> = s
+    let rows: Vec<(i64, String)> = s
         .lines()
         .filter_map(|line| {
             let mut it = line.splitn(2, ' ');
@@ -434,12 +449,7 @@ pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
         return Ok(0);
     }
 
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
-    let to_delete: Vec<String> = rows
-        .into_iter()
-        .skip(keep as usize)
-        .map(|(_, r)| r)
-        .collect();
+    let to_delete = select_refs_to_delete(rows, keep as usize);
 
     let mut deleted = 0u32;
     for r in &to_delete {
@@ -480,6 +490,48 @@ pub fn snapshot_turn_raw(
         auto_commits,
         undo_position,
     )
+}
+
+#[cfg(test)]
+mod prune_selection_tests {
+    use super::select_refs_to_delete;
+
+    fn rows(pairs: &[(i64, &str)]) -> Vec<(i64, String)> {
+        pairs.iter().map(|(t, r)| (*t, r.to_string())).collect()
+    }
+
+    /// The direction is the whole point: keep the NEWEST, delete the oldest.
+    /// Inverting this deletes the sessions the user most likely wants to undo
+    /// to — silent, unrecoverable loss. The integration test cannot catch an
+    /// inversion because its timestamps all tie at one-second granularity.
+    #[test]
+    fn keeps_the_newest_and_deletes_the_oldest() {
+        let deleted = select_refs_to_delete(
+            rows(&[(100, "old"), (300, "newest"), (200, "mid"), (50, "oldest")]),
+            2,
+        );
+        assert_eq!(deleted, vec!["old".to_string(), "oldest".to_string()]);
+    }
+
+    #[test]
+    fn keeping_more_than_present_deletes_nothing() {
+        assert!(select_refs_to_delete(rows(&[(1, "a"), (2, "b")]), 10).is_empty());
+    }
+
+    #[test]
+    fn keep_zero_deletes_everything() {
+        let deleted = select_refs_to_delete(rows(&[(1, "a"), (2, "b")]), 0);
+        assert_eq!(deleted.len(), 2);
+    }
+
+    /// Documents the known weakness rather than asserting a guarantee we do not
+    /// have: with equal timestamps the survivors are decided by git's output
+    /// order, not by recency.
+    #[test]
+    fn tied_timestamps_fall_back_to_input_order() {
+        let deleted = select_refs_to_delete(rows(&[(7, "a"), (7, "b"), (7, "c")]), 1);
+        assert_eq!(deleted, vec!["b".to_string(), "c".to_string()]);
+    }
 }
 
 #[cfg(test)]

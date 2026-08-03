@@ -254,7 +254,14 @@ fn anthropic_config_dir() -> Option<std::path::PathBuf> {
 /// the credentials directory first means we never execute anything unless the
 /// real CLI has actually been used here.
 fn ant_profile_dir_exists() -> bool {
-    anthropic_config_dir().is_some_and(|d| d.join("credentials").is_dir())
+    profile_dir_exists_at(anthropic_config_dir().as_deref())
+}
+
+/// Pure form of the check, so it can be tested without mutating process-global
+/// env. `set_var` races under the parallel test harness — the whole point of
+/// the `AuthEnv` seam above is to avoid exactly that.
+fn profile_dir_exists_at(config_dir: Option<&std::path::Path>) -> bool {
+    config_dir.is_some_and(|d| d.join("credentials").is_dir())
 }
 
 impl AuthEnv for ProcessAuthEnv {
@@ -472,47 +479,29 @@ mod tests {
     /// startup ran an unrelated build tool and stalled the process long enough
     /// to fail the headless SDK test. Nothing may be executed unless the real
     /// CLI has actually stored a profile here.
+    ///
+    /// Pure over the directory — no `set_var`, so it cannot race other tests.
     #[test]
     fn no_subprocess_when_no_profile_directory_exists() {
         let empty = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded within this test; the var is restored below.
-        let prev = std::env::var("ANTHROPIC_CONFIG_DIR").ok();
-        unsafe { std::env::set_var("ANTHROPIC_CONFIG_DIR", empty.path()) };
-
         assert!(
-            !ant_profile_dir_exists(),
+            !profile_dir_exists_at(Some(empty.path())),
             "a config dir with no credentials/ must not trigger a spawn"
         );
-        assert!(ProcessAuthEnv.ant_access_token().is_none());
-        assert!(!ProcessAuthEnv.ant_profile_present());
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("ANTHROPIC_CONFIG_DIR", v),
-                None => std::env::remove_var("ANTHROPIC_CONFIG_DIR"),
-            }
-        }
+        assert!(
+            !profile_dir_exists_at(None),
+            "no config dir at all must not trigger a spawn"
+        );
     }
 
     #[test]
-    fn config_dir_honours_the_env_override() {
+    fn profile_directory_is_detected_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var("ANTHROPIC_CONFIG_DIR").ok();
-        unsafe { std::env::set_var("ANTHROPIC_CONFIG_DIR", dir.path()) };
-
-        assert_eq!(anthropic_config_dir().as_deref(), Some(dir.path()));
         std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
         assert!(
-            ant_profile_dir_exists(),
+            profile_dir_exists_at(Some(dir.path())),
             "credentials/ present ⇒ the real CLI has been used here"
         );
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("ANTHROPIC_CONFIG_DIR", v),
-                None => std::env::remove_var("ANTHROPIC_CONFIG_DIR"),
-            }
-        }
     }
 
     #[test]

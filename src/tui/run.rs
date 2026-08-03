@@ -2571,7 +2571,22 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             "sandboxEnabled",
                             serde_json::Value::Bool(enabled),
                         );
-                        let msg = crate::sandbox::sandbox_status(enabled, &config.sandbox_mode);
+                        let mut msg = String::new();
+                        // Enabling is the moment the user forms a belief about how
+                        // protected they are. If the active mode cannot enforce
+                        // anything, say so here rather than burying it in status.
+                        if enabled
+                            && let Some(warning) =
+                                crate::sandbox::weak_mode_warning(&config.sandbox_mode)
+                        {
+                            msg.push_str("⚠ ");
+                            msg.push_str(&warning);
+                            msg.push_str("\n\n");
+                        }
+                        msg.push_str(&crate::sandbox::sandbox_status(
+                            enabled,
+                            &config.sandbox_mode,
+                        ));
                         app.overlay = Some(Overlay::new("sandbox", msg));
                     }
                     CommandAction::ShowThinkback => {
