@@ -117,7 +117,7 @@ impl Tool for MultiEditTool {
                 had_error = true;
                 continue;
             }
-            if let Some(err) = super::check_sensitive_path(&path, super::SensitiveOp::Write) {
+            if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Write) {
                 let msg = err
                     .content
                     .iter()

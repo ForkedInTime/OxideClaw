@@ -268,6 +268,64 @@ fn is_dotenv(file_name: &str) -> bool {
 /// Returns Some(error ToolOutput) if the path should be blocked for `op`.
 /// Read mode blocks private keys only. Write mode additionally blocks
 /// dotenv files, credential stores, and secrets directories.
+/// Deny-listed read paths expressed as ripgrep exclusion globs.
+///
+/// The Grep tool has two backends — a `ripgrep` subprocess and a pure-Rust
+/// fallback — and both must honour the same rules. The fallback can check each
+/// file as it opens it; `rg` opens files itself, so it has to be told up front.
+pub fn denied_read_globs() -> Vec<String> {
+    let mut g: Vec<String> = PRIVATE_KEY_NAMES.iter().map(|n| format!("!**/{n}")).collect();
+    g.extend(PRIVATE_KEY_SUFFIXES.iter().map(|s| format!("!**/*{s}")));
+    g
+}
+
+/// Resolve symlinks so [`check_sensitive_path`] sees the file that will actually
+/// be touched, not the name the caller supplied.
+///
+/// The deny-list matches on the *file name*, so without this every protection it
+/// offers is defeated by a symlink with an innocuous name. Verified: a link
+/// named `notes.md` pointing at `~/.ssh/id_rsa` returned the private key, and a
+/// link named `config.json` pointing at `~/.aws/credentials` overwrote them —
+/// while the same operations on the real names were correctly refused.
+///
+/// That needs no unusual privileges: a repository can simply *ship* a symlink
+/// called `README.md`, and asking the agent to read it exfiltrates the target.
+///
+/// Falls back to the parent directory for paths that do not exist yet (a fresh
+/// write), which also catches a symlinked parent, and to the input unchanged
+/// when nothing can be resolved — a check on the literal path is never worse
+/// than the old behaviour.
+pub fn resolve_for_sensitivity_check(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(real_parent) = std::fs::canonicalize(parent)
+    {
+        return real_parent.join(name);
+    }
+    path.to_path_buf()
+}
+
+/// [`check_sensitive_path`] applied to both the supplied path and its symlink
+/// target. Either looking sensitive is a refusal.
+///
+/// Use this at every filesystem entry point; the raw `check_sensitive_path` only
+/// inspects the name it is given.
+pub fn check_sensitive_path_resolved(
+    path: &std::path::Path,
+    op: SensitiveOp,
+) -> Option<ToolOutput> {
+    if let Some(err) = check_sensitive_path(path, op) {
+        return Some(err);
+    }
+    let resolved = resolve_for_sensitivity_check(path);
+    if resolved != path {
+        return check_sensitive_path(&resolved, op);
+    }
+    None
+}
+
 pub fn check_sensitive_path(path: &std::path::Path, op: SensitiveOp) -> Option<ToolOutput> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 

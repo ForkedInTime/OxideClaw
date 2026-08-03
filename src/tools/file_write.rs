@@ -53,7 +53,7 @@ impl Tool for FileWriteTool {
         if let Some(err) = super::check_protected_path(&path) {
             return Ok(err);
         }
-        if let Some(err) = super::check_sensitive_path(&path, super::SensitiveOp::Write) {
+        if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Write) {
             return Ok(err);
         }
 

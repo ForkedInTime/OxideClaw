@@ -61,7 +61,7 @@ impl Tool for FileReadTool {
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
 
-        if let Some(err) = super::check_sensitive_path(&path, super::SensitiveOp::Read) {
+        if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read) {
             return Ok(err);
         }
 

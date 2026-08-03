@@ -159,6 +159,13 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
         args.push(format!("!**/{excl}/**"));
     }
 
+    // Same read deny-list the fallback backend and FileRead enforce. rg opens
+    // files itself, so exclusions have to be declared rather than checked.
+    for g in super::denied_read_globs() {
+        args.push("--glob".into());
+        args.push(g);
+    }
+
     args.push("--".into());
     args.push(input.pattern.clone());
 
@@ -250,6 +257,15 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
         if let Some(ref gre) = glob_re
             && !gre.is_match(&path_str)
         {
+            continue;
+        }
+
+        // Honour the same read deny-list the FileRead tool enforces. Grep
+        // returns matching lines verbatim, so without this it is a read
+        // primitive that bypasses the guard entirely — verified: a search for a
+        // string inside `server.pem` returned the key material, while FileRead
+        // on the same file was correctly refused.
+        if super::check_sensitive_path_resolved(path, super::SensitiveOp::Read).is_some() {
             continue;
         }
 
