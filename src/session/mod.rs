@@ -116,6 +116,11 @@ impl Session {
             file.write_all(line.as_bytes()).await?;
             file.write_all(b"\n").await?;
         }
+        // Durability. Without this the turn is reported as saved while the bytes
+        // may still be in the page cache, so a crash loses it — and can leave a
+        // half-written final line behind (see `load_messages`, which tolerates
+        // exactly that).
+        file.sync_all().await?;
 
         // Update preview from first user message if not yet set
         if self.meta.preview.is_empty()
@@ -162,11 +167,7 @@ impl Session {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<Message>(l).map_err(anyhow::Error::from))
-            .collect()
+        parse_message_lines(id, &content)
     }
 
     /// List all saved sessions, newest first.
@@ -247,7 +248,10 @@ impl Session {
             }
         }
 
-        fs::write(dest, &out).await?;
+        // Same treatment as the session files themselves: a direct write
+        // truncates the destination first, so an interrupted export leaves the
+        // user with an empty or half-written file where their transcript was.
+        atomic_write(dest, out.as_bytes()).await?;
         Ok(dest.to_path_buf())
     }
 
@@ -407,6 +411,50 @@ fn human_session_name() -> String {
         .unwrap_or_else(|| "New session".to_string())
 }
 
+
+/// Parse a session's JSONL body.
+///
+/// Split out from `load_messages` so the torn-tail and mid-file-corruption
+/// behaviour can be tested against an explicit file rather than the global
+/// sessions directory.
+fn parse_message_lines(id: &str, content: &str) -> Result<Vec<Message>> {
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        let total = lines.len();
+        let mut out = Vec::with_capacity(total);
+
+        for (i, line) in lines.into_iter().enumerate() {
+            match serde_json::from_str::<Message>(line) {
+                Ok(m) => out.push(m),
+                Err(e) => {
+                    // A torn *final* line is the expected shape of a crash
+                    // mid-append: nothing else references it, so dropping it
+                    // recovers the whole session minus one turn. Previously any
+                    // bad line failed the entire load via `collect()`, which
+                    // turned a half-written last line into total loss of the
+                    // conversation — the one thing sessions exist to prevent.
+                    if i + 1 == total {
+                        tracing::warn!(
+                            "session {id}: discarding incomplete final line \
+                             (likely an interrupted write): {e}"
+                        );
+                        break;
+                    }
+                    // Corruption anywhere else is not a torn write. Skipping it
+                    // could drop a tool_use while keeping its tool_result, which
+                    // the API rejects outright — a subtly broken conversation is
+                    // worse than a clear error.
+                    return Err(anyhow::anyhow!(
+                        "session {id} is corrupt at line {} of {total}: {e}. \
+                         Refusing to load a partial history — later messages may \
+                         depend on it.",
+                        i + 1
+                    ));
+                }
+            }
+        }
+    Ok(out)
+}
+
 /// Atomic file write: write to a sibling temp file, fsync, then rename over
 /// the target. Survives mid-write crashes — the target is either the old
 /// content or the new content, never a truncated splice. Falls back to a
@@ -534,5 +582,101 @@ mod atomic_write_tests {
         let target = dir.path().join("nested/sub/session.meta");
         atomic_write(&target, b"x").await.unwrap();
         assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "x");
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::api::types::{ContentBlock, Role};
+
+    fn msg(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// Write a JSONL file directly so these tests do not depend on the real
+    /// sessions directory or on `Session::new`'s side effects.
+    fn write_jsonl(dir: &std::path::Path, id: &str, msgs: &[Message], torn_tail: Option<usize>) {
+        let mut body = String::new();
+        for (i, m) in msgs.iter().enumerate() {
+            let line = serde_json::to_string(m).unwrap();
+            if let Some(keep) = torn_tail.filter(|_| i + 1 == msgs.len()) {
+                let keep = keep.min(line.len());
+                body.push_str(&line[..keep]); // no trailing newline: a cut-off write
+            } else {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        std::fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+    }
+
+    fn parse(dir: &std::path::Path, id: &str) -> Result<Vec<Message>> {
+        // Mirror of load_messages' parsing over an explicit path, so the test
+        // does not have to relocate the global sessions directory.
+        let content = std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap_or_default();
+        parse_message_lines(id, &content)
+    }
+
+    /// The regression: a crash mid-append leaves the final line cut off. That
+    /// used to fail the entire load via `collect()`, losing the whole
+    /// conversation rather than one turn.
+    #[test]
+    fn torn_final_line_costs_one_turn_not_the_session() {
+        let d = tempfile::tempdir().unwrap();
+        write_jsonl(d.path(), "s", &[msg("one"), msg("two"), msg("three")], Some(14));
+
+        let got = parse(d.path(), "s").expect("a torn tail must not fail the load");
+        assert_eq!(got.len(), 2, "complete turns survive, the torn one is dropped");
+    }
+
+    /// Corruption that is not a torn tail must fail loudly: silently skipping a
+    /// middle line can drop a tool_use while keeping its tool_result, which the
+    /// API rejects outright. A subtly broken conversation is worse than an error.
+    #[test]
+    fn mid_file_corruption_is_reported_with_its_location() {
+        let d = tempfile::tempdir().unwrap();
+        write_jsonl(d.path(), "s", &[msg("one"), msg("two"), msg("three")], None);
+        let p = d.path().join("s.jsonl");
+        let mut lines: Vec<String> = std::fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines[1] = "{ not json".into();
+        std::fs::write(&p, lines.join("\n")).unwrap();
+
+        let err = parse(d.path(), "s").expect_err("must not silently skip");
+        let m = err.to_string();
+        assert!(m.contains("corrupt"), "{m}");
+        assert!(m.contains("line 2"), "must locate the damage: {m}");
+    }
+
+    #[test]
+    fn intact_history_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        write_jsonl(d.path(), "s", &[msg("a"), msg("b"), msg("c")], None);
+        assert_eq!(parse(d.path(), "s").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn empty_history_is_not_corruption() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("s.jsonl"), "").unwrap();
+        assert!(parse(d.path(), "s").unwrap().is_empty());
+    }
+
+    /// Blank lines are padding, not damage.
+    #[test]
+    fn blank_lines_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        write_jsonl(d.path(), "s", &[msg("a"), msg("b")], None);
+        let p = d.path().join("s.jsonl");
+        let c = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, c.replace('\n', "\n\n")).unwrap();
+        assert_eq!(parse(d.path(), "s").unwrap().len(), 2);
     }
 }
