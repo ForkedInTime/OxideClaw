@@ -268,6 +268,68 @@ fn is_dotenv(file_name: &str) -> bool {
 /// Returns Some(error ToolOutput) if the path should be blocked for `op`.
 /// Read mode blocks private keys only. Write mode additionally blocks
 /// dotenv files, credential stores, and secrets directories.
+/// Write a file atomically: temp file in the same directory, fsync, rename.
+///
+/// A direct `fs::write` truncates the target first, so a crash, a full disk, or
+/// a kill between truncate and write leaves the user's file empty or partial —
+/// silently, and with the original gone. `session/` was given this treatment in
+/// an earlier audit; the file tools were not.
+///
+/// The temp file is created in the *same directory* so the rename is a
+/// same-filesystem operation and therefore atomic; `/tmp` may be a different
+/// mount, where rename degrades to copy-then-delete and loses the guarantee.
+///
+/// **Permissions are carried over from the original.** Renaming replaces the
+/// inode, so without this an edit to a `0600` file would silently republish it
+/// at the default `0644` — turning a routine edit into a disclosure.
+pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = parent.join(format!(
+        ".{stem}.rustyclaw-{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    // Mode of the file we are replacing, if it exists.
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .map(|m| m.permissions().mode())
+    };
+
+    let write_result = async {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut f, content.as_bytes()).await?;
+        // Durability: without this the rename can land before the data does, so
+        // a crash yields a present-but-empty file — the exact outcome this is
+        // meant to prevent.
+        f.sync_all().await?;
+        drop(f);
+
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await?;
+        }
+
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+
+    if write_result.is_err() {
+        // Never leave a stray temp file behind on failure.
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    write_result
+}
+
 /// Deny-listed read paths expressed as ripgrep exclusion globs.
 ///
 /// The Grep tool has two backends — a `ripgrep` subprocess and a pure-Rust

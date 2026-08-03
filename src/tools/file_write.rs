@@ -67,7 +67,7 @@ impl Tool for FileWriteTool {
             })?;
         }
 
-        fs::write(&path, &input.content)
+        super::atomic_write(&path, &input.content)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
 

@@ -9,6 +9,11 @@ use serde_json::json;
 use std::path::Path;
 use std::time::SystemTime;
 
+/// Cap on returned matches. Generous enough that ordinary searches are never
+/// truncated, low enough that a repo-wide `**/*` cannot produce a multi-megabyte
+/// tool result.
+const MAX_GLOB_RESULTS: usize = 1000;
+
 pub struct GlobTool;
 
 #[derive(Deserialize)]
@@ -100,15 +105,33 @@ impl Tool for GlobTool {
         // Sort by modification time, most recent first
         entries.sort_by_key(|e| std::cmp::Reverse(e.0));
 
+        // Bound the result. A broad pattern over a large tree (`**/*`) otherwise
+        // builds an unbounded Vec and then joins it into one enormous string
+        // that is sent to the model as a tool result — cost and memory scale
+        // with the repository, and nothing downstream caps it. Sorting first
+        // means the cap keeps the most recently modified matches, which is what
+        // the ordering exists to surface.
+        let total = entries.len();
+        let truncated = total > MAX_GLOB_RESULTS;
+        entries.truncate(MAX_GLOB_RESULTS);
+
         if entries.is_empty() {
             return Ok(ToolOutput::success("No files matched the pattern."));
         }
 
-        let output = entries
+        let mut output = entries
             .into_iter()
             .map(|(_, path)| path)
             .collect::<Vec<_>>()
             .join("\n");
+
+        if truncated {
+            output.push_str(&format!(
+                "\n\n... {} of {total} matches shown (most recently modified first). \
+                 Narrow the pattern or search a subdirectory to see the rest.",
+                MAX_GLOB_RESULTS
+            ));
+        }
 
         Ok(ToolOutput::success(output))
     }

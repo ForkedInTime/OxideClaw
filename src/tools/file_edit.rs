@@ -93,7 +93,7 @@ impl Tool for FileEditTool {
                     path.display()
                 )));
             }
-            fs::write(&path, &new_content).await?;
+            super::atomic_write(&path, &new_content).await?;
             return Ok(ToolOutput::success(format!(
                 "Replaced {count} occurrence(s) in {}",
                 path.display()
@@ -109,7 +109,7 @@ impl Tool for FileEditTool {
             ))),
             1 => {
                 let new_content = content.replacen(&input.old_string, &input.new_string, 1);
-                fs::write(&path, &new_content).await?;
+                super::atomic_write(&path, &new_content).await?;
                 Ok(ToolOutput::success(format!(
                     "Edit applied successfully to {}",
                     path.display()
