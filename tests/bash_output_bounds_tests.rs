@@ -117,3 +117,40 @@ async fn stdin_is_not_inherited() {
         "command should complete on stdin EOF, got: {body}"
     );
 }
+
+/// The captured buffer and the TUI stream are two different paths. Bounding
+/// only the buffer left `stream_tx` — an *unbounded* channel — receiving a
+/// clone of every line, so a runaway command still grew memory without limit.
+#[tokio::test]
+async fn tui_stream_is_bounded_not_just_the_buffer() {
+    let dir = TempDir::new().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let mut c = ctx(&dir);
+    c.stream_tx = Some(tx);
+
+    // 3000 lines x ~2 KB = ~6 MB, well past the 1 MB cap.
+    let out = BashTool
+        .execute(
+            json!({
+                "command": "yes \"$(head -c 2000 /dev/zero | tr '\\0' x)\" | head -3000",
+                "timeout": 60000
+            }),
+            &c,
+        )
+        .await
+        .expect("tool should return a result");
+
+    drop(c);
+    let mut forwarded = 0usize;
+    while rx.try_recv().is_ok() {
+        forwarded += 1;
+    }
+
+    assert!(
+        forwarded < 2000,
+        "stream should stop forwarding past the cap, got {forwarded} of 3000 lines"
+    );
+    assert!(forwarded > 0, "some output must still reach the UI");
+    assert!(text(&out).len() < MAX_OUTPUT_BYTES * 3);
+}

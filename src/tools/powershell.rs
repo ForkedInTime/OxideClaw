@@ -67,13 +67,53 @@ impl Tool for PowerShellTool {
         use tokio::process::Command;
         use tokio::time::{Duration, timeout};
 
-        let fut = Command::new("pwsh")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &input.command])
-            .current_dir(&ctx.cwd)
-            // Same reason as the Bash tool: inherited stdin lets an interactive
-            // prompt fight the TUI for keystrokes.
-            .stdin(std::process::Stdio::null())
-            .output();
+        // Parity with the Bash tool, which this had drifted from on two counts:
+        //
+        //  1. `Command::output()` reads both pipes to EOF with no cap, so a
+        //     runaway command exhausts memory — the same OOM class already
+        //     fixed for Bash.
+        //  2. Nothing killed the child on timeout. Dropping an `output()` future
+        //     does not kill the process unless `kill_on_drop` is set, so a
+        //     timed-out command (and anything it spawned) kept running forever.
+        //
+        // Uses the same ProcessGroupGuard as Bash so the whole subtree dies.
+        let fut = async {
+            let mut cmd = Command::new("pwsh");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", &input.command])
+                .current_dir(&ctx.cwd)
+                // Inherited stdin lets an interactive prompt fight the TUI for
+                // the user's keystrokes.
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            let mut guard = super::bash::ProcessGroupGuard::new(cmd.spawn()?);
+            let mut child_out = guard
+                .child_mut()
+                .stdout
+                .take()
+                .ok_or_else(|| std::io::Error::other("no stdout pipe"))?;
+            let mut child_err = guard
+                .child_mut()
+                .stderr
+                .take()
+                .ok_or_else(|| std::io::Error::other("no stderr pipe"))?;
+
+            // Read both concurrently — draining one to EOF first deadlocks if
+            // the command fills the other pipe.
+            let (o, e) = tokio::join!(
+                super::bash::read_to_cap(&mut child_out, super::bash::MAX_OUTPUT_BYTES),
+                super::bash::read_to_cap(&mut child_err, super::bash::MAX_OUTPUT_BYTES),
+            );
+            let (stdout, out_trunc) = o?;
+            let (stderr, err_trunc) = e?;
+            let status = guard.child_mut().wait().await?;
+            guard.disarm();
+            Ok::<_, std::io::Error>((status, stdout, stderr, out_trunc || err_trunc))
+        };
 
         let result = timeout(Duration::from_millis(timeout_ms), fut).await;
 
@@ -90,11 +130,8 @@ impl Tool for PowerShellTool {
                     Ok(ToolOutput::error(format!("Failed to run pwsh: {e}")))
                 }
             }
-            Ok(Ok(output)) => {
+            Ok(Ok((status, stdout, stderr, truncated))) => {
                 let mut out = String::new();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
                 if !stdout.is_empty() {
                     out.push_str(&stdout);
                 }
@@ -105,11 +142,14 @@ impl Tool for PowerShellTool {
                     out.push_str("[stderr]\n");
                     out.push_str(&stderr);
                 }
+                if truncated {
+                    out.push_str("\n... (output truncated)");
+                }
                 if out.is_empty() {
-                    out = format!("(exit code {})", output.status.code().unwrap_or(-1));
+                    out = format!("(exit code {})", status.code().unwrap_or(-1));
                 }
 
-                let is_error = !output.status.success();
+                let is_error = !status.success();
                 if is_error {
                     Ok(ToolOutput::error(out))
                 } else {

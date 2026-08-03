@@ -5362,9 +5362,13 @@ async fn run_api_task(task: ApiTask) {
                         // Permission check — for Bash, parse compound commands (&&, ||, ;, |)
                         // so each sub-command is checked individually against prefix rules
                         let decision = match autonomy_override.unwrap_or_else(|| {
-                            if name == "Bash" {
+                            if crate::permissions::is_command_tool(name) {
                                 if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
-                                    crate::permissions::check_compound_bash(&perm_state, cmd)
+                                    crate::permissions::check_compound_command(
+                                        &perm_state,
+                                        name,
+                                        cmd,
+                                    )
                                 } else {
                                     perm_state.check_with_input(name, Some(input))
                                 }

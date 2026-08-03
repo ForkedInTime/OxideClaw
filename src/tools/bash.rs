@@ -20,7 +20,7 @@ use tokio::time::{Duration, timeout};
 /// `process_group(0)`) and sending SIGKILL to the negated pgid on drop, we
 /// guarantee the whole subtree dies when the tool future is dropped (Esc
 /// cancellation, tokio::time::timeout, task::abort, etc.).
-struct ProcessGroupGuard {
+pub(crate) struct ProcessGroupGuard {
     child: Child,
     /// Process group ID = child pid (we always spawn with process_group(0)).
     /// `None` means the child was already reaped cleanly via `wait().await`,
@@ -29,20 +29,20 @@ struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    fn new(child: Child) -> Self {
+    pub(crate) fn new(child: Child) -> Self {
         // child.id() is None only if the child has already been polled to
         // completion. Since we just spawned it, this is always Some.
         let pgid = child.id().map(|id| id as i32);
         Self { child, pgid }
     }
 
-    fn child_mut(&mut self) -> &mut Child {
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
 
     /// Called after a successful `wait()` so Drop does not try to signal
     /// an already-reaped pid.
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.pgid = None;
     }
 }
@@ -65,7 +65,7 @@ impl Drop for ProcessGroupGuard {
 }
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes, same as TypeScript default
-const MAX_OUTPUT_BYTES: usize = 1_000_000; // 1MB cap
+pub(crate) const MAX_OUTPUT_BYTES: usize = 1_000_000; // 1MB cap
 const CHUNK_SIZE: usize = 8192;
 
 type StreamTx = Option<tokio::sync::mpsc::UnboundedSender<String>>;
@@ -79,12 +79,16 @@ fn emit_line(raw: &str, tx: &StreamTx, combined: &mut String, truncated: &mut bo
     if clean.is_empty() {
         return;
     }
-    if let Some(tx) = tx {
-        let _ = tx.send(clean.clone());
-    }
-    if combined.len() >= MAX_OUTPUT_BYTES {
+    // Past the cap we keep *draining* the pipe (so the child can exit instead of
+    // blocking on a full one) but stop *forwarding*. `stream_tx` is unbounded:
+    // without this, a command emitting millions of lines queues a clone of every
+    // one, so bounding `combined` alone did not bound memory.
+    if *truncated || combined.len() >= MAX_OUTPUT_BYTES {
         *truncated = true;
         return;
+    }
+    if let Some(tx) = tx {
+        let _ = tx.send(clean.clone());
     }
     // Trim the final line so the buffer never overshoots the cap, however long
     // a single line happens to be.
@@ -126,6 +130,35 @@ fn absorb(
         partial.clear();
         *truncated = true;
     }
+}
+
+/// Read a pipe to EOF keeping at most `cap` bytes.
+///
+/// Draining past the cap matters: stopping the read leaves the child blocked on
+/// a full pipe until its timeout fires.
+pub(crate) async fn read_to_cap<R>(reader: &mut R, cap: usize) -> std::io::Result<(String, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut kept: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if kept.len() < cap {
+            let room = cap - kept.len();
+            kept.extend_from_slice(&buf[..room.min(n)]);
+            if n > room {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((String::from_utf8_lossy(&kept).into_owned(), truncated))
 }
 
 /// Strip ANSI escape sequences and carriage returns from terminal output.
