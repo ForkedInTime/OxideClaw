@@ -4947,7 +4947,7 @@ struct ApiTask {
 
 async fn run_api_task(task: ApiTask) {
     let ApiTask {
-        client,
+        mut client,
         tools,
         mut messages,
         config,
@@ -4958,6 +4958,17 @@ async fn run_api_task(task: ApiTask) {
         session_id,
     } = task;
     let session_id = session_id.as_str();
+    // Surface the client's retry backoff in the transcript. Without this a
+    // rate-limited turn sits on a spinner for up to a minute with no
+    // explanation and reads as a freeze.
+    {
+        let notice_tx = tx.clone();
+        client.set_retry_notifier(std::sync::Arc::new(
+            move |n: &crate::api::retry::RetryNotice| {
+                let _ = notice_tx.send(AppEvent::SystemMessage(n.message()));
+            },
+        ));
+    }
     // Set up AskUserQuestion channel: tool → TUI dialog
     let (ask_tx, mut ask_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, oneshot::Sender<String>)>();
@@ -5078,7 +5089,15 @@ async fn run_api_task(task: ApiTask) {
             session_id: Some(session_id.to_string()),
         };
 
-        // API call with retry for transient errors (429/529/connection)
+        // Transient *pre-stream* failures (429, 5xx, connection refused) are
+        // retried inside the API client, which honours `retry-after` and backs
+        // off exponentially. What is left here is recovery the client cannot
+        // do: compacting an over-long prompt, and switching models on 529.
+        //
+        // Nothing may be retried once a chunk has reached the transcript.
+        // `AppEvent::TextChunk` appends to `app.streaming` and that buffer is
+        // never rewound, so re-issuing the call replays the whole response and
+        // the user sees a truncated answer followed by a complete one.
         const MAX_RETRIES: u32 = 3;
         let mut attempt = 0u32;
         let mut should_compact_retry = false;
@@ -5086,8 +5105,11 @@ async fn run_api_task(task: ApiTask) {
             attempt += 1;
             let tx2 = tx.clone();
             let req_clone = request.clone();
+            let streamed_any = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let streamed_flag = streamed_any.clone();
             let result = client
                 .messages_stream(req_clone, move |chunk| {
+                    streamed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = tx2.send(AppEvent::TextChunk(chunk.to_string()));
                 })
                 .await;
@@ -5108,16 +5130,35 @@ async fn run_api_task(task: ApiTask) {
                         };
                     }
 
-                    // Retryable errors: rate limit (429), overloaded (529), connection issues
-                    let is_retryable = err_str.contains("429")
-                        || err_str.contains("529")
+                    // 429 and 5xx are deliberately absent: the client already
+                    // retried those with proper backoff, and repeating them
+                    // here would multiply into 15 attempts while ignoring the
+                    // server's `retry-after`. 529 stays because the client
+                    // leaves it alone for the model-switch path, and the
+                    // connection cases stay for a drop on the very first event.
+                    let is_retryable = err_str.contains("529")
                         || err_str.contains("overloaded")
-                        || err_str.contains("rate_limit")
+                        || err_str.contains("Overloaded")
                         || err_str.contains("connection")
-                        || err_str.contains("timed out")
                         || err_str.contains("reset by peer");
 
-                    if is_retryable && attempt < MAX_RETRIES {
+                    // The duplication guard. Losing a partial response is bad;
+                    // showing it twice is worse and corrupts the saved turn.
+                    let streamed =
+                        streamed_any.load(std::sync::atomic::Ordering::Relaxed);
+                    if is_retryable && streamed {
+                        tracing::warn!(
+                            "not retrying: output already streamed, a retry would \
+                             duplicate the response ({err_str})"
+                        );
+                    }
+
+                    if crate::api::retry::may_retry_stream(
+                        is_retryable,
+                        streamed,
+                        attempt,
+                        MAX_RETRIES,
+                    ) {
                         let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt - 1));
                         let _ = tx.send(AppEvent::SystemMessage(format!(
                             "API error (attempt {attempt}/{MAX_RETRIES}): {err_str}\nRetrying in {:.0}s…",

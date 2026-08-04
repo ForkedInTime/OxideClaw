@@ -1,6 +1,7 @@
 /// Anthropic API client — port of services/api/claude.ts
 pub mod ollama;
 pub mod openai_compat;
+pub mod retry;
 pub mod types;
 
 use anyhow::{Context, Result, anyhow};
@@ -69,6 +70,9 @@ pub struct ClaudeClient {
     /// would send the field twice. Merging into the single per-request value
     /// keeps exactly one.
     credential_betas: Vec<String>,
+    /// Optional sink for retry notices, so a backoff sleep is visible rather
+    /// than looking like a hang. Set by the TUI and the headless runner.
+    retry_notifier: Option<retry::RetryNotifier>,
 }
 
 impl ClaudeClient {
@@ -119,7 +123,25 @@ impl ClaudeClient {
             api_key,
             base_url: ANTHROPIC_API_BASE.to_string(),
             credential_betas,
+            retry_notifier: None,
         })
+    }
+
+    /// Test-only: point the client at a local scripted server.
+    ///
+    /// Deliberately `#[cfg(test)]`. A runtime base-URL override is a
+    /// credential-exfiltration vector, which is exactly why
+    /// `ANTHROPIC_BASE_URL` is excluded from the `.env` allowlist in main.rs.
+    /// This exists so the retry wiring can be proven without weakening that.
+    #[cfg(test)]
+    pub(crate) fn set_base_url_for_test(&mut self, url: impl Into<String>) {
+        self.base_url = url.into();
+    }
+
+    /// Install a sink for retry notices. Without one a backoff sleep is
+    /// invisible and a rate-limited turn looks like a hang.
+    pub fn set_retry_notifier(&mut self, n: retry::RetryNotifier) {
+        self.retry_notifier = Some(n);
     }
 
     /// Merge the request's betas with any the credential requires.
@@ -148,15 +170,22 @@ impl ClaudeClient {
         let url = format!("{}/v1/messages", self.base_url);
         debug!("POST {url} model={}", request.model);
 
-        let mut builder = self.client.post(&url).json(&request);
-        if let Some(betas) = self.beta_header(&request.betas) {
-            builder = builder.header("anthropic-beta", betas);
-        }
-        if let Some(ref sid) = request.session_id {
-            builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
-        }
-
-        let resp = builder.send().await.context("API request failed")?;
+        let betas = self.beta_header(&request.betas);
+        let resp = retry::send_with_retry(
+            || {
+                let mut builder = self.client.post(&url).json(&request);
+                if let Some(ref b) = betas {
+                    builder = builder.header("anthropic-beta", b.as_str());
+                }
+                if let Some(ref sid) = request.session_id {
+                    builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
+                }
+                builder
+            },
+            self.retry_notifier.as_ref(),
+            "API request failed",
+        )
+        .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -181,18 +210,24 @@ impl ClaudeClient {
         let url = format!("{}/v1/messages", self.base_url);
         debug!("POST {url} stream=true model={}", request.model);
 
-        let mut builder = self.client.post(&url).json(&request);
-        if let Some(betas) = self.beta_header(&request.betas) {
-            builder = builder.header("anthropic-beta", betas);
-        }
-        if let Some(ref sid) = request.session_id {
-            builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
-        }
-
-        let resp = builder
-            .send()
-            .await
-            .context("Streaming API request failed")?;
+        // Retrying is safe here and only here: nothing has been handed to
+        // `on_text` yet, so a retry cannot duplicate text the user has seen.
+        let betas = self.beta_header(&request.betas);
+        let resp = retry::send_with_retry(
+            || {
+                let mut builder = self.client.post(&url).json(&request);
+                if let Some(ref b) = betas {
+                    builder = builder.header("anthropic-beta", b.as_str());
+                }
+                if let Some(ref sid) = request.session_id {
+                    builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
+                }
+                builder
+            },
+            self.retry_notifier.as_ref(),
+            "Streaming API request failed",
+        )
+        .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -449,6 +484,18 @@ impl ApiBackend {
             Self::Ollama(c) => c.tools_disabled(),
             Self::OpenAiCompat(c) => c.tools_disabled(),
             Self::Anthropic(_) => false,
+        }
+    }
+
+    /// Route retry notices to the UI. Applies to every backend that talks to
+    /// a remote provider.
+    pub fn set_retry_notifier(&mut self, n: retry::RetryNotifier) {
+        match self {
+            Self::Anthropic(c) => c.set_retry_notifier(n),
+            Self::OpenAiCompat(c) => c.set_retry_notifier(n),
+            // Ollama is a local daemon: it does not rate limit, and a
+            // connection failure there means the server is down, not busy.
+            Self::Ollama(_) => {}
         }
     }
 

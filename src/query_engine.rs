@@ -56,8 +56,13 @@ impl QueryEngine {
             ));
         }
 
-        let client = ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host)
+        let mut client = ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host)
             .context("Failed to create API client")?;
+        // Headless: retry notices go to stderr so they never contaminate
+        // stdout, which carries the machine-readable result in --json modes.
+        client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
+            eprintln!("{}", n.message().yellow());
+        }));
         let system_prompt = config.build_system_prompt();
         Ok(Self {
             client,

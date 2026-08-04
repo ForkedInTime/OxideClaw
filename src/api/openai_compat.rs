@@ -529,6 +529,9 @@ pub struct OpenAiCompatClient {
     /// Set to true after the first 400 "does not support tools" error.
     no_tools: Arc<AtomicBool>,
     tools_notice_sent: Arc<AtomicBool>,
+    /// See `ClaudeClient::retry_notifier`. Rate limiting is far more common on
+    /// these providers than on Anthropic — Groq and OpenRouter throttle hard.
+    retry_notifier: Option<super::retry::RetryNotifier>,
 }
 
 impl OpenAiCompatClient {
@@ -595,6 +598,7 @@ impl OpenAiCompatClient {
             .context("Failed to build HTTP client")?;
 
         Ok(Self {
+            retry_notifier: None,
             client,
             base_url,
             api_key,
@@ -608,6 +612,11 @@ impl OpenAiCompatClient {
     #[allow(dead_code)]
     pub fn tools_disabled(&self) -> bool {
         self.no_tools.load(Ordering::Relaxed)
+    }
+
+    /// See `ClaudeClient::set_retry_notifier`.
+    pub fn set_retry_notifier(&mut self, n: super::retry::RetryNotifier) {
+        self.retry_notifier = Some(n);
     }
 
     pub fn take_tools_notice(&self) -> bool {
@@ -658,22 +667,28 @@ impl OpenAiCompatClient {
             }),
         };
 
-        let mut builder = self.client.post(&url).json(&oai_request);
+        // Nothing has reached `on_text` yet, so retrying cannot duplicate
+        // output. `send_with_retry` hands back the final response even on an
+        // error status, which keeps the "does not support tools" sniff below
+        // working exactly as before.
+        let build = |req: &OaiRequest| {
+            let mut builder = self.client.post(&url).json(req);
+            if !self.api_key.is_empty() {
+                builder = builder.bearer_auth(&self.api_key);
+            }
+            // Provider-specific headers (e.g. OpenRouter's HTTP-Referer)
+            for (k, v) in &self.extra_headers {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+            builder
+        };
 
-        // Auth header
-        if !self.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.api_key);
-        }
-
-        // Provider-specific headers (e.g. OpenRouter's HTTP-Referer)
-        for (k, v) in &self.extra_headers {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
-
-        let resp = builder
-            .send()
-            .await
-            .context(format!("{} request failed", self.provider_name))?;
+        let resp = super::retry::send_with_retry(
+            || build(&oai_request),
+            self.retry_notifier.as_ref(),
+            &format!("{} request failed", self.provider_name),
+        )
+        .await?;
 
         let status = resp.status();
         let resp = if !status.is_success() {
@@ -687,17 +702,12 @@ impl OpenAiCompatClient {
                 oai_request.messages = translate_messages(&patched_system, &request.messages);
                 oai_request.tools = vec![];
 
-                let mut retry = self.client.post(&url).json(&oai_request);
-                if !self.api_key.is_empty() {
-                    retry = retry.bearer_auth(&self.api_key);
-                }
-                for (k, v) in &self.extra_headers {
-                    retry = retry.header(k.as_str(), v.as_str());
-                }
-                retry
-                    .send()
-                    .await
-                    .context(format!("{} request failed", self.provider_name))?
+                super::retry::send_with_retry(
+                    || build(&oai_request),
+                    self.retry_notifier.as_ref(),
+                    &format!("{} request failed", self.provider_name),
+                )
+                .await?
             } else {
                 return Err(anyhow!("{} error {status}: {body}", self.provider_name));
             }
