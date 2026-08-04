@@ -3,7 +3,7 @@
 /// Each session is stored as two files in ~/.claude/sessions/:
 ///   <uuid>.jsonl  — one Message per line (full API history)
 ///   <uuid>.meta   — JSON with name, created_at, first_preview
-use crate::api::types::{ContentBlock, Message, Role};
+use crate::api::types::{ContentBlock, Message, Role, ToolResultContent};
 use crate::tui::app::ChatEntry;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -412,6 +412,92 @@ fn human_session_name() -> String {
 }
 
 
+/// Ensure every `tool_use` is answered by a `tool_result`.
+///
+/// The API rejects an assistant turn containing a `tool_use` that no following
+/// user turn answers. History can reach that shape legitimately: a crash during
+/// `append` can tear the *tool_result* line, and `parse_message_lines` then
+/// drops it — recovering the session file but leaving it API-invalid. Nothing
+/// validated history before sending, so the next request 400s, and the one after
+/// that, permanently: the session file is intact and the session is unusable.
+///
+/// Repairing means synthesising the missing results. That is honest — the tool
+/// genuinely produced no recorded result — and it is the only shape the API will
+/// accept short of discarding the assistant turn, which would lose more.
+fn repair_dangling_tool_uses(messages: &mut Vec<Message>) -> usize {
+    let mut repaired = 0usize;
+
+    for i in 0..messages.len() {
+        if messages[i].role != Role::Assistant {
+            continue;
+        }
+        let pending: Vec<String> = messages[i]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+
+        // Which of them the following user turn already answers.
+        let answered: Vec<String> = messages
+            .get(i + 1)
+            .filter(|m| m.role == Role::User)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let missing: Vec<String> = pending
+            .into_iter()
+            .filter(|id| !answered.contains(id))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+
+        let stubs: Vec<ContentBlock> = missing
+            .iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: vec![ToolResultContent::text(
+                    "[no result recorded — the session was interrupted before this tool \
+                     finished]",
+                )],
+                is_error: Some(true),
+            })
+            .collect();
+        repaired += stubs.len();
+
+        match messages.get_mut(i + 1) {
+            // Extend the existing answer turn rather than inserting a second
+            // user message, which would leave two user turns in a row.
+            Some(next) if next.role == Role::User => {
+                next.content.splice(0..0, stubs);
+            }
+            _ => messages.insert(
+                i + 1,
+                Message {
+                    role: Role::User,
+                    content: stubs,
+                },
+            ),
+        }
+    }
+
+    repaired
+}
+
 /// Parse a session's JSONL body.
 ///
 /// Split out from `load_messages` so the torn-tail and mid-file-corruption
@@ -452,6 +538,17 @@ fn parse_message_lines(id: &str, content: &str) -> Result<Vec<Message>> {
                 }
             }
         }
+    // Recovery above can leave an assistant `tool_use` unanswered (its
+    // `tool_result` was the torn line). The API rejects that outright, so repair
+    // before the history is ever sent.
+    let repaired = repair_dangling_tool_uses(&mut out);
+    if repaired > 0 {
+        tracing::warn!(
+            "session {id}: synthesised {repaired} missing tool result(s) for an \
+             interrupted turn"
+        );
+    }
+
     Ok(out)
 }
 
@@ -667,6 +764,102 @@ mod durability_tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("s.jsonl"), "").unwrap();
         assert!(parse(d.path(), "s").unwrap().is_empty());
+    }
+
+    fn tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }],
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: vec![ToolResultContent::text("ok")],
+                is_error: None,
+            }],
+        }
+    }
+
+    fn ids_of_results(m: &Message) -> Vec<String> {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The interaction between torn-line recovery and the API contract: if the
+    /// line that was torn was the tool_result, recovery leaves an assistant
+    /// tool_use unanswered. Nothing validated history before sending, so every
+    /// later request 400s — the file is intact and the session is unusable.
+    #[test]
+    fn dangling_tool_use_is_repaired_so_the_session_stays_usable() {
+        let mut msgs = vec![msg("hello"), tool_use("toolu_1")];
+        let n = repair_dangling_tool_uses(&mut msgs);
+        assert_eq!(n, 1, "the unanswered tool_use must be repaired");
+        assert_eq!(msgs.len(), 3, "a user turn answering it must be appended");
+        assert_eq!(msgs[2].role, Role::User);
+        assert_eq!(ids_of_results(&msgs[2]), vec!["toolu_1".to_string()]);
+    }
+
+    /// Parallel tool calls: only the unanswered ones get stubs, and they join
+    /// the existing user turn rather than creating two user turns in a row.
+    #[test]
+    fn partially_answered_turn_is_completed_in_place() {
+        let mut a = tool_use("toolu_1");
+        a.content.push(ContentBlock::ToolUse {
+            id: "toolu_2".into(),
+            name: "Read".into(),
+            input: serde_json::json!({}),
+        });
+        let mut msgs = vec![a, tool_result("toolu_1")];
+
+        let n = repair_dangling_tool_uses(&mut msgs);
+        assert_eq!(n, 1, "only the missing one is synthesised");
+        assert_eq!(msgs.len(), 2, "must not insert a second consecutive user turn");
+        let mut got = ids_of_results(&msgs[1]);
+        got.sort();
+        assert_eq!(got, vec!["toolu_1".to_string(), "toolu_2".to_string()]);
+    }
+
+    /// A fully-answered history must be left exactly as it is.
+    #[test]
+    fn complete_history_is_not_modified() {
+        let mut msgs = vec![msg("hi"), tool_use("toolu_1"), tool_result("toolu_1")];
+        let before = msgs.len();
+        assert_eq!(repair_dangling_tool_uses(&mut msgs), 0);
+        assert_eq!(msgs.len(), before);
+    }
+
+    #[test]
+    fn history_without_tool_use_is_untouched() {
+        let mut msgs = vec![msg("a"), msg("b")];
+        assert_eq!(repair_dangling_tool_uses(&mut msgs), 0);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    /// The end-to-end shape: a torn tail that removes the tool_result must load
+    /// AND come back API-valid.
+    #[test]
+    fn torn_tool_result_recovers_to_a_sendable_history() {
+        let d = tempfile::tempdir().unwrap();
+        let msgs = vec![msg("go"), tool_use("toolu_9"), tool_result("toolu_9")];
+        write_jsonl(d.path(), "s", &msgs, Some(10));
+
+        let got = parse(d.path(), "s").expect("must load");
+        let last = got.last().expect("history must not be empty");
+        assert_eq!(last.role, Role::User, "must end answering the tool_use");
+        assert_eq!(ids_of_results(last), vec!["toolu_9".to_string()]);
     }
 
     /// Blank lines are padding, not damage.
