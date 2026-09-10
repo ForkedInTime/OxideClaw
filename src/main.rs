@@ -1078,19 +1078,33 @@ async fn self_update() -> Result<()> {
         .bin_name("rustyclaw")
         .current_version(VERSION)
         .target(&target)
-        .identifier(&target) // match artifact name pattern
+        .asset_matcher(move |assets| pick_release_asset(assets, &target))
         .show_download_progress(true)
         .no_confirm(false)
         .build()?
         .update()?;
 
-    if status.updated() {
+    if status.is_updated() {
         println!("Updated to {}!", status.version());
     } else {
         println!("Already on latest version ({VERSION}).");
     }
 
     Ok(())
+}
+
+/// Select the release asset for `target` by **exact** name.
+///
+/// The library's default heuristic is substring matching, and our asset names
+/// overlap: `linux-x64` is a substring of `rustyclaw-linux-x64-musl` and of
+/// every `.sha256` sidecar. Whichever the API listed first would have been
+/// installed as the binary — possibly a checksum text file.
+fn pick_release_asset(
+    assets: &[self_update::update::ReleaseAsset],
+    target: &str,
+) -> Option<self_update::update::ReleaseAsset> {
+    let want = format!("rustyclaw-{target}");
+    assets.iter().find(|a| a.name() == want).cloned()
 }
 
 /// Map the current platform to our GitHub release artifact suffix.
@@ -1377,6 +1391,50 @@ fn find_claude_desktop_config() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod self_update_tests {
+    use self_update::update::ReleaseAsset;
+
+    fn assets(names: &[&str]) -> Vec<ReleaseAsset> {
+        names
+            .iter()
+            .map(|n| ReleaseAsset::new(*n, format!("https://host/{n}")))
+            .collect()
+    }
+
+    /// `linux-x64` is a substring of the musl binary and of both `.sha256`
+    /// sidecars. Whatever the API lists first must not win — only the exact
+    /// name may.
+    #[test]
+    fn picks_exact_asset_even_when_substring_matches_come_first() {
+        let a = assets(&[
+            "manifest.json",
+            "rustyclaw-linux-x64.sha256",
+            "rustyclaw-linux-x64-musl",
+            "rustyclaw-linux-x64-musl.sha256",
+            "rustyclaw-linux-x64",
+        ]);
+        let got = super::pick_release_asset(&a, "linux-x64").expect("asset");
+        assert_eq!(got.name(), "rustyclaw-linux-x64");
+
+        let got = super::pick_release_asset(&a, "linux-x64-musl").expect("asset");
+        assert_eq!(got.name(), "rustyclaw-linux-x64-musl");
+    }
+
+    #[test]
+    fn windows_target_carries_exe_suffix() {
+        let a = assets(&["rustyclaw-windows-x64.exe", "rustyclaw-windows-x64.exe.sha256"]);
+        let got = super::pick_release_asset(&a, "windows-x64.exe").expect("asset");
+        assert_eq!(got.name(), "rustyclaw-windows-x64.exe");
+    }
+
+    #[test]
+    fn missing_asset_is_none_not_a_near_match() {
+        let a = assets(&["rustyclaw-linux-x64.sha256", "rustyclaw-linux-x64-musl"]);
+        assert!(super::pick_release_asset(&a, "linux-x64").is_none());
+    }
 }
 
 #[cfg(test)]
