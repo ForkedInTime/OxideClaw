@@ -56,7 +56,11 @@ impl Tool for WebFetchTool {
 
         // Fetch
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; rustyclaw/0.1)")
+            .user_agent(concat!(
+                "Mozilla/5.0 (compatible; rustyclaw/",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            ))
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
 

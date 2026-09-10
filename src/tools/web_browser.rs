@@ -107,7 +107,11 @@ async fn try_chromium(url: &str, max_chars: usize) -> Option<String> {
 async fn fetch_plain(url: &str, max_chars: usize) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (compatible; RustyClaw/1.0)")
+        .user_agent(concat!(
+            "Mozilla/5.0 (compatible; rustyclaw/",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        ))
         .build()?;
 
     let resp = client.get(url).send().await?.text().await?;
