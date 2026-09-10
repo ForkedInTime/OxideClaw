@@ -799,6 +799,8 @@ mod tests {
         git(&main, &["config", "user.email", "t@t"]).await;
         git(&main, &["config", "user.name", "t"]).await;
         git(&main, &["config", "commit.gpgsign", "false"]).await;
+        // Windows CI: autocrlf would rewrite "user\n" as "user\r\n" on restore.
+        git(&main, &["config", "core.autocrlf", "false"]).await;
         std::fs::write(main.join("a.txt"), "base\n").unwrap();
         git(&main, &["add", "-A"]).await;
         git(&main, &["commit", "-q", "-m", "base"]).await;
@@ -873,6 +875,8 @@ mod tests {
         git(&main, &["config", "user.email", "t@t"]).await;
         git(&main, &["config", "user.name", "t"]).await;
         git(&main, &["config", "commit.gpgsign", "false"]).await;
+        // Windows CI: autocrlf would rewrite "user\n" as "user\r\n" on restore.
+        git(&main, &["config", "core.autocrlf", "false"]).await;
         std::fs::write(main.join("a.txt"), "base\n").unwrap();
         git(&main, &["add", "-A"]).await;
         git(&main, &["commit", "-q", "-m", "base"]).await;
