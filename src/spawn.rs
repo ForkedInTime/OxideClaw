@@ -270,7 +270,7 @@ async fn run_spawned_agent(
     task: &str,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<String> {
-    let tools = default_tools();
+    let tools = default_tools(crate::net_policy::NetPolicy::from_config(&config));
     let mut engine = QueryEngine::new(config, tools)?;
 
     // Race the agent against the cancel signal

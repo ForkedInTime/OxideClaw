@@ -483,7 +483,7 @@ pub trait Tool: Send + Sync {
 pub type DynTool = Arc<dyn Tool>;
 
 /// Build the default tool set.
-pub fn default_tools() -> Vec<DynTool> {
+pub fn default_tools(net: crate::net_policy::NetPolicy) -> Vec<DynTool> {
     vec![
         Arc::new(bash::BashTool),
         Arc::new(file_read::FileReadTool),
@@ -492,7 +492,7 @@ pub fn default_tools() -> Vec<DynTool> {
         Arc::new(multi_edit::MultiEditTool),
         Arc::new(glob::GlobTool),
         Arc::new(grep::GrepTool),
-        Arc::new(web_fetch::WebFetchTool),
+        Arc::new(web_fetch::WebFetchTool { policy: net }),
     ]
 }
 
@@ -507,11 +507,13 @@ pub struct SharedToolState {
 
 /// Build the full tool set. Returns tools + shared state so slash commands can read it.
 pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, SharedToolState) {
-    let mut tools = default_tools();
+    let net = crate::net_policy::NetPolicy::from_config(config);
+    let mut tools = default_tools(net);
 
     tools.push(Arc::new(web_search::WebSearchTool {
         api_key: config.api_key.clone(),
         model: config.model.clone(),
+        auth_is_oauth: config.auth_is_oauth,
     }));
     tools.push(Arc::new(agent::AgentTool {
         config: config.clone(),
@@ -571,7 +573,7 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     // Simple utilities
     tools.push(Arc::new(sleep::SleepTool));
     tools.push(Arc::new(powershell::PowerShellTool));
-    tools.push(Arc::new(web_browser::WebBrowserTool));
+    tools.push(Arc::new(web_browser::WebBrowserTool { policy: net }));
 
     // Browser automation tools (shared session across all browser_* tools AND /browser commands).
     let browser_session_shared = if config.browser_enabled {

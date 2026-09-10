@@ -13,6 +13,7 @@ mod distro;
 mod hooks;
 mod mcp;
 mod memory;
+mod net_policy;
 mod permissions;
 mod query_engine;
 mod rag;
