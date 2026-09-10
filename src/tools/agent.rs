@@ -9,8 +9,32 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
+/// How many `Agent` launches may nest. The session is depth 0; a child it
+/// launches runs at depth 1 and may launch grandchildren (depth 2), which
+/// may not launch further. Before this cap the recursion was unbounded —
+/// every level a full engine billing tokens.
+pub const MAX_AGENT_DEPTH: u8 = 2;
+
 pub struct AgentTool {
     pub config: Config,
+}
+
+impl AgentTool {
+    /// The child engine inherits the executor's permission gate (so its
+    /// Bash/Write/Edit prompt the same human, or fail closed the same way)
+    /// and sits one level deeper in the launch chain.
+    fn build_sub_engine(
+        &self,
+        sub_config: Config,
+        tools: Vec<DynTool>,
+        ctx: &ToolContext,
+    ) -> Result<QueryEngine> {
+        let mut engine = QueryEngine::new(sub_config, tools)?.with_agent_depth(ctx.agent_depth + 1);
+        if let Some(gate) = &ctx.permission_gate {
+            engine = engine.with_permission_gate(gate.clone());
+        }
+        Ok(engine)
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,6 +91,14 @@ impl Tool for AgentTool {
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: AgentInput = serde_json::from_value(input)?;
+
+        if ctx.agent_depth >= MAX_AGENT_DEPTH {
+            return Ok(ToolOutput::error(format!(
+                "Agent launches may nest at most {MAX_AGENT_DEPTH} deep; this agent is already \
+                 at depth {}. Do the work directly instead of delegating further.",
+                ctx.agent_depth
+            )));
+        }
 
         if let Some(desc) = &input.description {
             eprintln!("[Agent: {}]", desc);
@@ -163,7 +195,7 @@ impl Tool for AgentTool {
             });
         }
 
-        let mut sub_engine = QueryEngine::new(sub_config, tools)?;
+        let mut sub_engine = self.build_sub_engine(sub_config, tools, ctx)?;
         sub_engine.query_and_collect(&input.prompt).await
     }
 }
@@ -310,3 +342,113 @@ When asked to convert the user's shell PS1 configuration, follow these steps:
 4. Write the converted statusLine command to the user's settings.json
 
 Only use Read and Edit tools. Do not create new files unless asked.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::{ContentBlock, ToolResultContent};
+    use crate::permissions::PermissionGate;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    fn config() -> Config {
+        Config {
+            model: "ollama:test-model".into(),
+            ..Config::default()
+        }
+    }
+
+    fn tool_text(o: &ToolOutput) -> String {
+        o.content
+            .iter()
+            .map(|c| {
+                let ToolResultContent::Text { text } = c;
+                text.as_str()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn launch_is_refused_at_the_depth_cap() {
+        let tool = AgentTool { config: config() };
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.agent_depth = MAX_AGENT_DEPTH;
+        let out = tool
+            .execute(json!({"prompt": "do a thing"}), &ctx)
+            .await
+            .expect("a refusal is a tool error, not Err");
+        assert!(out.is_error);
+        assert!(tool_text(&out).contains("nest"), "{}", tool_text(&out));
+    }
+
+    struct Probe(Mutex<Option<(u8, bool)>>);
+    #[async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
+            *self.0.lock().unwrap() = Some((ctx.agent_depth, ctx.permission_gate.is_some()));
+            Ok(ToolOutput::success("ok"))
+        }
+    }
+
+    /// The child must run one level deeper and carry the parent's gate.
+    #[tokio::test]
+    async fn child_engine_is_one_level_deeper_and_inherits_the_gate() {
+        let tool = AgentTool { config: config() };
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.agent_depth = 1;
+        ctx.permission_gate = Some(PermissionGate::bypass());
+        let probe = Arc::new(Probe(Mutex::new(None)));
+        let engine = tool
+            .build_sub_engine(config(), vec![probe.clone()], &ctx)
+            .unwrap();
+        let call = vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Probe".into(),
+            input: json!({}),
+        }];
+        engine.execute_tools(&call).await.unwrap();
+        assert_eq!(*probe.0.lock().unwrap(), Some((2, true)));
+    }
+
+    /// With a bypass gate inherited, a sensitive tool in the child runs;
+    /// with the parent's gate absent the child falls back to headless and
+    /// refuses. Proves the inherited gate is the one consulted.
+    #[tokio::test]
+    async fn child_uses_the_inherited_gate_not_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = AgentTool { config: config() };
+        let write = || -> Vec<DynTool> { vec![Arc::new(crate::tools::file_write::FileWriteTool)] };
+        let call = |p: &std::path::Path| {
+            vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Write".into(),
+                input: json!({"file_path": p.to_string_lossy(), "content": "x"}),
+            }]
+        };
+
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.permission_gate = Some(PermissionGate::bypass());
+        let allowed = dir.path().join("allowed.txt");
+        let e = tool.build_sub_engine(config(), write(), &ctx).unwrap();
+        e.execute_tools(&call(&allowed)).await.unwrap();
+        assert!(allowed.exists(), "bypass gate inherited → Write runs");
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let refused = dir.path().join("refused.txt");
+        let e = tool.build_sub_engine(config(), write(), &ctx).unwrap();
+        e.execute_tools(&call(&refused)).await.unwrap();
+        assert!(
+            !refused.exists(),
+            "no gate on the context → headless → refused"
+        );
+    }
+}

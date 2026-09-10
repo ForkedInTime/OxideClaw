@@ -97,6 +97,13 @@ pub struct ToolContext {
     pub live_model: Option<String>,
     pub live_api_key: Option<String>,
     pub live_ollama_host: Option<String>,
+    /// The permission gate of the executor running this tool. A tool that
+    /// launches a nested engine (`Agent`) must hand it on so every
+    /// descendant prompts through the same human — or, headless, fails
+    /// closed the same way.
+    pub permission_gate: Option<crate::permissions::PermissionGate>,
+    /// How many `Agent` launches deep this executor is (0 = the session).
+    pub agent_depth: u8,
 
     /// Middleware chain: pre/post hooks around every tool call.
     /// Default empty = no-op (existing behavior unchanged).
@@ -130,6 +137,8 @@ impl ToolContext {
             live_model: None,
             live_api_key: None,
             live_ollama_host: None,
+            permission_gate: None,
+            agent_depth: 0,
             middlewares: Vec::new(),
         }
     }

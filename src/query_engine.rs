@@ -32,6 +32,11 @@ pub struct QueryEngine {
     middlewares: crate::browser::middleware::MiddlewareChain,
     /// Turn counter.
     turns: u32,
+    /// Every tool call goes through this. Defaults to the headless gate
+    /// (settings/CLI rules apply; anything needing a prompt is refused).
+    gate: crate::permissions::PermissionGate,
+    /// Nesting level for `Agent` launches; published to tools via ToolContext.
+    agent_depth: u8,
 }
 
 impl QueryEngine {
@@ -64,6 +69,7 @@ impl QueryEngine {
             eprintln!("{}", n.message().yellow());
         }));
         let system_prompt = config.build_system_prompt();
+        let gate = crate::permissions::PermissionGate::headless(&config);
         Ok(Self {
             client,
             system_prompt,
@@ -79,7 +85,22 @@ impl QueryEngine {
             read_cache: crate::tools::new_read_cache(),
             middlewares: Vec::new(),
             turns: 0,
+            gate,
+            agent_depth: 0,
         })
+    }
+
+    /// Replace the headless default with the parent executor's gate, so a
+    /// sub-agent's Bash/Write/Edit prompt the same human as the session.
+    pub fn with_permission_gate(mut self, gate: crate::permissions::PermissionGate) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// Record how deep this engine sits in the `Agent` launch chain.
+    pub fn with_agent_depth(mut self, depth: u8) -> Self {
+        self.agent_depth = depth;
+        self
     }
 
     /// Output responses as JSON objects (one per turn).
@@ -362,7 +383,10 @@ impl QueryEngine {
 
     /// Execute all tool_use blocks in the response content.
     /// Returns a vec of tool_result ContentBlocks to send back.
-    async fn execute_tools(&self, content: &[ContentBlock]) -> Result<Vec<ContentBlock>> {
+    pub(crate) async fn execute_tools(
+        &self,
+        content: &[ContentBlock],
+    ) -> Result<Vec<ContentBlock>> {
         let mut ctx = ToolContext::new(self.config.cwd.clone());
         ctx.default_shell = self.config.default_shell.clone();
         ctx.snapshot_dir = self.config.file_snapshot_dir.clone();
@@ -376,6 +400,8 @@ impl QueryEngine {
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
         ctx.middlewares = self.middlewares.clone();
+        ctx.permission_gate = Some(self.gate.clone());
+        ctx.agent_depth = self.agent_depth;
         let mut results = Vec::new();
 
         for block in content {
@@ -451,6 +477,19 @@ impl QueryEngine {
                     }
                 }
                 if middleware_denied {
+                    continue;
+                }
+
+                // ── Permission gate ───────────────────────────────────
+                // Same decision the TUI makes; headless engines fail closed.
+                if let crate::permissions::GateOutcome::Denied(reason) =
+                    self.gate.decide(name, input).await
+                {
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: vec![ToolResultContent::text(reason)],
+                        is_error: Some(true),
+                    });
                     continue;
                 }
 
@@ -754,4 +793,149 @@ fn estimate_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 
     };
     (input_tokens as f64 / 1_000_000.0) * price_in
         + (output_tokens as f64 / 1_000_000.0) * price_out
+}
+
+#[cfg(test)]
+mod permission_wiring_tests {
+    use super::*;
+    use crate::permissions::{
+        PermissionAsker, PermissionDecision, PermissionGate, PermissionState,
+    };
+    use crate::tools::{Tool, ToolContext, ToolOutput};
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    fn engine(dir: &Path, tools: Vec<DynTool>) -> QueryEngine {
+        // Ollama needs no credential, and nothing is contacted until a query runs.
+        let c = Config {
+            model: "ollama:test-model".into(),
+            cwd: dir.to_path_buf(),
+            ..Config::default()
+        };
+        QueryEngine::new(c, tools).unwrap()
+    }
+
+    fn write_call(path: &Path) -> Vec<ContentBlock> {
+        vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Write".into(),
+            input: json!({"file_path": path.to_string_lossy(), "content": "x"}),
+        }]
+    }
+
+    fn result(blocks: &[ContentBlock]) -> (bool, String) {
+        match &blocks[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                let text = content
+                    .iter()
+                    .map(|c| {
+                        let ToolResultContent::Text { text } = c;
+                        text.clone()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                (is_error.unwrap_or(false), text)
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
+
+    struct AlwaysDeny;
+    #[async_trait::async_trait]
+    impl PermissionAsker for AlwaysDeny {
+        async fn ask(&self, _: &str, _: &str) -> Option<PermissionDecision> {
+            Some(PermissionDecision::Deny)
+        }
+    }
+
+    /// The bug this guards: sub-agents and `-p` sessions ran Write/Edit/Bash
+    /// with no check at all.
+    #[tokio::test]
+    async fn default_engine_refuses_a_sensitive_tool_with_no_human_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let e = engine(
+            dir.path(),
+            vec![Arc::new(crate::tools::file_write::FileWriteTool)],
+        );
+        let out = e.execute_tools(&write_call(&marker)).await.unwrap();
+        let (is_error, text) = result(&out);
+        assert!(is_error, "{text}");
+        assert!(text.contains("no interactive session"), "{text}");
+        assert!(!marker.exists(), "the tool must not have run");
+    }
+
+    #[tokio::test]
+    async fn a_human_deny_means_the_tool_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let gate = PermissionGate::new(
+            PermissionState::new(false, &[], &[]),
+            false,
+            Some(Arc::new(AlwaysDeny)),
+        );
+        let e = engine(
+            dir.path(),
+            vec![Arc::new(crate::tools::file_write::FileWriteTool)],
+        )
+        .with_permission_gate(gate);
+        let out = e.execute_tools(&write_call(&marker)).await.unwrap();
+        let (is_error, text) = result(&out);
+        assert!(is_error && text.contains("Permission denied"), "{text}");
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn a_bypass_gate_lets_the_tool_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let e = engine(
+            dir.path(),
+            vec![Arc::new(crate::tools::file_write::FileWriteTool)],
+        )
+        .with_permission_gate(PermissionGate::bypass());
+        let out = e.execute_tools(&write_call(&marker)).await.unwrap();
+        let (is_error, text) = result(&out);
+        assert!(!is_error, "{text}");
+        assert!(marker.exists());
+    }
+
+    /// Records what the executor published to it.
+    struct Probe(Mutex<Option<(u8, bool)>>);
+    #[async_trait::async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
+            *self.0.lock().unwrap() = Some((ctx.agent_depth, ctx.permission_gate.is_some()));
+            Ok(ToolOutput::success("ok"))
+        }
+    }
+
+    /// `Agent` reads these off its context to build the child engine; if
+    /// the executor stopped publishing them, nesting would silently lose
+    /// both the gate and the depth cap.
+    #[tokio::test]
+    async fn tools_see_the_gate_and_depth_of_their_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe(Mutex::new(None)));
+        let e = engine(dir.path(), vec![probe.clone()]).with_agent_depth(2);
+        let call = vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Probe".into(),
+            input: json!({}),
+        }];
+        e.execute_tools(&call).await.unwrap();
+        assert_eq!(*probe.0.lock().unwrap(), Some((2, true)));
+    }
 }
