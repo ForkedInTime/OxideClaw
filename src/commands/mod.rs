@@ -168,6 +168,8 @@ pub enum CommandAction {
     SetOutputStyle(String),
     /// Set the active UI theme ("dark", "light", "solarized")
     SetTheme(String),
+    /// Set the effort level sent as `output_config.effort` ("low" | "medium" | "high" | "max"); `None` clears it
+    SetEffort(Option<String>),
     /// Enable or disable voice input mode
     SetVoiceEnabled(bool),
     /// Enable or disable TTS (XTTS v2 voice output)
@@ -478,7 +480,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         // ── New commands (gap fill) ───────────────────────────────────────
         "commit" => cmd_commit(args, ctx),
         "commit-push-pr" => cmd_commit_push_pr(args, ctx),
-        "effort" => cmd_effort(args, ctx),
+        "effort" => cmd_effort(args),
         "insights" => cmd_insights(ctx),
         "security-review" => cmd_security_review(),
         "ide" => cmd_ide(ctx),
@@ -587,7 +589,48 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
 
 #[cfg(test)]
 mod model_catalogue_tests {
-    use super::{KNOWN_MODELS, resolve_model_alias};
+    use super::{CommandAction, KNOWN_MODELS, cmd_effort, resolve_model_alias};
+
+    /// `/effort high` must set the API effort level, not inject a prompt —
+    /// on Claude 5 the model ignores prose about effort but honours the
+    /// `output_config.effort` parameter.
+    #[test]
+    fn effort_command_sets_the_api_level() {
+        for (arg, want) in [
+            ("low", "low"),
+            ("1", "low"),
+            ("medium", "medium"),
+            ("2", "medium"),
+            ("", "medium"),
+            ("high", "high"),
+            ("3", "high"),
+            ("MAX", "max"),
+            ("4", "max"),
+        ] {
+            match cmd_effort(arg) {
+                CommandAction::SetEffort(Some(level)) => assert_eq!(level, want, "arg {arg:?}"),
+                _ => panic!("arg {arg:?}: expected SetEffort(Some({want}))"),
+            }
+        }
+    }
+
+    #[test]
+    fn effort_off_clears_the_level() {
+        for arg in ["off", "default", "none", "clear"] {
+            assert!(
+                matches!(cmd_effort(arg), CommandAction::SetEffort(None)),
+                "{arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_rejects_unknown_levels_with_usage() {
+        match cmd_effort("ultra") {
+            CommandAction::Message(m) => assert!(m.contains("Usage") && m.contains("max"), "{m}"),
+            _ => panic!("expected usage message"),
+        }
+    }
 
     /// Bare family names mean the current generation (Claude 5 shipped
     /// 2026); the picker and aliases still pointed at 4.6 and a dated Haiku id.

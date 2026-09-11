@@ -633,6 +633,7 @@ mod tests {
             tools: vec![],
             stream: None,
             thinking: None,
+            output_config: None,
             betas: vec![],
             session_id: None,
         }

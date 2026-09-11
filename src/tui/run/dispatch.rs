@@ -573,6 +573,28 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
             app.scroll_to_bottom();
         }
+        CommandAction::SetEffort(level) => {
+            config.effort = level.clone();
+            app.effort = level.clone();
+            let _ = crate::config::Config::save_user_setting(
+                "effort",
+                match &level {
+                    Some(l) => serde_json::Value::String(l.clone()),
+                    None => serde_json::Value::Null,
+                },
+            );
+            let note = match &level {
+                None => "Effort cleared — the API default applies.".to_string(),
+                Some(l) if crate::api::thinking::supports_effort(&config.model) => {
+                    format!("Effort set to '{l}' (sent as output_config.effort).")
+                }
+                Some(l) => format!(
+                    "Effort set to '{l}'. {} has no effort parameter, so it is applied as a prompt nudge.",
+                    config.model
+                ),
+            };
+            app.entries.push(ChatEntry::system(note));
+        }
         CommandAction::SetTheme(name) => {
             config.theme = Some(name.clone());
             app.theme = name.clone();

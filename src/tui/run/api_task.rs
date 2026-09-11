@@ -112,30 +112,40 @@ pub(super) async fn run_api_task(task: ApiTask) {
             last.cache_control = Some(crate::api::types::CacheControl::ephemeral());
         }
 
+        let max_tokens = config.max_tokens_for(&config.model);
+
+        // Effort: a real parameter on models that have one, a prompt nudge elsewhere.
+        let mut system_text = system_prompt.clone();
+        let output_config =
+            match crate::api::thinking::effort_for(&config.model, config.effort.as_deref()) {
+                Some(crate::api::thinking::EffortWire::Param(oc)) => Some(oc),
+                Some(crate::api::thinking::EffortWire::Prompt(nudge)) => {
+                    system_text.push_str("\n\n");
+                    system_text.push_str(&nudge);
+                    None
+                }
+                None => None,
+            };
+
         // Build system content — wrap in blocks for prompt caching if enabled
         let system_content = if config.prompt_cache {
             crate::api::types::SystemContent::Blocks(vec![crate::api::types::SystemBlock {
                 block_type: "text".into(),
-                text: system_prompt.clone(),
+                text: system_text,
                 cache_control: Some(crate::api::types::CacheControl::ephemeral()),
             }])
         } else {
-            crate::api::types::SystemContent::Plain(system_prompt.clone())
+            crate::api::types::SystemContent::Plain(system_text)
         };
 
-        // Extended thinking config
-        let (thinking_cfg, mut betas) = if let Some(budget) = config.thinking_budget_tokens {
-            if !crate::api::is_ollama_model(&config.model) {
-                (
-                    Some(crate::api::types::ThinkingConfig::enabled(budget)),
-                    vec!["interleaved-thinking-2025-05-14".to_string()],
-                )
-            } else {
-                (None, vec![])
-            }
-        } else {
-            (None, vec![])
-        };
+        // Extended thinking: adaptive on Claude 4.6+/5, budget_tokens on older
+        // models, nothing on non-Claude backends (see api::thinking).
+        let thinking_cfg = crate::api::thinking::thinking_for(
+            &config.model,
+            config.thinking_budget_tokens,
+            max_tokens,
+        );
+        let mut betas = crate::api::thinking::thinking_betas(thinking_cfg.as_ref());
         // Append extra betas from CLI --betas flag
         for b in &config.extra_betas {
             if !betas.contains(b) {
@@ -166,12 +176,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
 
         let request = MessagesRequest {
             model: config.model.clone(),
-            max_tokens: config.max_tokens_for(&config.model),
+            max_tokens,
             system: system_content,
             messages: budgeted_messages,
             tools: tool_defs,
             stream: None,
             thinking: thinking_cfg,
+            output_config,
             betas,
             session_id: Some(session_id.to_string()),
         };

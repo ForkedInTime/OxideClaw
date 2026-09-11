@@ -183,6 +183,7 @@ impl QueryEngine {
                 tools: tool_defs,
                 stream: None,
                 thinking: None,
+                output_config: None,
                 betas: self.config.extra_betas.clone(),
                 session_id: self.session_id.clone(),
             };
@@ -587,6 +588,7 @@ impl QueryEngine {
                 tools: tool_defs,
                 stream: None,
                 thinking: None,
+                output_config: None,
                 betas: vec![],
                 session_id: self.session_id.clone(),
             };

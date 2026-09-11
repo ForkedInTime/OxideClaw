@@ -115,30 +115,28 @@ pub fn resolve_model_alias(model: &str) -> String {
     }
 }
 
-pub(super) fn cmd_effort(args: &str, ctx: &CommandContext) -> CommandAction {
-    let level = args.trim().to_lowercase();
-    let _ = ctx;
-    match level.as_str() {
-        "1" | "low" | "quick" => CommandAction::SendPrompt(
-            "For this conversation, keep responses brief and fast. \
-             Prefer quick solutions over thorough analysis. Skip detailed explanations unless asked."
-                .into()
-        ),
-        "2" | "medium" | "normal" | "" => CommandAction::SendPrompt(
-            "Use normal effort for this conversation — balance thoroughness with efficiency."
-                .into()
-        ),
-        "3" | "high" | "thorough" | "max" => CommandAction::SendPrompt(
-            "For this conversation, use maximum effort. Be thorough, check edge cases, \
-             write comprehensive tests, and explain your reasoning in detail."
-                .into()
-        ),
-        _ => CommandAction::Message(format!(
-            "Usage: /effort [1|2|3] or [low|medium|high]\n\n\
-             1 / low    — quick, brief responses\n\
-             2 / medium — balanced (default)\n\
-             3 / high   — thorough, detailed responses\n\n\
-             Got: '{}'", args.trim()
-        )),
-    }
+pub(super) fn cmd_effort(args: &str) -> CommandAction {
+    let level = args.trim().to_ascii_lowercase();
+    let level = match level.as_str() {
+        "1" | "low" | "quick" => "low",
+        "2" | "medium" | "normal" | "" => "medium",
+        "3" | "high" | "thorough" => "high",
+        "4" | "max" | "maximum" => "max",
+        "off" | "default" | "none" | "clear" => return CommandAction::SetEffort(None),
+        _ => {
+            return CommandAction::Message(format!(
+                "Usage: /effort [1|2|3|4] or [low|medium|high|max|off]\n\n\
+                 1 / low    — quick, brief responses\n\
+                 2 / medium — balanced\n\
+                 3 / high   — thorough, detailed responses\n\
+                 4 / max    — deepest reasoning the model offers\n\
+                 off        — clear (API default)\n\n\
+                 Sent as `output_config.effort` on Claude 4.6+ / Claude 5; \
+                 older and non-Claude models get a prompt nudge instead.\n\n\
+                 Got: '{}'",
+                args.trim()
+            ));
+        }
+    };
+    CommandAction::SetEffort(Some(level.to_string()))
 }
