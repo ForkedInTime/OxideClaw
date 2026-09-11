@@ -49,6 +49,14 @@ impl Tool for SkillTool {
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: Input = serde_json::from_value(input)?;
 
+        // The name becomes `<skills dir>/<name>.md`; keep it a bare file stem.
+        if input.skill.is_empty() || input.skill.contains(['/', '\\']) || input.skill.contains("..")
+        {
+            return Ok(ToolOutput::error(
+                "skill must be a bare name (the file stem under .claude/skills), not a path",
+            ));
+        }
+
         let skill_content = find_skill(&ctx.cwd, &input.skill).await?;
 
         // Expand the skill content (strip frontmatter, optionally append args)
@@ -110,4 +118,34 @@ fn strip_frontmatter(content: &str) -> String {
         }
     }
     content.trim_start().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The name became `<skills dir>/<name>.md` unchecked, so `../../x`
+    /// read markdown from anywhere.
+    #[tokio::test]
+    async fn skill_names_with_path_separators_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("secret.md");
+        std::fs::write(&outside, "leaked").unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(cwd.join(".claude/skills")).unwrap();
+        let abs = outside.with_extension("").to_string_lossy().into_owned();
+        for name in ["../../../secret", "..\\..\\..\\secret", abs.as_str(), "a/b"] {
+            let out = SkillTool
+                .execute(json!({"skill": name}), &ToolContext::new(cwd.clone()))
+                .await;
+            let text = match out {
+                Ok(o) => format!("{:?}", o.content),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                !text.contains("leaked"),
+                "{name:?} read outside the skills dir"
+            );
+        }
+    }
 }

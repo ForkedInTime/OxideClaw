@@ -29,7 +29,7 @@ pub enum PermissionDecision {
 /// `PowerShell` executes arbitrary commands exactly like `Bash` and must be
 /// gated the same way. It was previously absent, so on any machine with `pwsh`
 /// installed the model could run shell commands with no approval prompt at all.
-pub const SENSITIVE_TOOLS: &[&str] = &["Bash", "PowerShell", "Write", "Edit"];
+pub const SENSITIVE_TOOLS: &[&str] = &["Bash", "PowerShell", "Write", "Edit", "NotebookEdit"];
 
 /// Session-scoped permission state — shared between tool executor and TUI.
 #[derive(Clone, Default)]
@@ -346,6 +346,16 @@ fn truncate(s: &str, max: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// NotebookEdit rewrites files exactly like Edit does; it must prompt the same way.
+    #[test]
+    fn notebook_edit_is_a_sensitive_tool() {
+        let state = super::PermissionState::new(false, &[], &[]);
+        let input = serde_json::json!({ "notebook_path": "a.ipynb", "edit_mode": "delete" });
+        assert!(matches!(
+            state.check_with_input("NotebookEdit", Some(&input)),
+            super::CheckResult::Ask
+        ));
+    }
     use super::*;
 
     fn state() -> PermissionState {
