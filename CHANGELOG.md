@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **crates.io:** `cargo install oxideclaw` (published 2026-09-11).
+
 - **BENCHMARKS.md** with `scripts/bench.py`: reproducible cold-start,
   executable-size, and peak-RSS numbers against whatever agents are on
   `PATH` (measured: Claude Code, Codex, Gemini CLI, Goose).
