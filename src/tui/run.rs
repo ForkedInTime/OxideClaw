@@ -2658,10 +2658,6 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 Some(Overlay::with_items("voices", lines.join("\n"), ids));
                         }
                     }
-                    CommandAction::PreviewVoiceModel(path) => {
-                        // Direct set without picker (future use)
-                        app.pending_voice_model = Some(path);
-                    }
                     CommandAction::SetSandboxEnabled { enabled, mode } => {
                         config.sandbox_enabled = enabled;
                         if enabled && !mode.is_empty() {
@@ -3004,17 +3000,6 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             }
                         }
                     },
-                    CommandAction::PersistModel => {
-                        let _ = crate::config::Config::save_user_setting(
-                            "model",
-                            serde_json::Value::String(config.model.clone()),
-                        );
-                        app.entries.push(ChatEntry::system(format!(
-                            "Model '{}' saved to settings.json.",
-                            config.model
-                        )));
-                        app.scroll_to_bottom();
-                    }
                     CommandAction::PluginInstall(spec) => {
                         app.entries.push(ChatEntry::system(format!(
                             "Installing plugin: {} …",
@@ -3718,11 +3703,6 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     .push(ChatEntry::system(format!("Checkpoint task error: {e}")));
                             }
                         }
-                        app.scroll_to_bottom();
-                    }
-                    CommandAction::ShowCostDashboard => {
-                        let text = app.cost_tracker.summary();
-                        app.entries.push(ChatEntry::system(text));
                         app.scroll_to_bottom();
                     }
                     CommandAction::SpawnAgent(task) => {

@@ -997,7 +997,7 @@ impl Config {
             serde_json::json!({})
         };
         json["bannerOrgDisplay"] = serde_json::Value::String(value.to_string());
-        std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+        write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
         Ok(())
     }
 
@@ -1062,7 +1062,7 @@ impl Config {
             serde_json::json!({})
         };
         json[key] = value;
-        std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+        write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
         Ok(())
     }
 
@@ -1685,5 +1685,59 @@ mod instruction_file_symlink_tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "project rules").unwrap();
         assert!(Config::load_claude_md(tmp.path()).contains("project rules"));
+    }
+}
+
+/// Write a settings/config JSON file atomically (sibling temp file + rename)
+/// so a crash mid-write never leaves the user's settings truncated.
+/// Creates the parent directory if needed.
+pub fn write_json_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod atomic_settings_write_tests {
+    use super::write_json_atomic;
+
+    /// settings.json is the user's permission and trust store; a crash
+    /// mid-write must not leave it truncated, and no temp file may linger.
+    #[test]
+    fn writes_the_content_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"old\": true}").unwrap();
+        write_json_atomic(&path, "{\"new\": true}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "settings.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn creates_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep").join("settings.json");
+        write_json_atomic(&path, "{}").unwrap();
+        assert!(path.exists());
     }
 }

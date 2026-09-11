@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes only on an incompatible wire change; hosts should gate on it
   rather than on the crate version.
 
+### Changed
+
+- **Default model is now `claude-sonnet-5`** (was `claude-sonnet-4-6`): the
+  current generation, and cheaper per token. `/model` aliases follow suit:
+  `opus` → `claude-opus-5`, `sonnet` → `claude-sonnet-5`, `haiku` →
+  `claude-haiku-4-5`, new `fable` → `claude-fable-5-1`; the 4.6 ids remain
+  available by name. The `/model` picker and the smart router's defaults
+  list the current generation. Nothing changes for users who set a model
+  explicitly in settings or on the command line.
+- Settings writes (`/trust`, `/config set`, MCP server registration, banner
+  label) are atomic: a crash mid-write cannot truncate `settings.json`.
+- Three slash-command actions that nothing could trigger (`PersistModel`,
+  `PreviewVoiceModel`, `ShowCostDashboard`) were removed along with their
+  dead handlers; `/model`, `/voice` and `/cost` are unaffected.
+
 ### Security
 
 - **The browser agent's form-field protections were never wired.** The
