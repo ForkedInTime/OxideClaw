@@ -49,6 +49,11 @@ git clone https://github.com/ForkedInTime/OxideClaw && cd OxideClaw/contrib/aur 
 brew install ForkedInTime/oxideclaw/oxideclaw
 ```
 
+**Cargo (builds from source, any platform with Rust 1.86+):**
+```bash
+cargo install oxideclaw
+```
+
 <details>
 <summary>Other install methods</summary>
 
