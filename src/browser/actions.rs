@@ -37,12 +37,29 @@ fn validate_navigation_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Everything checked before `Page.navigate` is sent: the scheme allowlist
+/// plus the always-denied address tier (link-local / cloud metadata). The
+/// user's browser may reach loopback and private networks — testing a local
+/// dev server is the primary use of `/browse` — so this uses
+/// `NetPolicy::LOCAL_OK`, not the strict fetch policy.
+pub async fn preflight_navigation_url(url: &str) -> Result<()> {
+    validate_navigation_url(url)?;
+    let trimmed = url.trim();
+    if trimmed.to_ascii_lowercase().starts_with("about:") {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|e| anyhow::anyhow!("navigation URL '{url}' is invalid: {e}"))?;
+    crate::net_policy::NetPolicy::LOCAL_OK.resolve(&parsed).await?;
+    Ok(())
+}
+
 /// Navigate to a URL. Returns (title, status). Does NOT mutate session state —
 /// the caller is responsible for updating `current_url` / `current_title`
 /// after this returns, so the session lock can be released while we wait on
 /// the page load event (bounded by `timeout_ms`).
 pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<(String, u16)> {
-    validate_navigation_url(url)?;
+    preflight_navigation_url(url).await?;
     // Subscribe BEFORE navigating so we don't miss Page.loadEventFired on fast loads.
     let mut events = client.subscribe();
 
@@ -292,5 +309,31 @@ mod tests {
         assert!(validate_navigation_url("   ").is_err());
         assert!(validate_navigation_url("/foo/bar").is_err());
         assert!(validate_navigation_url("example.com").is_err());
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::preflight_navigation_url;
+
+    #[tokio::test]
+    async fn metadata_service_is_refused() {
+        let err = preflight_navigation_url("http://169.254.169.254/latest/meta-data/")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("169.254.169.254"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn local_dev_server_is_allowed() {
+        preflight_navigation_url("http://localhost:3000/").await.unwrap();
+        preflight_navigation_url("http://127.0.0.1:8080/api").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_http_schemes_are_still_refused() {
+        assert!(preflight_navigation_url("file:///etc/passwd").await.is_err());
+        assert!(preflight_navigation_url("javascript:alert(1)").await.is_err());
+        assert!(preflight_navigation_url("about:blank").await.is_ok());
     }
 }

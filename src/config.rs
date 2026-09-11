@@ -320,6 +320,11 @@ pub struct Config {
     /// Path to the TTS voice model file or clone sample.
     pub tts_voice_model: Option<String>,
 
+    /// Let the unprompted fetch tools (WebFetch, WebBrowser) reach loopback
+    /// and private-network addresses. Off by default; link-local / cloud
+    /// metadata is refused regardless. See `net_policy`.
+    pub allow_private_network_fetch: bool,
+
     /// Whether browser automation is enabled.
     pub browser_enabled: bool,
     /// Run browser in headless mode (default: true).
@@ -453,6 +458,7 @@ impl Default for Config {
             voice_api_url: None,
             tts_enabled: false,
             tts_voice_model: None,
+            allow_private_network_fetch: false,
             browser_enabled: true,
             browser_headless: true,
             browser_chrome_path: None,
@@ -543,6 +549,7 @@ impl Config {
         cfg.include_co_authored_by = settings.include_co_authored_by.unwrap_or(true);
         cfg.theme = settings.theme;
         cfg.sandbox_enabled = settings.sandbox_enabled.unwrap_or(false);
+        cfg.allow_private_network_fetch = settings.allow_private_network_fetch.unwrap_or(false);
         if let Some(mode) = settings.sandbox_mode {
             cfg.sandbox_mode = mode;
         }
