@@ -168,6 +168,10 @@ pub struct Settings {
     #[serde(rename = "sandboxEnabled")]
     pub sandbox_enabled: Option<bool>,
 
+    /// Let WebFetch / WebBrowser reach loopback and private networks.
+    #[serde(rename = "allowPrivateNetworkFetch")]
+    pub allow_private_network_fetch: Option<bool>,
+
     /// Active sandbox mode ("strict", "bwrap", "firejail").
     #[serde(rename = "sandboxMode")]
     pub sandbox_mode: Option<String>,
@@ -477,6 +481,9 @@ impl Settings {
             output_style: other.output_style.or(self.output_style),
             theme: other.theme.or(self.theme),
             sandbox_enabled: other.sandbox_enabled.or(self.sandbox_enabled),
+            allow_private_network_fetch: other
+                .allow_private_network_fetch
+                .or(self.allow_private_network_fetch),
             sandbox_mode: other.sandbox_mode.or(self.sandbox_mode),
             voice_enabled: other.voice_enabled.or(self.voice_enabled),
             voice_api_url: other.voice_api_url.or(self.voice_api_url),

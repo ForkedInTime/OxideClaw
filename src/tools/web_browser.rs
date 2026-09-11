@@ -2,11 +2,15 @@
 /// Fetches a URL using headless Chromium (if available) or falls back to reqwest.
 /// Returns rendered DOM text content, stripped of scripts and styles.
 use super::{Tool, ToolContext, ToolOutput, async_trait};
+use crate::net_policy::NetPolicy;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 
-pub struct WebBrowserTool;
+pub struct WebBrowserTool {
+    /// Which destinations this tool may reach. See `net_policy`.
+    pub policy: NetPolicy,
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -19,6 +23,10 @@ struct Input {
 fn default_max_chars() -> usize {
     50_000
 }
+
+/// Raw response cap for the plain-HTTP fallback.
+const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[async_trait]
 impl Tool for WebBrowserTool {
@@ -56,13 +64,25 @@ impl Tool for WebBrowserTool {
         let input: Input = serde_json::from_value(input)?;
         let max_chars = input.max_chars;
 
-        // Try headless Chromium first
-        if let Some(text) = try_chromium(&input.url, max_chars).await {
+        // Parse + policy check *before* anything touches the URL: chromium
+        // would print `file:///etc/passwd` on request, and a flag-shaped
+        // string would be parsed as a switch.
+        let url = match url::Url::parse(&input.url) {
+            Ok(u) => u,
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid URL: {e}"))),
+        };
+        if let Err(e) = self.policy.resolve(&url).await {
+            return Ok(ToolOutput::error(format!("WebBrowser refused: {e}")));
+        }
+
+        // Try headless Chromium first. Residual: chromium follows redirects
+        // itself, so only the initial URL is policy-checked on this path.
+        if let Some(text) = try_chromium(url.as_str(), max_chars).await {
             return Ok(ToolOutput::success(text));
         }
 
-        // Fallback: plain reqwest fetch
-        match fetch_plain(&input.url, max_chars).await {
+        // Fallback: guarded plain fetch (every hop checked, body capped).
+        match fetch_plain(url.as_str(), &self.policy, max_chars).await {
             Ok(text) => Ok(ToolOutput::success(text)),
             Err(e) => Ok(ToolOutput::error(format!("WebBrowser fetch failed: {e}"))),
         }
@@ -85,6 +105,9 @@ async fn try_chromium(url: &str, max_chars: usize) -> Option<String> {
             Duration::from_secs(20),
             Command::new(exe)
                 .args(["--headless", "--disable-gpu", "--dump-dom", url])
+                // A timeout drops this future; without this the browser
+                // would outlive the tool call as an orphan.
+                .kill_on_drop(true)
                 .output(),
         )
         .await;
@@ -104,18 +127,15 @@ async fn try_chromium(url: &str, max_chars: usize) -> Option<String> {
 }
 
 /// Plain HTTP fetch as fallback.
-async fn fetch_plain(url: &str, max_chars: usize) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!(
-            "Mozilla/5.0 (compatible; rustyclaw/",
-            env!("CARGO_PKG_VERSION"),
-            ")"
-        ))
-        .build()?;
-
-    let resp = client.get(url).send().await?.text().await?;
-    Ok(strip_html(&resp, max_chars))
+async fn fetch_plain(url: &str, policy: &NetPolicy, max_chars: usize) -> Result<String> {
+    let fetched = crate::net_policy::fetch(url, policy, MAX_RESPONSE_BYTES, FETCH_TIMEOUT).await?;
+    if !fetched.status.is_success() {
+        anyhow::bail!("HTTP {}", fetched.status);
+    }
+    Ok(strip_html(
+        &String::from_utf8_lossy(&fetched.body),
+        max_chars,
+    ))
 }
 
 /// Very lightweight HTML → plain-text extractor.
@@ -127,12 +147,7 @@ fn strip_html(html: &str, max_chars: usize) -> String {
     let mut tag_buf = String::new();
     let mut prev_space = false;
 
-    let chars: Vec<char> = html.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-
+    for c in html.chars() {
         if in_tag {
             tag_buf.push(c);
             if c == '>' {
@@ -179,7 +194,6 @@ fn strip_html(html: &str, max_chars: usize) -> String {
             out.push_str("\n[content truncated]");
             break;
         }
-        i += 1;
     }
 
     // Decode common HTML entities
@@ -189,4 +203,93 @@ fn strip_html(html: &str, max_chars: usize) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::ToolResultContent;
+    use crate::net_policy::test_support::{ok_with, scripted_server};
+    use std::sync::atomic::Ordering;
+
+    async fn run(policy: NetPolicy, url: &str) -> ToolOutput {
+        let tool = WebBrowserTool { policy };
+        let ctx = ToolContext::new(std::env::temp_dir());
+        tool.execute(json!({"url": url}), &ctx)
+            .await
+            .expect("refusals are tool errors, not Err")
+    }
+
+    fn text(o: &ToolOutput) -> String {
+        o.content
+            .iter()
+            .map(|c| match c {
+                ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect()
+    }
+
+    /// `chromium --dump-dom file:///etc/passwd` would happily print the
+    /// file. The URL must be refused before any process is spawned.
+    #[tokio::test]
+    async fn file_url_is_refused() {
+        let out = run(NetPolicy::LOCAL_OK, "file:///etc/passwd").await;
+        assert!(out.is_error);
+        assert!(text(&out).contains("http/https"), "{}", text(&out));
+    }
+
+    /// A flag-shaped "URL" would be parsed by chromium as a switch.
+    #[tokio::test]
+    async fn flag_shaped_url_is_refused() {
+        let out = run(NetPolicy::LOCAL_OK, "--remote-debugging-port=9222").await;
+        assert!(out.is_error);
+        assert!(
+            text(&out).to_lowercase().contains("invalid url"),
+            "{}",
+            text(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_policy_refuses_loopback_without_connecting() {
+        let (base, hits) = scripted_server(vec![ok_with("text/html", "<p>secret</p>")]).await;
+        let out = run(NetPolicy::STRICT, &base).await;
+        assert!(out.is_error);
+        assert!(text(&out).contains("private"), "{}", text(&out));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The plain-HTTP fallback goes through the same guarded fetch.
+    #[tokio::test]
+    async fn fallback_fetch_is_capped() {
+        let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\
+                    content-length: 99999999\r\nconnection: close\r\n\r\nx";
+        let (base, _) = scripted_server(vec![resp.to_string()]).await;
+        let err = fetch_plain(&base, &NetPolicy::LOCAL_OK, 1000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fallback_fetch_strips_html() {
+        let (base, _) = scripted_server(vec![ok_with(
+            "text/html",
+            "<h1>Hi</h1><script>x()</script>",
+        )])
+        .await;
+        let got = fetch_plain(&base, &NetPolicy::LOCAL_OK, 1000)
+            .await
+            .unwrap();
+        assert!(got.contains("Hi"), "{got}");
+        assert!(!got.contains("x()"), "{got}");
+    }
+
+    #[test]
+    fn strip_html_does_not_scan_past_the_cap() {
+        let html = format!("<p>{}</p>", "a".repeat(100_000));
+        let out = strip_html(&html, 10);
+        assert!(out.len() < 100, "{}", out.len());
+        assert!(out.contains("[content truncated]"));
+    }
 }

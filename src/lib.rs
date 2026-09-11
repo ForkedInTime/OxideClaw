@@ -17,6 +17,7 @@ pub mod distro;
 pub mod hooks;
 pub mod mcp;
 pub mod memory;
+pub mod net_policy;
 pub mod permissions;
 pub mod query_engine;
 pub mod rag;

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **WebFetch / WebBrowser could reach the cloud metadata service, loopback
+  and private networks** with only a scheme check, and followed redirects
+  unchecked. Destinations are now resolved and classified before any
+  connection (link-local always refused; loopback/private refused unless
+  `allowPrivateNetworkFetch: true`), the connection is pinned to the checked
+  addresses, and every redirect hop is re-checked. Responses are refused past
+  5 MiB instead of being buffered whole. `browser_navigate` refuses
+  link-local/metadata addresses too.
+- **WebBrowser passed the model's URL straight to `chromium --dump-dom`**, so
+  `file:///etc/passwd` printed the file and a flag-shaped string became a
+  Chromium switch. Validated before spawn; the browser is killed on timeout
+  instead of orphaned.
+
+### Fixed
+
+- **WebSearch returned 401 for every OAuth user** — it always sent
+  `x-api-key`, but the credential chain puts a bearer token there. It also
+  had no request timeout.
+
 ## [0.3.0] - 2026-09-10
 
 This release contains every fix from the enterprise security audit (PRs #11–#20).

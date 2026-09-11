@@ -170,7 +170,7 @@ impl Tool for AgentTool {
 
 /// Build tools for a sub-agent (same as default but includes AgentTool recursively).
 fn default_tools_with_config(config: &Config) -> Vec<DynTool> {
-    let mut tools = default_tools();
+    let mut tools = default_tools(crate::net_policy::NetPolicy::from_config(config));
     tools.push(Arc::new(AgentTool {
         config: config.clone(),
     }));
