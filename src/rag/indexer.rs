@@ -420,6 +420,9 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
 
     // Batch insert with a transaction for speed
     let tx = db.conn.unchecked_transaction()?;
+    // Every indexable file we saw this pass; anything in the index that is
+    // not here was deleted or renamed and gets pruned below.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in walker.filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
@@ -453,6 +456,7 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
+        seen.insert(rel_path.clone());
 
         // Check mtime for incremental indexing
         let mtime: i64 = path
@@ -525,6 +529,18 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
         debug!("Indexed {rel_path}: {} chunks", chunks.len());
     }
 
+    // Prune chunks whose file is gone. Files that became too large or
+    // unreadable this pass were still *seen*, so their old chunks stay.
+    let indexed: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT DISTINCT file_path FROM code_chunks")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for stale in indexed.into_iter().filter(|p| !seen.contains(p)) {
+        tx.execute("DELETE FROM code_chunks WHERE file_path = ?1", [&stale])?;
+        debug!("Pruned {stale}: file no longer present");
+    }
+
     tx.commit()?;
 
     Ok(IndexResult {
@@ -550,6 +566,23 @@ mod tests {
             std::fs::write(&full, content).unwrap();
         }
         tmp
+    }
+
+    /// Chunks for a file that no longer exists must not survive an
+    /// incremental re-index — otherwise search keeps returning code that is
+    /// gone until the user thinks to `--force`.
+    #[test]
+    fn deleted_files_are_pruned_on_incremental_reindex() {
+        let tmp = setup_project(&[("keep.rs", "fn keep() {}"), ("gone.rs", "fn gone() {}")]);
+        let db = RagDb::open(tmp.path()).unwrap();
+        index_project(&db, tmp.path(), false).unwrap();
+        assert_eq!(db.file_count().unwrap(), 2);
+
+        std::fs::remove_file(tmp.path().join("gone.rs")).unwrap();
+        index_project(&db, tmp.path(), false).unwrap();
+        assert_eq!(db.file_count().unwrap(), 1, "gone.rs chunks must be pruned");
+        let hits = super::super::search::search(&db, "gone", 10).unwrap();
+        assert!(hits.is_empty(), "search still returns the deleted file");
     }
 
     #[test]
