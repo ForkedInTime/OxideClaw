@@ -152,6 +152,16 @@ impl ApprovalGate {
         }
     }
 
+    /// Price-looking strings in page text, for `GateContext::visible_prices`.
+    /// Capped so a catalogue page does not produce thousands of reasons.
+    pub fn visible_prices_in(&self, text: &str) -> Vec<String> {
+        self.price_re
+            .find_iter(text)
+            .take(20)
+            .map(|m| m.as_str().to_string())
+            .collect()
+    }
+
     /// Evaluate a tool call context. Returns `Allow` or `RequireConfirmation`.
     pub fn check(&self, c: &GateContext) -> GateVerdict {
         // 1. Read-only tools always pass.
@@ -328,16 +338,19 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         // `target_text` is what we match against `button_patterns`. For @eN
         // refs, resolve to the element's accessible name via the browser
         // session's ref-name map; otherwise fall back to the raw identifier.
-        let target_text = if ref_or_selector.starts_with('@')
-            && let Some(session_arc) = &self.browser_session
-        {
+        let (target_text, visible_prices) = if let Some(session_arc) = &self.browser_session {
             let session = session_arc.lock().await;
-            session
-                .resolve_ref_name(&ref_or_selector)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| ref_or_selector.clone())
+            let name = if ref_or_selector.starts_with('@') {
+                session
+                    .resolve_ref_name(&ref_or_selector)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| ref_or_selector.clone())
+            } else {
+                ref_or_selector.clone()
+            };
+            (name, self.gate.visible_prices_in(&session.last_page_text))
         } else {
-            ref_or_selector.clone()
+            (ref_or_selector.clone(), Vec::new())
         };
 
         let gate_ctx = GateContext {
@@ -345,7 +358,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             url: url.clone(),
             target_text: target_text.clone(),
             form_field_signals: form_signals_for(tool_name, &target_text),
-            visible_prices: Vec::new(),
+            visible_prices,
         };
 
         let is_submit_key = tool_name == "browser_press_key"
@@ -568,5 +581,58 @@ mod wiring_tests {
         ));
         drop(mw);
         assert_eq!(host.await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod price_signal_tests {
+    use super::*;
+    use crate::browser::browse_loop::BrowsePolicy;
+    use serde_json::json;
+    use std::sync::atomic::AtomicU32;
+
+    /// A price on screen is the gate's fifth signal and was never fed in
+    /// production. With the last page text on the session, a click on a
+    /// checkout page showing "$49.99" prompts even without a matching
+    /// button name.
+    #[tokio::test]
+    async fn a_visible_price_gates_a_click() {
+        let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+        let session = Arc::new(tokio::sync::Mutex::new(
+            crate::browser::BrowserSession::default(),
+        ));
+        {
+            let mut s = session.lock().await;
+            s.last_page_text = "Your total today: $49.99 [Continue]".into();
+            s.set_refs_with_names(
+                std::collections::HashMap::from([("@e1".to_string(), 1i64)]),
+                std::collections::HashMap::from([("@e1".to_string(), "Continue".to_string())]),
+            );
+        }
+        let mw = ApprovalGateMiddleware::new(
+            ApprovalGate::default(),
+            BrowsePolicy::Pattern,
+            Arc::new(tokio::sync::Mutex::new("https://shop.example/cart".into())),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            false,
+        )
+        .with_browser_session(Some(session));
+        let host = tokio::spawn(async move {
+            let mut n = 0;
+            while let Some(p) = rx.recv().await {
+                n += 1;
+                let _ = p.reply.send(true);
+            }
+            n
+        });
+        mw.before_tool("browser_click", &json!({"ref": "@e1"}))
+            .await;
+        drop(mw);
+        assert_eq!(
+            host.await.unwrap(),
+            1,
+            "the visible price must have prompted"
+        );
     }
 }

@@ -248,7 +248,9 @@ async fn plugin_install_task(spec: String, tx: tokio::sync::mpsc::UnboundedSende
     };
 
     let result: anyhow::Result<String> = async {
-        let (pm, pm_runner) = detect_package_manager();
+        let (pm, pm_runner) = tokio::task::spawn_blocking(detect_package_manager)
+            .await
+            .unwrap_or(("npm", "npx"));
 
         if is_marketplace {
             // ── Marketplace install: git clone + install deps locally ─────────
@@ -535,6 +537,19 @@ async fn run_loop(
         app.entries.push(ChatEntry::system(
             "Deep link received — the prompt is in the input box. Review it, then press Enter to send.",
         ));
+    }
+    // Spawn worktrees a crash left behind (a clean exit removes running
+    // ones; a crash has no exit path).
+    let leftovers = crate::spawn::leftover_spawn_worktrees(&config.cwd).await;
+    if !leftovers.is_empty() {
+        let list: Vec<String> = leftovers
+            .iter()
+            .map(|(b, p)| format!("  {b}  →  {}", p.display()))
+            .collect();
+        app.entries.push(ChatEntry::system(format!(
+            "Leftover spawn worktrees from a previous session:\n{}\nMerge with `git merge <branch>` or remove with `git worktree remove <path>`.",
+            list.join("\n")
+        )));
     }
     if !config.untrusted_project_config.is_empty() {
         app.entries.push(ChatEntry::system(format!(

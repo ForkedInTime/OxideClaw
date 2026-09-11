@@ -29,6 +29,22 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Headless SDK server — reads NDJSON requests, writes NDJSON responses.
 pub struct SdkServer;
 
+/// A client-supplied working directory must exist; otherwise every tool in
+/// the session fails one call at a time with a confusing path error.
+fn validate_session_cwd(dir: Option<String>) -> Result<Option<PathBuf>, String> {
+    match dir {
+        None => Ok(None),
+        Some(d) => {
+            let p = PathBuf::from(&d);
+            if p.is_dir() {
+                Ok(Some(p))
+            } else {
+                Err(format!("cwd {d:?} is not a directory"))
+            }
+        }
+    }
+}
+
 impl SdkServer {
     /// Run the server loop until the transport closes (EOF on stdin).
     pub async fn run(config: Config, mut transport: impl Transport) -> Result<()> {
@@ -122,8 +138,19 @@ impl SdkServer {
             } => {
                 // Clone and override config
                 let mut cfg = config.clone();
-                if let Some(dir) = cwd {
-                    cfg.cwd = PathBuf::from(dir);
+                match validate_session_cwd(cwd) {
+                    Ok(Some(dir)) => cfg.cwd = dir,
+                    Ok(None) => {}
+                    Err(message) => {
+                        transport
+                            .send_response(SdkResponse::Error {
+                                id,
+                                code: "invalid_cwd".into(),
+                                message,
+                            })
+                            .await?;
+                        return Ok(());
+                    }
                 }
                 if let Some(m) = model {
                     cfg.model = m;
@@ -529,4 +556,21 @@ fn rag_search(cwd: &std::path::Path, query: &str, limit: usize) -> Result<Vec<Ra
             snippet: r.content,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::validate_session_cwd;
+
+    #[test]
+    fn a_missing_directory_is_rejected_up_front() {
+        assert!(validate_session_cwd(None).unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            validate_session_cwd(Some(dir.path().to_string_lossy().into_owned())).unwrap(),
+            Some(dir.path().to_path_buf())
+        );
+        let err = validate_session_cwd(Some("/definitely/not/here".into())).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+    }
 }

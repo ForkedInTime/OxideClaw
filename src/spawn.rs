@@ -342,6 +342,38 @@ async fn run_spawned_agent(
 
 // ── Agent management helpers ─────────────────────────────────────────────────
 
+/// Spawn worktrees still on disk with no registry to track them — what a
+/// crash (no shutdown path) leaves behind. `(branch, path)` pairs.
+pub async fn leftover_spawn_worktrees(main_cwd: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let Ok(out) = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_cwd)
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found = Vec::new();
+    for block in text.split("\n\n") {
+        let mut path: Option<PathBuf> = None;
+        let mut branch: Option<String> = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b.to_string());
+            }
+        }
+        if let (Some(p), Some(b)) = (path, branch)
+            && b.starts_with("spawn-")
+        {
+            found.push((b, p));
+        }
+    }
+    found
+}
+
 /// TUI shutdown: cancel every running agent and remove its worktree and
 /// branch — an in-flight agent's half-done tree is worthless once the
 /// registry that tracks it is gone. Completed (unmerged) work is kept and
@@ -855,6 +887,57 @@ mod tests {
         );
         assert!(msg.contains("spawn-done"), "{msg}");
         assert!(msg.contains(wt_done.to_str().unwrap()), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn leftover_spawn_worktrees_are_listed_by_branch_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("repo");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]).await;
+        git(&main, &["config", "user.email", "t@t"]).await;
+        git(&main, &["config", "user.name", "t"]).await;
+        git(&main, &["config", "commit.gpgsign", "false"]).await;
+        git(&main, &["config", "core.autocrlf", "false"]).await;
+        std::fs::write(main.join("a.txt"), "base\n").unwrap();
+        git(&main, &["add", "-A"]).await;
+        git(&main, &["commit", "-q", "-m", "base"]).await;
+        let wt = tmp.path().join("repo-spawn-left");
+        let other = tmp.path().join("repo-feature");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "spawn-left-ab12",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .await;
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                other.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .await;
+
+        let left = leftover_spawn_worktrees(&main).await;
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].0, "spawn-left-ab12");
+        assert_eq!(
+            left[0].1.canonicalize().unwrap(),
+            wt.canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]
