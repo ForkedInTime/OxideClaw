@@ -269,10 +269,7 @@ pub enum SdkResponse {
     },
 
     #[serde(rename = "browse/started")]
-    BrowseStarted {
-        id: String,
-        session_id: String,
-    },
+    BrowseStarted { id: String, session_id: String },
 
     #[serde(rename = "error")]
     Error {

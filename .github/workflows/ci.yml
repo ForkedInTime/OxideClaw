@@ -29,6 +29,19 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # The tree was formatted in one isolated commit (2026-09-11). This keeps
+      # it that way, so a PR diff is never buried under someone's editor
+      # re-wrapping unrelated files.
+      - name: rustfmt (check only)
+        run: cargo fmt --all -- --check
+
   readme-lint:
     runs-on: ubuntu-latest
     steps:

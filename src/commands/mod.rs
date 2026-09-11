@@ -377,11 +377,19 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "init" => cmd_init(ctx),
         "watch" => {
             let a = args.trim();
-            CommandAction::Watch(if a.is_empty() { None } else { Some(a.to_string()) })
+            CommandAction::Watch(if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            })
         }
         "diff" => {
             let a = args.trim();
-            CommandAction::ShowDiff(if a.is_empty() { None } else { Some(a.to_string()) })
+            CommandAction::ShowDiff(if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            })
         }
         "permissions" => cmd_permissions(ctx),
         "skills" => cmd_skills(ctx),
@@ -575,7 +583,11 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
         }
     }
     let goal = tokens.join(" ").trim().to_string();
-    CommandAction::Browse { goal, policy, max_steps }
+    CommandAction::Browse {
+        goal,
+        policy,
+        max_steps,
+    }
 }
 
 // ── Individual commands ───────────────────────────────────────────────────────
@@ -1112,7 +1124,10 @@ fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
         } else {
             crate::auth::Credential::ApiKey(ctx.config.api_key.clone())
         };
-        checks.push(format!("✓ Anthropic credential: {} via {src}", cred.redacted()));
+        checks.push(format!(
+            "✓ Anthropic credential: {} via {src}",
+            cred.redacted()
+        ));
         // Surface the "stale env var shadows your profile" trap, which is
         // otherwise invisible and sends requests to the wrong org/workspace.
         for w in &ctx.config.auth_warnings {
@@ -1873,7 +1888,9 @@ pub fn clipboard_write(text: &str) -> CommandAction {
         child
             .stdin
             .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin not available"))?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin not available")
+            })?
             .write_all(text.as_bytes())?;
         child.wait()
     };
@@ -2261,7 +2278,10 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
         "Browser",
         "Autonomous browser agent",
         &[
-            ("/browse <goal>", "run autonomous browser agent towards a goal"),
+            (
+                "/browse <goal>",
+                "run autonomous browser agent towards a goal",
+            ),
             ("/browse --yolo <goal>", "yolo mode: no approval prompts"),
             ("/browse --ask <goal>", "ask before every action"),
             ("/browse --max-steps N <goal>", "cap the run at N steps"),

@@ -574,7 +574,11 @@ mod tests {
     /// A gate that could not run has not approved anything.
     #[test]
     fn unevaluable_gating_hook_blocks() {
-        let r = hook_unevaluable("PreToolUse", &entry("/bin/broken"), "failed to start: ENOENT");
+        let r = hook_unevaluable(
+            "PreToolUse",
+            &entry("/bin/broken"),
+            "failed to start: ENOENT",
+        );
         assert!(!r.should_continue, "PreToolUse must fail closed");
         let reason = r.stop_reason.expect("must explain why it blocked");
         assert!(reason.contains("/bin/broken"), "{reason}");
@@ -757,7 +761,11 @@ mod tests {
 
         let big = "é".repeat(MAX_HOOK_ENV_BYTES);
         let capped = cap_env_value(&big);
-        assert!(capped.len() <= MAX_HOOK_ENV_BYTES + 64, "len {}", capped.len());
+        assert!(
+            capped.len() <= MAX_HOOK_ENV_BYTES + 64,
+            "len {}",
+            capped.len()
+        );
         assert!(capped.contains("truncated"));
         // Round-trips as valid UTF-8 (would have panicked on a bad slice).
         assert!(!capped.is_empty());

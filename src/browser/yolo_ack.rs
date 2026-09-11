@@ -14,11 +14,7 @@ fn ack_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
-                .unwrap_or_else(|| {
-                    std::env::var("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_default()
-                })
+                .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_default())
                 .join(".local/state")
         });
     state_home.join("rustyclaw").join("yolo-ack")

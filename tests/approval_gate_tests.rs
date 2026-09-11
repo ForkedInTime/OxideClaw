@@ -37,7 +37,10 @@ fn trips_on_checkout_url() {
         url: "https://shop.example.com/checkout".into(),
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 3. Article about checkout should not trip (path is /articles/checkout-guide).
@@ -62,7 +65,10 @@ fn trips_on_confirm_purchase_button() {
         target_text: "Confirm Purchase".into(),
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 5. "Start Free Trial" → trips
@@ -74,7 +80,10 @@ fn trips_on_start_free_trial_autobill() {
         target_text: "Start Free Trial".into(),
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 6. Bare "Submit" does NOT trip.
@@ -98,7 +107,10 @@ fn trips_on_oauth_authorize_url() {
         url: "https://accounts.google.com/oauth/authorize?client_id=abc".into(),
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 8. "Delete Account" → trips
@@ -110,7 +122,10 @@ fn trips_on_delete_account() {
         target_text: "Delete Account".into(),
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 9. "$12.99" → trips, reason contains "visible_price"
@@ -124,7 +139,10 @@ fn trips_on_visible_price() {
     };
     match g.check(&c) {
         GateVerdict::RequireConfirmation { reason, .. } => {
-            assert!(reason.contains("visible_price"), "reason should mention visible_price, got: {reason}");
+            assert!(
+                reason.contains("visible_price"),
+                "reason should mention visible_price, got: {reason}"
+            );
         }
         GateVerdict::Allow => panic!("expected RequireConfirmation for $12.99"),
     }
@@ -151,7 +169,10 @@ fn trips_on_password_field() {
         form_field_signals: vec!["input:type=password".into()],
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 12. CC autocomplete → trips
@@ -163,7 +184,10 @@ fn trips_on_cc_autocomplete() {
         form_field_signals: vec!["input:autocomplete=cc-number".into()],
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 13. User extension pattern matches → trips
@@ -175,7 +199,10 @@ fn user_extension_patterns_append() {
         target_text: "force-merge into main".into(),
         ..Default::default()
     };
-    assert!(matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        g.check(&c),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 // 14. Invalid user regex is skipped — no panic, still Allow for benign context.

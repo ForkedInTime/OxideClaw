@@ -54,7 +54,11 @@ fn prefers_backend_dom_node_id_over_ax_node_id() {
     ]);
 
     let (_, ref_map) = parse_ax_nodes(&nodes);
-    assert_eq!(ref_map.get("@e1"), Some(&777), "ref_map must store backendDOMNodeId, not the AX nodeId");
+    assert_eq!(
+        ref_map.get("@e1"),
+        Some(&777),
+        "ref_map must store backendDOMNodeId, not the AX nodeId"
+    );
 }
 
 #[test]

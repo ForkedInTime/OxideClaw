@@ -1,5 +1,5 @@
 use rustyclaw::api::types::ToolResultContent;
-use rustyclaw::tools::{browser_tools::BrowseDoneTool, Tool, ToolContext};
+use rustyclaw::tools::{Tool, ToolContext, browser_tools::BrowseDoneTool};
 use serde_json::json;
 
 fn extract_text(output: &rustyclaw::tools::ToolOutput) -> String {
@@ -21,8 +21,14 @@ async fn browse_done_records_summary_and_achieved() {
     let input = json!({ "summary": "Found flight", "achieved": true });
     let result = tool.execute(input, &ctx).await.unwrap();
     let text = extract_text(&result);
-    assert!(text.contains("BROWSE_DONE"), "expected BROWSE_DONE sentinel in: {text}");
-    assert!(text.contains("achieved=true"), "expected achieved=true in: {text}");
+    assert!(
+        text.contains("BROWSE_DONE"),
+        "expected BROWSE_DONE sentinel in: {text}"
+    );
+    assert!(
+        text.contains("achieved=true"),
+        "expected achieved=true in: {text}"
+    );
     assert!(text.contains("Found flight"), "expected summary in: {text}");
 }
 
@@ -33,5 +39,8 @@ async fn browse_done_handles_not_achieved() {
     let input = json!({ "summary": "Stuck", "achieved": false });
     let result = tool.execute(input, &ctx).await.unwrap();
     let text = extract_text(&result);
-    assert!(text.contains("achieved=false"), "expected achieved=false in: {text}");
+    assert!(
+        text.contains("achieved=false"),
+        "expected achieved=false in: {text}"
+    );
 }

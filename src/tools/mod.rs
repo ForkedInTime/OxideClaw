@@ -345,7 +345,10 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
 /// fallback — and both must honour the same rules. The fallback can check each
 /// file as it opens it; `rg` opens files itself, so it has to be told up front.
 pub fn denied_read_globs() -> Vec<String> {
-    let mut g: Vec<String> = PRIVATE_KEY_NAMES.iter().map(|n| format!("!**/{n}")).collect();
+    let mut g: Vec<String> = PRIVATE_KEY_NAMES
+        .iter()
+        .map(|n| format!("!**/{n}"))
+        .collect();
     g.extend(PRIVATE_KEY_SUFFIXES.iter().map(|s| format!("!**/*{s}")));
     g
 }
@@ -510,8 +513,7 @@ pub struct SharedToolState {
     pub todo: todo::TodoState,
     /// Shared across the 8 browser tools and the /browser slash commands.
     /// None when config.browser_enabled == false.
-    pub browser_session:
-        Option<std::sync::Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
+    pub browser_session: Option<std::sync::Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
 }
 
 /// Build the full tool set. Returns tools + shared state so slash commands can read it.
@@ -979,7 +981,9 @@ mod schema_contract_tests {
             seen.push(name.clone());
 
             if t.description().trim().is_empty() {
-                problems.push(format!("{name}: empty description — the model selects on this"));
+                problems.push(format!(
+                    "{name}: empty description — the model selects on this"
+                ));
             }
 
             let schema = t.input_schema();
@@ -1002,9 +1006,15 @@ mod schema_contract_tests {
 
             for (prop, def) in props {
                 if def.get("type").is_none() && def.get("enum").is_none() {
-                    problems.push(format!("{name}.{prop}: property has neither `type` nor `enum`"));
+                    problems.push(format!(
+                        "{name}.{prop}: property has neither `type` nor `enum`"
+                    ));
                 }
-                if def.get("description").and_then(|d| d.as_str()).is_none_or(str::is_empty) {
+                if def
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .is_none_or(str::is_empty)
+                {
                     problems.push(format!(
                         "{name}.{prop}: no description — the model has to guess what it means"
                     ));

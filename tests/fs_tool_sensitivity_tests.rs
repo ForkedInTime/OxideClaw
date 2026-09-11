@@ -61,7 +61,10 @@ async fn symlink_cannot_be_used_to_read_a_private_key() {
         .execute(json!({"file_path": "notes.md"}), &ctx)
         .await
         .unwrap();
-    assert!(out.is_error, "reading a link to a private key must be refused");
+    assert!(
+        out.is_error,
+        "reading a link to a private key must be refused"
+    );
     assert!(
         !text(&out).contains("PRIVATE-KEY-MATERIAL"),
         "key material must not appear in the result"
@@ -76,11 +79,17 @@ async fn symlink_cannot_be_used_to_overwrite_credentials() {
 
     let ctx = ToolContext::new(proj);
     let out = FileWriteTool
-        .execute(json!({"file_path": "config.json", "content": "CLOBBERED\n"}), &ctx)
+        .execute(
+            json!({"file_path": "config.json", "content": "CLOBBERED\n"}),
+            &ctx,
+        )
         .await
         .unwrap();
 
-    assert!(out.is_error, "writing through a link to credentials must be refused");
+    assert!(
+        out.is_error,
+        "writing through a link to credentials must be refused"
+    );
     assert_eq!(
         std::fs::read_to_string(&creds).unwrap(),
         before,
@@ -96,10 +105,17 @@ async fn normal_files_are_unaffected() {
     let ctx = ToolContext::new(proj.clone());
 
     let w = FileWriteTool
-        .execute(json!({"file_path": "src.rs", "content": "fn main() {}\n"}), &ctx)
+        .execute(
+            json!({"file_path": "src.rs", "content": "fn main() {}\n"}),
+            &ctx,
+        )
         .await
         .unwrap();
-    assert!(!w.is_error, "writing an ordinary file must work: {}", text(&w));
+    assert!(
+        !w.is_error,
+        "writing an ordinary file must work: {}",
+        text(&w)
+    );
 
     let r = FileReadTool
         .execute(json!({"file_path": "src.rs"}), &ctx)
@@ -113,7 +129,11 @@ async fn normal_files_are_unaffected() {
         .execute(json!({"file_path": "alias.rs"}), &ctx)
         .await
         .unwrap();
-    assert!(!a.is_error, "benign symlinks must not be blocked: {}", text(&a));
+    assert!(
+        !a.is_error,
+        "benign symlinks must not be blocked: {}",
+        text(&a)
+    );
 }
 
 /// Grep returns matching lines verbatim, so it must honour the same read
@@ -128,11 +148,18 @@ async fn grep_does_not_return_private_key_contents() {
         "-----BEGIN PRIVATE KEY-----\nPEMSECRET\n",
     )
     .unwrap();
-    std::fs::write(proj.join("app.rs"), "// PEMSECRET appears here legitimately\n").unwrap();
+    std::fs::write(
+        proj.join("app.rs"),
+        "// PEMSECRET appears here legitimately\n",
+    )
+    .unwrap();
 
     let ctx = ToolContext::new(proj);
     let out = GrepTool
-        .execute(json!({"pattern": "PEMSECRET", "output_mode": "content"}), &ctx)
+        .execute(
+            json!({"pattern": "PEMSECRET", "output_mode": "content"}),
+            &ctx,
+        )
         .await
         .unwrap();
     let body = text(&out);
@@ -161,7 +188,10 @@ async fn grep_fallback_backend_also_honours_the_deny_list() {
     // PATH users in this binary.
     unsafe { std::env::set_var("PATH", "") };
     let out = GrepTool
-        .execute(json!({"pattern": "FALLBACKSECRET", "output_mode": "content"}), &ctx)
+        .execute(
+            json!({"pattern": "FALLBACKSECRET", "output_mode": "content"}),
+            &ctx,
+        )
         .await
         .unwrap();
     unsafe {
@@ -172,6 +202,12 @@ async fn grep_fallback_backend_also_honours_the_deny_list() {
     }
 
     let body = text(&out);
-    assert!(!body.contains("key.pem"), "fallback leaked key material: {body}");
-    assert!(body.contains("ok.txt"), "fallback must still search normal files: {body}");
+    assert!(
+        !body.contains("key.pem"),
+        "fallback leaked key material: {body}"
+    );
+    assert!(
+        body.contains("ok.txt"),
+        "fallback must still search normal files: {body}"
+    );
 }

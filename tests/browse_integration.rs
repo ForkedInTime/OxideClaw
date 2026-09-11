@@ -4,13 +4,15 @@
 //! stagnation termination, and denial-counter termination.
 //! No network, no Chrome — all in-process with channels.
 
-use rustyclaw::browser::approval_gate::{ApprovalGate, ApprovalGateMiddleware, GateContext, GateVerdict};
+use rustyclaw::browser::approval_gate::{
+    ApprovalGate, ApprovalGateMiddleware, GateContext, GateVerdict,
+};
 use rustyclaw::browser::browse_loop::{BrowsePolicy, BrowseReason, BrowseResult};
 use rustyclaw::browser::loop_detector::LoopDetectorMiddleware;
 use rustyclaw::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
 use serde_json::json;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 // ── Approval gate (standalone) ──────────────────────────────────────────────
 
@@ -35,7 +37,10 @@ fn gate_trips_on_checkout_url() {
         target_text: "Continue".into(),
         ..Default::default()
     };
-    assert!(matches!(gate.check(&ctx), GateVerdict::RequireConfirmation { .. }));
+    assert!(matches!(
+        gate.check(&ctx),
+        GateVerdict::RequireConfirmation { .. }
+    ));
 }
 
 #[test]
@@ -83,7 +88,10 @@ async fn loop_detector_stops_at_level_three() {
         nudges.push(n);
     }
     assert!(!nudges.is_empty(), "should have received nudges");
-    assert!(nudges.last().unwrap().contains("Stopping"), "last nudge should be terminal");
+    assert!(
+        nudges.last().unwrap().contains("Stopping"),
+        "last nudge should be terminal"
+    );
 
     // After L3, before_tool should return Deny
     let verdict = mw.before_tool("browser_click", &json!({})).await;
@@ -114,9 +122,18 @@ async fn approval_middleware_allows_read_tools() {
     let (approval_tx, _) = tokio::sync::mpsc::channel(4);
     let step = Arc::new(AtomicU32::new(0));
 
-    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Pattern, current_url, approval_tx, step, false);
+    let mw = ApprovalGateMiddleware::new(
+        gate,
+        BrowsePolicy::Pattern,
+        current_url,
+        approval_tx,
+        step,
+        false,
+    );
 
-    let verdict = mw.before_tool("browser_navigate", &json!({"url": "https://example.com"})).await;
+    let verdict = mw
+        .before_tool("browser_navigate", &json!({"url": "https://example.com"}))
+        .await;
     assert!(matches!(verdict, MiddlewareVerdict::Allow));
 }
 
@@ -127,9 +144,18 @@ async fn approval_middleware_yolo_allows_everything() {
     let (approval_tx, _) = tokio::sync::mpsc::channel(4);
     let step = Arc::new(AtomicU32::new(0));
 
-    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Yolo, current_url, approval_tx, step, false);
+    let mw = ApprovalGateMiddleware::new(
+        gate,
+        BrowsePolicy::Yolo,
+        current_url,
+        approval_tx,
+        step,
+        false,
+    );
 
-    let verdict = mw.before_tool("browser_click", &json!({"ref": "@e1"})).await;
+    let verdict = mw
+        .before_tool("browser_click", &json!({"ref": "@e1"}))
+        .await;
     assert!(matches!(verdict, MiddlewareVerdict::Allow));
 }
 
@@ -142,9 +168,18 @@ async fn approval_middleware_denies_on_dropped_channel() {
 
     drop(approval_rx);
 
-    let mw = ApprovalGateMiddleware::new(gate, BrowsePolicy::Pattern, current_url, approval_tx, step, false);
+    let mw = ApprovalGateMiddleware::new(
+        gate,
+        BrowsePolicy::Pattern,
+        current_url,
+        approval_tx,
+        step,
+        false,
+    );
 
-    let verdict = mw.before_tool("browser_click", &json!({"ref": "@e1"})).await;
+    let verdict = mw
+        .before_tool("browser_click", &json!({"ref": "@e1"}))
+        .await;
     assert!(matches!(verdict, MiddlewareVerdict::Deny { .. }));
 }
 
@@ -169,23 +204,41 @@ fn browse_result_roundtrip() {
 
 #[test]
 fn browse_policy_serializes_lowercase() {
-    assert_eq!(serde_json::to_string(&BrowsePolicy::Pattern).unwrap(), r#""pattern""#);
-    assert_eq!(serde_json::to_string(&BrowsePolicy::Yolo).unwrap(), r#""yolo""#);
-    assert_eq!(serde_json::to_string(&BrowsePolicy::Ask).unwrap(), r#""ask""#);
+    assert_eq!(
+        serde_json::to_string(&BrowsePolicy::Pattern).unwrap(),
+        r#""pattern""#
+    );
+    assert_eq!(
+        serde_json::to_string(&BrowsePolicy::Yolo).unwrap(),
+        r#""yolo""#
+    );
+    assert_eq!(
+        serde_json::to_string(&BrowsePolicy::Ask).unwrap(),
+        r#""ask""#
+    );
 }
 
 #[test]
 fn browse_reason_serializes_snake_case() {
-    assert_eq!(serde_json::to_string(&BrowseReason::StepCap).unwrap(), r#""step_cap""#);
-    assert_eq!(serde_json::to_string(&BrowseReason::BrowserCrashed).unwrap(), r#""browser_crashed""#);
-    assert_eq!(serde_json::to_string(&BrowseReason::UserDenied).unwrap(), r#""user_denied""#);
+    assert_eq!(
+        serde_json::to_string(&BrowseReason::StepCap).unwrap(),
+        r#""step_cap""#
+    );
+    assert_eq!(
+        serde_json::to_string(&BrowseReason::BrowserCrashed).unwrap(),
+        r#""browser_crashed""#
+    );
+    assert_eq!(
+        serde_json::to_string(&BrowseReason::UserDenied).unwrap(),
+        r#""user_denied""#
+    );
 }
 
 // ── Voice routing ───────────────────────────────────────────────────────────
 
 #[test]
 fn voice_routes_browse_not_find() {
-    use rustyclaw::voice::{voice_routes_to_browse, strip_browse_prefix};
+    use rustyclaw::voice::{strip_browse_prefix, voice_routes_to_browse};
 
     assert!(voice_routes_to_browse("browse find flights to Tokyo"));
     assert!(voice_routes_to_browse("book a hotel in Paris"));

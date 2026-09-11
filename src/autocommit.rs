@@ -594,7 +594,11 @@ mod prune_selection_tests {
     #[test]
     fn timestamp_beats_refname() {
         let deleted = select_refs_to_delete(rows(&[(1, "zzz"), (9, "aaa")]), 1);
-        assert_eq!(deleted, vec!["zzz".to_string()], "older loses regardless of name");
+        assert_eq!(
+            deleted,
+            vec!["zzz".to_string()],
+            "older loses regardless of name"
+        );
     }
 }
 

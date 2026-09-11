@@ -140,10 +140,9 @@ impl GiveUpReason {
                 format_delay(*d),
                 MAX_RETRY_AFTER.as_secs()
             ),
-            Self::BudgetExhausted => format!(
-                " (gave up after {}s of retries)",
-                MAX_TOTAL_RETRY.as_secs()
-            ),
+            Self::BudgetExhausted => {
+                format!(" (gave up after {}s of retries)", MAX_TOTAL_RETRY.as_secs())
+            }
         }
     }
 }
@@ -365,7 +364,11 @@ mod tests {
         for v in ["", "abc", "-5", "NaN", "inf"] {
             let mut h = HeaderMap::new();
             h.insert("retry-after", HeaderValue::from_str(v).unwrap());
-            assert_eq!(parse_retry_after(&h), None, "value {v:?} should be rejected");
+            assert_eq!(
+                parse_retry_after(&h),
+                None,
+                "value {v:?} should be rejected"
+            );
         }
     }
 
@@ -400,9 +403,7 @@ mod tests {
     fn backoff_grows_exponentially_and_is_bounded() {
         let mut last = Duration::ZERO;
         for attempt in 0..MAX_ATTEMPTS - 1 {
-            let RetryDecision::Retry(d) =
-                decide(attempt, true, None, Duration::ZERO, 0.0)
-            else {
+            let RetryDecision::Retry(d) = decide(attempt, true, None, Duration::ZERO, 0.0) else {
                 panic!("attempt {attempt} should retry");
             };
             assert!(d > last, "attempt {attempt}: {d:?} !> {last:?}");
@@ -618,8 +619,7 @@ mod tests {
                           content-length: 0\r\nconnection: close\r\n\r\n";
 
     fn test_client(base: &str) -> crate::api::ClaudeClient {
-        let mut c =
-            crate::api::ClaudeClient::new("sk-ant-test").expect("client should build");
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").expect("client should build");
         c.set_base_url_for_test(base.trim_end_matches('/'));
         c
     }

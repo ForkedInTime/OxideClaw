@@ -2,8 +2,8 @@ use crate::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 const WINDOW_SIZE: usize = 10;
