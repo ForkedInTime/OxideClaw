@@ -324,7 +324,8 @@ impl SdkServer {
                 let browser_session = shared_state.browser_session.clone();
 
                 // Channels: progress events from browse loop → notif forwarding task
-                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BrowseProgress>(64);
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::channel::<BrowseProgress>(64);
                 // Channel: approval prompts from browse loop → host
                 let (approval_tx, mut approval_rx) =
                     tokio::sync::mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(4);
@@ -355,12 +356,10 @@ impl SdkServer {
                                     target,
                                 }
                             }
-                            BrowseProgress::Completed(result) => {
-                                SdkNotification::BrowseCompleted {
-                                    session_id: fwd_sid.clone(),
-                                    result,
-                                }
-                            }
+                            BrowseProgress::Completed(result) => SdkNotification::BrowseCompleted {
+                                session_id: fwd_sid.clone(),
+                                result,
+                            },
                             BrowseProgress::Nudge { .. } | BrowseProgress::Started { .. } => {
                                 // Not surfaced as SDK notifications
                                 continue;
@@ -404,7 +403,11 @@ impl SdkServer {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let session_counter = Arc::clone(active_sessions);
                 tokio::spawn(async move {
-                    let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
+                    let channels = crate::browser::browse_loop::BrowseChannels {
+                        progress_tx,
+                        approval_tx,
+                        cancel,
+                    };
                     let _ = run_browse(
                         browse_req,
                         &cfg,

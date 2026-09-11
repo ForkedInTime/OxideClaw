@@ -189,9 +189,7 @@ fn resolve_stage(env: &impl AuthEnv, allow_profile: bool) -> Option<Resolved> {
         });
     }
 
-    if allow_profile
-        && let Some(token) = non_empty(env.ant_access_token())
-    {
+    if allow_profile && let Some(token) = non_empty(env.ant_access_token()) {
         return Some(Resolved {
             credential: Credential::OAuth(token),
             source: CredentialSource::AntProfile(profile),
@@ -448,7 +446,11 @@ mod tests {
             .with("ANTHROPIC_AUTH_TOKEN", "tok");
         let r = resolve_with(&env).unwrap();
         assert_eq!(r.credential, Credential::OAuth("tok".into()));
-        assert!(r.warnings.iter().any(|w| w.contains("empty")), "{:?}", r.warnings);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("empty")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]
@@ -459,7 +461,8 @@ mod tests {
 
     #[test]
     fn values_are_trimmed() {
-        let r = resolve_with(&FakeEnv::default().with("ANTHROPIC_API_KEY", "  sk-ant-x\n")).unwrap();
+        let r =
+            resolve_with(&FakeEnv::default().with("ANTHROPIC_API_KEY", "  sk-ant-x\n")).unwrap();
         assert_eq!(r.credential.secret(), "sk-ant-x");
     }
 
@@ -471,7 +474,11 @@ mod tests {
             .with("ANTHROPIC_API_KEY", "k")
             .with("ANTHROPIC_AUTH_TOKEN", "t");
         let r = resolve_with(&env).unwrap();
-        assert!(r.warnings.iter().any(|w| w.contains("Both")), "{:?}", r.warnings);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("Both")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// Regression: `ant` collides with Apache Ant, which ships on the Windows

@@ -15,10 +15,7 @@ struct RecordingMiddleware {
 #[async_trait]
 impl ToolMiddleware for RecordingMiddleware {
     async fn before_tool(&self, tool_name: &str, _input: &Value) -> MiddlewareVerdict {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("before:{tool_name}"));
+        self.log.lock().unwrap().push(format!("before:{tool_name}"));
         MiddlewareVerdict::Allow
     }
 
@@ -35,7 +32,9 @@ async fn recording_middleware_fires_before_and_after() {
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let mw = RecordingMiddleware { log: log.clone() };
 
-    let verdict = mw.before_tool("bash", &serde_json::json!({"cmd": "ls"})).await;
+    let verdict = mw
+        .before_tool("bash", &serde_json::json!({"cmd": "ls"}))
+        .await;
     assert!(matches!(verdict, MiddlewareVerdict::Allow));
 
     mw.after_tool("bash", "file1.rs\nfile2.rs").await;
@@ -107,5 +106,8 @@ async fn middleware_chain_short_circuits_on_deny() {
     }
 
     assert!(denied);
-    assert!(log.lock().unwrap().is_empty(), "recorder should not have fired");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "recorder should not have fired"
+    );
 }

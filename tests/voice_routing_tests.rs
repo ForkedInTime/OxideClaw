@@ -1,4 +1,4 @@
-use rustyclaw::voice::{voice_routes_to_browse, strip_browse_prefix};
+use rustyclaw::voice::{strip_browse_prefix, voice_routes_to_browse};
 
 #[test]
 fn routes_browse_prefix() {
@@ -21,7 +21,13 @@ fn does_not_route_plain_find() {
 
 #[test]
 fn strip_preserves_case() {
-    assert_eq!(strip_browse_prefix("browse Find Tokyo flights"), "Find Tokyo flights");
-    assert_eq!(strip_browse_prefix("Book a Hotel in Paris"), "a Hotel in Paris");
+    assert_eq!(
+        strip_browse_prefix("browse Find Tokyo flights"),
+        "Find Tokyo flights"
+    );
+    assert_eq!(
+        strip_browse_prefix("Book a Hotel in Paris"),
+        "a Hotel in Paris"
+    );
     assert_eq!(strip_browse_prefix("GO TO example.com"), "example.com");
 }

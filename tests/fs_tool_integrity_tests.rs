@@ -159,7 +159,10 @@ async fn atomic_write_preserves_file_permissions() {
         .unwrap();
 
     let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "permissions must survive the rename, got {mode:o}");
+    assert_eq!(
+        mode, 0o600,
+        "permissions must survive the rename, got {mode:o}"
+    );
     assert_eq!(std::fs::read_to_string(&p).unwrap(), "token=xyz\n");
 }
 
@@ -181,7 +184,10 @@ async fn atomic_write_leaves_no_temp_files() {
         .filter(|n| n.contains("rustyclaw-") || n.ends_with(".tmp"))
         .collect();
     assert!(strays.is_empty(), "temp files left behind: {strays:?}");
-    assert_eq!(std::fs::read_to_string(td.path().join("out.txt")).unwrap(), "hello\n");
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("out.txt")).unwrap(),
+        "hello\n"
+    );
 }
 
 /// A broad pattern over a large tree must not build an unbounded result.
@@ -215,7 +221,15 @@ async fn glob_small_result_sets_are_untouched() {
         std::fs::write(td.path().join(format!("f{i}.txt")), "x").unwrap();
     }
     let ctx = ToolContext::new(PathBuf::from(td.path()));
-    let body = text(&GlobTool.execute(json!({"pattern": "**/*.txt"}), &ctx).await.unwrap());
+    let body = text(
+        &GlobTool
+            .execute(json!({"pattern": "**/*.txt"}), &ctx)
+            .await
+            .unwrap(),
+    );
     assert_eq!(body.lines().filter(|l| l.ends_with(".txt")).count(), 5);
-    assert!(!body.contains("matches shown"), "no notice expected: {body}");
+    assert!(
+        !body.contains("matches shown"),
+        "no notice expected: {body}"
+    );
 }

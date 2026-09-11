@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -52,12 +52,16 @@ enum CdpIncoming {
 #[derive(Clone)]
 pub struct CdpClient {
     /// WebSocket write half — protected by mutex for concurrent sends.
-    writer: Arc<Mutex<futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    writer: Arc<
+        Mutex<
+            futures_util::stream::SplitSink<
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                WsMessage,
+            >,
         >,
-        WsMessage,
-    >>>,
+    >,
     /// Monotonically increasing command ID.
     next_id: Arc<AtomicU64>,
     /// Pending command responses: id -> oneshot sender.
@@ -105,11 +109,7 @@ impl CdpClient {
     }
 
     /// Send a CDP command and wait for its response.
-    pub async fn send(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    pub async fn send(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         if !self.alive.load(Ordering::Relaxed) {
             bail!("CDP connection is closed");
         }

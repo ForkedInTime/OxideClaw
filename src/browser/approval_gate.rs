@@ -345,7 +345,10 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             GateVerdict::Allow => {
                 // Clear denial counter on approval for this action key.
                 let key = format!("{tool_name}:{target_text}");
-                self.denial_counts.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                self.denial_counts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
                 MiddlewareVerdict::Allow
             }
             GateVerdict::RequireConfirmation { reason, .. } => {
@@ -366,7 +369,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                         reason: "approval channel closed".to_string(),
                     };
                 }
-                use tokio::time::{timeout, Duration};
+                use tokio::time::{Duration, timeout};
                 // If voice is on, race the keyboard reply against a voice-approval
                 // listener. Whichever resolves first wins. Voice only contributes
                 // an Approve vote (false/timeout is ignored unless no keyboard reply
@@ -391,14 +394,18 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                     Some(true) => {
                         // Approved — clear denial counter for this action.
                         let key = format!("{tool_name}:{target_text}");
-                        self.denial_counts.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                        self.denial_counts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&key);
                         MiddlewareVerdict::Allow
                     }
                     Some(false) => {
                         // User explicitly denied — increment counter; terminate after 2 denials.
                         let key = format!("{tool_name}:{target_text}");
                         let count = {
-                            let mut counts = self.denial_counts.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut counts =
+                                self.denial_counts.lock().unwrap_or_else(|e| e.into_inner());
                             let entry = counts.entry(key).or_insert(0);
                             *entry += 1;
                             *entry
@@ -406,8 +413,9 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                         if count >= 2 {
                             self.user_denied.store(true, Ordering::SeqCst);
                             return MiddlewareVerdict::Deny {
-                                reason: "User denied this action twice. Terminating browse session."
-                                    .into(),
+                                reason:
+                                    "User denied this action twice. Terminating browse session."
+                                        .into(),
                             };
                         }
                         MiddlewareVerdict::Deny { reason }

@@ -19,7 +19,7 @@
 
 use crate::browser::{self, BrowserSession};
 use crate::tools::{Tool, ToolContext, ToolOutput};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -439,7 +439,9 @@ impl Tool for BrowserWaitTool {
     }
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let selector = required_str(&input, "selector")?;
-        let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(self.default_timeout_ms);
+        let timeout_ms = input["timeout_ms"]
+            .as_u64()
+            .unwrap_or(self.default_timeout_ms);
 
         // Clone the client so the polling loop does NOT hold the session
         // lock for the full timeout window.

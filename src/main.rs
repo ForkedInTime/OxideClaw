@@ -639,8 +639,15 @@ async fn main() -> Result<()> {
             Commands::Update => {
                 return self_update().await;
             }
-            Commands::Browse { goal, yolo, ask, max_steps } => {
-                use crate::browser::browse_loop::{BrowsePolicy, BrowseRequest, BrowseProgress, run_browse};
+            Commands::Browse {
+                goal,
+                yolo,
+                ask,
+                max_steps,
+            } => {
+                use crate::browser::browse_loop::{
+                    BrowsePolicy, BrowseProgress, BrowseRequest, run_browse,
+                };
                 use tokio::sync::mpsc;
 
                 let goal_str = goal.join(" ");
@@ -681,7 +688,10 @@ async fn main() -> Result<()> {
                 let is_non_anthropic = crate::api::is_ollama_model(&config.model)
                     || crate::api::is_openai_compat_model(&config.model);
                 if !is_non_anthropic && config.api_key.is_empty() {
-                    eprintln!("Error: ANTHROPIC_API_KEY not set for model: {}", config.model);
+                    eprintln!(
+                        "Error: ANTHROPIC_API_KEY not set for model: {}",
+                        config.model
+                    );
                     std::process::exit(1);
                 }
                 let (tools, shared_state) = crate::tools::all_tools_with_state(&config);
@@ -690,7 +700,8 @@ async fn main() -> Result<()> {
 
                 let (progress_tx, mut progress_rx) = mpsc::channel::<BrowseProgress>(64);
                 // Approval channel: in CLI mode auto-deny (user must use --yolo or --ask interactively)
-                let (approval_tx, mut approval_rx) = mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(8);
+                let (approval_tx, mut approval_rx) =
+                    mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(8);
 
                 // Spawn task to handle approval prompts: prompt on stderr, read from stdin
                 let _approval_task = tokio::spawn(async move {
@@ -698,7 +709,11 @@ async fn main() -> Result<()> {
                     while let Some(prompt) = approval_rx.recv().await {
                         eprint!(
                             "Approval needed [step {}]: {} on '{}' at {}\n  Reason: {}\nAllow? [y/N] ",
-                            prompt.step, prompt.tool_name, prompt.target_text, prompt.url, prompt.reason
+                            prompt.step,
+                            prompt.tool_name,
+                            prompt.target_text,
+                            prompt.url,
+                            prompt.reason
                         );
                         let _ = std::io::stderr().flush();
                         let mut line = String::new();
@@ -726,8 +741,13 @@ async fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                     cancel_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 });
-                let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
-                let result = run_browse(req, &config, tools, current_url, browser_session, channels).await?;
+                let channels = crate::browser::browse_loop::BrowseChannels {
+                    progress_tx,
+                    approval_tx,
+                    cancel,
+                };
+                let result =
+                    run_browse(req, &config, tools, current_url, browser_session, channels).await?;
                 progress_task.await.ok();
 
                 // Print final result as JSON
@@ -1426,7 +1446,10 @@ mod self_update_tests {
 
     #[test]
     fn windows_target_carries_exe_suffix() {
-        let a = assets(&["rustyclaw-windows-x64.exe", "rustyclaw-windows-x64.exe.sha256"]);
+        let a = assets(&[
+            "rustyclaw-windows-x64.exe",
+            "rustyclaw-windows-x64.exe.sha256",
+        ]);
         let got = super::pick_release_asset(&a, "windows-x64.exe").expect("asset");
         assert_eq!(got.name(), "rustyclaw-windows-x64.exe");
     }

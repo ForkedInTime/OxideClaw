@@ -1,14 +1,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::mpsc;
 
+use crate::browser::BrowserSession;
 use crate::browser::approval_gate::{ApprovalGate, ApprovalGateMiddleware, ApprovalPrompt};
 use crate::browser::loop_detector::LoopDetectorMiddleware;
 use crate::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
-use crate::browser::BrowserSession;
 use crate::config::Config;
 use crate::query_engine::QueryEngine;
 use crate::tools::DynTool;
@@ -48,10 +48,26 @@ pub struct BrowseRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowseProgress {
-    Started { goal: String, max_steps: u32 },
-    Step { n: u32, action: String, target: String },
-    Nudge { level: u8, text: String },
-    ApprovalNeeded { step: u32, action: String, target_text: String, url: String, reason: String },
+    Started {
+        goal: String,
+        max_steps: u32,
+    },
+    Step {
+        n: u32,
+        action: String,
+        target: String,
+    },
+    Nudge {
+        level: u8,
+        text: String,
+    },
+    ApprovalNeeded {
+        step: u32,
+        action: String,
+        target_text: String,
+        url: String,
+        reason: String,
+    },
     Completed(BrowseResult),
 }
 
@@ -197,7 +213,11 @@ pub async fn run_browse(
     browser_session: Option<Arc<tokio::sync::Mutex<BrowserSession>>>,
     channels: BrowseChannels,
 ) -> Result<BrowseResult> {
-    let BrowseChannels { progress_tx, approval_tx, cancel } = channels;
+    let BrowseChannels {
+        progress_tx,
+        approval_tx,
+        cancel,
+    } = channels;
     // 1. Emit Started event + speak the goal if voice is enabled.
     let _ = progress_tx
         .send(BrowseProgress::Started {
@@ -208,11 +228,7 @@ pub async fn run_browse(
     if req.voice {
         let goal = req.goal.clone();
         tokio::spawn(async move {
-            crate::voice::speak_browse_milestone(
-                crate::voice::BrowseMilestone::Start,
-                &goal,
-            )
-            .await;
+            crate::voice::speak_browse_milestone(crate::voice::BrowseMilestone::Start, &goal).await;
         });
     }
 
@@ -327,7 +343,11 @@ pub async fn run_browse(
         let _ = approval_bridge_handle.await;
         let final_url = {
             let url = current_url.lock().await;
-            if url.is_empty() { None } else { Some(url.clone()) }
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.clone())
+            }
         };
         let result = BrowseResult {
             achieved: false,
@@ -336,7 +356,9 @@ pub async fn run_browse(
             steps_used: 0,
             final_url,
         };
-        let _ = progress_tx.send(BrowseProgress::Completed(result.clone())).await;
+        let _ = progress_tx
+            .send(BrowseProgress::Completed(result.clone()))
+            .await;
         return Ok(result);
     }
 
@@ -347,7 +369,11 @@ pub async fn run_browse(
     let steps_used = engine.turns_used();
     let final_url = {
         let url = current_url.lock().await;
-        if url.is_empty() { None } else { Some(url.clone()) }
+        if url.is_empty() {
+            None
+        } else {
+            Some(url.clone())
+        }
     };
 
     // Check cancellation flag — if set during run, override the result.
@@ -443,8 +469,19 @@ pub async fn run_browse(
                 if msg.contains("budget") || msg.contains("Budget") {
                     BrowseReason::Budget
                 } else {
-                    let crash_keywords = ["browser", "CDP", "Chrome", "WebSocket", "connection", "disconnected", "tungstenite"];
-                    if crash_keywords.iter().any(|kw| msg.to_lowercase().contains(&kw.to_lowercase())) {
+                    let crash_keywords = [
+                        "browser",
+                        "CDP",
+                        "Chrome",
+                        "WebSocket",
+                        "connection",
+                        "disconnected",
+                        "tungstenite",
+                    ];
+                    if crash_keywords
+                        .iter()
+                        .any(|kw| msg.to_lowercase().contains(&kw.to_lowercase()))
+                    {
                         BrowseReason::BrowserCrashed
                     } else {
                         BrowseReason::Bailed
@@ -472,11 +509,7 @@ pub async fn run_browse(
             format!("Stopped. {}", result.summary)
         };
         tokio::spawn(async move {
-            crate::voice::speak_browse_milestone(
-                crate::voice::BrowseMilestone::End,
-                &phrase,
-            )
-            .await;
+            crate::voice::speak_browse_milestone(crate::voice::BrowseMilestone::End, &phrase).await;
         });
     }
 

@@ -25,7 +25,7 @@ pub enum DiffLineKind {
     Added,   // + line
     Removed, // - line
     #[allow(dead_code)]
-    Header,  // @@ header or file header
+    Header, // @@ header or file header
 }
 
 #[derive(Debug, Clone)]
