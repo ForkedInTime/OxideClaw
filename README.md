@@ -39,14 +39,19 @@ Invoke-WebRequest https://github.com/ForkedInTime/OxideClaw/releases/latest/down
 ```
 Then move `oxideclaw.exe` somewhere on your `PATH` (e.g. `%USERPROFILE%\bin`).
 
-**Arch Linux:**
+**Arch Linux (AUR):**
 ```bash
-git clone https://github.com/ForkedInTime/OxideClaw && cd OxideClaw/contrib/aur && makepkg -si
+yay -S oxideclaw-bin
 ```
 
 **Homebrew (macOS / Linux):**
 ```bash
 brew install ForkedInTime/oxideclaw/oxideclaw
+```
+
+**npm (downloads the release binary, verifies its checksum):**
+```bash
+npm install -g oxideclaw
 ```
 
 **Cargo (builds from source, any platform with Rust 1.86+):**
