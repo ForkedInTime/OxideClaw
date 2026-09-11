@@ -4988,7 +4988,14 @@ fn base64_encode(data: &[u8]) -> String {
 const MAX_TOOL_ITERATIONS: u32 = 50;
 
 /// Destructive tools blocked when plan mode is active.
-const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "MultiEdit", "EnterWorktree"];
+const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
+    "Bash",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "EnterWorktree",
+];
 
 /// Owned bundle handed to `run_api_task` when a user turn kicks off a new
 /// conversation-streaming task. Exists to stay under the clippy argument cap;

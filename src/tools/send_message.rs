@@ -15,6 +15,16 @@ use serde_json::{Value, json};
 
 pub struct SendMessageTool;
 
+/// A team or teammate name is used as a path component under
+/// `~/.claude/{teams,mailboxes}`. Anything but `[A-Za-z0-9_-]` (or the
+/// broadcast `*`, where allowed) is refused so a model-supplied
+/// `../../.claude/settings` cannot reach outside the mailbox tree.
+pub fn valid_team_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Check whether agent swarms are enabled.
 pub fn is_agent_swarms_enabled() -> bool {
     std::env::var("RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS")
@@ -83,15 +93,21 @@ impl Tool for SendMessageTool {
             _ => return Ok(ToolOutput::error("'to' must not be empty")),
         };
 
-        if to.contains('@') {
+        if to != "*" && !valid_team_ident(to) {
             return Ok(ToolOutput::error(
-                "to must be a bare teammate name or \"*\" — there is only one team per session",
+                "to must be a bare teammate name ([A-Za-z0-9_-]) or \"*\" — it becomes a \
+                 mailbox path component",
             ));
         }
 
         let message = &input["message"];
         let summary = input["summary"].as_str();
         let team_name = std::env::var("RUSTYCLAW_TEAM_NAME").unwrap_or_else(|_| "default".into());
+        if !valid_team_ident(&team_name) {
+            return Ok(ToolOutput::error(
+                "RUSTYCLAW_TEAM_NAME must match [A-Za-z0-9_-] — it becomes a mailbox path component",
+            ));
+        }
         let sender_name =
             std::env::var("RUSTYCLAW_AGENT_NAME").unwrap_or_else(|_| "team-lead".into());
         let timestamp = {
@@ -370,4 +386,34 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod ident_tests {
+    use super::valid_team_ident;
+
+    #[test]
+    fn plain_names_pass() {
+        for n in ["alice", "team-lead", "worker_2", "A1"] {
+            assert!(valid_team_ident(n), "{n}");
+        }
+    }
+
+    /// Every one of these was accepted before and became a path component.
+    #[test]
+    fn traversal_and_separators_are_refused() {
+        for n in [
+            "",
+            "..",
+            "../x",
+            "../../.claude/settings",
+            "a/b",
+            "a\\b",
+            ".",
+            "name with space",
+            "*",
+        ] {
+            assert!(!valid_team_ident(n), "{n:?} must be refused");
+        }
+    }
 }

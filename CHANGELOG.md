@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`TeamDelete` took an unvalidated name** and used it as a path component:
+  `../../.claude/settings` deleted an arbitrary `.json` under home and could
+  `remove_dir_all` a directory. `SendMessage`'s recipient had the same hole.
+  Both now accept `[A-Za-z0-9_-]` only (experimental agent-teams feature,
+  off by default).
+- **Notebook tools bypassed the sensitive-path deny-list** that Read/Write/
+  Edit honour, and `NotebookEdit` needed no approval. Both now go through the
+  same checks; `NotebookEdit` prompts like `Edit`, is blocked in plan mode,
+  and writes atomically.
+- `Skill` accepted a path as the skill name and read markdown from anywhere.
+
+### Fixed
+
+- **The `LSP` tool never worked**: the language server was killed the instant
+  it was spawned (the child handle was dropped with kill-on-drop), so every
+  query timed out after 15 s. The server now lives as long as the client, runs
+  in the project directory, and a server that dies fails in-flight requests
+  immediately instead of after the timeout.
+- `CronList` panicked on a prompt with a multi-byte character at the 80-byte
+  cut. Step values beyond the field range (`*/99`) are rejected. The job store
+  is written atomically.
+- `NotebookRead`/`NotebookEdit` and `LSP` panicked on a bare `~` path.
+
+### Changed
+
+- **The cron tools are honest about what they do.** `CronCreate`/`CronList`/
+  `CronDelete` record jobs in `~/.claude/cron_jobs.json`; nothing in RustyClaw
+  runs them. The descriptions now say so.
+
 ## [0.3.1] - 2026-09-10
 
 Every item below comes from the Phase 5 and Phase 6 code reviews. **Upgrade from

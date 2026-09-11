@@ -64,12 +64,9 @@ impl Tool for TeamCreateTool {
             _ => return Ok(ToolOutput::error("team name must not be empty")),
         };
 
-        if !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
+        if !crate::tools::send_message::valid_team_ident(name) {
             return Ok(ToolOutput::error(
-                "team name must contain only alphanumeric characters, hyphens, or underscores",
+                "team name must contain only ASCII alphanumerics, hyphens, or underscores",
             ));
         }
 
@@ -147,6 +144,13 @@ impl Tool for TeamDeleteTool {
             Some(s) if !s.is_empty() => s,
             _ => return Ok(ToolOutput::error("team name must not be empty")),
         };
+        // Same rule as TeamCreate. Without it `../../.claude/settings` deleted
+        // an arbitrary .json under home and `remove_dir_all`'d a directory.
+        if !crate::tools::send_message::valid_team_ident(name) {
+            return Ok(ToolOutput::error(
+                "team name must contain only ASCII alphanumerics, hyphens, or underscores",
+            ));
+        }
 
         let team_file = dirs::home_dir()
             .unwrap_or_else(std::env::temp_dir)

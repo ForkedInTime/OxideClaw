@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -91,7 +91,10 @@ impl Tool for LSPTool {
 
         // Resolve file path
         let file_path = match &input.file_path {
-            Some(p) => resolve_path(&ctx.cwd, p),
+            Some(p) => match super::file_read::resolve_path(p, &ctx.cwd) {
+                Ok(resolved) => resolved,
+                Err(e) => return Ok(ToolOutput::error(e.to_string())),
+            },
             None if input.operation != "workspaceSymbol" => {
                 return Ok(ToolOutput::error(
                     "file_path is required for this operation",
@@ -311,14 +314,19 @@ struct LspClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     id_counter: Arc<AtomicU64>,
+    /// Owns the language server. `kill_on_drop` means the server lives
+    /// exactly as long as this client — previously the handle was dropped at
+    /// the end of `connect`, which killed the server before `initialize`.
+    _child: tokio::process::Child,
 }
 
 impl LspClient {
-    async fn connect(command: &str, args: &[String], _cwd: &Path) -> Result<Self> {
+    async fn connect(command: &str, args: &[String], cwd: &Path) -> Result<Self> {
         use tokio::process::Command;
 
         let mut child = Command::new(command)
             .args(args)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -340,6 +348,9 @@ impl LspClient {
                 // Read Content-Length header
                 let mut header = String::new();
                 if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
+                    // Server gone: fail every in-flight request now rather
+                    // than letting each sit out the full request timeout.
+                    pending_clone.lock().await.clear();
                     break;
                 }
                 let header = header.trim().to_string();
@@ -397,6 +408,7 @@ impl LspClient {
             stdin: Arc::new(Mutex::new(stdin)),
             pending,
             id_counter: Arc::new(AtomicU64::new(1)),
+            _child: child,
         })
     }
 
@@ -482,24 +494,6 @@ fn path_to_uri(path: &Path) -> String {
         std::env::current_dir().unwrap_or_default().join(path)
     };
     format!("file://{}", abs.display())
-}
-
-fn resolve_path(cwd: &Path, p: &str) -> PathBuf {
-    let expanded = if p.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&p[2..])
-        } else {
-            PathBuf::from(p)
-        }
-    } else {
-        PathBuf::from(p)
-    };
-
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    }
 }
 
 fn lang_id_for_ext(ext: Option<&str>) -> &'static str {
@@ -638,5 +632,78 @@ fn symbol_kind(kind: u64) -> &'static str {
         25 => "Operator",
         26 => "TypeParameter",
         _ => "Symbol",
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// `"~"` alone used to slice `p[2..]` on a 1-byte string and panic.
+    #[tokio::test]
+    async fn a_bare_tilde_path_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = LSPTool
+            .execute(
+                json!({"operation": "hover", "file_path": "~"}),
+                &ToolContext::new(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(out.is_ok() || out.is_err()); // reaching here is the assertion
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+
+    /// A stand-in language server: waits for the first request line, then
+    /// answers request id 1 (the client's `initialize`) and stays alive.
+    fn fake_server() -> (String, Vec<String>) {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        let script = format!(
+            "read -r _line; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; sleep 5",
+            body.len(),
+            body
+        );
+        ("sh".to_string(), vec!["-c".to_string(), script])
+    }
+
+    /// The server must still be alive when `initialize` is sent. Before the
+    /// fix the `Child` was dropped at the end of `connect` with
+    /// `kill_on_drop`, so every LSP call killed its own server and timed out.
+    #[tokio::test]
+    async fn server_survives_connect_and_answers_initialize() {
+        let (cmd, args) = fake_server();
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = LspClient::connect(&cmd, &args, dir.path()).await.unwrap();
+        let init = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.initialize(dir.path()),
+        )
+        .await;
+        assert!(
+            matches!(init, Ok(Ok(()))),
+            "initialize must succeed against a live server: {init:?}"
+        );
+    }
+
+    /// When the server dies, in-flight requests must fail promptly instead of
+    /// sitting out the 15 s request timeout.
+    #[tokio::test]
+    async fn a_dead_server_fails_requests_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "read -r _line; exit 0".to_string();
+        let mut client = LspClient::connect("sh", &["-c".to_string(), script], dir.path())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let r = client.request("initialize", json!({})).await;
+        assert!(r.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}; the pending request was left waiting for the full timeout",
+            started.elapsed()
+        );
     }
 }

@@ -93,7 +93,13 @@ impl Tool for NotebookReadTool {
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: ReadInput = serde_json::from_value(input)?;
-        let path = resolve_path(&ctx.cwd, &input.notebook_path);
+        let path = match super::file_read::resolve_path(&input.notebook_path, &ctx.cwd) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+        };
+        if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read) {
+            return Ok(err);
+        }
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -182,7 +188,14 @@ impl Tool for NotebookEditTool {
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: EditInput = serde_json::from_value(input)?;
-        let path = resolve_path(&ctx.cwd, &input.notebook_path);
+        let path = match super::file_read::resolve_path(&input.notebook_path, &ctx.cwd) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+        };
+        // Same deny-list as Write/Edit: a notebook under ~/.ssh is still ~/.ssh.
+        if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Write) {
+            return Ok(err);
+        }
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -259,7 +272,9 @@ impl Tool for NotebookEditTool {
         }
 
         let updated = serde_json::to_string_pretty(&notebook)?;
-        tokio::fs::write(&path, updated)
+        // Atomic like the other file tools: a crash mid-write must not leave
+        // a truncated notebook behind.
+        super::atomic_write(&path, &updated)
             .await
             .map_err(|e| anyhow!("Cannot write {}: {}", path.display(), e))?;
 
@@ -270,20 +285,77 @@ impl Tool for NotebookEditTool {
     }
 }
 
-fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
-    let expanded = if p.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&p[2..])
-        } else {
-            std::path::PathBuf::from(p)
-        }
-    } else {
-        std::path::PathBuf::from(p)
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
+    const NB: &str = r#"{"cells":[{"id":"c1","cell_type":"code","source":["x = 1\n"],"metadata":{}}],"nbformat":4,"nbformat_minor":5,"metadata":{}}"#;
+
+    fn ctx(dir: &std::path::Path) -> ToolContext {
+        ToolContext::new(dir.to_path_buf())
+    }
+
+    /// `"~"` alone used to slice `p[2..]` on a 1-byte string and panic.
+    #[tokio::test]
+    async fn a_bare_tilde_path_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = NotebookReadTool
+            .execute(json!({"notebook_path": "~"}), &ctx(dir.path()))
+            .await;
+        assert!(out.is_ok() || out.is_err()); // reaching here is the assertion
+    }
+
+    /// Notebook tools bypassed the deny-list the other file tools honour.
+    #[tokio::test]
+    async fn read_refuses_a_private_key_named_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_rsa");
+        std::fs::write(&key, NB).unwrap();
+        let out = NotebookReadTool
+            .execute(
+                json!({"notebook_path": key.to_string_lossy()}),
+                &ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "must refuse to read a private-key path");
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_a_path_inside_a_secrets_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let nb = ssh.join("notes.ipynb");
+        std::fs::write(&nb, NB).unwrap();
+        let out = NotebookEditTool
+            .execute(
+                json!({"notebook_path": nb.to_string_lossy(), "edit_mode": "delete", "cell_id": "c1"}),
+                &ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "must refuse to write under .ssh");
+        assert_eq!(
+            std::fs::read_to_string(&nb).unwrap(),
+            NB,
+            "file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_a_cell_in_an_ordinary_notebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb = dir.path().join("a.ipynb");
+        std::fs::write(&nb, NB).unwrap();
+        let out = NotebookEditTool
+            .execute(
+                json!({"notebook_path": "a.ipynb", "edit_mode": "replace", "cell_id": "c1", "new_source": "y = 2"}),
+                &ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(std::fs::read_to_string(&nb).unwrap().contains("y = 2"));
     }
 }
