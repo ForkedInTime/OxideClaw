@@ -217,14 +217,15 @@ pub async fn fill(session: &mut BrowserSession, element_ref: &str, value: &str) 
         .send("Input.insertText", json!({"text": value}))
         .await?;
 
-    Ok(format!(
-        "Filled {element_ref} with \"{}\"",
-        if value.len() > 50 {
-            format!("{}...", &value[..50])
-        } else {
-            value.to_string()
-        }
-    ))
+    Ok(fill_summary(element_ref, value))
+}
+
+/// What the model is told after a fill. The value itself is **not** echoed:
+/// it may be a password or card number, and tool results go into the
+/// transcript on disk. (The old `&value[..50]` also panicked on a
+/// multi-byte character at byte 50.)
+fn fill_summary(element_ref: &str, value: &str) -> String {
+    format!("Filled {element_ref} ({} chars)", value.chars().count())
 }
 
 /// Take a screenshot. Returns base64-encoded PNG.
@@ -410,5 +411,25 @@ mod preflight_tests {
                 .is_err()
         );
         assert!(preflight_navigation_url("about:blank").await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fill_summary_tests {
+    use super::fill_summary;
+
+    #[test]
+    fn the_typed_value_is_never_echoed() {
+        let s = fill_summary("@e3", "hunter2-secret");
+        assert!(!s.contains("hunter2"), "{s}");
+        assert!(s.contains("@e3"));
+        assert!(s.contains("14"), "length is fine to report: {s}");
+    }
+
+    #[test]
+    fn multibyte_values_do_not_panic() {
+        let v = format!("{}🦀", "a".repeat(49));
+        let s = fill_summary("@e1", &v);
+        assert!(!s.contains('🦀'));
     }
 }
