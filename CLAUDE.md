@@ -2,7 +2,7 @@
 
 ## Mission
 
-RustyClaw is a Rust-native Claude Code CLI. The goal is to be the **#1 Rust port of Claude Code** — faster, smaller, and more capable than every competitor. Full competitive analysis is in the private `.secret/` folder (not checked into the public repo).
+RustyClaw is a single-binary coding agent (Claude, Ollama, OpenAI-compatible backends). It is positioned as a **provider-neutral agent, not a "Rust port of Claude Code"** — that term is owned by leak clones since 2026-03-31. The goal is to win on the features nobody else ships (zero-setup code index, cost router, auto-fix loop, voice cloning, autonomous browser, /redo) and match the field on the rest. Full competitive analysis is in the private `.secret/` folder (not checked into the public repo).
 
 ## Role
 

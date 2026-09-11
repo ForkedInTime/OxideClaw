@@ -15,6 +15,7 @@ Everything available in RustyClaw, organized by category.
 - [Cost Tracking](#cost-tracking)
 - [Session Management](#session-management)
 - [SDK / Headless Mode](#sdk--headless-mode)
+- [Hooks](#hooks)
 - [Sandboxing](#sandboxing)
 - [Configuration](#configuration)
 - [Keyboard Shortcuts](#keyboard-shortcuts)
@@ -319,6 +320,44 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 
 ---
 
+## Hooks
+
+User-defined shell commands that run at lifecycle events. Configure them under `"hooks"` in `settings.json`; each entry is `{ "matcher": "<tool name or *>", "command": "<sh -c command>" }`.
+
+| Event | When | Environment |
+|-------|------|-------------|
+| `preToolUse` | Before a tool runs. Exit 2 blocks it. | `TOOL_NAME`, `TOOL_INPUT` |
+| `postToolUse` | After a tool completes | `TOOL_NAME`, `TOOL_RESULT` |
+| `userPromptSubmit` | When you send a message. Stdout is appended as context. | `CLAUDE_MESSAGE` |
+| `notification` | When the model sends a text response | `CLAUDE_MESSAGE` |
+| `stop` | When the session ends | — |
+| `sessionStart` | When a session begins | — |
+| `preCompact` | Before a compact/summarize cycle | — |
+| `postCompact` | After a compact/summarize cycle | — |
+
+Every hook also receives `CLAUDE_HOOK_EVENT`, `CLAUDE_SESSION_ID`, and `CLAUDE_CWD`. Long values are capped before export.
+
+```json
+{
+  "hooks": {
+    "preToolUse": [
+      { "matcher": "Bash", "command": "./scripts/guard.sh" }
+    ],
+    "postToolUse": [
+      { "matcher": "*", "command": "echo \"$TOOL_NAME\" >> ~/.cache/rustyclaw/tool.log" }
+    ]
+  }
+}
+```
+
+**Exit codes:** `0` allow and continue · `2` block (the tool is not run, or the turn stops; stdout or `stopReason` is shown) · anything else is logged and ignored.
+
+**JSON on stdout (optional):** `{ "decision": "approve" | "block", "reason": "...", "continue": false, "stopReason": "...", "systemMessage": "...", "additionalContext": "..." }`.
+
+Each hook has a 60-second timeout and runs in its own process group, so a timed-out hook cannot leave children behind. `"disableAllHooks": true` in settings or `--bare` on the command line skips every hook.
+
+---
+
 ## Sandboxing
 
 RustyClaw supports multiple sandbox backends for tool isolation:
@@ -339,7 +378,7 @@ RustyClaw supports multiple sandbox backends for tool isolation:
 
 ```json
 {
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "showThinkingSummaries": true,
   "spinnerStyle": "themed",
   "providers": {}
@@ -348,7 +387,7 @@ RustyClaw supports multiple sandbox backends for tool isolation:
 
 | Setting | Values | Default | Description |
 |---------|--------|---------|-------------|
-| `model` | any model name | `claude-sonnet-4-6` | Default model |
+| `model` | any model name | `claude-sonnet-5` | Default model |
 | `showThinkingSummaries` | `true` / `false` | `false` | Show model reasoning |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
 
