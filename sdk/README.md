@@ -19,7 +19,7 @@ This starts a long-running server that reads JSON requests from stdin and writes
 ```
 
 ```json
-{"type":"health/check","id":"1","status":"ok","version":"0.3.1","protocol_version":1,"active_sessions":0,"uptime_seconds":0}
+{"type":"health/check","id":"1","status":"ok","version":"0.3.2","protocol_version":1,"active_sessions":0,"uptime_seconds":0}
 ```
 
 ### 2. Ask a question

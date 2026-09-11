@@ -48,7 +48,7 @@ cd RustyClaw && cargo build --release
 
 **Specific version (Linux/macOS):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.3.1
+curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.3.2
 ```
 
 Pre-built binaries attached to every [release](https://github.com/ForkedInTime/RustyClaw/releases):
