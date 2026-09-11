@@ -27,19 +27,25 @@ use std::process::Command;
 
 // ── Availability checks ───────────────────────────────────────────────────────
 
+/// Probed once per process: the old version forked `bwrap --version` on
+/// every Bash call.
 pub fn bwrap_available() -> bool {
-    Command::new("bwrap")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| probe("bwrap"))
 }
 
 pub fn firejail_available() -> bool {
-    Command::new("firejail")
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| probe("firejail"))
+}
+
+fn probe(binary: &str) -> bool {
+    Command::new(binary)
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
         .unwrap_or(false)
 }
 
@@ -538,5 +544,14 @@ mod tests {
         fn unwrap_err_or_else_msg(self) -> String {
             self.expect_err("expected the gate to refuse")
         }
+    }
+}
+
+#[cfg(test)]
+mod availability_cache_tests {
+    #[test]
+    fn availability_is_stable_within_a_process() {
+        assert_eq!(super::bwrap_available(), super::bwrap_available());
+        assert_eq!(super::firejail_available(), super::firejail_available());
     }
 }

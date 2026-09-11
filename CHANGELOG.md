@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **LSP queries no longer pay a full language-server start per call.** One
+  server per (command, project root) is kept for the session. File URIs are
+  percent-encoded, so paths with spaces resolve.
+- **The browser agent's visible-price signal is live.** The last snapshot's
+  text is kept on the session, so a click on a page showing a price prompts
+  even when the button text is innocuous. The stagnation detector now keys
+  on the element acted on, so clicks on different elements that return the
+  same text are no longer mistaken for a loop.
+- The code index missed an edit made within the same second as the previous
+  index (whole-second mtimes); nanosecond mtimes now.
+- `Config` tool reported the startup model after `/model` changed it.
+- SDK: a `session/start` with a `cwd` that is not a directory is refused up
+  front (`invalid_cwd`) instead of failing every tool call.
+- Startup lists spawn worktrees a previous crash left behind, with the merge
+  or remove command for each.
+- `bwrap`/`firejail` availability is probed once per process, not on every
+  Bash call. The package-manager probe during plugin install no longer
+  freezes the TUI.
+
 ## [0.3.2] - 2026-09-10
 
 Phases 7–15 of the code review. **Upgrade from 0.3.1**: it still has the

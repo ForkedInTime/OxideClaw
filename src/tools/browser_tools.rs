@@ -128,6 +128,7 @@ impl Tool for BrowserNavigateTool {
                 session.current_url = url.to_string();
                 session.current_title = title.clone();
                 session.set_refs_with_names(refs, names);
+                session.last_page_text = tree.clone();
                 tree
             }
             Err(e) => {
@@ -171,7 +172,11 @@ impl Tool for BrowserSnapshotTool {
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let client = clone_client(&self.session).await?;
         let (tree, refs, names) = browser::snapshot::take_snapshot(&client).await?;
-        self.session.lock().await.set_refs_with_names(refs, names);
+        {
+            let mut s = self.session.lock().await;
+            s.set_refs_with_names(refs, names);
+            s.last_page_text = tree.clone();
+        }
         Ok(ToolOutput::success(tree))
     }
 }
@@ -221,7 +226,11 @@ impl Tool for BrowserClickTool {
         // losing the successful click result.
         let trailer = match browser::snapshot::take_snapshot(&client).await {
             Ok((tree, refs, names)) => {
-                self.session.lock().await.set_refs_with_names(refs, names);
+                {
+                    let mut s = self.session.lock().await;
+                    s.set_refs_with_names(refs, names);
+                    s.last_page_text = tree.clone();
+                }
                 format!("\n\nUpdated snapshot:\n{tree}")
             }
             Err(e) => format!("\n\n(snapshot unavailable: {e})"),

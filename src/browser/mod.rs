@@ -37,6 +37,9 @@ pub struct BrowserSession {
     ref_names: HashMap<String, String>,
     /// Current page URL
     pub current_url: String,
+    /// Text of the last snapshot / get_text, for the approval gate's
+    /// visible-price signal.
+    pub last_page_text: String,
     /// Current page title
     pub current_title: String,
     /// Captured console messages (Runtime.consoleAPICalled + Runtime.exceptionThrown).
