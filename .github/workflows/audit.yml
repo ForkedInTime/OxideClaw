@@ -1,0 +1,33 @@
+name: Audit
+
+# Dependency advisory gate. The 0.3.0 release was the first time `cargo audit`
+# was ever run against this tree; it found 8 vulnerabilities that had been
+# sitting in the lockfile for five months. This job fails a PR that introduces
+# one, and the weekly schedule catches advisories published against an
+# unchanged lockfile. Unmaintained/unsound *warnings* do not fail the job —
+# the remaining ones are transitive (via ratatui 0.29, notify 7, image) and are
+# tracked separately.
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.lock', 'Cargo.toml', '.github/workflows/audit.yml']
+  pull_request:
+    branches: [main]
+    paths: ['Cargo.lock', 'Cargo.toml', '.github/workflows/audit.yml']
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
