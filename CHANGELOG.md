@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **crates.io:** `cargo install oxideclaw` (published 2026-09-11).
 - **AUR:** `oxideclaw-bin`.
 - **Docker:** `ghcr.io/forkedintime/oxideclaw` (Alpine + the musl binary, 41 MB), built by `.github/workflows/docker.yml` on every release.
-- **npm installer package** in `npm/` (`npm install -g oxideclaw` downloads the release binary, verifies its SHA-256; fetches lazily on first run if install scripts were blocked).
+- **npm:** `npm install -g oxideclaw` (published 2026-09-11; downloads the release binary, verifies its SHA-256, fetches lazily on first run if install scripts were blocked).
 
 - **BENCHMARKS.md** with `scripts/bench.py`: reproducible cold-start,
   executable-size, and peak-RSS numbers against whatever agents are on
