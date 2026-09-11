@@ -6,7 +6,31 @@ use crate::compact::{CompactNeeded, compact_needed, snip_compact, summarize_comp
 use crate::config::Config;
 use crate::hooks;
 use crate::mcp::{McpManager, mcp_dyn_tools};
-use crate::permissions::{CheckResult, PermissionDecision, PermissionState, describe_tool_call};
+use crate::permissions::{
+    GateOutcome, PermissionAsker, PermissionDecision, PermissionGate, PermissionState,
+};
+
+/// Puts a permission prompt in front of the user through the TUI event
+/// loop. A dropped reply (TUI shutdown, panic, SIGHUP) is `None`, which the
+/// gate treats as Deny — the "close terminal = auto-approve" class.
+struct TuiAsker {
+    tx: mpsc::UnboundedSender<AppEvent>,
+}
+
+#[async_trait::async_trait]
+impl PermissionAsker for TuiAsker {
+    async fn ask(&self, tool_name: &str, description: &str) -> Option<PermissionDecision> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(AppEvent::PermissionRequest {
+                tool_name: tool_name.to_string(),
+                description: description.to_string(),
+                reply: reply_tx,
+            })
+            .ok()?;
+        reply_rx.await.ok()
+    }
+}
 use crate::session::{Session, entries_from_messages};
 use crate::skills::{load_skills, parse_skill_invocation};
 use crate::tools::todo::TodoState;
@@ -1363,6 +1387,13 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                 && !config.disable_all_hooks
             {
                 hooks::run_stop_hooks(hook_cfg, &session.id, &config.cwd).await;
+            }
+
+            // Background spawn agents: cancel what is running and remove its
+            // worktree (the registry that tracks it dies with us); tell the
+            // user where completed, unmerged work is.
+            if let Some(msg) = crate::spawn::cleanup_on_exit(&spawn_registry, &config.cwd).await {
+                eprintln!("{msg}");
             }
             break;
         }
@@ -3641,7 +3672,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             {
                                 Ok(id) => {
                                     let _ = tx2.send(AppEvent::SystemMessage(
-                                        format!("Spawned agent [{id}]: {task2}\nWorking in background. Use /spawn list to check status."),
+                                        format!("Spawned agent [{id}]: {task2}\nRuns in the background with no approval prompts (settings deny rules still apply). Use /spawn list to check status."),
                                     ));
                                 }
                                 Err(e) => {
@@ -5287,6 +5318,15 @@ async fn run_api_task(task: ApiTask) {
                 ctx.live_model = Some(config.model.clone());
                 ctx.live_api_key = Some(config.api_key.clone());
                 ctx.live_ollama_host = Some(config.ollama_host.clone());
+                // One gate per turn (autonomy can change between turns via
+                // /autonomy). Published on the context so `Agent` children
+                // prompt through the same user.
+                let gate = PermissionGate::new(
+                    perm_state.clone(),
+                    config.autonomy == "suggest",
+                    Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
+                );
+                ctx.permission_gate = Some(gate.clone());
                 let mut results: Vec<ContentBlock> = Vec::new();
 
                 // Auto-fix loop: accumulate file paths touched by Write/Edit/MultiEdit
@@ -5391,63 +5431,15 @@ async fn run_api_task(task: ApiTask) {
                             }
                         } // disable_all_hooks guard
 
-                        // Autonomy check: "suggest" mode forces Ask for Write/Edit
-                        let autonomy_override = if config.autonomy == "suggest"
-                            && (name == "Write" || name == "Edit")
-                        {
-                            Some(CheckResult::Ask)
-                        } else {
-                            None
+                        // Permission check — the gate handles the suggest-mode
+                        // override, compound-command splitting, the prompt,
+                        // and always-allow recording. Same code path as
+                        // sub-agents and headless engines.
+                        let decision = match gate.decide(name, input).await {
+                            GateOutcome::Allowed => PermissionDecision::Allow,
+                            GateOutcome::Denied(_) => PermissionDecision::Deny,
                         };
 
-                        // Permission check — for Bash, parse compound commands (&&, ||, ;, |)
-                        // so each sub-command is checked individually against prefix rules
-                        let decision = match autonomy_override.unwrap_or_else(|| {
-                            if crate::permissions::is_command_tool(name) {
-                                if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
-                                    crate::permissions::check_compound_command(
-                                        &perm_state,
-                                        name,
-                                        cmd,
-                                    )
-                                } else {
-                                    perm_state.check_with_input(name, Some(input))
-                                }
-                            } else {
-                                perm_state.check_with_input(name, Some(input))
-                            }
-                        }) {
-                            CheckResult::Allow => PermissionDecision::Allow,
-                            CheckResult::Deny => PermissionDecision::Deny,
-                            CheckResult::Ask => {
-                                let desc = describe_tool_call(name, input);
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                if tx
-                                    .send(AppEvent::PermissionRequest {
-                                        tool_name: name.clone(),
-                                        description: desc,
-                                        reply: reply_tx,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                // Security contract: if the oneshot sender is
-                                // dropped without a value, we MUST treat this
-                                // as Deny. This fires on TUI shutdown, panic,
-                                // terminal close (SIGHUP), or runtime tear-down,
-                                // preventing the "close terminal = auto-approve"
-                                // bug ([redacted] #17276).
-                                match reply_rx.await {
-                                    Ok(d) => d,
-                                    Err(_) => PermissionDecision::Deny,
-                                }
-                            }
-                        };
-
-                        if decision == PermissionDecision::AlwaysAllow {
-                            perm_state.record_always_allow(name);
-                        }
                         if decision == PermissionDecision::Deny {
                             let _ = tx.send(AppEvent::ToolResult {
                                 is_error: true,
@@ -5721,4 +5713,55 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+#[cfg(test)]
+mod tui_asker_tests {
+    use super::*;
+
+    /// The TUI answers → the gate gets the decision.
+    #[tokio::test]
+    async fn forwards_the_users_decision() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let asker = TuiAsker { tx };
+        let ui = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(AppEvent::PermissionRequest {
+                    tool_name,
+                    description,
+                    reply,
+                }) => {
+                    assert_eq!(tool_name, "Bash");
+                    assert!(description.contains("ls"));
+                    reply.send(PermissionDecision::AlwaysAllow).unwrap();
+                }
+                _ => panic!("expected a PermissionRequest"),
+            }
+        });
+        let got = asker.ask("Bash", "Bash: ls").await;
+        assert_eq!(got, Some(PermissionDecision::AlwaysAllow));
+        ui.await.unwrap();
+    }
+
+    /// TUI gone (receiver dropped) → `None`, which the gate turns into Deny.
+    #[tokio::test]
+    async fn a_dead_ui_yields_no_decision() {
+        let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
+        drop(rx);
+        let asker = TuiAsker { tx };
+        assert_eq!(asker.ask("Bash", "Bash: ls").await, None);
+    }
+
+    /// TUI received the request but dropped the reply without answering.
+    #[tokio::test]
+    async fn an_unanswered_request_yields_no_decision() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let asker = TuiAsker { tx };
+        let ui = tokio::spawn(async move {
+            let ev = rx.recv().await;
+            drop(ev);
+        });
+        assert_eq!(asker.ask("Bash", "Bash: ls").await, None);
+        ui.await.unwrap();
+    }
 }
