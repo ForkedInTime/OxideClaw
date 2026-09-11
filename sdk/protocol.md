@@ -48,7 +48,7 @@ Start a new conversation and execute the first prompt.
   "type": "session/start",
   "prompt": "Fix the failing tests in src/auth.rs",
   "cwd": "/home/user/project",
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "max_turns": 10,
   "max_budget_usd": 5.0,
   "record": true,
@@ -75,7 +75,7 @@ Start a new conversation and execute the first prompt.
 | `id` | yes | | Request correlation ID |
 | `prompt` | yes | | The user's message |
 | `cwd` | no | server cwd | Working directory for tools |
-| `model` | no | from config | Model name (e.g. `claude-sonnet-4-6`, `ollama:llama3`) |
+| `model` | no | from config | Model name (e.g. `claude-sonnet-5`, `ollama:llama3`) |
 | `max_turns` | no | 50 | Max agentic loop iterations |
 | `max_budget_usd` | no | unlimited | Budget cap |
 | `record` | no | false | Save session to disk |
@@ -89,7 +89,7 @@ Start a new conversation and execute the first prompt.
   "type": "session/started",
   "id": "req-1",
   "session_id": "65f9c008-dcef-4d7b-8f16-3f3fb13e7409",
-  "model": "claude-sonnet-4-6"
+  "model": "claude-sonnet-5"
 }
 ```
 
@@ -256,7 +256,7 @@ Token usage and cost after each API call.
   "budget_remaining_usd": 4.985,
   "input_tokens": 1200,
   "output_tokens": 85,
-  "model": "claude-sonnet-4-6"
+  "model": "claude-sonnet-5"
 }
 ```
 
@@ -313,7 +313,7 @@ The turn is finished. Contains the full response and summary stats.
   "cost_usd": 0.015,
   "total_session_cost_usd": 0.015,
   "tokens": {"input": 14000, "output": 250},
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "tools_used": ["Read", "Edit", "Bash"],
   "duration_ms": 12500
 }

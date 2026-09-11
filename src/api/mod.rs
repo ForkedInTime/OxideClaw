@@ -19,7 +19,7 @@ pub use types::*;
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 8096;
 
 /// Maximum time to wait for the *next* SSE event before declaring the stream dead.

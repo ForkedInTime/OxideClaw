@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes only on an incompatible wire change; hosts should gate on it
   rather than on the crate version.
 
+### Changed
+
+- **Default model is now `claude-sonnet-5`** (was `claude-sonnet-4-6`): the
+  current generation, and cheaper per token. `/model` aliases follow suit:
+  `opus` → `claude-opus-5`, `sonnet` → `claude-sonnet-5`, `haiku` →
+  `claude-haiku-4-5`, new `fable` → `claude-fable-5-1`; the 4.6 ids remain
+  available by name. The `/model` picker and the smart router's defaults
+  list the current generation. Nothing changes for users who set a model
+  explicitly in settings or on the command line.
+- Settings writes (`/trust`, `/config set`, MCP server registration, banner
+  label) are atomic: a crash mid-write cannot truncate `settings.json`.
+- Three slash-command actions that nothing could trigger (`PersistModel`,
+  `PreviewVoiceModel`, `ShowCostDashboard`) were removed along with their
+  dead handlers; `/model`, `/voice` and `/cost` are unaffected.
+
 ### Security
 
 - **The browser agent's form-field protections were never wired.** The
@@ -66,6 +81,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Text-to-speech went silent on multi-line replies.** The XTTS request
+  body was hand-escaped (quotes and backslashes only), so any newline or tab
+  in the model's text produced invalid JSON the server rejected. Built with
+  serde now.
+- **Voice temp files were shared by every RustyClaw on the machine**
+  (`rustyclaw-voice.wav` and three XTTS files under the temp dir): two
+  sessions clobbered each other's audio, and a fixed name in a world-writable
+  temp dir is a pre-created-symlink target. Per-process names now.
+- The Whisper transcription request had no timeout.
+- **Plan mode now applies to sub-agents.** It was enforced only in the
+  session's own tool loop; an `Agent` launched during plan mode could write
+  and run commands. The block list rides on the permission gate, which
+  children inherit.
+- The session picker and `/sessions` could panic on a session id shorter
+  than 8 characters (a hand-edited or foreign `.meta` file).
 - **SDK: a late approval reply for an earlier prompt denied the current tool
   and left the real answer queued**, cascading down every following prompt.
   Replies for other approval ids are now skipped.

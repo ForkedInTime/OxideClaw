@@ -54,9 +54,9 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             low_model: "claude-haiku-4-5".into(),
-            medium_model: "claude-sonnet-4-6".into(),
+            medium_model: "claude-sonnet-5".into(),
             high_model: String::new(), // filled from config.model at runtime
-            super_high_model: "claude-opus-4-6".into(),
+            super_high_model: "claude-opus-5".into(),
             enabled: false,
         }
     }
@@ -436,10 +436,10 @@ impl Default for PhaseRouterConfig {
         Self {
             enabled: false,
             research_model: "claude-haiku-4-5".into(),
-            plan_model: "claude-sonnet-4-6".into(),
-            edit_model: "claude-sonnet-4-6".into(),
-            review_model: "claude-opus-4-6".into(),
-            default_model: "claude-sonnet-4-6".into(),
+            plan_model: "claude-sonnet-5".into(),
+            edit_model: "claude-sonnet-5".into(),
+            review_model: "claude-opus-5".into(),
+            default_model: "claude-sonnet-5".into(),
         }
     }
 }
