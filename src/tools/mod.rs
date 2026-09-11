@@ -628,7 +628,7 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
         None
     };
 
-    tools.push(Arc::new(lsp::LSPTool));
+    tools.push(Arc::new(lsp::LSPTool::default()));
     tools.push(Arc::new(discover_skills::DiscoverSkillsTool));
     tools.push(Arc::new(skill_tool::SkillTool));
     tools.push(Arc::new(workflow::WorkflowTool));

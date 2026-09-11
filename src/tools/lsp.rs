@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -16,7 +16,37 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, oneshot};
 
-pub struct LSPTool;
+/// One language server per (command, project root), kept for the life of
+/// the tool set. A fresh server per call meant paying rust-analyzer's full
+/// startup and indexing on every query.
+type ClientCache = Arc<Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>>;
+
+#[derive(Default)]
+pub struct LSPTool {
+    cache: ClientCache,
+}
+
+impl LSPTool {
+    /// The cached, initialised client for this server + root, spawning it
+    /// on first use.
+    async fn client_for(
+        &self,
+        command: &str,
+        args: &[String],
+        root: &Path,
+    ) -> Result<Arc<LspClient>> {
+        let key = (format!("{command} {}", args.join(" ")), root.to_path_buf());
+        let mut cache = self.cache.lock().await;
+        if let Some(c) = cache.get(&key) {
+            return Ok(Arc::clone(c));
+        }
+        let client = LspClient::connect(command, args, root).await?;
+        client.initialize(root).await?;
+        let client = Arc::new(client);
+        cache.insert(key, Arc::clone(&client));
+        Ok(client)
+    }
+}
 
 // ── Input schema ──────────────────────────────────────────────────────────────
 
@@ -131,8 +161,10 @@ impl Tool for LSPTool {
             }
         };
 
-        // Spawn and connect to the language server
-        let mut client = match LspClient::connect(&server_cmd[0], &server_cmd[1..], &ctx.cwd).await
+        // One initialised server per (command, root), cached across calls.
+        let client = match self
+            .client_for(&server_cmd[0], &server_cmd[1..], &ctx.cwd)
+            .await
         {
             Ok(c) => c,
             Err(e) => {
@@ -142,9 +174,6 @@ impl Tool for LSPTool {
                 )));
             }
         };
-
-        // Initialize
-        client.initialize(&ctx.cwd).await?;
 
         // Convert file path to URI
         let uri = path_to_uri(&file_path);
@@ -421,7 +450,7 @@ impl LspClient {
         Ok(())
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.id_counter.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
 
@@ -445,7 +474,7 @@ impl LspClient {
             .map_err(|_| anyhow!("LSP request '{}' cancelled", method))?
     }
 
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+    async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.send_raw(json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -454,7 +483,7 @@ impl LspClient {
         .await
     }
 
-    async fn initialize(&mut self, root: &Path) -> Result<()> {
+    async fn initialize(&self, root: &Path) -> Result<()> {
         let root_uri = path_to_uri(root);
         self.request(
             "initialize",
@@ -493,7 +522,11 @@ fn path_to_uri(path: &Path) -> String {
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
-    format!("file://{}", abs.display())
+    // `Url::from_file_path` percent-encodes reserved characters (spaces,
+    // `#`, `?`) that a raw `format!` left in the URI.
+    url::Url::from_file_path(&abs)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", abs.display()))
 }
 
 fn lang_id_for_ext(ext: Option<&str>) -> &'static str {
@@ -643,7 +676,7 @@ mod path_tests {
     #[tokio::test]
     async fn a_bare_tilde_path_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
-        let out = LSPTool
+        let out = LSPTool::default()
             .execute(
                 json!({"operation": "hover", "file_path": "~"}),
                 &ToolContext::new(dir.path().to_path_buf()),
@@ -676,7 +709,7 @@ mod lifecycle_tests {
     async fn server_survives_connect_and_answers_initialize() {
         let (cmd, args) = fake_server();
         let dir = tempfile::tempdir().unwrap();
-        let mut client = LspClient::connect(&cmd, &args, dir.path()).await.unwrap();
+        let client = LspClient::connect(&cmd, &args, dir.path()).await.unwrap();
         let init = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             client.initialize(dir.path()),
@@ -694,7 +727,7 @@ mod lifecycle_tests {
     async fn a_dead_server_fails_requests_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let script = "read -r _line; exit 0".to_string();
-        let mut client = LspClient::connect("sh", &["-c".to_string(), script], dir.path())
+        let client = LspClient::connect("sh", &["-c".to_string(), script], dir.path())
             .await
             .unwrap();
         let started = std::time::Instant::now();
@@ -705,5 +738,47 @@ mod lifecycle_tests {
             "took {:?}; the pending request was left waiting for the full timeout",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::path_to_uri;
+
+    /// Spaces and other reserved characters must be percent-encoded, or the
+    /// server cannot resolve the document.
+    #[test]
+    fn paths_are_percent_encoded_file_uris() {
+        let uri = path_to_uri(std::path::Path::new("/tmp/my project/a b.rs"));
+        // Windows resolves `/tmp` under a drive letter; the encoding is the point.
+        assert!(uri.starts_with("file:///"), "{uri}");
+        assert!(uri.ends_with("/tmp/my%20project/a%20b.rs"), "{uri}");
+        assert!(path_to_uri(std::path::Path::new("/plain/x.rs")).starts_with("file:///"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cache_tests {
+    use super::*;
+
+    /// Two queries against the same root must reuse one server process.
+    #[tokio::test]
+    async fn the_same_root_reuses_one_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("starts");
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        let script = format!(
+            "echo x >> '{}'; read -r _l; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; sleep 5",
+            counter.display(),
+            body.len(),
+            body
+        );
+        let tool = LSPTool::default();
+        let args = vec!["-c".to_string(), script];
+        let a = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        let b = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "second call must hit the cache");
+        let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(starts, 1, "server spawned {starts} times");
     }
 }

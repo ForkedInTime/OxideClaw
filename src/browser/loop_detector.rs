@@ -96,6 +96,10 @@ pub struct LoopDetectorMiddleware {
     inner: Mutex<LoopDetector>,
     nudge_tx: mpsc::Sender<String>,
     stopped: AtomicBool,
+    /// Target of the call in flight (ref / selector / url / key), captured
+    /// in `before_tool` because `after_tool` only sees the output. Without
+    /// it, distinct elements with identical output text looked like a loop.
+    last_target: Mutex<String>,
 }
 
 impl LoopDetectorMiddleware {
@@ -104,6 +108,7 @@ impl LoopDetectorMiddleware {
             inner: Mutex::new(LoopDetector::new()),
             nudge_tx,
             stopped: AtomicBool::new(false),
+            last_target: Mutex::new(String::new()),
         }
     }
 
@@ -115,7 +120,13 @@ impl LoopDetectorMiddleware {
 
 #[async_trait]
 impl ToolMiddleware for LoopDetectorMiddleware {
-    async fn before_tool(&self, _tool_name: &str, _input: &serde_json::Value) -> MiddlewareVerdict {
+    async fn before_tool(&self, _tool_name: &str, input: &serde_json::Value) -> MiddlewareVerdict {
+        let target = ["ref", "selector", "url", "key"]
+            .iter()
+            .find_map(|k| input[*k].as_str())
+            .unwrap_or("")
+            .to_string();
+        *self.last_target.lock().unwrap_or_else(|e| e.into_inner()) = target;
         if self.stopped.load(Ordering::SeqCst) {
             return MiddlewareVerdict::Deny {
                 reason: "Stagnation detected: the browser agent has been stopped after \
@@ -133,8 +144,13 @@ impl ToolMiddleware for LoopDetectorMiddleware {
             return;
         }
         let nudge = {
+            let target = self
+                .last_target
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let mut ld = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            ld.record_action(tool_name, "", output);
+            ld.record_action(tool_name, &target, output);
             ld.check_stagnation()
         };
         if let Some(nudge) = nudge {
@@ -145,5 +161,37 @@ impl ToolMiddleware for LoopDetectorMiddleware {
             }
             let _ = self.nudge_tx.send(nudge).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Three clicks on *different* elements that happen to return the same
+    /// text are progress, not stagnation. The fingerprint must include the
+    /// target, which only `before_tool` sees.
+    #[tokio::test]
+    async fn different_targets_with_identical_output_are_not_stagnation() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mw = LoopDetectorMiddleware::new(tx);
+        for r in ["@e1", "@e2", "@e3", "@e4", "@e5", "@e6"] {
+            mw.before_tool("browser_click", &json!({"ref": r})).await;
+            mw.after_tool("browser_click", "Clicked. Title: Home").await;
+        }
+        assert!(!mw.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn the_same_target_repeated_still_stops() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mw = LoopDetectorMiddleware::new(tx);
+        for _ in 0..5 {
+            mw.before_tool("browser_click", &json!({"ref": "@e1"}))
+                .await;
+            mw.after_tool("browser_click", "Clicked. Title: Home").await;
+        }
+        assert!(mw.is_stopped());
     }
 }

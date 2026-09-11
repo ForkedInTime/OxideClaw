@@ -465,7 +465,9 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
                 m.modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
+                    // Nanoseconds: whole seconds missed an edit made within the
+                    // same second as the previous index.
+                    .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0)
             })
             .unwrap_or(0);
@@ -583,6 +585,19 @@ mod tests {
         assert_eq!(db.file_count().unwrap(), 1, "gone.rs chunks must be pruned");
         let hits = super::super::search::search(&db, "gone", 10).unwrap();
         assert!(hits.is_empty(), "search still returns the deleted file");
+    }
+
+    /// Whole-second mtimes missed an edit made within the same second as
+    /// the previous index; nanoseconds do not.
+    #[test]
+    fn an_edit_shortly_after_indexing_is_picked_up() {
+        let tmp = setup_project(&[("lib.rs", "fn a() {}")]);
+        let db = RagDb::open(tmp.path()).unwrap();
+        index_project(&db, tmp.path(), false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(tmp.path().join("lib.rs"), "fn b() {}").unwrap();
+        let r = index_project(&db, tmp.path(), false).unwrap();
+        assert_eq!(r.files_indexed, 1, "the edited file must be re-indexed");
     }
 
     #[test]
