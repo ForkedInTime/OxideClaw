@@ -22,3 +22,8 @@ contrib/aur/src/
 contrib/aur/pkg/
 contrib/aur/*.pkg.tar.*
 contrib/aur/oxideclaw-*
+
+# npm packaging scratch
+npm/vendor/
+npm/*.tgz
+npm/node_modules/
