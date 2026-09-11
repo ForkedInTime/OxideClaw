@@ -16,6 +16,22 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::time::Duration;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default ceiling on what one tool call or resource read hands the model.
+const DEFAULT_MAX_RESULT_CHARS: usize = 25_000;
+
+/// Truncate at a char boundary and say so.
+fn cap_output(output: String, max_chars: usize) -> String {
+    if output.chars().count() <= max_chars {
+        return output;
+    }
+    let truncated: String = output.chars().take(max_chars).collect();
+    format!(
+        "{}\n\n[Result truncated: {} chars total, limit {}]",
+        truncated,
+        output.chars().count(),
+        max_chars
+    )
+}
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -187,36 +203,80 @@ impl HttpTransport {
     }
 }
 
-#[async_trait]
-impl McpTransport for HttpTransport {
-    async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
-        let req = JsonRpcRequest::new(id, method, params);
+/// Largest HTTP MCP response body we will buffer. Resources and tool
+/// results are capped far below this before reaching the model; this is
+/// the transport-level guard against a server that streams forever.
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+impl HttpTransport {
+    async fn post(&self, req: &JsonRpcRequest, method: &str) -> Result<reqwest::Response> {
         let resp = tokio::time::timeout(
             REQUEST_TIMEOUT,
             self.client
                 .post(&self.url)
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
-                .json(&req)
+                .json(req)
                 .send(),
         )
         .await
         .map_err(|_| anyhow!("HTTP MCP request timed out ({})", method))??;
+        Ok(resp)
+    }
+
+    /// Read a response body, refusing it once it exceeds the cap.
+    async fn bounded_body(resp: reqwest::Response, method: &str) -> Result<Vec<u8>> {
+        use tokio_stream::StreamExt;
+        if let Some(len) = resp.content_length()
+            && len > MAX_HTTP_BODY_BYTES as u64
+        {
+            return Err(anyhow!(
+                "HTTP MCP {method} response too large: {len} bytes (limit {MAX_HTTP_BODY_BYTES})"
+            ));
+        }
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
+                return Err(anyhow!(
+                    "HTTP MCP {method} response too large (limit {MAX_HTTP_BODY_BYTES} bytes)"
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+}
+
+#[async_trait]
+impl McpTransport for HttpTransport {
+    async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+        let req = JsonRpcRequest::new(id, method, params);
+        let resp = self.post(&req, method).await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::bounded_body(resp, method).await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&body);
             return Err(anyhow!("HTTP MCP {} failed: {} — {}", method, status, body));
         }
 
-        let rpc_resp: JsonRpcResponse = resp.json().await?;
+        let body = Self::bounded_body(resp, method).await?;
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body)?;
 
         if let Some(err) = rpc_resp.error {
             return Err(anyhow!("MCP error {}: {}", err.code, err.message));
         }
 
         Ok(rpc_resp.result.unwrap_or(Value::Null))
+    }
+
+    /// Streamable-HTTP servers expect `notifications/initialized` like any
+    /// other transport; a notification has no id and its reply is ignored.
+    async fn notify(&self, method: &str) {
+        let req = JsonRpcRequest::notification(method);
+        let _ = self.post(&req, method).await;
     }
 }
 
@@ -229,10 +289,6 @@ pub struct McpClient {
     transport: Box<dyn McpTransport>,
     next_id: AtomicU64,
 }
-
-// Box<dyn McpTransport + Send + Sync> is Send+Sync; AtomicU64 is Send+Sync.
-unsafe impl Send for McpClient {}
-unsafe impl Sync for McpClient {}
 
 impl McpClient {
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -385,7 +441,9 @@ impl McpClient {
             })
             .unwrap_or_else(|| serde_json::to_string_pretty(&result).unwrap_or_default());
 
-        Ok(text)
+        // Same ceiling as tool results: one large resource must not flood
+        // the context window.
+        Ok(cap_output(text, DEFAULT_MAX_RESULT_CHARS))
     }
 
     /// Execute an MCP tool call and return the text output.
@@ -426,18 +484,8 @@ impl McpClient {
             .iter()
             .find(|t| t.name == tool_name)
             .map(|t| t.max_result_chars())
-            .unwrap_or(25_000);
-
-        if output.len() > max_chars {
-            // Truncate at a char boundary
-            let truncated: String = output.chars().take(max_chars).collect();
-            output = format!(
-                "{}\n\n[Result truncated: {} chars total, limit {}]",
-                truncated,
-                output.len(),
-                max_chars
-            );
-        }
+            .unwrap_or(DEFAULT_MAX_RESULT_CHARS);
+        output = cap_output(output, max_chars);
 
         if call_result.is_error {
             Err(anyhow!("MCP tool '{}' error: {}", tool_name, output))
@@ -654,5 +702,66 @@ mod tests {
         assert!(all.is_empty());
         // Must have stopped at MAX_PAGES (256), not consumed all 300.
         assert_eq!(mock.calls().len(), 256, "must cap at MAX_PAGES");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::net_policy::test_support::scripted_server;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    struct Canned(Value);
+    #[async_trait]
+    impl McpTransport for Canned {
+        async fn call(&self, _id: u64, _method: &str, _params: Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn client(resp: Value) -> McpClient {
+        McpClient {
+            server_name: "mock".into(),
+            tools: Vec::new(),
+            transport_kind: "stdio",
+            transport: Box::new(Canned(resp)),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// `tools/call` output is capped at 25K chars; `resources/read` was not,
+    /// so one hostile or merely large resource flooded the context window.
+    #[tokio::test]
+    async fn resource_read_output_is_capped_like_tool_output() {
+        let big = "x".repeat(200_000);
+        let c = client(json!({"contents": [{"uri": "u", "text": big}]}));
+        let out = c.read_resource("u").await.unwrap();
+        assert!(out.len() < 30_000, "got {} chars", out.len());
+        assert!(out.contains("[Result truncated"), "must say it was cut");
+    }
+
+    /// Streamable-HTTP servers must receive `notifications/initialized`
+    /// before requests; the HTTP transport's `notify` was a no-op.
+    #[tokio::test]
+    async fn http_transport_sends_notifications() {
+        let (base, hits) = scripted_server(vec![
+            "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
+        ])
+        .await;
+        let t = HttpTransport::new(&base, &HashMap::new()).unwrap();
+        t.notify("notifications/initialized").await;
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "no request was sent");
+    }
+
+    /// A server answering with a multi-gigabyte body must be refused, not
+    /// buffered.
+    #[tokio::test]
+    async fn http_transport_refuses_oversized_responses() {
+        let resp = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    content-length: 999999999\r\nconnection: close\r\n\r\n{";
+        let (base, _) = scripted_server(vec![resp.to_string()]).await;
+        let t = HttpTransport::new(&base, &HashMap::new()).unwrap();
+        let err = t.call(1, "tools/list", json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 }

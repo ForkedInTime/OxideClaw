@@ -130,17 +130,26 @@ fn parse_yaml_skill(content: &str, fallback_name: &str) -> Result<Skill> {
         .strip_prefix("---\r\n")
         .or_else(|| content.strip_prefix("---\n"))
         .ok_or_else(|| anyhow::anyhow!("Expected YAML frontmatter delimiter"))?;
-    let end = after_first
-        .find("\n---\n")
-        .or_else(|| after_first.find("\n---\r\n"))
-        .ok_or_else(|| anyhow::anyhow!("No closing --- in YAML frontmatter"))?;
-    let yaml_str = &after_first[..end];
-    // Skip past `\n---\n` or `\n---\r\n`.
-    let prompt_start = if after_first[end..].starts_with("\n---\r\n") {
-        end + 6
+    // An empty frontmatter block (`---` immediately followed by `---`) has
+    // its closing delimiter at offset 0, with no preceding newline.
+    let (end, prompt_start) = if after_first.starts_with("---\r\n") {
+        (0, 5)
+    } else if after_first.starts_with("---\n") {
+        (0, 4)
     } else {
-        end + 5
+        let end = after_first
+            .find("\n---\n")
+            .or_else(|| after_first.find("\n---\r\n"))
+            .ok_or_else(|| anyhow::anyhow!("No closing --- in YAML frontmatter"))?;
+        // Skip past `\n---\n` or `\n---\r\n`.
+        let skip = if after_first[end..].starts_with("\n---\r\n") {
+            6
+        } else {
+            5
+        };
+        (end, end + skip)
     };
+    let yaml_str = &after_first[..end];
     let prompt = after_first[prompt_start..].trim().to_string();
 
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str)?;
@@ -322,4 +331,41 @@ fn bundled_skills() -> Vec<Skill> {
             params: vec![],
         },
     ]
+}
+
+#[cfg(test)]
+mod frontmatter_tests {
+    use super::parse_skill_from_content;
+
+    #[test]
+    fn malformed_frontmatter_is_an_error_not_a_panic() {
+        assert!(parse_skill_from_content("---\nname: [oops\n---\nbody", "x").is_err());
+        assert!(parse_skill_from_content("---\nname: never-closed\n", "x").is_err());
+        assert!(
+            parse_skill_from_content("---\n---\n", "x").is_ok(),
+            "empty frontmatter is fine"
+        );
+    }
+
+    #[test]
+    fn crlf_frontmatter_parses() {
+        let s =
+            parse_skill_from_content("---\r\nname: Win Skill\r\n---\r\nbody here", "x").unwrap();
+        assert_eq!(s.name, "win-skill");
+        assert_eq!(s.prompt_template, "body here");
+    }
+
+    #[test]
+    fn params_that_are_not_a_mapping_are_ignored() {
+        let s = parse_skill_from_content("---\nname: p\nparams: [a, b]\n---\nbody", "x").unwrap();
+        assert!(s.params.is_empty());
+    }
+
+    #[test]
+    fn unicode_next_to_the_delimiters_does_not_break_slicing() {
+        let s = parse_skill_from_content("---\nname: é\ndescription: ü\n---\n日本語 {{ARGS}}", "x")
+            .unwrap();
+        assert_eq!(s.name, "é");
+        assert!(s.expand("x").starts_with("日本語"));
+    }
 }

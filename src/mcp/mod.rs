@@ -77,11 +77,7 @@ pub fn mcp_dyn_tools(manager: &McpManager) -> Vec<DynTool> {
             let original = tool_def.name.clone();
             let composed = format!("mcp__{}__{}", server, sanitize_name(&original));
 
-            let description = if tool_def.description.is_empty() {
-                format!("[MCP: {}] {}", client.server_name, original)
-            } else {
-                format!("[MCP: {}] {}", client.server_name, tool_def.description)
-            };
+            let description = describe(&client.server_name, &original, &tool_def.description);
 
             tools.push(Arc::new(McpDynamicTool {
                 composed_name: composed,
@@ -97,6 +93,27 @@ pub fn mcp_dyn_tools(manager: &McpManager) -> Vec<DynTool> {
 }
 
 /// Replace non-alphanumeric characters with underscores for safe tool names.
+/// Tool descriptions come from the server and go straight into the model's
+/// prompt — attacker-controlled text across a trust boundary. The prefix
+/// keeps provenance visible and the cap bounds the payload.
+pub(crate) const MAX_DESCRIPTION_CHARS: usize = 2_000;
+
+fn describe(server: &str, original: &str, description: &str) -> String {
+    let body = if description.is_empty() {
+        original
+    } else {
+        description
+    };
+    let mut d = format!("[MCP: {server}] ");
+    if body.chars().count() > MAX_DESCRIPTION_CHARS {
+        d.extend(body.chars().take(MAX_DESCRIPTION_CHARS));
+        d.push_str(" [description truncated…]");
+    } else {
+        d.push_str(body);
+    }
+    d
+}
+
 fn sanitize_name(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -107,4 +124,29 @@ fn sanitize_name(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+
+    #[test]
+    fn descriptions_are_prefixed_with_the_server_and_capped() {
+        let d = describe("srv", "tool", "does things");
+        assert_eq!(d, "[MCP: srv] does things");
+        assert_eq!(describe("srv", "tool", ""), "[MCP: srv] tool");
+
+        let long = "y".repeat(50_000);
+        let d = describe("srv", "tool", &long);
+        assert!(
+            d.chars().count() <= MAX_DESCRIPTION_CHARS + 64,
+            "{}",
+            d.len()
+        );
+        assert!(
+            d.ends_with("…]"),
+            "must mark the cut: {}",
+            &d[d.len() - 20..]
+        );
+    }
 }
