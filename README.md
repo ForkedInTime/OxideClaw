@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="OxideClaw — Claude Code, carved in Rust" width="100%">
+  <img src="assets/banner.png" alt="OxideClaw — the single-binary coding agent" width="100%">
 </p>
 
 <p align="center">
@@ -10,14 +10,15 @@
   <a href="https://github.com/ForkedInTime/OxideClaw/stargazers"><img src="https://img.shields.io/github/stars/ForkedInTime/OxideClaw?style=flat-square&color=F08A3E" alt="Stars"></a>
 </p>
 
-<p align="center"><sub>Formerly <b>RustyClaw</b> (renamed 2026-09-11). Existing installs keep working: config, sessions, index and undo history migrate to the new name on first run.</sub></p>
-
-<h3 align="center">A single-binary coding agent that indexes your repo, routes each task to the cheapest capable model, fixes its own lint and test failures, and answers in your own voice.</h3>
+<h3 align="center">OxideClaw is a single-binary coding agent that indexes your repo, routes each task to the cheapest capable model, fixes its own lint and test failures, and answers in your own voice.</h3>
 
 <p align="center">
-  Claude, Ollama, and 9 OpenAI-compatible providers. One 19 MB static binary.<br>
-  No Node. No Python. No <code>node_modules</code>. No flickering TUI.
+  Claude, Ollama, and 9 OpenAI-compatible providers. One 19 MB static binary, 3 ms cold start.<br>
+  No Node. No Python. No <code>node_modules</code>. No flickering TUI.<br>
+  <sub>Rust is iron oxide. The claw stays.</sub>
 </p>
+
+<p align="center"><sub>Formerly <b>RustyClaw</b> (renamed 2026-09-11). Existing installs keep working: <code>RUSTYCLAW_*</code> settings are still read, and config, sessions, index and undo history move to the new name on first run.</sub></p>
 
 <p align="center">
   <img src="assets/demo.gif" alt="OxideClaw demo" width="100%">
