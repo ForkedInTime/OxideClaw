@@ -11,6 +11,14 @@ use uuid::Uuid;
 
 // ── Job store ─────────────────────────────────────────────────────────────────
 
+/// First `n` characters — a byte slice would panic on a multi-byte boundary.
+fn prefix_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
     pub id: String,
@@ -48,7 +56,10 @@ pub fn save_jobs(jobs: &[CronJob]) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(jobs)?;
-    std::fs::write(&path, json)?;
+    // Sibling temp file + rename: a crash mid-write cannot truncate the store.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -85,6 +96,9 @@ fn validate_cron_field(field: &str, min: u32, max: u32) -> Result<()> {
             .map_err(|_| anyhow!("invalid step value"))?;
         if step == 0 {
             return Err(anyhow!("step cannot be zero"));
+        }
+        if step > max {
+            return Err(anyhow!("step {step} exceeds the field maximum {max}"));
         }
         return Ok(());
     }
@@ -137,8 +151,9 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create a cron job that fires a prompt on a schedule. \
-        Schedule uses standard 5-field cron syntax: minute hour day month weekday. \
+        "Record a cron job (a prompt plus a 5-field schedule) in ~/.claude/cron_jobs.json. \
+        RustyClaw stores and lists these but does not run them itself yet; an external \
+        scheduler must read the file. Schedule syntax: minute hour day month weekday. \
         Examples: '*/15 * * * *' (every 15 minutes), '0 9 * * 1' (Mondays at 9am)."
     }
 
@@ -263,7 +278,7 @@ impl Tool for CronListTool {
     }
 
     fn description(&self) -> &str {
-        "List all scheduled cron jobs with their ids, schedules, and prompts."
+        "List the recorded cron jobs (ids, schedules, prompts). Note: RustyClaw does not run them itself yet."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -288,13 +303,58 @@ impl Tool for CronListTool {
                 };
                 format!(
                     "[{status}] {id} | {schedule}{desc}\n  prompt: {prompt}",
-                    id = &j.id[..8.min(j.id.len())],
+                    id = prefix_chars(&j.id, 8),
                     schedule = j.schedule,
-                    prompt = &j.prompt[..80.min(j.prompt.len())],
+                    prompt = prefix_chars(&j.prompt, 80),
                 )
             })
             .collect();
 
         Ok(ToolOutput::success(lines.join("\n\n")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with(prompt: &str) -> CronStore {
+        Arc::new(Mutex::new(vec![CronJob {
+            id: "0123456789abcdef".into(),
+            schedule: "* * * * *".into(),
+            prompt: prompt.into(),
+            description: String::new(),
+            created_at: 0,
+            last_run: None,
+            enabled: true,
+        }]))
+    }
+
+    /// The listing trimmed the prompt with a byte slice at 80; a multi-byte
+    /// character straddling that boundary panicked the whole tool call.
+    #[tokio::test]
+    async fn listing_a_prompt_with_multibyte_text_at_the_cut_does_not_panic() {
+        // 79 ASCII bytes then a 4-byte emoji: byte 80 is inside the emoji.
+        let prompt = format!("{}🦀 and more text after", "a".repeat(79));
+        let tool = CronListTool {
+            store: store_with(&prompt),
+        };
+        let out = tool
+            .execute(json!({}), &ToolContext::new(std::env::temp_dir()))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+    }
+
+    #[test]
+    fn cron_validation_rejects_bad_steps_and_ranges() {
+        assert!(validate_cron("*/0 * * * *").is_err());
+        assert!(
+            validate_cron("*/61 * * * *").is_err(),
+            "step beyond the field range"
+        );
+        assert!(validate_cron("5- * * * *").is_err());
+        assert!(validate_cron("0 9 * * 1").is_ok());
+        assert!(validate_cron("*/15 * * * *").is_ok());
     }
 }
