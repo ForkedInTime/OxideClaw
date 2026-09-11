@@ -13,3 +13,6 @@
 
 # Local RAG index and other .claude/ scratch state
 .claude/
+
+# Playwright MCP session artefacts
+.playwright-mcp/
