@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **MCP resource reads were uncapped.** Tool results were already limited to
+  25K characters; `resources/read` was not, so one large or hostile resource
+  flooded the context window. Same cap now. Server-supplied tool descriptions
+  (untrusted text that goes into the model's prompt) are capped at 2,000
+  characters and always carry the `[MCP: server]` provenance prefix.
+- **HTTP MCP responses are refused past 32 MiB** instead of being buffered.
+
 - **`TeamDelete` took an unvalidated name** and used it as a path component:
   `../../.claude/settings` deleted an arbitrary `.json` under home and could
   `remove_dir_all` a directory. `SendMessage`'s recipient had the same hole.
@@ -22,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A hung MCP server blocked startup for a minute, and several hung servers
+  blocked it for a minute each.** Servers now connect concurrently under a
+  20-second per-server budget; a server that does not answer is skipped with
+  a warning.
+- **HTTP MCP servers never received `notifications/initialized`**; spec-strict
+  servers reject every request until they do.
+- **The code index kept chunks for deleted or renamed files** until a forced
+  re-index, so search returned code that no longer existed. Incremental
+  re-index now prunes them.
+- A skill file with an empty frontmatter block (`---` directly followed by
+  `---`) was rejected as malformed.
 - **The `LSP` tool never worked**: the language server was killed the instant
   it was spawned (the child handle was dropped with kill-on-drop), so every
   query timed out after 15 s. The server now lives as long as the client, runs
