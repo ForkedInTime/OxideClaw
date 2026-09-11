@@ -2,10 +2,10 @@
 name = "rustyclaw"
 version = "0.3.2"
 edition = "2024"
-description = "RustyClaw — a Rust-native Claude Code CLI"
+description = "Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning. Claude, Ollama, and OpenAI-compatible backends."
 license = "Apache-2.0"
 repository = "https://github.com/ForkedInTime/RustyClaw"
-keywords = ["cli", "ai", "claude", "coding-assistant", "llm"]
+keywords = ["cli", "ai", "coding-agent", "claude", "ollama"]
 categories = ["command-line-utilities", "development-tools"]
 
 [lib]

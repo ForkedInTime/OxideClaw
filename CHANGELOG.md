@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **README repositioned.** RustyClaw is presented as a provider-neutral
+  coding agent rather than a "Rust port of Claude Code". The comparison
+  table now names Claude Code, Codewhale, jcode, and claurst and only claims
+  what each project documents (checked 2026-09-11).
+- **Hooks are documented.** README and FEATURES.md describe the eight
+  lifecycle events, environment variables, exit codes, and JSON output.
+- README browser tool count is 9 (`browser_console` was missing from the
+  tour); readme-lint no longer counts the `browse_done` loop terminator.
+
 ### Fixed
 
 - **LSP queries no longer pay a full language-server start per call.** One
