@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Sub-agents ran with no permission check at all.** The approval gate lived
+  only in the TUI loop; the engine behind the `Agent` tool, `/spawn`, and
+  `-p` print mode had none. A model could call `Agent { prompt: "…" }` and
+  the child ran Bash/Write/Edit unprompted. There is now one
+  `PermissionGate`: the TUI plugs in its prompt, `Agent` children inherit the
+  parent's gate (their prompts reach the same user), and a headless engine
+  fails closed on anything that would have needed a prompt.
+- **`Agent` nesting was unbounded.** Capped at 2 levels below the session.
+- **`permissions.deny` now holds under `--dangerously-skip-permissions`.**
+  Bypass skips prompts; it no longer overrides a rule the user wrote down.
+
 - **WebFetch / WebBrowser could reach the cloud metadata service, loopback
   and private networks** with only a scheme check, and followed redirects
   unchecked. Destinations are now resolved and classified before any
@@ -22,8 +33,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Chromium switch. Validated before spawn; the browser is killed on timeout
   instead of orphaned.
 
+### Changed
+
+- **`rustyclaw -p` fails closed on sensitive tools.** Print mode used to run
+  Bash/Write/Edit with no check. It now applies `permissions.allow`/`deny`,
+  `--allowedTools` and `--dangerously-skip-permissions`, and refuses anything
+  else with a message saying how to allow it. This matches Claude Code's
+  print-mode semantics.
+- `/spawn` says up front that the background agent runs without approval
+  prompts (settings deny rules still apply), and refuses a 9th concurrent
+  agent.
+
 ### Fixed
 
+- **`/merge` of a conflicting spawn left your checkout mid-merge and deleted
+  the worktree** you would have needed to resolve it. It now aborts the merge
+  and keeps the worktree, branch and registry entry.
+- **Quitting the TUI mid-spawn leaked the agent's worktree** next to your
+  repo. Shutdown now cancels running agents, removes their worktrees and
+  branches, and prints where completed unmerged work is.
+- `/kill` showed the agent as *failed* instead of *cancelled*. Two spawns with
+  the same description collided on the branch name. Worktree paths are
+  passed as OS strings (non-UTF-8 paths no longer fall back to `/tmp`).
+- The in-memory task registry is capped at 1000 entries.
 - **WebSearch returned 401 for every OAuth user** — it always sent
   `x-api-key`, but the credential chain puts a bearer token there. It also
   had no request timeout.

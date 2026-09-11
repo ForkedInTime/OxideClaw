@@ -10,6 +10,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+pub mod gate;
+pub use gate::{GateOutcome, PermissionAsker, PermissionGate};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionDecision {
     /// Allow this one time
@@ -72,15 +75,18 @@ impl PermissionState {
         input: Option<&serde_json::Value>,
     ) -> CheckResult {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.bypass {
-            return CheckResult::Allow;
-        }
 
-        // Check deny list — supports Bash(prefix:...) rules
+        // Deny list first — an explicit `permissions.deny` holds even under
+        // `--dangerously-skip-permissions`; bypass skips *prompts*, it does
+        // not override a rule the user wrote down.
         for rule in &inner.deny_list {
             if rule_matches(rule, tool_name, input) {
                 return CheckResult::Deny;
             }
+        }
+
+        if inner.bypass {
+            return CheckResult::Allow;
         }
 
         if !SENSITIVE_TOOLS.contains(&tool_name) {

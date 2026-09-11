@@ -36,6 +36,20 @@ pub fn new_registry() -> TaskRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// The registry is in-memory and model-driven; without a ceiling a long
+/// session (or a looping model) grows it without bound.
+pub const MAX_TASKS: usize = 1000;
+
+/// Insert a task, refusing once the registry is full.
+fn insert_task(registry: &TaskRegistry, task: Task) -> Result<()> {
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if reg.len() >= MAX_TASKS {
+        anyhow::bail!("Task registry is full ({MAX_TASKS} tasks). Complete or delete tasks first.");
+    }
+    reg.insert(task.id.clone(), task);
+    Ok(())
+}
+
 // ── TaskCreate ────────────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool {
@@ -84,7 +98,9 @@ impl Tool for TaskCreateTool {
             output: None,
             active_form: input.active_form,
         };
-        self.registry.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), task);
+        if let Err(e) = insert_task(&self.registry, task) {
+            return Ok(ToolOutput::error(e.to_string()));
+        }
         Ok(ToolOutput::success(
             json!({ "task": { "id": id } }).to_string(),
         ))
@@ -343,5 +359,32 @@ impl Tool for TaskOutputTool {
                 input.task_id
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str) -> Task {
+        Task {
+            id: id.into(),
+            subject: "s".into(),
+            description: "d".into(),
+            status: TaskStatus::Pending,
+            output: None,
+            active_form: None,
+        }
+    }
+
+    #[test]
+    fn registry_refuses_inserts_past_the_cap() {
+        let reg = new_registry();
+        for i in 0..MAX_TASKS {
+            insert_task(&reg, task(&i.to_string())).unwrap();
+        }
+        let err = insert_task(&reg, task("one-too-many")).unwrap_err();
+        assert!(err.to_string().contains("full"), "{err}");
+        assert_eq!(reg.lock().unwrap().len(), MAX_TASKS);
     }
 }
