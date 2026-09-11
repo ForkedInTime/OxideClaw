@@ -109,14 +109,21 @@ pub const SLASH_COMMANDS: &[&str] = &[
 // ── Model catalogue ───────────────────────────────────────────────────────────
 
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-6", "Most capable — best for complex tasks"),
-    ("claude-sonnet-4-6", "Smart & fast — recommended (default)"),
+    ("claude-sonnet-5", "Smart & fast — recommended (default)"),
     (
-        "claude-haiku-4-5-20251001",
+        "claude-opus-5",
+        "Most capable general model — complex, long tasks",
+    ),
+    (
+        "claude-fable-5-1",
+        "Frontier model — hardest reasoning; priced above Opus",
+    ),
+    (
+        "claude-haiku-4-5",
         "Fastest & cheapest — great for simple tasks",
     ),
-    ("claude-opus-4-5", "Previous Opus generation"),
-    ("claude-sonnet-4-5", "Previous Sonnet generation"),
+    ("claude-opus-4-6", "Previous Opus generation"),
+    ("claude-sonnet-4-6", "Previous Sonnet generation"),
 ];
 
 // Cost per million tokens (input, output) in USD
@@ -137,7 +144,6 @@ fn model_pricing(model: &str) -> (f64, f64) {
 // ── Command action ────────────────────────────────────────────────────────────
 
 /// What the run-loop should do after a slash command is dispatched.
-#[allow(dead_code)] // some variants are built but not yet wired to commands
 pub enum CommandAction {
     /// Display a system message in the chat panel
     Message(String),
@@ -203,8 +209,6 @@ pub enum CommandAction {
     EditClaudeMd,
     /// Search sessions by query string
     SearchSessions(String),
-    /// Persist the current model to settings.json
-    PersistModel,
     /// Install a plugin. Spec is "marketplace:<user/repo>" or a direct npm package spec.
     PluginInstall(String),
     /// Remove a plugin by name
@@ -221,8 +225,6 @@ pub enum CommandAction {
     ListModels,
     /// Show interactive voice model picker
     ListVoiceModels,
-    /// Set the voice model and play a preview
-    PreviewVoiceModel(String),
     /// Show interactive help category picker
     ListHelp,
     /// Show help for a specific category by index
@@ -251,8 +253,6 @@ pub enum CommandAction {
     GitCheckpoint(Option<String>),
     /// Set autonomy level: "suggest", "auto-edit", "full-auto"
     SetAutonomy(String),
-    /// Show cost dashboard
-    ShowCostDashboard,
     /// Spawn a background agent in a git worktree
     SpawnAgent(String),
     /// List all spawned background agents
@@ -903,15 +903,19 @@ fn cmd_model(args: &str, _ctx: &CommandContext) -> CommandAction {
 }
 
 /// Resolve common model shorthands to full Anthropic model IDs.
-/// e.g. "opus" → "claude-opus-4-6", "sonnet" → "claude-sonnet-4-6"
+/// e.g. "opus" → "claude-opus-5", "sonnet" → "claude-sonnet-5"
 pub fn resolve_model_alias(model: &str) -> String {
-    match model {
-        "opus" | "Opus" => "claude-opus-4-6".into(),
-        "sonnet" | "Sonnet" => "claude-sonnet-4-6".into(),
-        "haiku" | "Haiku" => "claude-haiku-4-5-20251001".into(),
+    match model.to_ascii_lowercase().as_str() {
+        // Bare family names mean the current generation.
+        "opus" => "claude-opus-5".into(),
+        "sonnet" => "claude-sonnet-5".into(),
+        "haiku" => "claude-haiku-4-5".into(),
+        "fable" => "claude-fable-5-1".into(),
+        "opus-4-6" | "opus4.6" => "claude-opus-4-6".into(),
+        "sonnet-4-6" | "sonnet4.6" => "claude-sonnet-4-6".into(),
         "opus-4-5" | "opus4.5" => "claude-opus-4-5".into(),
         "sonnet-4-5" | "sonnet4.5" => "claude-sonnet-4-5".into(),
-        other => other.to_string(),
+        _ => model.to_string(),
     }
 }
 
@@ -1709,19 +1713,14 @@ fn mcp_add_server(args: &str) -> CommandAction {
     }
 
     match serde_json::to_string_pretty(&val) {
-        Ok(s) => {
-            if let Some(parent) = settings_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::write(&settings_path, s) {
-                Ok(_) => CommandAction::Message(format!(
-                    "MCP server '{}' added to {}\nRestart rustyclaw to connect.",
-                    name,
-                    settings_path.display()
-                )),
-                Err(e) => CommandAction::Message(format!("Failed to write settings: {e}")),
-            }
-        }
+        Ok(s) => match crate::config::write_json_atomic(&settings_path, &s) {
+            Ok(_) => CommandAction::Message(format!(
+                "MCP server '{}' added to {}\nRestart rustyclaw to connect.",
+                name,
+                settings_path.display()
+            )),
+            Err(e) => CommandAction::Message(format!("Failed to write settings: {e}")),
+        },
         Err(e) => CommandAction::Message(format!("Serialization error: {e}")),
     }
 }
@@ -1747,7 +1746,7 @@ fn mcp_remove_server(args: &str) -> CommandAction {
     }
 
     match serde_json::to_string_pretty(&val) {
-        Ok(s) => match std::fs::write(&settings_path, s) {
+        Ok(s) => match crate::config::write_json_atomic(&settings_path, &s) {
             Ok(_) => CommandAction::Message(format!(
                 "MCP server '{}' removed from settings.json\nRestart rustyclaw to disconnect.",
                 name
@@ -3800,4 +3799,42 @@ fn cmd_powerup(args: &str) -> CommandAction {
     );
 
     CommandAction::Message(format!("{header}{content}"))
+}
+
+#[cfg(test)]
+mod model_catalogue_tests {
+    use super::{KNOWN_MODELS, resolve_model_alias};
+
+    /// Bare family names mean the current generation (Claude 5 shipped
+    /// 2026); the picker and aliases still pointed at 4.6 and a dated Haiku id.
+    #[test]
+    fn aliases_resolve_to_the_current_generation() {
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-5");
+        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-5");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5");
+        assert_eq!(resolve_model_alias("fable"), "claude-fable-5-1");
+        assert_eq!(resolve_model_alias("opus-4-6"), "claude-opus-4-6");
+        assert_eq!(resolve_model_alias("sonnet-4-6"), "claude-sonnet-4-6");
+        assert_eq!(resolve_model_alias("ollama:llama3"), "ollama:llama3");
+    }
+
+    #[test]
+    fn the_picker_lists_current_models_without_date_suffixes() {
+        let ids: Vec<&str> = KNOWN_MODELS.iter().map(|(id, _)| *id).collect();
+        for want in [
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ] {
+            assert!(ids.contains(&want), "picker is missing {want}");
+        }
+        for id in &ids {
+            assert!(
+                !id.ends_with(|c: char| c.is_ascii_digit()) || !id.contains("-2025"),
+                "{id} carries a date suffix; model ids are complete without one"
+            );
+        }
+        assert_eq!(super::super::api::default_model(), "claude-sonnet-5");
+    }
 }

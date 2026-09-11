@@ -67,7 +67,35 @@ fn which(cmd: &str) -> bool {
 /// Using the wrong dir means the recorder writes the WAV somewhere whisper
 /// never finds it, producing a "Failed to load audio" error.
 pub fn temp_wav_path() -> PathBuf {
-    std::env::temp_dir().join("rustyclaw-voice.wav")
+    scratch_path("voice", "wav")
+}
+
+/// A per-process scratch file under the temp dir. Fixed names like
+/// `rustyclaw-voice.wav` were shared by every RustyClaw on the machine
+/// (two sessions clobbered each other's audio) and, in a world-writable
+/// temp dir, are the classic pre-created-symlink target.
+pub fn scratch_path(stem: &str, ext: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("rustyclaw-{stem}-{}.{ext}", std::process::id()))
+}
+
+/// JSON body for the XTTS server. Built with serde so newlines, tabs and
+/// control characters in model output are escaped — the hand-rolled
+/// escaping only handled `\\` and `"`, and multi-line replies produced
+/// invalid JSON that the server rejected (TTS silently went quiet).
+fn tts_request_body(text: &str, speaker_wav: Option<&std::path::Path>) -> String {
+    let body = match speaker_wav {
+        Some(wav) => serde_json::json!({
+            "text": text,
+            "speaker_wav": wav.display().to_string(),
+            "language": "en",
+        }),
+        None => serde_json::json!({
+            "text": text,
+            "speaker": XTTS_DEFAULT_SPEAKER,
+            "language": "en",
+        }),
+    };
+    body.to_string()
 }
 
 // ── Recording ─────────────────────────────────────────────────────────────────
@@ -220,7 +248,11 @@ async fn transcribe_api(wav: &std::path::Path, url: &str, api_key: &str) -> Resu
         .text("model", "whisper-1")
         .text("response_format", "text");
 
-    let client = reqwest::Client::new();
+    // A transcription is a short upload; never let a silent connection hang
+    // the voice loop.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
     let resp = client
         .post(url)
         .bearer_auth(api_key)
@@ -475,24 +507,9 @@ async fn speak_via_server(text: &str, stop_rx: tokio::sync::oneshot::Receiver<()
 
     // Build JSON payload
     let clone_path = voice_clone_sample_path().filter(|p| p.exists());
-    let body = if let Some(ref wav) = clone_path {
-        format!(
-            r#"{{"text":"{}","speaker_wav":"{}","language":"en"}}"#,
-            speech_text.replace('\\', "\\\\").replace('"', "\\\""),
-            wav.display()
-                .to_string()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\""),
-        )
-    } else {
-        format!(
-            r#"{{"text":"{}","speaker":"{}","language":"en"}}"#,
-            speech_text.replace('\\', "\\\\").replace('"', "\\\""),
-            XTTS_DEFAULT_SPEAKER,
-        )
-    };
+    let body = tts_request_body(&speech_text, clone_path.as_deref());
 
-    let wav_out = std::env::temp_dir().join("rustyclaw-xtts-server.wav");
+    let wav_out = scratch_path("xtts-server", "wav");
     tokio::pin!(stop_rx);
 
     // HTTP POST to server
@@ -558,13 +575,9 @@ async fn speak_via_server_default(
         clean
     };
 
-    let body = format!(
-        r#"{{"text":"{}","speaker":"{}","language":"en"}}"#,
-        speech_text.replace('\\', "\\\\").replace('"', "\\\""),
-        XTTS_DEFAULT_SPEAKER,
-    );
+    let body = tts_request_body(&speech_text, None);
 
-    let wav_out = std::env::temp_dir().join("rustyclaw-xtts-test.wav");
+    let wav_out = scratch_path("xtts-test", "wav");
     tokio::pin!(stop_rx);
 
     let mut curl = Command::new("curl")
@@ -681,7 +694,7 @@ async fn speak_xtts_default(
         clean
     };
 
-    let wav_out = std::env::temp_dir().join("rustyclaw-xtts-default.wav");
+    let wav_out = scratch_path("xtts-default", "wav");
     let wav_out_str = wav_out.display().to_string();
     tokio::pin!(stop_rx);
 
@@ -1238,7 +1251,7 @@ pub async fn speak_cloned(
         clean
     };
 
-    let wav_out = std::env::temp_dir().join("rustyclaw-xtts.wav");
+    let wav_out = scratch_path("xtts", "wav");
     let wav_out_str = wav_out.display().to_string();
     tokio::pin!(stop_rx);
 
@@ -1283,4 +1296,35 @@ pub async fn speak_cloned(
 
     play_wav(&wav_out, stop_rx).await?;
     Ok(truncated)
+}
+
+#[cfg(test)]
+mod scratch_and_body_tests {
+    use super::{scratch_path, tts_request_body};
+
+    #[test]
+    fn scratch_paths_are_per_process_and_distinct_per_use() {
+        let a = scratch_path("voice", "wav");
+        let b = scratch_path("xtts", "wav");
+        let pid = std::process::id().to_string();
+        assert!(a.to_string_lossy().contains(&pid), "{a:?}");
+        assert_ne!(a, b);
+        assert!(a.starts_with(std::env::temp_dir()));
+        assert_eq!(a.extension().and_then(|e| e.to_str()), Some("wav"));
+    }
+
+    #[test]
+    fn tts_body_is_valid_json_for_multiline_text() {
+        let text = "line one\nline two\t\"quoted\" back\\slash \u{1}ctl 日本語";
+        let body = tts_request_body(text, None);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["text"].as_str(), Some(text));
+        assert!(v["speaker"].is_string());
+        assert_eq!(v["language"], "en");
+
+        let with_clone = tts_request_body("hi", Some(std::path::Path::new("/tmp/me \"x\".wav")));
+        let v: serde_json::Value = serde_json::from_str(&with_clone).unwrap();
+        assert_eq!(v["speaker_wav"].as_str(), Some("/tmp/me \"x\".wav"));
+        assert!(v.get("speaker").is_none());
+    }
 }

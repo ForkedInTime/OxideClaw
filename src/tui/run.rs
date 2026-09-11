@@ -10,6 +10,16 @@ use crate::permissions::{
     GateOutcome, PermissionAsker, PermissionDecision, PermissionGate, PermissionState,
 };
 
+/// First `n` characters of an id for display. Session ids are UUIDs, but a
+/// hand-edited or foreign `.meta` file can carry anything; a byte slice
+/// panics on a short or non-ASCII id and takes the picker down with it.
+fn short_id(id: &str, n: usize) -> &str {
+    match id.char_indices().nth(n) {
+        Some((i, _)) => &id[..i],
+        None => id,
+    }
+}
+
 /// Puts a permission prompt in front of the user through the TUI event
 /// loop. A dropped reply (TUI shutdown, panic, SIGHUP) is `None`, which the
 /// gate treats as Deny — the "close terminal = auto-approve" class.
@@ -660,7 +670,7 @@ async fn run_loop(
             .take(5)
             .map(|m| {
                 let id_short = if m.id.len() >= 8 {
-                    m.id[..8].to_string()
+                    short_id(&m.id, 8).to_string()
                 } else {
                     m.id.clone()
                 };
@@ -758,13 +768,19 @@ async fn run_loop(
         if let Some(id) = app.pending_delete.take() {
             match Session::delete(&id).await {
                 Ok(()) => {
-                    app.entries
-                        .push(ChatEntry::system(format!("Deleted session {}.", &id[..8])));
+                    app.entries.push(ChatEntry::system(format!(
+                        "Deleted session {}.",
+                        short_id(&id, 8)
+                    )));
                     // Refresh the session list overlay + welcome banner
                     if let Ok(list) = Session::list().await {
                         let mut lines = vec![
                             format!("Sessions ({})\n", list.len()),
-                            format!("Current: {} ({})\n", session.meta.name, &session.id[..8]),
+                            format!(
+                                "Current: {} ({})\n",
+                                session.meta.name,
+                                short_id(&session.id, 8)
+                            ),
                         ];
                         let mut ids = Vec::new();
                         for (i, meta) in list.iter().enumerate() {
@@ -777,7 +793,7 @@ async fn run_loop(
                             lines.push(format!(
                                 "  {}. [{}] {} — {}{}",
                                 i + 1,
-                                &meta.id[..8],
+                                short_id(&meta.id, 8),
                                 meta.name,
                                 preview,
                                 current
@@ -801,7 +817,7 @@ async fn run_loop(
                             .take(5)
                             .map(|m| {
                                 let id_short = if m.id.len() >= 8 {
-                                    m.id[..8].to_string()
+                                    short_id(&m.id, 8).to_string()
                                 } else {
                                     m.id.clone()
                                 };
@@ -2001,7 +2017,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 .take(5)
                                 .map(|m| {
                                     let id_short = if m.id.len() >= 8 {
-                                        m.id[..8].to_string()
+                                        short_id(&m.id, 8).to_string()
                                     } else {
                                         m.id.clone()
                                     };
@@ -2295,7 +2311,13 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                         _ => {
                                             let ids: Vec<_> = matched
                                                 .iter()
-                                                .map(|m| format!("  {} — {}", &m.id[..12], m.name))
+                                                .map(|m| {
+                                                    format!(
+                                                        "  {} — {}",
+                                                        short_id(&m.id, 12),
+                                                        m.name
+                                                    )
+                                                })
                                                 .collect();
                                             app.overlay = Some(Overlay::new(
                                                 "resume",
@@ -2362,14 +2384,18 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 format!(
                                     "Sessions\n\nNo saved sessions yet.\nCurrent: {} ({})\n\nSessions are saved automatically.",
                                     session.meta.name,
-                                    &session.id[..8]
+                                    short_id(&session.id, 8)
                                 ),
                             ));
                         }
                         Ok(list) => {
                             let mut lines = vec![
                                 format!("Sessions ({})\n", list.len()),
-                                format!("Current: {} ({})\n", session.meta.name, &session.id[..8]),
+                                format!(
+                                    "Current: {} ({})\n",
+                                    session.meta.name,
+                                    short_id(&session.id, 8)
+                                ),
                             ];
                             let mut ids = Vec::new();
                             for (i, meta) in list.iter().enumerate() {
@@ -2382,7 +2408,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 lines.push(format!(
                                     "  {}. [{}] {} — {}{}",
                                     i + 1,
-                                    &meta.id[..8],
+                                    short_id(&meta.id, 8),
                                     meta.name,
                                     preview,
                                     current
@@ -2422,7 +2448,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     CommandAction::ExportCurrentSession => {
                         let id = session.id.clone();
                         let name = session.meta.name.clone();
-                        let dest = config.cwd.join(format!("session-{}.md", &id[..8]));
+                        let dest = config.cwd.join(format!("session-{}.md", short_id(&id, 8)));
                         match Session::export(&id, &dest).await {
                             Ok(path) => {
                                 app.overlay = Some(Overlay::new(
@@ -2631,10 +2657,6 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             app.overlay =
                                 Some(Overlay::with_items("voices", lines.join("\n"), ids));
                         }
-                    }
-                    CommandAction::PreviewVoiceModel(path) => {
-                        // Direct set without picker (future use)
-                        app.pending_voice_model = Some(path);
                     }
                     CommandAction::SetSandboxEnabled { enabled, mode } => {
                         config.sandbox_enabled = enabled;
@@ -2967,7 +2989,7 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     };
                                     lines.push(format!(
                                         "  [{}] {} — {}",
-                                        &m.id[..8],
+                                        short_id(&m.id, 8),
                                         m.name,
                                         preview
                                     ));
@@ -2978,17 +3000,6 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             }
                         }
                     },
-                    CommandAction::PersistModel => {
-                        let _ = crate::config::Config::save_user_setting(
-                            "model",
-                            serde_json::Value::String(config.model.clone()),
-                        );
-                        app.entries.push(ChatEntry::system(format!(
-                            "Model '{}' saved to settings.json.",
-                            config.model
-                        )));
-                        app.scroll_to_bottom();
-                    }
                     CommandAction::PluginInstall(spec) => {
                         app.entries.push(ChatEntry::system(format!(
                             "Installing plugin: {} …",
@@ -3692,11 +3703,6 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     .push(ChatEntry::system(format!("Checkpoint task error: {e}")));
                             }
                         }
-                        app.scroll_to_bottom();
-                    }
-                    CommandAction::ShowCostDashboard => {
-                        let text = app.cost_tracker.summary();
-                        app.entries.push(ChatEntry::system(text));
                         app.scroll_to_bottom();
                     }
                     CommandAction::SpawnAgent(task) => {
@@ -5423,7 +5429,12 @@ async fn run_api_task(task: ApiTask) {
                     perm_state.clone(),
                     config.autonomy == "suggest",
                     Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
-                );
+                )
+                .with_blocked_tools(if effective_plan_mode {
+                    PLAN_MODE_BLOCKED_TOOLS
+                } else {
+                    &[]
+                });
                 ctx.permission_gate = Some(gate.clone());
                 let mut results: Vec<ContentBlock> = Vec::new();
 
@@ -5861,5 +5872,21 @@ mod tui_asker_tests {
         });
         assert_eq!(asker.ask("Bash", "Bash: ls").await, None);
         ui.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod short_id_tests {
+    use super::short_id;
+
+    #[test]
+    fn short_ids_and_multibyte_ids_do_not_panic() {
+        assert_eq!(short_id("ab", 8), "ab");
+        assert_eq!(short_id("0123456789abcdef", 8), "01234567");
+        assert_eq!(
+            short_id("日本語のセッション", 8),
+            "日本語のセッション"[..24].to_string()
+        );
+        assert_eq!(short_id("", 8), "");
     }
 }

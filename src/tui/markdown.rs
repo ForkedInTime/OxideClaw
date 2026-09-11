@@ -1021,3 +1021,71 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     }
     spans
 }
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::{render, render_dim};
+
+    /// Model output is adversarial by accident: unclosed fences, lone
+    /// markers, huge lines, mixed scripts. The renderer is a parser and
+    /// must never panic on any of it.
+    #[test]
+    fn hostile_inputs_never_panic() {
+        let long = "x".repeat(200_000);
+        let deep = "> ".repeat(500) + "quote";
+        let nest = "* ".repeat(300) + "item";
+        let cases: Vec<String> = vec![
+            String::new(),
+            "```".into(),
+            "```rust\nfn main() {".into(),
+            "```\n```\n```".into(),
+            "`".into(),
+            "``".into(),
+            "**".into(),
+            "***".into(),
+            "*".into(),
+            "_".into(),
+            "#".into(),
+            "#######".into(),
+            "# ".into(),
+            "1.".into(),
+            "1. ".into(),
+            "12. x".into(),
+            "- ".into(),
+            "-".into(),
+            "[link".into(),
+            "[](".into(),
+            "](".into(),
+            "![img".into(),
+            "|".into(),
+            "| a | b |\n|---|".into(),
+            "\r\n\r\n".into(),
+            "\t\t\t".into(),
+            "日本語 **太字** `コード`".into(),
+            "مرحبا **بالعالم**".into(),
+            "e\u{301}\u{301}\u{301}".into(),
+            "\u{200b}\u{200b}**\u{200b}**".into(),
+            "🦀🦀🦀 ```🦀```".into(),
+            long.clone(),
+            format!("# {long}"),
+            format!("```\n{long}\n```"),
+            format!("`{long}`"),
+            deep,
+            nest,
+            "\u{0}\u{1}\u{7f}".into(),
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            let _ = render(c);
+            let _ = render_dim(c);
+            let _ = i;
+        }
+    }
+
+    #[test]
+    fn ordinary_markdown_produces_lines() {
+        let lines = render(
+            "# Title\n\nSome **bold** text and `code`.\n\n- a\n- b\n\n```rs\nlet x = 1;\n```",
+        );
+        assert!(lines.len() >= 5, "got {} lines", lines.len());
+    }
+}
