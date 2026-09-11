@@ -81,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Text-to-speech went silent on multi-line replies.** The XTTS request
+  body was hand-escaped (quotes and backslashes only), so any newline or tab
+  in the model's text produced invalid JSON the server rejected. Built with
+  serde now.
+- **Voice temp files were shared by every RustyClaw on the machine**
+  (`rustyclaw-voice.wav` and three XTTS files under the temp dir): two
+  sessions clobbered each other's audio, and a fixed name in a world-writable
+  temp dir is a pre-created-symlink target. Per-process names now.
+- The Whisper transcription request had no timeout.
 - **Plan mode now applies to sub-agents.** It was enforced only in the
   session's own tool loop; an `Agent` launched during plan mode could write
   and run commands. The block list rides on the permission gate, which
