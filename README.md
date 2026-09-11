@@ -54,6 +54,11 @@ brew install ForkedInTime/oxideclaw/oxideclaw
 cargo install oxideclaw
 ```
 
+**Docker (x86_64, from GitHub Container Registry):**
+```bash
+docker run --rm -it -e ANTHROPIC_API_KEY -v "$PWD:/work" ghcr.io/forkedintime/oxideclaw
+```
+
 <details>
 <summary>Other install methods</summary>
 
