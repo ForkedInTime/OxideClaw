@@ -101,6 +101,7 @@ impl SdkServer {
                         id,
                         status: "ok".into(),
                         version: VERSION.into(),
+                        protocol_version: crate::sdk::protocol::PROTOCOL_VERSION,
                         active_sessions: active_sessions.load(Ordering::Relaxed),
                         uptime_seconds: start_time.elapsed().as_secs(),
                     })
