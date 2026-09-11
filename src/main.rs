@@ -546,27 +546,27 @@ async fn main() -> Result<()> {
         return deeplink::register_protocol();
     }
 
-    // --handle-uri: parse and launch the TUI with the given prompt
+    // --handle-uri: a link from a browser or another app. It opens the
+    // interactive TUI with the prompt pre-filled and never runs headlessly —
+    // that would be an unattended agent session with the user's credentials,
+    // triggered by any web page.
     if let Some(ref uri) = cli.handle_uri {
-        match deeplink::parse_deep_link(uri) {
-            None => {
-                eprintln!("Invalid or unrecognised deep link URI: {uri}");
+        let Some(params) = deeplink::parse_deep_link(uri) else {
+            eprintln!("Invalid or unrecognised deep link URI: {uri}");
+            std::process::exit(1);
+        };
+        use std::io::IsTerminal;
+        match deeplink::plan(params, std::io::stdin().is_terminal()) {
+            deeplink::DeepLinkAction::Refuse(msg) => {
+                eprintln!("{msg}");
                 std::process::exit(1);
             }
-            Some(params) => {
+            deeplink::DeepLinkAction::OpenTui { query, cwd } => {
                 let mut config = Config::load()?;
-                if let Some(ref dir) = params.cwd {
-                    let p = std::path::PathBuf::from(dir);
-                    if p.is_dir() {
-                        config.cwd = p;
-                    }
+                if let Some(dir) = cwd {
+                    config.cwd = std::path::PathBuf::from(dir);
                 }
-                // Run in --print mode with the extracted query so it works headlessly too
-                config.verbose = false;
-                let tools = all_tools(&config);
-                let mut engine = QueryEngine::new(config, tools)?;
-                engine.query(params.query).await?;
-                return Ok(());
+                return tui::run_tui(config, None, Some(query)).await;
             }
         }
     }
@@ -1082,7 +1082,7 @@ async fn main() -> Result<()> {
     };
 
     // Interactive TUI mode
-    tui::run_tui(config, resume_id).await
+    tui::run_tui(config, resume_id, None).await
 }
 
 /// Self-update: download the latest release from GitHub and replace the running binary.

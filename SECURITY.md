@@ -34,7 +34,8 @@ RustyClaw executes shell commands and modifies files as part of its core functio
 
 - **API keys** — stored in `.env` files. Never commit these to version control.
 - **Tool execution** — the AI agent can run Bash commands. Use sandboxing (`bwrap`, `firejail`, `strict`) for untrusted workloads.
-- **MCP plugins** — third-party plugins execute with the same permissions as RustyClaw.
+- **MCP plugins** — third-party plugins execute with the same permissions as RustyClaw. Project-scoped plugins (`.claude/settings.json`, `.mcp.json`), project hooks and a project `apiKeyHelper` are ignored until you run `/trust` in that folder — a cloned repository cannot run commands on your machine by itself.
+- **HTTP MCP servers use static headers.** The bearer token in `mcpServers.<name>.headers` is sent as-is; RustyClaw has no OAuth refresh flow. When a token expires the server returns 401, the failure is reported, and you replace the token and restart.
 - **SDK / Headless mode** — the NDJSON server accepts commands on stdin. Secure the transport layer in production deployments.
 
 ## Sandboxing

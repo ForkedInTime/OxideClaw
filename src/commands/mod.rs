@@ -103,6 +103,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "undo",
     "redo",
     "autocommit",
+    "trust",
 ];
 
 // ── Model catalogue ───────────────────────────────────────────────────────────
@@ -294,6 +295,10 @@ pub enum CommandAction {
     Redo { n: Option<u32> },
     /// `/autocommit [status]` — print auto-commit state to the chat. v1 only supports `status`.
     AutoCommitStatus,
+    /// `/trust` — add the current project to the global `trustedProjects`
+    /// list so its `.claude/settings.json` hooks, `apiKeyHelper` and MCP
+    /// servers are honoured. `/trust status` reports without changing anything.
+    TrustProject { status_only: bool },
     /// Start an autonomous browser run.
     Browse {
         goal: String,
@@ -400,6 +405,9 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "undo" => cmd_undo(args),
         "redo" => cmd_redo(args),
         "autocommit" => cmd_autocommit(args),
+        "trust" => CommandAction::TrustProject {
+            status_only: args.trim() == "status",
+        },
         "browser" => {
             let url = args.trim().to_string();
             if url == "close" {
@@ -2217,6 +2225,10 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             (
                 "/autocommit",
                 "Show auto-commit status (enabled, session ID, turns recorded)",
+            ),
+            (
+                "/trust",
+                "Trust this project: honour its settings hooks, apiKeyHelper and MCP servers",
             ),
         ],
     ),

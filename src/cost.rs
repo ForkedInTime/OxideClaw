@@ -17,67 +17,67 @@ struct ModelPrice {
 
 /// Get pricing for a model.  Returns (input_price, output_price) per million tokens.
 fn model_price(model: &str) -> ModelPrice {
-    if model.contains("opus") {
-        ModelPrice {
-            input: 15.0,
-            output: 75.0,
-            estimated: false,
+    let published = |input: f64, output: f64| ModelPrice {
+        input,
+        output,
+        estimated: false,
+    };
+    let rough = |input: f64, output: f64| ModelPrice {
+        input,
+        output,
+        estimated: true,
+    };
+    let m = model.to_ascii_lowercase();
+
+    // Anthropic list prices per million tokens (docs, 2026-06). Newer
+    // generations are cheaper than older ones, so match the generation, not
+    // just the family — "opus" alone would charge Opus 5 at Opus 4.1 rates.
+    if m.contains("fable") || m.contains("mythos") {
+        published(10.0, 50.0)
+    } else if m.contains("opus") {
+        // Opus 4.6 and later: $5/$25. Opus 4.5 and earlier: $15/$75.
+        if m.contains("opus-4-5")
+            || m.contains("opus-4-1")
+            || m.contains("opus-4-0")
+            || m.contains("3-opus")
+        {
+            published(15.0, 75.0)
+        } else {
+            published(5.0, 25.0)
         }
-    } else if model.contains("haiku") {
-        ModelPrice {
-            input: 0.25,
-            output: 1.25,
-            estimated: false,
+    } else if m.contains("sonnet") {
+        if m.contains("sonnet-5") {
+            published(2.0, 10.0)
+        } else {
+            published(3.0, 15.0)
         }
-    } else if model.contains("sonnet") {
-        ModelPrice {
-            input: 3.0,
-            output: 15.0,
-            estimated: false,
+    } else if m.contains("haiku") {
+        if m.contains("3-5-haiku") || m.contains("haiku-3-5") {
+            published(0.8, 4.0)
+        } else if m.contains("3-haiku") || m.contains("haiku-3") {
+            published(0.25, 1.25)
+        } else {
+            published(1.0, 5.0)
         }
-    } else if model.starts_with("ollama:") {
+    } else if m.starts_with("ollama:") {
         // Local models are free
-        ModelPrice {
-            input: 0.0,
-            output: 0.0,
-            estimated: false,
-        }
-    } else if model.contains("groq:") || model.contains("together:") {
+        published(0.0, 0.0)
+    } else if m.contains("groq:") || m.contains("together:") {
         // Rough estimate for hosted open-source models
-        ModelPrice {
-            input: 0.5,
-            output: 1.0,
-            estimated: false,
-        }
-    } else if model.contains("deepseek:") {
-        ModelPrice {
-            input: 0.27,
-            output: 1.10,
-            estimated: false,
-        }
-    } else if model.contains("mistral:") {
-        ModelPrice {
-            input: 2.0,
-            output: 6.0,
-            estimated: false,
-        }
-    } else if model.contains("oai:") || model.contains("openai:") {
+        rough(0.5, 1.0)
+    } else if m.contains("deepseek:") {
+        rough(0.27, 1.10)
+    } else if m.contains("mistral:") {
+        rough(2.0, 6.0)
+    } else if m.contains("oai:") || m.contains("openai:") {
         // GPT-4o class pricing
-        ModelPrice {
-            input: 2.5,
-            output: 10.0,
-            estimated: false,
-        }
+        rough(2.5, 10.0)
     } else {
         // Unknown model — fall back to Sonnet-tier rates so a budget still
         // functions, but flag it: an unrecognised model may be an order of
         // magnitude cheaper or dearer, and silently reporting a guess as fact
         // is how a /budget cap gets trusted when it should not be.
-        ModelPrice {
-            input: 3.0,
-            output: 15.0,
-            estimated: true,
-        }
+        rough(3.0, 15.0)
     }
 }
 
@@ -403,8 +403,8 @@ mod tests {
     fn test_cost_tracking() {
         let mut tracker = CostTracker::new();
         tracker.record("claude-haiku-4-5-20251001", 10_000, 1_000);
-        // Haiku: 0.25/M in + 1.25/M out = 0.0025 + 0.00125 = 0.00375
-        assert!((tracker.total_cost_usd - 0.00375).abs() < 0.0001);
+        // Haiku 4.5: 1.0/M * 0.01 + 5.0/M * 0.001 = 0.010 + 0.005 = 0.015
+        assert!((tracker.total_cost_usd - 0.015).abs() < 0.0001);
         assert_eq!(tracker.by_model.len(), 1);
     }
 
@@ -433,7 +433,46 @@ mod tests {
             tracker.record("claude-haiku-4-5-20251001", 10_000, 2_000);
         }
         let savings = tracker.routing_savings("claude-opus-4-6-20250514");
-        // Should be significant
-        assert!(savings > 0.5);
+        // Haiku cost 5 × (0.010 + 0.010) = 0.10; Opus 4.6 would have been
+        // 5 × (0.050 + 0.050) = 0.50 → 0.40 saved.
+        assert!((savings - 0.40).abs() < 0.01, "{savings}");
+    }
+}
+
+#[cfg(test)]
+mod price_table_tests {
+    use super::model_price;
+
+    /// Anthropic list prices per million tokens (docs, 2026-06). The old
+    /// table charged Opus at 3× and Haiku at ¼ of reality, so `/budget`
+    /// stopped a session far too early or far too late.
+    #[test]
+    fn current_claude_models_use_published_rates() {
+        for (model, input, output) in [
+            ("claude-fable-5-1", 10.0, 50.0),
+            ("claude-opus-5", 5.0, 25.0),
+            ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-sonnet-5", 2.0, 10.0),
+            ("claude-sonnet-4-6", 3.0, 15.0),
+            ("claude-haiku-4-5", 1.0, 5.0),
+        ] {
+            let p = model_price(model);
+            assert_eq!((p.input, p.output), (input, output), "{model}");
+            assert!(!p.estimated, "{model} is a published rate");
+        }
+    }
+
+    /// Third-party rows the code itself calls "rough" must say so, or the
+    /// dashboard presents a guess as fact (the exact bug PR #14 fixed for
+    /// unknown models).
+    #[test]
+    fn approximate_third_party_rates_are_flagged_as_estimates() {
+        for model in ["groq:llama-3", "together:mixtral", "openai:gpt-4o"] {
+            assert!(model_price(model).estimated, "{model}");
+        }
+        assert!(
+            !model_price("ollama:llama3").estimated,
+            "local is exactly free"
+        );
     }
 }

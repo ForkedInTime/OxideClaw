@@ -55,7 +55,11 @@ use std::io;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-pub async fn run_tui(config: Config, resume_id: Option<String>) -> Result<()> {
+pub async fn run_tui(
+    config: Config,
+    resume_id: Option<String>,
+    initial_input: Option<String>,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Clear the visible screen and anchor cursor at top-left so the compact
@@ -70,7 +74,7 @@ pub async fn run_tui(config: Config, resume_id: Option<String>) -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture,
     )?;
-    let result = run_loop(config, resume_id).await;
+    let result = run_loop(config, resume_id, initial_input).await;
     disable_raw_mode()?;
     let mut cleanup = io::stdout();
     execute!(
@@ -423,7 +427,11 @@ async fn track_plugin(name: &str, spec: &str, marketplace: bool) -> anyhow::Resu
     Ok(())
 }
 
-async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
+async fn run_loop(
+    mut config: Config,
+    resume_id: Option<String>,
+    initial_input: Option<String>,
+) -> Result<()> {
     // Compute welcome-screen height and create the first terminal.
     let (init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let init_h = {
@@ -509,6 +517,23 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
 
     let mut app = App::new(&config.model, &config.cwd);
     app.browser_session = browser_session_for_app;
+    // A deep link's prompt lands in the input box for the user to read and
+    // send (or not) — it is never submitted on their behalf.
+    if let Some(text) = initial_input {
+        app.input = text.chars().collect();
+        app.cursor = app.input.len();
+        app.entries.push(ChatEntry::system(
+            "Deep link received — the prompt is in the input box. Review it, then press Enter to send.",
+        ));
+    }
+    if !config.untrusted_project_config.is_empty() {
+        app.entries.push(ChatEntry::system(format!(
+            "This project's settings define {} — ignored because the project is not trusted. \
+             A cloned repository must not run commands on your machine by itself. \
+             Run /trust to enable them for this folder.",
+            config.untrusted_project_config.join(", ")
+        )));
+    }
     if let Some(ref e) = config.effort {
         app.effort = Some(e.clone());
     }
@@ -4035,6 +4060,44 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 }
                             }
                         }
+                    }
+                    CommandAction::TrustProject { status_only } => {
+                        let global = crate::settings::Settings::load_global();
+                        let trusted = crate::settings::Settings::is_trusted(&global, &config.cwd);
+                        let canonical = config
+                            .cwd
+                            .canonicalize()
+                            .unwrap_or_else(|_| config.cwd.clone())
+                            .to_string_lossy()
+                            .into_owned();
+                        let msg = if status_only || trusted {
+                            format!(
+                                "Project {canonical} is {}.{}",
+                                if trusted { "trusted" } else { "NOT trusted" },
+                                if config.untrusted_project_config.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "\nIgnored from its settings: {}. Run /trust to enable.",
+                                        config.untrusted_project_config.join(", ")
+                                    )
+                                }
+                            )
+                        } else {
+                            let mut list = global.trusted_projects.unwrap_or_default();
+                            list.push(canonical.clone());
+                            match crate::config::Config::save_user_setting(
+                                "trustedProjects",
+                                serde_json::json!(list),
+                            ) {
+                                Ok(()) => format!(
+                                    "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
+                                     servers will be honoured — run /reload (or restart) to apply."
+                                ),
+                                Err(e) => format!("Could not save trust: {e}"),
+                            }
+                        };
+                        app.entries.push(ChatEntry::system(msg));
                     }
                     CommandAction::AutoCommitStatus => {
                         let cwd_ok = rustyclaw::autocommit::is_git_repo(&config.cwd);
