@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The browser agent's form-field protections were never wired.** The
+  approval gate had patterns for password and card fields, but production
+  never passed it a signal, so a `browser_fill` into "Card number" or
+  "Password" was never gated. Fields are now recognised by their accessible
+  name. And after such a fill is approved, pressing **Enter** to submit the
+  form is gated too — previously it submitted with no button for the
+  button-text patterns to see.
+- **The browser agent echoed what it typed.** A fill result read
+  `Filled @e3 with "<value>"`, so passwords and card numbers went into the
+  transcript on disk. It now reports the length only. (The byte slice at 50
+  also panicked on a multi-byte character.)
+
 - **A cloned repository could run commands on your machine.** Its
   `.claude/settings.json` and `.mcp.json` could define hooks (run around
   every tool call), an `apiKeyHelper` shell command (run at startup) and MCP
