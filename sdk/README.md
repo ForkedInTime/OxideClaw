@@ -6,7 +6,7 @@ Embed RustyClaw in any application. One binary, NDJSON over stdio, zero dependen
 rustyclaw --headless
 ```
 
-This starts a long-running server that reads JSON requests from stdin and writes JSON responses + streaming notifications to stdout. Pipe it from any language — Python, TypeScript, Go, shell scripts, CI/CD.
+This starts a long-running server that reads JSON requests from stdin and writes JSON responses + streaming notifications to stdout. (Editors that speak the Agent Client Protocol should use `rustyclaw acp` instead — see FEATURES.md → Editor Integration.) Pipe it from any language — Python, TypeScript, Go, shell scripts, CI/CD.
 
 ---
 

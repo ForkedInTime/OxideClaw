@@ -12,12 +12,57 @@ use crate::sdk::approval::{ApprovalDecision, PolicyEngine};
 use crate::sdk::protocol::*;
 use crate::tools::{DynTool, PermissionMode, ReadCache, ToolContext, ToolOutput, new_read_cache};
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 
 /// Maximum context window tokens (200K for Claude).  Used for health estimates.
 const MAX_CONTEXT_TOKENS: u64 = 200_000;
+
+/// Why a turn stopped. Maps onto ACP stop reasons and SDK notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    EndTurn,
+    MaxTokens,
+    MaxTurns,
+    BudgetExceeded,
+    Cancelled,
+}
+
+/// A cancellation flag that can also wake a waiting API stream.
+#[derive(Debug, Default)]
+pub struct CancelSignal {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelSignal {
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // `notify_one` stores a permit when nobody is waiting yet, so a
+        // cancel that lands between a flag check and `notified()` still wakes.
+        self.notify.notify_one();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reset(&self) {
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Resolves once `cancel` has been called (immediately if it already was).
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
 
 pub struct SdkSession {
     pub session_id: String,
@@ -37,6 +82,8 @@ pub struct SdkSession {
     approval_tx: mpsc::UnboundedSender<SdkNotification>,
     /// Channel to receive approval/deny decisions from the host.
     approval_rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
+    /// Set by `session/cancel`; checked between model calls and tools.
+    cancel: Arc<CancelSignal>,
 }
 
 impl SdkSession {
@@ -82,6 +129,7 @@ impl SdkSession {
             notif_tx,
             approval_rx,
             approval_tx,
+            cancel: Arc::new(CancelSignal::default()),
         })
     }
 
@@ -91,7 +139,12 @@ impl SdkSession {
     }
 
     /// Execute a full agentic turn: prompt → stream → tool loop → complete.
-    pub async fn execute_turn(&mut self, prompt: String) -> Result<()> {
+    /// Handle used to cancel a running turn from another task.
+    pub fn cancel_signal(&self) -> Arc<CancelSignal> {
+        Arc::clone(&self.cancel)
+    }
+
+    pub async fn execute_turn(&mut self, prompt: String) -> Result<TurnEnd> {
         let turn_start = Instant::now();
         let mut turn_input_tokens: u64 = 0;
         let mut turn_output_tokens: u64 = 0;
@@ -119,15 +172,21 @@ impl SdkSession {
 
         let mut final_text = String::new();
         let mut loop_turn = 0u32;
+        let mut end = TurnEnd::EndTurn;
 
         loop {
             loop_turn += 1;
+            if self.cancel.is_cancelled() {
+                end = TurnEnd::Cancelled;
+                break;
+            }
             if loop_turn > max_turns {
                 self.send_notif(SdkNotification::Error {
                     session_id: self.session_id.clone(),
                     code: "max_turns".into(),
                     message: format!("Stopped after {max_turns} agentic turns."),
                 });
+                end = TurnEnd::MaxTurns;
                 break;
             }
 
@@ -161,17 +220,24 @@ impl SdkSession {
             let sid = self.session_id.clone();
             let mut turn_text = String::new();
 
-            let response = self
-                .client
-                .messages_stream(request, |chunk| {
+            let cancel = Arc::clone(&self.cancel);
+            let response = {
+                let call = self.client.messages_stream(request, |chunk| {
                     turn_text.push_str(chunk);
                     let _ = notif_tx.send(SdkNotification::MessageDelta {
                         session_id: sid.clone(),
                         content: chunk.to_string(),
                     });
-                })
-                .await
-                .context("API stream call failed")?;
+                });
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        end = TurnEnd::Cancelled;
+                        break;
+                    }
+                    r = call => r.context("API stream call failed")?,
+                }
+            };
 
             if !turn_text.is_empty() {
                 final_text = turn_text;
@@ -225,6 +291,7 @@ impl SdkSession {
                         self.cost_tracker.total_cost_usd
                     ),
                 });
+                end = TurnEnd::BudgetExceeded;
                 break;
             }
 
@@ -257,6 +324,7 @@ impl SdkSession {
                         code: "max_tokens".into(),
                         message: "Max tokens reached.".into(),
                     });
+                    end = TurnEnd::MaxTokens;
                     break;
                 }
                 Some(StopReason::StopSequence) => break,
@@ -282,7 +350,7 @@ impl SdkSession {
             duration_ms,
         });
 
-        Ok(())
+        Ok(end)
     }
 
     /// Execute tool calls with policy-based approval.
@@ -311,6 +379,17 @@ impl SdkSession {
                 ContentBlock::ToolUse { id, name, input } => (id, name, input),
                 _ => continue,
             };
+
+            if self.cancel.is_cancelled() {
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: vec![ToolResultContent::text(
+                        "Cancelled by the client before this tool ran.",
+                    )],
+                    is_error: Some(true),
+                });
+                continue;
+            }
 
             let decision = self.policy_engine.evaluate(name);
 
@@ -626,5 +705,69 @@ mod approval_wait_tests {
         drop(tx);
         let out = await_approval(&mut rx, "this-id", Duration::from_secs(2)).await;
         assert_eq!(out, ApprovalOutcome::Closed);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn offline_session() -> (SdkSession, mpsc::UnboundedReceiver<SdkNotification>) {
+        let cfg = crate::config::Config {
+            api_key: "sk-ant-test".into(),
+            cwd: std::env::temp_dir(),
+            ..Default::default()
+        };
+        let (ntx, nrx) = mpsc::unbounded_channel();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let s = SdkSession::new(
+            cfg,
+            vec![],
+            Policy::default(),
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        (s, nrx)
+    }
+
+    /// A cancel that lands before the first model call must end the turn
+    /// as `Cancelled` without touching the network (the fake key would
+    /// otherwise surface as an API error, not `Ok`).
+    #[tokio::test]
+    async fn a_pre_cancelled_turn_ends_cancelled_before_calling_the_api() {
+        let (mut s, _rx) = offline_session();
+        s.cancel_signal().cancel();
+        let end = tokio::time::timeout(Duration::from_secs(2), s.execute_turn("hi".into()))
+            .await
+            .expect("must not hang")
+            .expect("must not error");
+        assert_eq!(end, TurnEnd::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_signal_wakes_a_waiter_and_resets() {
+        let sig = Arc::new(CancelSignal::default());
+        assert!(!sig.is_cancelled());
+        let waiter = {
+            let sig = Arc::clone(&sig);
+            tokio::spawn(async move { sig.cancelled().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sig.cancel();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter woke")
+            .unwrap();
+        assert!(sig.is_cancelled());
+        tokio::time::timeout(Duration::from_millis(100), sig.cancelled())
+            .await
+            .expect("immediate");
+        sig.reset();
+        assert!(!sig.is_cancelled());
     }
 }

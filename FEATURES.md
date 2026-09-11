@@ -15,6 +15,7 @@ Everything available in RustyClaw, organized by category.
 - [Cost Tracking](#cost-tracking)
 - [Session Management](#session-management)
 - [SDK / Headless Mode](#sdk--headless-mode)
+- [Editor Integration (ACP)](#editor-integration-acp)
 - [Hooks](#hooks)
 - [Sandboxing](#sandboxing)
 - [Configuration](#configuration)
@@ -318,6 +319,35 @@ Starts a long-running NDJSON server on stdin/stdout. Full protocol reference: [`
 ```
 
 Features: streaming responses, tool approval policies, cost tracking, context health monitoring, RAG search, session management.
+
+---
+
+## Editor Integration (ACP)
+
+`rustyclaw acp` runs RustyClaw as an [Agent Client Protocol](https://agentclientprotocol.com) agent: JSON-RPC 2.0 over stdio, one line per message. Any ACP client can drive it.
+
+**Zed** (`settings.json`):
+
+```json
+{
+  "agent_servers": {
+    "RustyClaw": { "command": "rustyclaw", "args": ["acp"] }
+  }
+}
+```
+
+| ACP method / update | RustyClaw behaviour |
+|---------------------|---------------------|
+| `initialize` | Protocol version 1. Advertises `embeddedContext`; no image/audio prompts, no `loadSession`, no HTTP/SSE MCP. |
+| `authenticate` | No-op. Credentials come from the normal chain (`ANTHROPIC_API_KEY`, `ant` profile, settings). |
+| `session/new` | Requires an existing `cwd`. Stdio `mcpServers` entries are recorded on the session config. |
+| `session/prompt` | Text, `resource_link`, and embedded text resources are flattened into one prompt. Answers with `stopReason`: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` (budget exceeded), or `cancelled`. |
+| `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call` (kind + title + raw input), `tool_call_update` (status + output summary). |
+| `session/request_permission` | Sent for every tool the SDK policy marks *ask* (the default for tools not on an allow list). Options: allow once / reject once. A `cancelled` outcome denies the tool. |
+| `session/cancel` | Stops the in-flight model stream and skips queued tools; the prompt is answered with `cancelled`. |
+| `session/load`, `session/set_mode` | Not supported (`-32601`). |
+
+Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, unknown session, media prompt), `-32000` when a prompt is already running, `-32601` unsupported method.
 
 ---
 

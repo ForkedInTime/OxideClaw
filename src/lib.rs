@@ -4,6 +4,7 @@
 //! binary-only env vars (`deeplink`) are excluded — they only compile as part
 //! of the `rustyclaw` binary.
 
+pub mod acp;
 pub mod api;
 pub mod auth;
 pub mod autocommit;
