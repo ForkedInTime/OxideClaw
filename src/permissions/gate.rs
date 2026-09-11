@@ -38,6 +38,10 @@ pub struct PermissionGate {
     /// would allow them.
     suggest_mode: bool,
     asker: Option<Arc<dyn PermissionAsker>>,
+    /// Tools refused outright for this turn (plan mode). Inherited by
+    /// sub-agents through the gate, so a child launched in plan mode
+    /// cannot write either.
+    blocked: Vec<String>,
 }
 
 impl PermissionGate {
@@ -50,7 +54,14 @@ impl PermissionGate {
             state,
             suggest_mode,
             asker,
+            blocked: Vec::new(),
         }
+    }
+
+    /// Refuse these tools for the life of this gate (plan mode).
+    pub fn with_blocked_tools(mut self, tools: &[&str]) -> Self {
+        self.blocked = tools.iter().map(|t| t.to_string()).collect();
+        self
     }
 
     /// A gate for an engine with no human attached (`-p`, SDK-less
@@ -75,6 +86,11 @@ impl PermissionGate {
     }
 
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
+        if self.blocked.iter().any(|b| b == tool_name) {
+            return GateOutcome::Denied(format!(
+                "{tool_name} is blocked in plan mode. Use ExitPlanMode when the plan is approved."
+            ));
+        }
         let check = if self.suggest_mode && matches!(tool_name, "Write" | "Edit") {
             CheckResult::Ask
         } else if is_command_tool(tool_name) {
@@ -283,6 +299,27 @@ mod tests {
         // Even with bypass on, an explicit deny is still a deny.
         let out = g.decide("Bash", &json!({"command": "id"})).await;
         assert!(matches!(out, GateOutcome::Denied(_)), "{out:?}");
+    }
+
+    /// Plan mode was enforced only in the TUI loop; a sub-agent launched
+    /// during plan mode inherited the gate but not the block, and wrote.
+    #[tokio::test]
+    async fn blocked_tools_are_refused_without_a_prompt() {
+        let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+        let g = gate(&[], Some(asker.clone())).with_blocked_tools(&["Write", "Bash"]);
+        let out = g.decide("Write", &json!({"file_path": "a"})).await;
+        assert!(
+            matches!(out, GateOutcome::Denied(ref m) if m.contains("plan mode")),
+            "{out:?}"
+        );
+        assert!(
+            asker.asked().is_empty(),
+            "a blocked tool must not even prompt"
+        );
+        assert_eq!(
+            g.decide("Read", &json!({"file_path": "a"})).await,
+            GateOutcome::Allowed
+        );
     }
 
     #[tokio::test]

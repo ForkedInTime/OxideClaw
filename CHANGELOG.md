@@ -66,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Plan mode now applies to sub-agents.** It was enforced only in the
+  session's own tool loop; an `Agent` launched during plan mode could write
+  and run commands. The block list rides on the permission gate, which
+  children inherit.
+- The session picker and `/sessions` could panic on a session id shorter
+  than 8 characters (a hand-edited or foreign `.meta` file).
 - **SDK: a late approval reply for an earlier prompt denied the current tool
   and left the real answer queued**, cascading down every following prompt.
   Replies for other approval ids are now skipped.
