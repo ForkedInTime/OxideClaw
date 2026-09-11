@@ -41,6 +41,34 @@ pub struct DeepLinkParams {
 ///
 /// Returns None if the URI is malformed, has the wrong scheme, or fails
 /// security validation (control chars, excessive lengths).
+/// What `--handle-uri` should do with a parsed link.
+#[derive(Debug, PartialEq)]
+pub enum DeepLinkAction {
+    /// Open the interactive TUI with the query pre-filled — not submitted —
+    /// in the given directory.
+    OpenTui { query: String, cwd: Option<String> },
+    /// No terminal: refuse. A deep link comes from a browser or another app;
+    /// running the query headlessly would be an unattended agent session
+    /// with the user's credentials, triggered by any web page.
+    Refuse(String),
+}
+
+pub fn plan(params: DeepLinkParams, has_tty: bool) -> DeepLinkAction {
+    if !has_tty {
+        return DeepLinkAction::Refuse(
+            "Deep links open an interactive session and need a terminal. Nothing was run. \
+             Re-run `rustyclaw --register-protocol` so the handler opens one, or paste the \
+             prompt into a running session yourself."
+                .to_string(),
+        );
+    }
+    let cwd = params.cwd.filter(|c| std::path::Path::new(c).is_dir());
+    DeepLinkAction::OpenTui {
+        query: params.query,
+        cwd,
+    }
+}
+
 pub fn parse_deep_link(uri: &str) -> Option<DeepLinkParams> {
     let scheme = protocol_name();
     let prefix = format!("{}://open?", scheme);
@@ -97,7 +125,10 @@ fn contains_control_chars(s: &str) -> bool {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Decode to bytes first: `%C3%A9` is one UTF-8 char, not two Latin-1
+    // ones. Anything that is not valid UTF-8 afterwards is replaced, not
+    // trusted.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -105,20 +136,19 @@ fn percent_decode(s: &str) -> String {
             let hi = bytes[i + 1];
             let lo = bytes[i + 2];
             if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
-                let byte = (h << 4) | l;
-                out.push(byte as char);
+                out.push((h << 4) | l);
                 i += 3;
                 continue;
             }
         } else if bytes[i] == b'+' {
-            out.push(' ');
+            out.push(b' ');
             i += 1;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -144,6 +174,27 @@ pub fn register_protocol() -> anyhow::Result<()> {
 }
 
 /// Register the deep link protocol handler on Linux.
+/// The `.desktop` entry that routes `<scheme>://` URIs to this binary.
+/// Linux-only at runtime (xdg); compiled under test everywhere so the
+/// `Terminal=true` guarantee is checked on every platform.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_entry(binary: &str) -> String {
+    let scheme = protocol_name();
+    // `Terminal=true`: the desktop environment opens a terminal for us, so
+    // the link lands in an interactive session with the usual approval
+    // prompts instead of an unattended headless run.
+    format!(
+        "[Desktop Entry]\n\
+         Name={bin} deep link handler\n\
+         Exec=\"{binary}\" --handle-uri %u\n\
+         Type=Application\n\
+         Terminal=true\n\
+         NoDisplay=true\n\
+         MimeType=x-scheme-handler/{scheme};\n",
+        bin = env!("CARGO_BIN_NAME"),
+    )
+}
+
 #[cfg(target_os = "linux")]
 pub fn register_protocol() -> anyhow::Result<()> {
     {
@@ -162,15 +213,7 @@ pub fn register_protocol() -> anyhow::Result<()> {
         std::fs::create_dir_all(&desktop_dir)?;
 
         let desktop_path = desktop_dir.join(format!("{desktop_name}.desktop"));
-        let desktop_content = format!(
-            "[Desktop Entry]\n\
-             Name={bin} deep link handler\n\
-             Exec=\"{binary}\" --handle-uri %u\n\
-             Type=Application\n\
-             NoDisplay=true\n\
-             MimeType=x-scheme-handler/{scheme};\n",
-            bin = env!("CARGO_BIN_NAME"),
-        );
+        let desktop_content = desktop_entry(&binary);
 
         std::fs::write(&desktop_path, &desktop_content)?;
 
@@ -204,5 +247,63 @@ pub fn register_protocol() -> anyhow::Result<()> {
             .status();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(q: &str) -> String {
+        format!("{}://open?q={q}", protocol_name())
+    }
+
+    /// `%C3%A9` is "é". Decoding byte-by-byte into `char` produced "Ã©",
+    /// so every non-ASCII query arrived mangled.
+    #[test]
+    fn percent_decoding_reassembles_utf8() {
+        let p = parse_deep_link(&link("caf%C3%A9+%E6%97%A5")).unwrap();
+        assert_eq!(p.query, "café 日");
+        assert_eq!(
+            percent_decode("a%2Fb%zz"),
+            "a/b%zz",
+            "bad escapes pass through"
+        );
+    }
+
+    #[test]
+    fn a_link_without_a_terminal_is_refused_not_executed() {
+        let p = parse_deep_link(&link("delete+everything")).unwrap();
+        assert!(matches!(plan(p, false), DeepLinkAction::Refuse(_)));
+    }
+
+    #[test]
+    fn with_a_terminal_the_query_is_prefilled_not_run() {
+        let p = parse_deep_link(&link("hello+world")).unwrap();
+        assert_eq!(
+            plan(p, true),
+            DeepLinkAction::OpenTui {
+                query: "hello world".into(),
+                cwd: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_cwd_that_is_not_a_directory_is_dropped() {
+        let uri = format!("{}&cwd=%2Fdefinitely%2Fnot%2Fhere", link("x"));
+        let p = parse_deep_link(&uri).unwrap();
+        assert_eq!(
+            plan(p, true),
+            DeepLinkAction::OpenTui {
+                query: "x".into(),
+                cwd: None
+            }
+        );
+    }
+
+    #[test]
+    fn the_desktop_entry_opens_a_terminal() {
+        assert!(desktop_entry("/usr/bin/rustyclaw").contains("Terminal=true"));
     }
 }

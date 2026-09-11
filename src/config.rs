@@ -305,6 +305,12 @@ pub struct Config {
     /// Whether sandbox mode is enabled for Bash tool execution.
     pub sandbox_enabled: bool,
 
+    /// Executable config (hooks, apiKeyHelper, mcpServers) found in this
+    /// project's settings and ignored because the project is not in the
+    /// global `trustedProjects` list. Shown at startup; `/trust` enables it.
+    #[serde(skip)]
+    pub untrusted_project_config: Vec<String>,
+
     /// Active sandbox mode: "strict", "bwrap", or "firejail".
     pub sandbox_mode: String,
 
@@ -453,6 +459,7 @@ impl Default for Config {
             theme: None,
             file_snapshot_dir: None,
             sandbox_enabled: false,
+            untrusted_project_config: Vec::new(),
             sandbox_mode: "strict".to_string(),
             voice_enabled: false,
             voice_api_url: None,
@@ -532,6 +539,7 @@ impl Config {
         }
         cfg.env = settings.env;
         cfg.api_key_helper = settings.api_key_helper;
+        cfg.untrusted_project_config = settings.untrusted_project_config;
         cfg.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
         // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
         // everything immediately?). Warn and treat as unset.
@@ -854,6 +862,17 @@ impl Config {
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         let mut include = |path: &PathBuf| {
+            // A symlinked instruction file is refused: a repository could
+            // point CLAUDE.md at ~/.ssh/id_rsa and have the key read into the
+            // system prompt. Same rule the file tools apply.
+            if path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                tracing::warn!("ignoring symlinked instruction file {}", path.display());
+                return;
+            }
             // Use the canonical path for dedup; fall back to the raw path if canonicalize fails
             let key = path.canonicalize().unwrap_or_else(|_| path.clone());
             if !seen.insert(key) {
@@ -904,6 +923,17 @@ impl Config {
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         let mut include = |path: &PathBuf| {
+            // A symlinked instruction file is refused: a repository could
+            // point CLAUDE.md at ~/.ssh/id_rsa and have the key read into the
+            // system prompt. Same rule the file tools apply.
+            if path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                tracing::warn!("ignoring symlinked instruction file {}", path.display());
+                return;
+            }
             let key = path.canonicalize().unwrap_or_else(|_| path.clone());
             if !seen.insert(key) {
                 return;
@@ -1618,5 +1648,42 @@ mod auto_commit_clamp_tests {
             message_prefix: Some("claw".to_string()),
         };
         assert_eq!(apply(&s).message_prefix, "claw");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod instruction_file_symlink_tests {
+    use super::Config;
+
+    /// A repository can ship `CLAUDE.md -> ~/.ssh/id_rsa`. The file tools
+    /// refuse symlinks into secrets (Phase 2); the instruction loaders must
+    /// not be the remaining way to read a key into the system prompt.
+    #[test]
+    fn symlinked_instruction_files_are_not_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, "PRIVATE KEY MATERIAL").unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::os::unix::fs::symlink(&secret, repo.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(&secret, repo.join("AGENTS.md")).unwrap();
+
+        let claude = Config::load_claude_md(&repo);
+        assert!(
+            !claude.contains("PRIVATE KEY"),
+            "CLAUDE.md symlink was followed"
+        );
+        let agents = Config::load_agents_md(&repo);
+        assert!(
+            !agents.contains("PRIVATE KEY"),
+            "AGENTS.md symlink was followed"
+        );
+    }
+
+    #[test]
+    fn regular_instruction_files_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "project rules").unwrap();
+        assert!(Config::load_claude_md(tmp.path()).contains("project rules"));
     }
 }

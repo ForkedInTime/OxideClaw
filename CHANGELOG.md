@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A cloned repository could run commands on your machine.** Its
+  `.claude/settings.json` and `.mcp.json` could define hooks (run around
+  every tool call), an `apiKeyHelper` shell command (run at startup) and MCP
+  servers (spawned at startup), and RustyClaw honoured them. Those three are
+  now ignored from project settings until you run **`/trust`** in that
+  folder, which records it in the global `trustedProjects` list. Startup
+  says what was ignored. Everything non-executable in project settings still
+  applies.
+- **Deep links no longer run anything.** `rustyclaw-cli://open?q=…` used to
+  start a headless agent session with your credentials, triggerable from any
+  web page once the handler was registered. It now opens the interactive TUI
+  with the prompt in the input box for you to review, and refuses to run at
+  all without a terminal. Re-run `rustyclaw --register-protocol` so the
+  handler opens a terminal. Non-ASCII queries were also mangled by the
+  percent-decoder.
+- **A symlinked `CLAUDE.md` / `AGENTS.md` is refused.** A repository could
+  point one at `~/.ssh/id_rsa` and have the key read into the system prompt
+  sent to the API.
+
 - **MCP resource reads were uncapped.** Tool results were already limited to
   25K characters; `resources/read` was not, so one large or hostile resource
   flooded the context window. Same cap now. Server-supplied tool descriptions
@@ -29,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The cost dashboard used the wrong prices for every current Claude
+  model.** Opus was charged at 3× the published rate and Haiku at ¼, so
+  `/budget` stopped a session far too early or far too late. Rates now match
+  Anthropic's list prices per generation (Fable $10/$50, Opus 4.6+ $5/$25,
+  Sonnet 5 $2/$10, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5). Third-party rows the
+  code itself calls "rough" are now flagged as estimates in the dashboard.
 - **A hung MCP server blocked startup for a minute, and several hung servers
   blocked it for a minute each.** Servers now connect concurrently under a
   20-second per-server budget; a server that does not answer is skipped with

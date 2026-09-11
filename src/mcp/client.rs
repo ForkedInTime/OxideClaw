@@ -174,13 +174,11 @@ pub(crate) struct HttpTransport {
 }
 
 impl HttpTransport {
-    // TODO(oauth): MCP streamable-HTTP servers may return 401 when a bearer
-    // token expires. RustyClaw currently takes auth headers from static
-    // config (settings.json → mcpServers.*.headers), so there is no refresh
-    // flow — an expired token surfaces as a plain "HTTP MCP <method> failed:
-    // 401" error and the user has to restart. Adding a real OAuth client
-    // (discovery, refresh tokens, PKCE) is a larger feature and is tracked
-    // separately; until then, the failure mode is loud but not silent.
+    // Auth is static by decision (2026-09-11): headers come from
+    // settings.json → mcpServers.*.headers and are sent as-is. An expired
+    // bearer token surfaces as a loud "HTTP MCP <method> failed: 401"; the
+    // user replaces it and restarts. No OAuth discovery/PKCE/refresh flow is
+    // planned — documented in SECURITY.md.
     pub fn new(url: &str, headers: &HashMap<String, String>) -> Result<Self> {
         let mut builder = reqwest::Client::builder();
 
