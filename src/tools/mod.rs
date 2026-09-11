@@ -5,7 +5,6 @@ pub mod bash;
 pub mod brief_tool;
 pub mod browser_tools;
 pub mod config_tool;
-pub mod cron;
 pub mod discover_skills;
 pub mod file_edit;
 pub mod file_read;
@@ -642,16 +641,6 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     tools.push(Arc::new(config_tool::ConfigTool {
         config: config.clone(),
     }));
-
-    // Cron tools (shared store)
-    let cron_store: cron::CronStore = Arc::new(std::sync::Mutex::new(cron::load_jobs()));
-    tools.push(Arc::new(cron::CronCreateTool {
-        store: cron_store.clone(),
-    }));
-    tools.push(Arc::new(cron::CronDeleteTool {
-        store: cron_store.clone(),
-    }));
-    tools.push(Arc::new(cron::CronListTool { store: cron_store }));
 
     // ToolSearch — built last so it can include all tool names+descriptions
     let snapshot: Vec<(String, String)> = tools
