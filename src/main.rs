@@ -1,5 +1,6 @@
 /// rustyclaw — Rust-native AI coding CLI
 /// Entry point
+mod acp;
 mod api;
 mod auth;
 mod autofix;
@@ -294,6 +295,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run as an Agent Client Protocol agent over stdio (Zed, JetBrains, any ACP client)
+    Acp,
     /// Show version information
     Version,
     /// Manage MCP servers
@@ -574,6 +577,7 @@ async fn main() -> Result<()> {
     // Handle subcommands
     if let Some(cmd) = &cli.command {
         match cmd {
+            Commands::Acp => {} // needs the full config; handled below
             Commands::Version => {
                 println!("rustyclaw {VERSION}");
                 return Ok(());
@@ -956,6 +960,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+
+    // `rustyclaw acp`: Agent Client Protocol over stdio
+    if matches!(cli.command, Some(Commands::Acp)) {
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        crate::acp::AcpServer::run(config, stdin, tokio::io::stdout()).await?;
+        return Ok(());
     }
 
     // --headless mode: long-running SDK server

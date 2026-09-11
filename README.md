@@ -96,6 +96,7 @@ How it compares with the agents people actually run. Every cell was checked agai
 | OpenAI-compatible providers | ❌ | ✅ | ✅ | ✅ | **✅ 9 providers** |
 | Lifecycle hooks | ✅ | ✅ | — | ✅ | **✅ 8 events** |
 | MCP servers | ✅ | ✅ | ✅ | ✅ | **✅** |
+| Editor integration (Agent Client Protocol) | via adapter | — | — | ✅ | **✅ `rustyclaw acp`** |
 | Sandboxed shell (bwrap / firejail) | ✅ | ✅ | — | — | **✅** |
 | CLAUDE.md + AGENTS.md | CLAUDE.md | — | — | ✅ | **✅ both, `/reload`** |
 
@@ -164,6 +165,14 @@ Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the too
 { "hooks": { "preToolUse": [ { "matcher": "Bash", "command": "./scripts/guard.sh" } ] } }
 ```
 
+### 🧩 &nbsp; Editor integration — Agent Client Protocol
+
+`rustyclaw acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so Zed, JetBrains, and any ACP client can use RustyClaw as their coding agent: streamed replies and thoughts, live tool-call status, permission prompts in the editor's own UI, and mid-turn cancel. In Zed:
+
+```json
+{ "agent_servers": { "RustyClaw": { "command": "rustyclaw", "args": ["acp"] } } }
+```
+
 ### 🛡️ &nbsp; Sandbox-first execution
 
 Shell commands can run under `bwrap`, `firejail`, or a `strict` mode (no network, read-only FS). Approvals are per-session, per-command-family.
@@ -186,6 +195,7 @@ rustyclaw /doctor       # verifies API keys, models, and sandbox
 # Day-to-day
 rustyclaw               # interactive TUI
 rustyclaw --headless    # NDJSON stdio for editor/CI embedding (see sdk/)
+rustyclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any ACP client)
 
 # Inside the TUI
 /help                   # interactive command menu
