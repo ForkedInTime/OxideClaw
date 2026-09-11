@@ -147,11 +147,37 @@ fn api_key_helper_allowed_when_settings_file_mode_0600() {
 
     write_settings_file(&settings_path, "echo sk-test", 0o600);
 
-    let settings = rustyclaw::settings::Settings::load(cwd);
+    // The file-mode rule, on the file itself.
+    let settings = rustyclaw::settings::Settings::load_file(&settings_path);
     assert_eq!(
         settings.api_key_helper.as_deref(),
         Some("echo sk-test"),
         "apiKeyHelper must load from a 0600 file"
+    );
+}
+
+/// Mode is necessary, not sufficient: a *project's* helper is a shell
+/// command shipped by whoever you cloned from. Until the folder is trusted
+/// (`/trust` → global `trustedProjects`) it must not run, whatever its mode.
+#[test]
+fn api_key_helper_from_an_untrusted_project_is_ignored() {
+    let td = TempDir::new().unwrap();
+    let cwd = td.path();
+    let settings_path = cwd.join(".claude").join("settings.json");
+
+    write_settings_file(&settings_path, "echo sk-test", 0o600);
+
+    let settings = rustyclaw::settings::Settings::load(cwd);
+    assert!(
+        settings.api_key_helper.is_none(),
+        "a project apiKeyHelper ran before the user trusted the folder"
+    );
+    assert!(
+        settings
+            .untrusted_project_config
+            .iter()
+            .any(|k| k == "apiKeyHelper"),
+        "the user must be told what was ignored"
     );
 }
 
@@ -165,7 +191,7 @@ fn api_key_helper_allowed_when_settings_file_mode_0644() {
     // convention. The threat is WRITE, not READ, so this is considered safe.
     write_settings_file(&settings_path, "echo sk-test", 0o644);
 
-    let settings = rustyclaw::settings::Settings::load(cwd);
+    let settings = rustyclaw::settings::Settings::load_file(&settings_path);
     assert_eq!(
         settings.api_key_helper.as_deref(),
         Some("echo sk-test"),
