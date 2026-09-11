@@ -1,10 +1,14 @@
-use rustyclaw::commands::{parse_browse_command, CommandAction};
 use rustyclaw::browser::browse_loop::BrowsePolicy;
+use rustyclaw::commands::{CommandAction, parse_browse_command};
 
 #[test]
 fn parses_plain_browse() {
     match parse_browse_command("find the cheapest flight") {
-        CommandAction::Browse { goal, policy, max_steps } => {
+        CommandAction::Browse {
+            goal,
+            policy,
+            max_steps,
+        } => {
             assert_eq!(goal, "find the cheapest flight");
             assert_eq!(policy, BrowsePolicy::Pattern);
             assert_eq!(max_steps, None);
@@ -27,7 +31,9 @@ fn parses_yolo_flag() {
 #[test]
 fn parses_max_steps() {
     match parse_browse_command("--max-steps 100 research X") {
-        CommandAction::Browse { max_steps, goal, .. } => {
+        CommandAction::Browse {
+            max_steps, goal, ..
+        } => {
             assert_eq!(max_steps, Some(100));
             assert_eq!(goal, "research X");
         }
@@ -38,7 +44,11 @@ fn parses_max_steps() {
 #[test]
 fn parses_ask_and_max_steps_combined() {
     match parse_browse_command("--ask --max-steps 25 quick check") {
-        CommandAction::Browse { policy, max_steps, goal } => {
+        CommandAction::Browse {
+            policy,
+            max_steps,
+            goal,
+        } => {
             assert_eq!(policy, BrowsePolicy::Ask);
             assert_eq!(max_steps, Some(25));
             assert_eq!(goal, "quick check");

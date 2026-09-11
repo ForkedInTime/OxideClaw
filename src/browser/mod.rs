@@ -1,7 +1,7 @@
 //! Browser automation via Chrome DevTools Protocol.
 pub mod actions;
-pub mod browse_loop;
 pub mod approval_gate;
+pub mod browse_loop;
 pub mod cdp;
 pub mod element;
 pub mod loop_detector;
@@ -46,7 +46,6 @@ pub struct BrowserSession {
     console_task: Option<JoinHandle<()>>,
 }
 
-
 impl BrowserSession {
     pub fn is_connected(&self) -> bool {
         self.client.is_some()
@@ -61,7 +60,9 @@ impl BrowserSession {
     }
 
     pub fn client(&self) -> Result<&CdpClient> {
-        self.client.as_ref().ok_or_else(|| anyhow::anyhow!("Browser not connected. Use /browser or browser_navigate first."))
+        self.client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Browser not connected. Use /browser or browser_navigate first.")
+        })
     }
 
     /// Launch Chrome and connect via CDP.
@@ -186,15 +187,23 @@ impl BrowserSession {
 
     /// Resolve an @eN ref to a backend node ID.
     pub fn resolve_ref(&self, r: &str) -> Result<i64> {
-        let key = if r.starts_with('@') { r.to_string() } else { format!("@{r}") };
-        self.refs.get(&key)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Element ref '{key}' not found. Run browser_snapshot first."))
+        let key = if r.starts_with('@') {
+            r.to_string()
+        } else {
+            format!("@{r}")
+        };
+        self.refs.get(&key).copied().ok_or_else(|| {
+            anyhow::anyhow!("Element ref '{key}' not found. Run browser_snapshot first.")
+        })
     }
 
     /// Resolve an @eN ref to its accessible name, if one was captured.
     pub fn resolve_ref_name(&self, r: &str) -> Option<&str> {
-        let key = if r.starts_with('@') { r.to_string() } else { format!("@{r}") };
+        let key = if r.starts_with('@') {
+            r.to_string()
+        } else {
+            format!("@{r}")
+        };
         self.ref_names.get(&key).map(|s| s.as_str())
     }
 }
@@ -210,15 +219,14 @@ pub fn find_chrome() -> Option<PathBuf> {
         "chrome",
     ];
     for name in &candidates {
-        if let Ok(output) = std::process::Command::new("which")
-            .arg(name)
-            .output()
-            && output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Some(PathBuf::from(path));
-                }
+        if let Ok(output) = std::process::Command::new("which").arg(name).output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
             }
+        }
     }
     // Well-known paths — Linux + macOS
     let known: &[&str] = &[
@@ -286,7 +294,11 @@ fn format_console_event(params: &serde_json::Value) -> Option<String> {
         .map(|a| {
             a.get("value")
                 .map(stringify_arg)
-                .or_else(|| a.get("description").and_then(|v| v.as_str()).map(String::from))
+                .or_else(|| {
+                    a.get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| "<unprintable>".into())
         })
         .collect();
@@ -299,7 +311,11 @@ fn format_exception_event(params: &serde_json::Value) -> Option<String> {
     let exception_text = details
         .get("exception")
         .and_then(|e| e.get("description").and_then(|d| d.as_str()))
-        .or_else(|| details.get("exception").and_then(|e| e.get("value").and_then(|v| v.as_str())))
+        .or_else(|| {
+            details
+                .get("exception")
+                .and_then(|e| e.get("value").and_then(|v| v.as_str()))
+        })
         .unwrap_or("");
     let combined = if exception_text.is_empty() {
         text.to_string()

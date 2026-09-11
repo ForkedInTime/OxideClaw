@@ -681,8 +681,7 @@ pub struct App {
     /// Shared browser session — populated from `SharedToolState::browser_session`
     /// so `/browser`, `/browse`, `/screenshot` and the `browser_*` tools all
     /// drive the same Chrome instance. `None` when `browser_enabled == false`.
-    pub browser_session:
-        Option<std::sync::Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
+    pub browser_session: Option<std::sync::Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
 
     /// Active file-watch state. `None` when no watcher is running.
     /// Dropping this stops watching.
@@ -691,9 +690,11 @@ pub struct App {
     /// Active browse approval prompt awaiting user input (A=approve, D=deny).
     pub browse_approval: Option<crate::browser::approval_gate::ApprovalPrompt>,
     /// Receiver for browse progress events (active during a /browse run).
-    pub browse_progress_rx: Option<tokio::sync::mpsc::Receiver<crate::browser::browse_loop::BrowseProgress>>,
+    pub browse_progress_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::browser::browse_loop::BrowseProgress>>,
     /// Receiver for browse approval prompts.
-    pub browse_approval_rx: Option<tokio::sync::mpsc::Receiver<crate::browser::approval_gate::ApprovalPrompt>>,
+    pub browse_approval_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::browser::approval_gate::ApprovalPrompt>>,
 }
 
 /// Format a raw model ID into a human-readable name like "Sonnet 4.6".
@@ -1558,7 +1559,9 @@ mod trim_entries_tests {
 
     fn app_with(n: usize) -> App {
         let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
-        app.entries = (0..n).map(|i| ChatEntry::assistant(i.to_string())).collect();
+        app.entries = (0..n)
+            .map(|i| ChatEntry::assistant(i.to_string()))
+            .collect();
         app
     }
 

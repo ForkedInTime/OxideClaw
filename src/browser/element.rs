@@ -9,7 +9,12 @@
 
 /// Score an element based on its properties. Higher = more interactive/important.
 #[allow(dead_code)]
-pub fn score_element(role: &str, has_click_listener: bool, has_label: bool, is_focusable: bool) -> u32 {
+pub fn score_element(
+    role: &str,
+    has_click_listener: bool,
+    has_label: bool,
+    is_focusable: bool,
+) -> u32 {
     let mut score = 0u32;
 
     score += match role {
@@ -25,9 +30,15 @@ pub fn score_element(role: &str, has_click_listener: bool, has_label: bool, is_f
         _ => 1,
     };
 
-    if has_click_listener { score += 5; }
-    if has_label { score += 3; }
-    if is_focusable { score += 2; }
+    if has_click_listener {
+        score += 5;
+    }
+    if has_label {
+        score += 3;
+    }
+    if is_focusable {
+        score += 2;
+    }
 
     score
 }

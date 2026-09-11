@@ -349,7 +349,10 @@ mod tests {
 
         let summary = tracker.summary();
         assert!(summary.contains("Per-model breakdown:"));
-        assert!(summary.contains("model-nan"), "every model must still render");
+        assert!(
+            summary.contains("model-nan"),
+            "every model must still render"
+        );
     }
 
     /// An unrecognised model is priced at Sonnet-tier rates so a budget still
@@ -364,14 +367,22 @@ mod tests {
             "unrecognised model must be flagged"
         );
         let s = t.summary();
-        assert!(s.contains('~'), "estimate must be marked in the report: {s}");
+        assert!(
+            s.contains('~'),
+            "estimate must be marked in the report: {s}"
+        );
         assert!(s.contains("not recognised"), "and explained: {s}");
     }
 
     #[test]
     fn known_models_are_not_marked_as_estimated() {
         let mut t = CostTracker::new();
-        for m in ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5", "ollama:llama3"] {
+        for m in [
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "ollama:llama3",
+        ] {
             t.record(m, 1000, 100);
             assert!(!t.by_model[m].estimated, "{m} has published rates");
         }

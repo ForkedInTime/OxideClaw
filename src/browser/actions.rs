@@ -5,8 +5,8 @@
 //! before a long-running operation (page load, wait_for polling, etc.).
 //! Functions that need the ref map (click / fill / get_text) still take
 //! `&mut BrowserSession` — those are fast, no long awaits.
-use super::cdp::CdpClient;
 use super::BrowserSession;
+use super::cdp::CdpClient;
 use anyhow::{Result, bail};
 use serde_json::json;
 
@@ -25,7 +25,13 @@ fn validate_navigation_url(url: &str) -> Result<()> {
     }
     let lower = trimmed.to_ascii_lowercase();
     let scheme = match lower.split_once(':') {
-        Some((s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') => s.to_string(),
+        Some((s, _))
+            if !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') =>
+        {
+            s.to_string()
+        }
         // No scheme — treat as relative; reject so callers always pass absolute URLs.
         _ => bail!("navigation URL '{url}' is missing an http(s):// scheme"),
     };
@@ -50,7 +56,9 @@ pub async fn preflight_navigation_url(url: &str) -> Result<()> {
     }
     let parsed = url::Url::parse(trimmed)
         .map_err(|e| anyhow::anyhow!("navigation URL '{url}' is invalid: {e}"))?;
-    crate::net_policy::NetPolicy::LOCAL_OK.resolve(&parsed).await?;
+    crate::net_policy::NetPolicy::LOCAL_OK
+        .resolve(&parsed)
+        .await?;
     Ok(())
 }
 
@@ -65,13 +73,13 @@ pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<
 
     let result = client.send("Page.navigate", json!({"url": url})).await?;
     if let Some(err) = result["errorText"].as_str()
-        && !err.is_empty() {
-            anyhow::bail!("Navigation failed: {err}");
-        }
+        && !err.is_empty()
+    {
+        anyhow::bail!("Navigation failed: {err}");
+    }
 
     // Wait for load event
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
         match tokio::time::timeout_at(deadline, events.recv()).await {
             Ok(Ok(ev)) if ev.method == "Page.loadEventFired" => break,
@@ -115,42 +123,63 @@ pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<St
     let client = session.client()?;
 
     // Resolve node to a RemoteObject for interaction
-    let resolved = client.send("DOM.resolveNode", json!({"backendNodeId": node_id})).await?;
-    let object_id = resolved["object"]["objectId"].as_str()
+    let resolved = client
+        .send("DOM.resolveNode", json!({"backendNodeId": node_id}))
+        .await?;
+    let object_id = resolved["object"]["objectId"]
+        .as_str()
         .ok_or_else(|| anyhow::anyhow!("Could not resolve element {element_ref} to JS object"))?;
 
     // Scroll into view
-    let _ = client.send("Runtime.callFunctionOn", json!({
-        "objectId": object_id,
-        "functionDeclaration": "function() { this.scrollIntoViewIfNeeded(); }",
-    })).await;
+    let _ = client
+        .send(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { this.scrollIntoViewIfNeeded(); }",
+            }),
+        )
+        .await;
 
     // Get element center coordinates
-    let box_model = client.send("DOM.getBoxModel", json!({"backendNodeId": node_id})).await?;
+    let box_model = client
+        .send("DOM.getBoxModel", json!({"backendNodeId": node_id}))
+        .await?;
     let content = &box_model["model"]["content"];
     if let Some(coords) = content.as_array()
-        && coords.len() >= 4 {
-            let x = (coords[0].as_f64().unwrap_or(0.0) + coords[2].as_f64().unwrap_or(0.0)) / 2.0;
-            let y = (coords[1].as_f64().unwrap_or(0.0) + coords[5].as_f64().unwrap_or(0.0)) / 2.0;
+        && coords.len() >= 4
+    {
+        let x = (coords[0].as_f64().unwrap_or(0.0) + coords[2].as_f64().unwrap_or(0.0)) / 2.0;
+        let y = (coords[1].as_f64().unwrap_or(0.0) + coords[5].as_f64().unwrap_or(0.0)) / 2.0;
 
-            // Mouse click sequence
-            for event_type in ["mousePressed", "mouseReleased"] {
-                client.send("Input.dispatchMouseEvent", json!({
-                    "type": event_type,
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "clickCount": 1,
-                })).await?;
-            }
-            return Ok(format!("Clicked {element_ref} at ({x:.0}, {y:.0})"));
+        // Mouse click sequence
+        for event_type in ["mousePressed", "mouseReleased"] {
+            client
+                .send(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": event_type,
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "clickCount": 1,
+                    }),
+                )
+                .await?;
         }
+        return Ok(format!("Clicked {element_ref} at ({x:.0}, {y:.0})"));
+    }
 
     // Fallback: JS click
-    client.send("Runtime.callFunctionOn", json!({
-        "objectId": object_id,
-        "functionDeclaration": "function() { this.click(); }",
-    })).await?;
+    client
+        .send(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { this.click(); }",
+            }),
+        )
+        .await?;
     Ok(format!("Clicked {element_ref} (JS fallback)"))
 }
 
@@ -160,28 +189,42 @@ pub async fn fill(session: &mut BrowserSession, element_ref: &str, value: &str) 
     let client = session.client()?;
 
     // Focus the element
-    client.send("DOM.focus", json!({"backendNodeId": node_id})).await?;
+    client
+        .send("DOM.focus", json!({"backendNodeId": node_id}))
+        .await?;
 
     // Clear existing value by calling .value = '' on the resolved element directly
     // (not on document.activeElement, which could be anything after focus changes).
-    let resolved = client.send("DOM.resolveNode", json!({"backendNodeId": node_id})).await?;
+    let resolved = client
+        .send("DOM.resolveNode", json!({"backendNodeId": node_id}))
+        .await?;
     if let Some(object_id) = resolved["object"]["objectId"].as_str() {
-        let _ = client.send("Runtime.callFunctionOn", json!({
-            "objectId": object_id,
-            "functionDeclaration":
-                "function() { if ('value' in this) this.value = ''; \
-                              else if (this.isContentEditable) this.textContent = ''; }",
-        })).await;
+        let _ = client
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration":
+                        "function() { if ('value' in this) this.value = ''; \
+                                      else if (this.isContentEditable) this.textContent = ''; }",
+                }),
+            )
+            .await;
     }
 
     // Type the value (handles input events correctly)
-    client.send("Input.insertText", json!({"text": value})).await?;
+    client
+        .send("Input.insertText", json!({"text": value}))
+        .await?;
 
-    Ok(format!("Filled {element_ref} with \"{}\"", if value.len() > 50 {
-        format!("{}...", &value[..50])
-    } else {
-        value.to_string()
-    }))
+    Ok(format!(
+        "Filled {element_ref} with \"{}\"",
+        if value.len() > 50 {
+            format!("{}...", &value[..50])
+        } else {
+            value.to_string()
+        }
+    ))
 }
 
 /// Take a screenshot. Returns base64-encoded PNG.
@@ -189,8 +232,12 @@ pub async fn screenshot(client: &CdpClient, full_page: bool) -> Result<String> {
     let mut params = json!({"format": "png"});
     if full_page {
         let metrics = client.send("Page.getLayoutMetrics", json!({})).await?;
-        let width = metrics["cssContentSize"]["width"].as_f64().unwrap_or(1280.0);
-        let height = metrics["cssContentSize"]["height"].as_f64().unwrap_or(720.0);
+        let width = metrics["cssContentSize"]["width"]
+            .as_f64()
+            .unwrap_or(1280.0);
+        let height = metrics["cssContentSize"]["height"]
+            .as_f64()
+            .unwrap_or(720.0);
         params["clip"] = json!({
             "x": 0, "y": 0,
             "width": width, "height": height,
@@ -214,15 +261,25 @@ pub async fn press_key(client: &CdpClient, key: &str) -> Result<String> {
         _ => (key, key),
     };
 
-    client.send("Input.dispatchKeyEvent", json!({
-        "type": "keyDown",
-        "key": key_code,
-        "text": text,
-    })).await?;
-    client.send("Input.dispatchKeyEvent", json!({
-        "type": "keyUp",
-        "key": key_code,
-    })).await?;
+    client
+        .send(
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyDown",
+                "key": key_code,
+                "text": text,
+            }),
+        )
+        .await?;
+    client
+        .send(
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyUp",
+                "key": key_code,
+            }),
+        )
+        .await?;
 
     Ok(format!("Pressed key: {key}"))
 }
@@ -231,8 +288,11 @@ pub async fn press_key(client: &CdpClient, key: &str) -> Result<String> {
 pub async fn get_text(session: &mut BrowserSession, element_ref: &str) -> Result<String> {
     let node_id = session.resolve_ref(element_ref)?;
     let client = session.client()?;
-    let resolved = client.send("DOM.resolveNode", json!({"backendNodeId": node_id})).await?;
-    let object_id = resolved["object"]["objectId"].as_str()
+    let resolved = client
+        .send("DOM.resolveNode", json!({"backendNodeId": node_id}))
+        .await?;
+    let object_id = resolved["object"]["objectId"]
+        .as_str()
         .ok_or_else(|| anyhow::anyhow!("Could not resolve {element_ref}"))?;
     let result = client.send("Runtime.callFunctionOn", json!({
         "objectId": object_id,
@@ -243,11 +303,7 @@ pub async fn get_text(session: &mut BrowserSession, element_ref: &str) -> Result
 }
 
 /// Wait for a CSS selector to appear, or timeout.
-pub async fn wait_for(
-    client: &CdpClient,
-    condition: &str,
-    timeout_ms: u64,
-) -> Result<String> {
+pub async fn wait_for(client: &CdpClient, condition: &str, timeout_ms: u64) -> Result<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
     // Serialize the selector as a proper JS string literal — handles quotes,
@@ -257,16 +313,23 @@ pub async fn wait_for(
     let expression = format!("!!document.querySelector({selector_js})");
 
     loop {
-        let result = client.send("Runtime.evaluate", json!({
-            "expression": expression,
-        })).await?;
+        let result = client
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                }),
+            )
+            .await?;
 
         if result["result"]["value"].as_bool() == Some(true) {
             return Ok(format!("Condition met: {condition}"));
         }
 
         if tokio::time::Instant::now() > deadline {
-            return Ok(format!("Timeout after {timeout_ms}ms waiting for: {condition}"));
+            return Ok(format!(
+                "Timeout after {timeout_ms}ms waiting for: {condition}"
+            ));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -326,14 +389,26 @@ mod preflight_tests {
 
     #[tokio::test]
     async fn local_dev_server_is_allowed() {
-        preflight_navigation_url("http://localhost:3000/").await.unwrap();
-        preflight_navigation_url("http://127.0.0.1:8080/api").await.unwrap();
+        preflight_navigation_url("http://localhost:3000/")
+            .await
+            .unwrap();
+        preflight_navigation_url("http://127.0.0.1:8080/api")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn non_http_schemes_are_still_refused() {
-        assert!(preflight_navigation_url("file:///etc/passwd").await.is_err());
-        assert!(preflight_navigation_url("javascript:alert(1)").await.is_err());
+        assert!(
+            preflight_navigation_url("file:///etc/passwd")
+                .await
+                .is_err()
+        );
+        assert!(
+            preflight_navigation_url("javascript:alert(1)")
+                .await
+                .is_err()
+        );
         assert!(preflight_navigation_url("about:blank").await.is_ok());
     }
 }
