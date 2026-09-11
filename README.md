@@ -36,6 +36,16 @@ Invoke-WebRequest https://github.com/ForkedInTime/RustyClaw/releases/latest/down
 ```
 Then move `rustyclaw.exe` somewhere on your `PATH` (e.g. `%USERPROFILE%\bin`).
 
+**Arch Linux:**
+```bash
+git clone https://github.com/ForkedInTime/RustyClaw && cd RustyClaw/contrib/aur && makepkg -si
+```
+
+**Homebrew (macOS / Linux):**
+```bash
+brew install ForkedInTime/rustyclaw/rustyclaw
+```
+
 <details>
 <summary>Other install methods</summary>
 
@@ -80,7 +90,7 @@ How it compares with the agents people actually run. Every cell was checked agai
 
 | | Claude Code | Codewhale | jcode | claurst | **RustyClaw** |
 |---|---|---|---|---|---|
-| Runtime | Node.js | Rust | Rust | Rust | **Rust, one static binary** |
+| Runtime | JavaScript (Bun-bundled binary) | Rust | Rust | Rust | **Rust, one static binary** |
 | License | Proprietary | MIT | MIT | GPL-3.0 | **Apache-2.0** |
 | Zero-setup codebase index (tree-sitter + FTS5) | ❌ | — | — | — | **✅ 8 languages** |
 | Auto model routing | ❌ | ✅ DeepSeek tiers | — | — | **✅ any provider, by task complexity, `/budget` cap** |
@@ -297,6 +307,7 @@ rustyclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 | Document | Description |
 |----------|-------------|
 | [FEATURES.md](FEATURES.md) | Complete feature reference — every command, shortcut, and config option |
+| [BENCHMARKS.md](BENCHMARKS.md) | Startup and footprint vs Claude Code, Codex, Gemini CLI, Goose — with the script to reproduce |
 | [sdk/](sdk/) | SDK / headless mode — protocol, examples, integration guide |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |

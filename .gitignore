@@ -16,3 +16,9 @@
 
 # Playwright MCP session artefacts
 .playwright-mcp/
+
+# AUR packaging scratch (contrib/aur)
+contrib/aur/src/
+contrib/aur/pkg/
+contrib/aur/*.pkg.tar.*
+contrib/aur/rustyclaw-*
