@@ -43,7 +43,7 @@ pub(super) fn cmd_banner(args: &str) -> CommandAction {
 }
 
 pub(super) fn cmd_version() -> CommandAction {
-    CommandAction::Message(format!("RustyClaw v{}", env!("CARGO_PKG_VERSION")))
+    CommandAction::Message(format!("OxideClaw v{}", env!("CARGO_PKG_VERSION")))
 }
 
 pub(super) fn cmd_keybindings() -> CommandAction {
@@ -129,7 +129,7 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/stats", "detailed session statistics"),
             ("/clear", "clear chat history"),
             ("/compact", "summarize & compress context"),
-            ("/exit", "quit rustyclaw"),
+            ("/exit", "quit oxideclaw"),
         ],
     ),
     (
@@ -368,7 +368,7 @@ pub(super) fn cmd_statusline(args: &str) -> CommandAction {
 // ── Voice ──────────────────────────────────────────────────────────────────────
 
 pub(super) fn cmd_feedback() -> CommandAction {
-    CommandAction::OpenBrowser("https://github.com/ForkedInTime/RustyClaw/issues".into())
+    CommandAction::OpenBrowser("https://github.com/ForkedInTime/OxideClaw/issues".into())
 }
 
 // ── Terminal Setup ─────────────────────────────────────────────────────────────
@@ -464,7 +464,7 @@ pub(super) fn cmd_notifications(args: &str, ctx: &CommandContext) -> CommandActi
 
 pub(super) fn cmd_release_notes(_args: &str) -> CommandAction {
     CommandAction::Message(
-        "Release Notes — RustyClaw v0.1.0\n\n\
+        "Release Notes — OxideClaw v0.1.0\n\n\
          Features:\n\
            • Voice input (/voice) — audio capture via arecord/sox/ffmpeg\n\
              + transcription via local whisper CLI or OpenAI-compatible API\n\
@@ -480,7 +480,7 @@ pub(super) fn cmd_release_notes(_args: &str) -> CommandAction {
            • Output styles (/output-style) — Explanatory, Learning, custom .md files\n\
            • Themes (/theme) — dark, light, solarized\n\n\
          See CHANGELOG.md for full history.\n\
-         See https://github.com/ForkedInTime/RustyClaw/releases for downloads."
+         See https://github.com/ForkedInTime/OxideClaw/releases for downloads."
             .into(),
     )
 }

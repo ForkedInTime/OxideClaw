@@ -13,7 +13,7 @@ mkfifo "$FIFO"
 trap 'rm -f "$FIFO"' EXIT
 
 # Start the server, reading from the FIFO
-rustyclaw --headless < "$FIFO" 2>/dev/null &
+oxideclaw --headless < "$FIFO" 2>/dev/null &
 SERVER_PID=$!
 
 # Open the FIFO for writing (keeps it open)

@@ -1,22 +1,22 @@
 # Maintainer: Alfredo Montesinos <alfredo@kubereva.com>
 # Binary package: prebuilt release from GitHub, verified against the
 # per-asset SHA-256 that the release workflow publishes.
-pkgname=rustyclaw-bin
-_pkgname=rustyclaw
+pkgname=oxideclaw-bin
+_pkgname=oxideclaw
 pkgver=0.3.2
 pkgrel=1
 pkgdesc="Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning. Claude, Ollama, OpenAI-compatible."
 arch=('x86_64' 'aarch64')
-url="https://github.com/ForkedInTime/RustyClaw"
+url="https://github.com/ForkedInTime/OxideClaw"
 license=('Apache-2.0')
-provides=('rustyclaw')
+provides=('oxideclaw')
 options=('!strip' '!debug')
-conflicts=('rustyclaw')
+conflicts=('oxideclaw')
 optdepends=('ollama: run local models offline'
             'bubblewrap: sandboxed shell execution'
             'firejail: alternative sandbox backend')
-source_x86_64=("${_pkgname}-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/rustyclaw-linux-x64")
-source_aarch64=("${_pkgname}-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/rustyclaw-linux-arm64")
+source_x86_64=("${_pkgname}-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/oxideclaw-linux-x64")
+source_aarch64=("${_pkgname}-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/oxideclaw-linux-arm64")
 sha256sums_x86_64=('52155bc9832dc4440cc20fbc6fd25dd417edda653a5a6cbb2e5241d5952d856c')
 sha256sums_aarch64=('8584bf8a6a4ec36e1dc9fa5989072b2fe5ac91257ff623c576bf1cc7cdee29d2')
 noextract=("${_pkgname}-${pkgver}-x86_64" "${_pkgname}-${pkgver}-aarch64")

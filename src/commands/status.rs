@@ -23,7 +23,7 @@ pub(super) fn cmd_status(ctx: &CommandContext) -> CommandAction {
     };
 
     let text = format!(
-        "RustyClaw v{ver}\n\
+        "OxideClaw v{ver}\n\
          \n\
          Model:      {model}\n\
          Max tokens: {max_tok}\n\
@@ -156,7 +156,7 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     let mut checks: Vec<String> = Vec::new();
 
     checks.push(format!("System: {}", distro.name()));
-    checks.push(format!("RustyClaw v{}", env!("CARGO_PKG_VERSION")));
+    checks.push(format!("OxideClaw v{}", env!("CARGO_PKG_VERSION")));
     checks.push(String::new());
 
     // XDG / config directory
@@ -227,11 +227,7 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     let env_paths = [
         ctx.config.cwd.join(".env"),
         dirs::home_dir().unwrap_or_default().join(".env"),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".config")
-            .join("rustyclaw")
-            .join(".env"),
+        crate::config::app_dir(&dirs::home_dir().unwrap_or_default().join(".config")).join(".env"),
     ];
     for p in env_paths.iter().filter(|p| p.exists()) {
         checks.push(format!("✓ .env loaded: {}", p.display()));

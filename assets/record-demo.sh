@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Record the RustyClaw hero demo for the README.
+# Record the OxideClaw hero demo for the README.
 #
 # What this does:
 #   1. Starts asciinema at 120x30 with idle pauses compressed to 2 sec.
-#   2. Launches ./target/release/rustyclaw inside the recording.
+#   2. Launches ./target/release/oxideclaw inside the recording.
 #   3. You drive the 8-scene demo manually (see SCENES below).
-#   4. When you /exit rustyclaw, the recording stops automatically.
+#   4. When you /exit oxideclaw, the recording stops automatically.
 #
 # Output: assets/demo.cast
 #
@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CAST_FILE="$SCRIPT_DIR/demo.cast"
-BINARY="$REPO_ROOT/target/release/rustyclaw"
+BINARY="$REPO_ROOT/target/release/oxideclaw"
 
 if [[ ! -x "$BINARY" ]]; then
   echo "ERROR: $BINARY not found. Run 'cargo build --release' first." >&2
@@ -31,7 +31,7 @@ fi
 
 cat <<'EOF'
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- RustyClaw — demo recording
+ OxideClaw — demo recording
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
  SCENES (target: ~60 sec total)
@@ -45,7 +45,7 @@ cat <<'EOF'
    7. /spawn refactor the banner config
    8. /exit
 
- When rustyclaw exits, the .cast will be saved automatically.
+ When oxideclaw exits, the .cast will be saved automatically.
 
  Starting in 3 sec...
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -57,7 +57,7 @@ asciinema rec \
   --cols 120 \
   --rows 30 \
   --idle-time-limit 2 \
-  --title "RustyClaw — AI coding CLI in Rust" \
+  --title "OxideClaw — AI coding CLI in Rust" \
   --command "$BINARY" \
   "$CAST_FILE"
 

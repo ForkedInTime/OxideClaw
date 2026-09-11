@@ -5,7 +5,7 @@
 //! This guards against the "close terminal = auto-approve" bug class,
 //! which has shipped as a regression in multiple competing tools.
 
-use rustyclaw::permissions::PermissionDecision;
+use oxideclaw::permissions::PermissionDecision;
 use tokio::sync::oneshot;
 
 /// Simulates the TUI run-loop dropping `App.pending_permission` on shutdown

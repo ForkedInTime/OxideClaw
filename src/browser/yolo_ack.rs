@@ -1,6 +1,6 @@
 //! First-run --yolo acknowledgment.
 //!
-//! Writes a timestamp+version file to $XDG_STATE_HOME/rustyclaw/yolo-ack
+//! Writes a timestamp+version file to $XDG_STATE_HOME/oxideclaw/yolo-ack
 //! on first --yolo use. Subsequent runs are silent.
 
 use std::fs;
@@ -17,7 +17,7 @@ fn ack_path() -> PathBuf {
                 .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_default())
                 .join(".local/state")
         });
-    state_home.join("rustyclaw").join("yolo-ack")
+    crate::config::app_dir(&state_home).join("yolo-ack")
 }
 
 pub fn is_acknowledged() -> bool {
@@ -34,6 +34,6 @@ pub fn acknowledge() -> std::io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let contents = format!("{secs} rustyclaw v{VERSION}\n");
+    let contents = format!("{secs} oxideclaw v{VERSION}\n");
     fs::write(p, contents)
 }

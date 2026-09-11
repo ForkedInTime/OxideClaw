@@ -1,4 +1,4 @@
-use rustyclaw::browser::approval_gate::{ApprovalGate, GateContext, GateVerdict};
+use oxideclaw::browser::approval_gate::{ApprovalGate, GateContext, GateVerdict};
 
 fn gate() -> ApprovalGate {
     ApprovalGate::default()

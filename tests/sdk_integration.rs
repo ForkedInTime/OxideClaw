@@ -1,5 +1,5 @@
 // tests/sdk_integration.rs
-//! Integration test: spawn rustyclaw --headless, send health/check, verify response.
+//! Integration test: spawn oxideclaw --headless, send health/check, verify response.
 
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -24,7 +24,7 @@ async fn test_health_check_via_headless() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to spawn rustyclaw --headless");
+        .expect("Failed to spawn oxideclaw --headless");
 
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();

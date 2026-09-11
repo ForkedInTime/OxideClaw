@@ -1,6 +1,6 @@
 //! Anthropic credential resolution.
 //!
-//! RustyClaw previously read `ANTHROPIC_API_KEY` and nothing else, which meant
+//! OxideClaw previously read `ANTHROPIC_API_KEY` and nothing else, which meant
 //! it ignored credentials the user may already have configured for Claude Code,
 //! the official SDKs, or the `ant` CLI — all of which share one resolution
 //! order. This module implements that same order so an existing login just
@@ -121,7 +121,7 @@ fn non_empty(v: Option<String>) -> Option<String> {
 /// Resolve a credential from an injected environment. Pure and order-defining.
 ///
 /// This is the canonical full chain. The binary drives the staged variants
-/// (`resolve_env` / `resolve_profile`) so RustyClaw's own explicit mechanisms
+/// (`resolve_env` / `resolve_profile`) so OxideClaw's own explicit mechanisms
 /// can sit between them; this entry point exists for library/SDK consumers and
 /// is what the ordering tests exercise.
 #[allow(dead_code)]
@@ -131,8 +131,8 @@ pub fn resolve_with(env: &impl AuthEnv) -> Option<Resolved> {
 
 /// Environment variables only — stops before consulting the `ant` profile.
 ///
-/// RustyClaw has two credential mechanisms of its own that predate this module
-/// (`RUSTYCLAW_API_KEY_FILE_DESCRIPTOR` and `apiKeyHelper`). Both are *explicit*
+/// OxideClaw has two credential mechanisms of its own that predate this module
+/// (`OXIDECLAW_API_KEY_FILE_DESCRIPTOR` and `apiKeyHelper`). Both are *explicit*
 /// local configuration, whereas an `ant` profile is ambient machine state, so
 /// config.rs runs: env vars → fd → helper → profile. Splitting the stages here
 /// keeps that ordering without duplicating the env-var precedence rules.

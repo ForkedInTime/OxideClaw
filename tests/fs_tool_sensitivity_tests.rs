@@ -18,18 +18,18 @@
 
 #![cfg(unix)]
 
-use rustyclaw::tools::{
+use oxideclaw::tools::{
     Tool, ToolContext, file_read::FileReadTool, file_write::FileWriteTool, grep::GrepTool,
 };
 use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-fn text(o: &rustyclaw::tools::ToolOutput) -> String {
+fn text(o: &oxideclaw::tools::ToolOutput) -> String {
     o.content
         .iter()
         .map(|c| match c {
-            rustyclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
+            oxideclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
         })
         .collect::<Vec<_>>()
         .join("")

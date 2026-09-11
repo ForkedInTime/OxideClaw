@@ -26,14 +26,14 @@ pub(super) async fn upgrade_check_task(tx: tokio::sync::mpsc::UnboundedSender<Ap
             }
         });
 
-    // Fetch latest RustyClaw release from GitHub API
+    // Fetch latest OxideClaw release from GitHub API
     let latest = async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
-            .user_agent("rustyclaw")
+            .user_agent("oxideclaw")
             .build()?;
         let resp: serde_json::Value = client
-            .get("https://api.github.com/repos/ForkedInTime/RustyClaw/releases/latest")
+            .get("https://api.github.com/repos/ForkedInTime/OxideClaw/releases/latest")
             .send()
             .await?
             .json()
@@ -46,19 +46,19 @@ pub(super) async fn upgrade_check_task(tx: tokio::sync::mpsc::UnboundedSender<Ap
     let msg = match latest {
         Ok(tag) => format!(
             "Upgrade Check\n\n\
-             rustyclaw v{current_version}{hash_str}\n\
+             oxideclaw v{current_version}{hash_str}\n\
              Latest release: {tag}\n\n\
              To rebuild from source:\n\
-               cd ~/Projects/RustyClaw\n\
+               cd ~/Projects/OxideClaw\n\
                git pull\n\
                cargo build --release"
         ),
         Err(_) => format!(
             "Upgrade Check\n\n\
-             rustyclaw v{current_version}{hash_str}\n\
+             oxideclaw v{current_version}{hash_str}\n\
              (Could not reach GitHub — check your connection)\n\n\
              To rebuild from source:\n\
-               cd ~/Projects/RustyClaw\n\
+               cd ~/Projects/OxideClaw\n\
                git pull\n\
                cargo build --release"
         ),
@@ -194,7 +194,7 @@ pub(super) async fn plugin_install_task(
                 "Plugin '{npm_name}' installed successfully (via {pm}).\n\
                  Registered as MCP server '{npm_name}' in ~/.claude/settings.json.\n\
                  \n\
-                 Restart rustyclaw for the plugin to take effect.\n\
+                 Restart oxideclaw for the plugin to take effect.\n\
                  After restart, verify with: /{npm_name}:ctx-doctor"
             ))
         } else {
@@ -232,7 +232,7 @@ pub(super) async fn plugin_install_task(
                 "Plugin '{npm_name}' installed successfully (via {pm}).\n\
                  Registered as MCP server '{npm_name}' in ~/.claude/settings.json.\n\
                  \n\
-                 Restart rustyclaw for the plugin to take effect."
+                 Restart oxideclaw for the plugin to take effect."
             ))
         }
     }.await;

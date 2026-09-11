@@ -334,7 +334,7 @@ impl Tool for BrowserScreenshotTool {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("rustyclaw_screenshot_{ts}.png"));
+        let path = std::env::temp_dir().join(format!("oxideclaw_screenshot_{ts}.png"));
         tokio::fs::write(&path, &bytes).await?;
 
         Ok(ToolOutput::success(format!(

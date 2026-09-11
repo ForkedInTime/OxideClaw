@@ -1,6 +1,6 @@
 //! Integration tests for auto-rollback core logic — TDD, written before implementation.
 
-use rustyclaw::autofix::{AutoFixConfig, AutoFixTrigger, detect_test_command, should_trigger};
+use oxideclaw::autofix::{AutoFixConfig, AutoFixTrigger, detect_test_command, should_trigger};
 use std::fs;
 use tempfile::TempDir;
 
@@ -132,7 +132,7 @@ fn test_default_config() {
     assert!(cfg.test_command.is_none());
     assert_eq!(
         cfg.timeout_secs,
-        rustyclaw::autofix::DEFAULT_TEST_TIMEOUT_SECS
+        oxideclaw::autofix::DEFAULT_TEST_TIMEOUT_SECS
     );
 }
 
@@ -149,7 +149,7 @@ fn test_settings_parse_auto_rollback_full() {
             "timeoutSecs": 120
         }
     }"#;
-    let s: rustyclaw::settings::Settings = serde_json::from_str(json).unwrap();
+    let s: oxideclaw::settings::Settings = serde_json::from_str(json).unwrap();
     let ar = s.auto_fix.expect("autoRollback missing");
     assert_eq!(ar.enabled, Some(true));
     assert_eq!(ar.trigger.as_deref(), Some("always"));
@@ -164,7 +164,7 @@ fn test_settings_parse_auto_rollback_trigger_case_insensitive() {
     // Verify by hand that the three canonical variants survive JSON parse.
     for t in &["autonomous", "AUTONOMOUS", "Always", "off", "Off"] {
         let json = format!(r#"{{"autoRollback": {{"trigger": "{t}"}}}}"#);
-        let s: rustyclaw::settings::Settings = serde_json::from_str(&json).unwrap();
+        let s: oxideclaw::settings::Settings = serde_json::from_str(&json).unwrap();
         let ar = s.auto_fix.expect("autoRollback missing");
         assert_eq!(ar.trigger.as_deref(), Some(*t));
     }

@@ -1,18 +1,18 @@
 //! Phase 2, data-integrity half: writes must not corrupt, MultiEdit must be
 //! atomic as documented, and result sets must be bounded.
 
-use rustyclaw::tools::{
+use oxideclaw::tools::{
     Tool, ToolContext, file_write::FileWriteTool, glob::GlobTool, multi_edit::MultiEditTool,
 };
 use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-fn text(o: &rustyclaw::tools::ToolOutput) -> String {
+fn text(o: &oxideclaw::tools::ToolOutput) -> String {
     o.content
         .iter()
         .map(|c| match c {
-            rustyclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
+            oxideclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
         })
         .collect::<Vec<_>>()
         .join("")
@@ -142,7 +142,7 @@ async fn atomic_write_preserves_file_permissions() {
     // Imported here rather than at module scope: this is the only user, and the
     // test is unix-only, so a top-level import is dead code on Windows and
     // trips `-D warnings` there.
-    use rustyclaw::tools::file_edit::FileEditTool;
+    use oxideclaw::tools::file_edit::FileEditTool;
     use std::os::unix::fs::PermissionsExt;
     let td = TempDir::new().unwrap();
     let ctx = ToolContext::new(PathBuf::from(td.path()));
@@ -181,7 +181,7 @@ async fn atomic_write_leaves_no_temp_files() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains("rustyclaw-") || n.ends_with(".tmp"))
+        .filter(|n| n.contains("oxideclaw-") || n.ends_with(".tmp"))
         .collect();
     assert!(strays.is_empty(), "temp files left behind: {strays:?}");
     assert_eq!(

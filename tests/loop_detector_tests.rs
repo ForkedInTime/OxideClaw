@@ -1,4 +1,4 @@
-use rustyclaw::browser::loop_detector::LoopDetector;
+use oxideclaw::browser::loop_detector::LoopDetector;
 
 // 1. Three identical actions → level-1 nudge ("different approach")
 #[test]

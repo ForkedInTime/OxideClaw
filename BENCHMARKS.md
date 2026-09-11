@@ -16,7 +16,7 @@ It says nothing about model quality or how fast a turn completes.
 
 ```bash
 cargo build --release
-PATH="$PWD/target/release:$PATH" scripts/bench.py --runs 20 rustyclaw claude codex gemini goose opencode jcode codewhale
+PATH="$PWD/target/release:$PATH" scripts/bench.py --runs 20 oxideclaw claude codex gemini goose opencode jcode codewhale
 ```
 
 ## Results
@@ -26,7 +26,7 @@ Date: 2026-09-11 · runs per tool: 20 · command: `<tool> --version`
 
 | Tool | Version | Executable | Cold start (median) | p95 | Peak RSS |
 |---|---|---|---|---|---|
-| rustyclaw | rustyclaw 0.3.2 | 19.4 MB | 3 ms | 8 ms | 19 MB |
+| oxideclaw | oxideclaw 0.3.2 | 19.4 MB | 3 ms | 8 ms | 19 MB |
 | claude | 2.1.268 (Claude Code) | 208.5 MB | 14 ms | 24 ms | 40 MB |
 | codex | codex-cli 0.153.4 | 246.7 MB | 15 ms | 20 ms | 22 MB |
 | gemini | 0.37.1 | script wrapper | 456 ms | 463 ms | 218 MB |

@@ -4,12 +4,12 @@
 //! stagnation termination, and denial-counter termination.
 //! No network, no Chrome — all in-process with channels.
 
-use rustyclaw::browser::approval_gate::{
+use oxideclaw::browser::approval_gate::{
     ApprovalGate, ApprovalGateMiddleware, GateContext, GateVerdict,
 };
-use rustyclaw::browser::browse_loop::{BrowsePolicy, BrowseReason, BrowseResult};
-use rustyclaw::browser::loop_detector::LoopDetectorMiddleware;
-use rustyclaw::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
+use oxideclaw::browser::browse_loop::{BrowsePolicy, BrowseReason, BrowseResult};
+use oxideclaw::browser::loop_detector::LoopDetectorMiddleware;
+use oxideclaw::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -238,7 +238,7 @@ fn browse_reason_serializes_snake_case() {
 
 #[test]
 fn voice_routes_browse_not_find() {
-    use rustyclaw::voice::{strip_browse_prefix, voice_routes_to_browse};
+    use oxideclaw::voice::{strip_browse_prefix, voice_routes_to_browse};
 
     assert!(voice_routes_to_browse("browse find flights to Tokyo"));
     assert!(voice_routes_to_browse("book a hotel in Paris"));

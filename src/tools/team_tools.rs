@@ -1,6 +1,6 @@
 /// TeamCreateTool and TeamDeleteTool — agent swarm team lifecycle management.
 ///
-/// Enabled when RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS=1 (same gate as SendMessageTool).
+/// Enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1 (same gate as SendMessageTool).
 ///
 /// Teams are stored in ~/.claude/teams/<name>.json
 use crate::tools::{Tool, ToolContext, ToolOutput};
@@ -20,7 +20,7 @@ impl Tool for TeamCreateTool {
     fn description(&self) -> &str {
         "Create a named agent team for multi-agent coordination. \
          Members can communicate via SendMessage. \
-         Requires RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS=1."
+         Requires OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1."
     }
 
     fn input_schema(&self) -> Value {
@@ -55,7 +55,7 @@ impl Tool for TeamCreateTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         if !crate::tools::send_message::is_agent_swarms_enabled() {
             return Ok(ToolOutput::error(
-                "Agent swarms are not enabled. Set RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS=1.",
+                "Agent swarms are not enabled. Set OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1.",
             ));
         }
 
@@ -117,7 +117,7 @@ impl Tool for TeamDeleteTool {
 
     fn description(&self) -> &str {
         "Delete a named agent team. \
-         Requires RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS=1."
+         Requires OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1."
     }
 
     fn input_schema(&self) -> Value {
@@ -136,7 +136,7 @@ impl Tool for TeamDeleteTool {
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         if !crate::tools::send_message::is_agent_swarms_enabled() {
             return Ok(ToolOutput::error(
-                "Agent swarms are not enabled. Set RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS=1.",
+                "Agent swarms are not enabled. Set OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1.",
             ));
         }
 

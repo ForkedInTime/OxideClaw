@@ -1,8 +1,8 @@
-# CLAUDE.md — RustyClaw
+# CLAUDE.md — OxideClaw
 
 ## Mission
 
-RustyClaw is a single-binary coding agent (Claude, Ollama, OpenAI-compatible backends). It is positioned as a **provider-neutral agent, not a "Rust port of Claude Code"** — that term is owned by leak clones since 2026-03-31. The goal is to win on the features nobody else ships (zero-setup code index, cost router, auto-fix loop, voice cloning, autonomous browser, /undo + /redo on invisible git refs) and match the field on the rest. OpenCode also has /undo + /redo (git-based); Codewhale has a cloud TTS tool; keep claims scoped. Full competitive analysis is in the private `.secret/` folder (not checked into the public repo).
+OxideClaw is a single-binary coding agent (Claude, Ollama, OpenAI-compatible backends). It is positioned as a **provider-neutral agent, not a "Rust port of Claude Code"** — that term is owned by leak clones since 2026-03-31. The goal is to win on the features nobody else ships (zero-setup code index, cost router, auto-fix loop, voice cloning, autonomous browser, /undo + /redo on invisible git refs) and match the field on the rest. OpenCode also has /undo + /redo (git-based); Codewhale has a cloud TTS tool; keep claims scoped. Full competitive analysis is in the private `.secret/` folder (not checked into the public repo).
 
 ## Role
 
@@ -21,12 +21,12 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 1. **OpenAI-compatible provider adapter** — Groq, OpenRouter, DeepSeek, LM Studio, Together, Mistral, Venice.ai, OpenAI, generic openai-compat.
 2. **Local Codebase RAG Indexing** — tree-sitter AST parsing + SQLite FTS5 semantic search. Zero setup. 8 languages.
 3. **Smart Model Router + Cost Dashboard** — Auto-detect task complexity, route simple→Haiku/Ollama, complex→Opus. Real-time cost tracking. `/budget $5`.
-4. **Background Parallel Agents in Git Worktrees** — `rustyclaw spawn "refactor auth"` runs an agent in an isolated worktree while you keep working.
+4. **Background Parallel Agents in Git Worktrees** — `oxideclaw spawn "refactor auth"` runs an agent in an isolated worktree while you keep working.
 5. **Self-voice model** — XTTS v2 voice cloning. No competitor has TTS at all.
 
 ### PHASE 1 ROBUSTNESS (shipped 2026-04-08)
 - **AGENTS.md support** — Industry-standard agent config alongside CLAUDE.md (3,518 upvotes on claude-code)
-- **XDG Base Directory compliance** — $XDG_CONFIG_HOME/rustyclaw, $XDG_DATA_HOME, $XDG_CACHE_HOME with backward compat
+- **XDG Base Directory compliance** — $XDG_CONFIG_HOME/oxideclaw, $XDG_DATA_HOME, $XDG_CACHE_HOME with backward compat
 - **Context usage % in status bar** — Real-time ctx % + color-coded warnings (yellow at 70%, red at 90%)
 - **Always-show-thinking** — Display model reasoning in TUI when enabled (`showThinkingSummaries: true`)
 - **Spinner style toggle** — `spinnerStyle: "themed" | "minimal" | "silent"` in settings.json
@@ -34,8 +34,8 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 
 ### PHASE 2 (shipping now)
 - **Auto-fix loop (2026-04-10)** — Post-edit lint + tests + feedback-driven retries replace the old rollback revert. Anti-cheat protected. `autoFixLoop` in settings.json, `autoRollback` alias kept for backward compat.
-- **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn working-tree snapshots on private shadow refs (`refs/rustyclaw/sessions/<id>`). New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. Other tools with undo pollute history; RustyClaw's shadow refs are invisible to `git log`/`branch`/`status`. No competitor has `/redo`.
-8. **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `rustyclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
+- **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn working-tree snapshots on private shadow refs (`refs/oxideclaw/sessions/<id>`). New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. Other tools with undo pollute history; OxideClaw's shadow refs are invisible to `git log`/`branch`/`status`. No competitor has `/redo`.
+8. **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `oxideclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
 
 ### NEXT UP
 6. **SDK/headless sidecar** — NDJSON stdio binary for editor embedding. Uncontested.
@@ -93,7 +93,7 @@ src/
 
 ```bash
 cargo build --release
-./target/release/rustyclaw
+./target/release/oxideclaw
 ```
 
 ## Release Process
@@ -111,7 +111,7 @@ CI cross-compiles: x86_64-gnu, aarch64-gnu, x86_64-musl. Uses `cross` + `rustls-
 
 ## GitHub
 
-- **Repo**: https://github.com/ForkedInTime/RustyClaw (public)
+- **Repo**: https://github.com/ForkedInTime/OxideClaw (public)
 - **User**: ForkedInTime
 - **Default branch**: main
 

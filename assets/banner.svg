@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2400 700" role="img" aria-label="RustyClaw — Claude Code, carved in Rust">
-  <title>RustyClaw</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2400 700" role="img" aria-label="OxideClaw — the single-binary coding agent">
+  <title>OxideClaw</title>
 
   <defs>
     <!-- Background: left is deep black, right fades into GitHub-dark -->
@@ -99,13 +99,13 @@
   </g>
 
   <!-- ── Wordmark + tagline (lots of breathing room) ──────────────── -->
-  <!-- Wordmark uses a bold sans (much narrower than mono) so "RustyClaw" fits comfortably. -->
+  <!-- Wordmark uses a bold sans (much narrower than mono) so "OxideClaw" fits comfortably. -->
   <g font-family="DejaVu Sans, Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif">
     <text x="780" y="340"
           font-size="220"
           font-weight="900"
           fill="url(#wordmark)"
-          letter-spacing="-4">RustyClaw</text>
+          letter-spacing="-4">OxideClaw</text>
 
     <!-- Accent rule under the wordmark -->
     <rect x="784" y="380" width="220" height="9" fill="url(#rust)" rx="3"/>
@@ -116,20 +116,20 @@
     <text x="780" y="465"
           font-size="54"
           font-weight="500"
-          fill="#C9D1D9">Claude Code, carved in Rust.</text>
+          fill="#C9D1D9">Rust is iron oxide. The claw stays.</text>
 
     <!-- Feature line — concise, punchy -->
     <text x="780" y="540"
           font-size="36"
           font-weight="400"
-          fill="#8B949E">19 MB static binary · sub-50 ms cold-start · Ollama · local RAG · voice · offline</text>
+          fill="#8B949E">19 MB binary · 3 ms cold start · Claude · Ollama · local RAG · voice</text>
 
     <!-- Prompt flourish along the bottom -->
     <g transform="translate(780 620)"
        font-size="34"
        font-weight="500">
       <text fill="#F08A3E">$</text>
-      <text x="36" fill="#F5E9D8">rustyclaw</text>
+      <text x="36" fill="#F5E9D8">oxideclaw</text>
       <text x="286" fill="#58A6FF">—</text>
       <text x="326" fill="#8B949E">grip your codebase.</text>
     </g>
