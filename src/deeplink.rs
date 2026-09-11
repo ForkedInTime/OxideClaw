@@ -175,6 +175,9 @@ pub fn register_protocol() -> anyhow::Result<()> {
 
 /// Register the deep link protocol handler on Linux.
 /// The `.desktop` entry that routes `<scheme>://` URIs to this binary.
+/// Linux-only at runtime (xdg); compiled under test everywhere so the
+/// `Terminal=true` guarantee is checked on every platform.
+#[cfg(any(target_os = "linux", test))]
 fn desktop_entry(binary: &str) -> String {
     let scheme = protocol_name();
     // `Terminal=true`: the desktop environment opens a terminal for us, so
