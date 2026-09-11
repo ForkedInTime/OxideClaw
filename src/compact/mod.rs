@@ -206,6 +206,7 @@ pub async fn summarize_compact(
         tools: vec![],
         stream: None,
         thinking: None,
+        output_config: None,
         betas: vec![],
         session_id: None,
     };

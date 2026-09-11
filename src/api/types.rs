@@ -47,23 +47,9 @@ impl Default for SystemContent {
     }
 }
 
-// ── Extended thinking ─────────────────────────────────────────────────────────
+// ── Extended thinking / effort ───────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ThinkingConfig {
-    #[serde(rename = "type")]
-    pub think_type: String,
-    pub budget_tokens: u32,
-}
-
-impl ThinkingConfig {
-    pub fn enabled(budget_tokens: u32) -> Self {
-        Self {
-            think_type: "enabled".into(),
-            budget_tokens,
-        }
-    }
-}
+pub use super::thinking::{OutputConfig, ThinkingConfig};
 
 // ── Image source ──────────────────────────────────────────────────────────────
 
@@ -140,6 +126,9 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// `output_config.effort` — only on models that support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
     /// Beta headers to include in the request (not serialised to body).
     #[serde(skip)]
     pub betas: Vec<String>,
