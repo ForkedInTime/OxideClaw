@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-10
+
+Every item below comes from the Phase 5 and Phase 6 code reviews. **Upgrade from
+0.3.0**: it still has the SSRF and the sub-agent permission bypass fixed here.
+
 ### Security
 
 - **Sub-agents ran with no permission check at all.** The approval gate lived
@@ -210,7 +215,8 @@ This release contains every fix from the enterprise security audit (PRs #11–#2
 - **Cross-compilation** — CI builds x86_64-gnu, aarch64-gnu, x86_64-musl via `cross`.
 - **Install script** — one-liner install with version pinning.
 
-[Unreleased]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ForkedInTime/RustyClaw/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ForkedInTime/RustyClaw/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ForkedInTime/RustyClaw/releases/tag/v0.1.0
