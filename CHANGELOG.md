@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coding agent rather than a "Rust port of Claude Code". The comparison
   table now names Claude Code, Codewhale, jcode, and claurst and only claims
   what each project documents (checked 2026-09-11).
+  Second verification pass: Codewhale's cloud TTS tool (MiMo, voice clone
+  on request) and `/restore` are now credited; the voice claim is scoped to
+  local, every-reply, own-voice TTS.
 - **Hooks are documented.** README and FEATURES.md describe the eight
   lifecycle events, environment variables, exit codes, and JSON output.
 - README browser tool count is 9 (`browser_console` was missing from the
