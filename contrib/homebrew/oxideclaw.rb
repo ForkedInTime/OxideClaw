@@ -4,28 +4,28 @@
 class Oxideclaw < Formula
   desc "Single-binary coding agent: codebase index, cost-aware routing, worktree agents, voice"
   homepage "https://github.com/ForkedInTime/OxideClaw"
-  version "0.3.2"
+  version "0.4.0"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
       url "https://github.com/ForkedInTime/OxideClaw/releases/download/v#{version}/oxideclaw-macos-arm64"
-      sha256 "d36c4206c52f2a115bf66127b155126dc9d574fb57fec7ce7fccb1ec09aeecc6"
+      sha256 "926881aa989ed1d57602697cd91a380166cc84a8d05d96173d5ff009fb60e0cf"
     end
     on_intel do
       url "https://github.com/ForkedInTime/OxideClaw/releases/download/v#{version}/oxideclaw-macos-x64"
-      sha256 "404d0733163a5f6fa17d8a22f228eba48605d0ad26007dd6becb433822785dfd"
+      sha256 "ea8176956f70c4846b04bc852bc7b896fe61c4cbe8f0967eb294a99df83944bf"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/ForkedInTime/OxideClaw/releases/download/v#{version}/oxideclaw-linux-arm64"
-      sha256 "8584bf8a6a4ec36e1dc9fa5989072b2fe5ac91257ff623c576bf1cc7cdee29d2"
+      sha256 "c4f6d018c2f9c5244a0be6f70cf33a7027a29f4ca147adf8a4bd0fa0d2d65d1a"
     end
     on_intel do
       url "https://github.com/ForkedInTime/OxideClaw/releases/download/v#{version}/oxideclaw-linux-x64"
-      sha256 "52155bc9832dc4440cc20fbc6fd25dd417edda653a5a6cbb2e5241d5952d856c"
+      sha256 "b6cb388873f0b83ffa405cab7c14a36647c9488eb3009f8ab55e7ce346f87bd8"
     end
   end
 
