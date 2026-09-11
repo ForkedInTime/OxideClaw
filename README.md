@@ -10,11 +10,11 @@
   <a href="https://github.com/ForkedInTime/RustyClaw/stargazers"><img src="https://img.shields.io/github/stars/ForkedInTime/RustyClaw?style=flat-square&color=F08A3E" alt="Stars"></a>
 </p>
 
-<h3 align="center">The Claude Code experience — native, offline-capable, and in a single 19 MB binary.</h3>
+<h3 align="center">A single-binary coding agent that indexes your repo, routes each task to the cheapest capable model, fixes its own lint and test failures, and answers in your own voice.</h3>
 
 <p align="center">
-  No Node. No Python. No 80 MB of <code>node_modules</code>. No flickering TUI.<br>
-  Indexes your codebase, routes each task to the cheapest capable model, and runs agents in parallel.
+  Claude, Ollama, and 9 OpenAI-compatible providers. One 19 MB static binary.<br>
+  No Node. No Python. No <code>node_modules</code>. No flickering TUI.
 </p>
 
 <p align="center">
@@ -73,27 +73,33 @@ rustyclaw
 
 ## Why RustyClaw?
 
-> **Every other "Rust port" of Claude Code re-implements the CLI and stops there.**
-> RustyClaw takes the Rust advantage and builds the features a native binary makes possible — an on-disk codebase index, a smart router that keeps your bill down, parallel agents in git worktrees, voice I/O, and a `/undo` that actually works.
+RustyClaw is a coding agent, not a port. It talks to Claude, Ollama, and 9 OpenAI-compatible providers, and it builds the things only a native binary makes practical: an on-disk index of your codebase, a router that sends each task to the cheapest model that can handle it, agents that run in parallel git worktrees, a lint-and-test loop that fixes its own mistakes, and spoken answers in your own voice.
 
-|  | Claude Code (npm) | Other Rust ports | **RustyClaw** |
-|---|---|---|---|
-| Runtime | Node.js / Bun | Rust | **Rust** |
-| Binary | ~50 MB + `node_modules` | ~15 MB | **19 MB static, zero deps** |
-| Cold start | ~300 ms | ~50 ms | **sub-50 ms** |
-| Memory idle | ~150 MB | ~40 MB | **~10 MB** |
-| Ollama tool-use | No | Broken / partial | **Working** |
-| Codebase RAG | No | No | **tree-sitter + FTS5, 8 langs** |
-| Model router | No | No | **Auto-route by task complexity** |
-| Parallel agents | No | No | **Git-worktree isolation** |
-| Voice I/O | No | No | **Whisper + XTTS v2 cloning** |
-| Browser automation | External MCP server | No | **10 CDP tools, in the binary** |
-| Autonomous browser agent | No | No | **Goal-driven, 50-step cap, safety-gated** |
-| Auto-fix loop | No | No | **Post-edit lint + tests + retry** |
-| `/undo` · `/redo` | No | Partial (pollutes git log) | **Invisible shadow refs** |
-| OpenAI-compat providers | No | Partial | **9 providers, working tools** |
-| Sandbox | No | No | **bwrap / firejail / strict** |
-| CLAUDE.md + AGENTS.md | Partial | No | **Both, with `/reload`** |
+How it compares with the agents people actually run. Every cell was checked against the project's public README and source on 2026-09-11.
+✅ documented · ❌ not offered · — not documented by the project.
+
+| | Claude Code | Codewhale | jcode | claurst | **RustyClaw** |
+|---|---|---|---|---|---|
+| Runtime | Node.js | Rust | Rust | Rust | **Rust, one static binary** |
+| License | Proprietary | MIT | MIT | GPL-3.0 | **Apache-2.0** |
+| Zero-setup codebase index (tree-sitter + FTS5) | ❌ | — | — | — | **✅ 8 languages** |
+| Auto model routing | ❌ | ✅ DeepSeek tiers | — | — | **✅ any provider, by task complexity, `/budget` cap** |
+| Auto-fix loop (lint + tests + retry after every edit) | ❌ | — | — | — | **✅** |
+| Spoken replies in a cloned voice (XTTS v2) | ❌ | — | — | ❌ | **✅** |
+| Autonomous browser agent (`/browse <goal>`) | ❌ | — | — | — | **✅ 50-step cap, approval gate** |
+| `/redo` after `/undo` | — | — | — | — | **✅** |
+| `/undo` | ✅ `/rewind` | ✅ | — | — | **✅ hidden git refs, clean `git log`** |
+| Parallel agents in git worktrees | ✅ | ✅ | ✅ swarm, no worktrees | ✅ | **✅ `spawn`, up to 8** |
+| Voice input (Whisper) | ✅ | — | ✅ | ✅ | **✅** |
+| Browser automation in the binary | via MCP | ✅ | ✅ | — | **✅ 9 CDP tools** |
+| Ollama with native tool calling | ❌ | ✅ | ✅ | ✅ | **✅** |
+| OpenAI-compatible providers | ❌ | ✅ | ✅ | ✅ | **✅ 9 providers** |
+| Lifecycle hooks | ✅ | ✅ | — | ✅ | **✅ 8 events** |
+| MCP servers | ✅ | ✅ | ✅ | ✅ | **✅** |
+| Sandboxed shell (bwrap / firejail) | ✅ | ✅ | — | — | **✅** |
+| CLAUDE.md + AGENTS.md | CLAUDE.md | — | — | ✅ | **✅ both, `/reload`** |
+
+The first seven rows are what you get here and nowhere else. The rest is table stakes, and RustyClaw has it too.
 
 ---
 
@@ -124,7 +130,7 @@ rustyclaw spawn "refactor the auth middleware"
 
 ### 🎤 &nbsp; Voice I/O with XTTS v2 cloning
 
-Push-to-talk speech input (Whisper). TTS responses in any voice, including a clone of your own after a 6-second sample. **No competitor ships this.**
+Push-to-talk speech input (Whisper). TTS responses in any voice, including a clone of your own after a 6-second sample. **No other coding agent documents spoken replies, let alone in your own voice.**
 
 ### ♻️ &nbsp; Auto-fix loop
 
@@ -136,11 +142,11 @@ Every assistant turn silently snapshots the working tree to `refs/rustyclaw/sess
 
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 
-Full tool use over Ollama's native format. Other Rust ports have had this broken or partial for months — ours just works. Auto-falls back to prompt-injected JSON on models that don't support native tools.
+Full tool use over Ollama's native format, so local models can read, edit, and run things. Claude Code cannot talk to Ollama at all. Auto-falls back to prompt-injected JSON on models that don't support native tools.
 
 ### 🌐 &nbsp; Built-in browser automation — no extra server
 
-Eight CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_get_text`, `browser_press_key`, `browser_wait` — shipped in the binary and enabled by default. Snapshots return a text tree with stable `@eN` element refs you can pass to click/fill. Works against any Chromium-based browser (Chrome, Chromium, Brave, Edge) you already have installed. No external automation server, no separate install.
+Nine CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_get_text`, `browser_press_key`, `browser_wait`, `browser_console` — shipped in the binary and enabled by default. Snapshots return a text tree with stable `@eN` element refs you can pass to click/fill. Works against any Chromium-based browser (Chrome, Chromium, Brave, Edge) you already have installed. No external automation server, no separate install.
 
 ### 🤖 &nbsp; Autonomous browser mode — `/browse <goal>`
 
@@ -148,7 +154,15 @@ Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July
 
 ### 🦀 &nbsp; Single 19 MB static binary
 
-No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Cross-compiled for `x86_64-linux-gnu`, `aarch64-linux-gnu`, and `x86_64-linux-musl` on every release.
+No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `rustyclaw upgrade` verifies them.
+
+### 🪝 &nbsp; Lifecycle hooks
+
+Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the tool), `postToolUse`, `userPromptSubmit` (stdout becomes extra context), `notification`, `stop`, `sessionStart`, `preCompact`, `postCompact`. Match one tool or `*`. Hooks get the event in environment variables (`TOOL_NAME`, `TOOL_INPUT`, `TOOL_RESULT`, `CLAUDE_MESSAGE`, `CLAUDE_SESSION_ID`, `CLAUDE_CWD`) and may print JSON to block, add a system message, or stop the turn. 60-second timeout, own process group, `--bare` skips them all.
+
+```json
+{ "hooks": { "preToolUse": [ { "matcher": "Bash", "command": "./scripts/guard.sh" } ] } }
+```
 
 ### 🛡️ &nbsp; Sandbox-first execution
 

@@ -28,7 +28,8 @@ else
 fi
 
 # ── 2. Browser tool count ────────────────────────────────────────────────────
-browser_tool_count=$(grep -cE '^\s*fn name\(&self\) -> &str \{' src/tools/browser_tools.rs)
+# Count tools named browser_*; browse_done is the agent-loop terminator, not a CDP tool.
+browser_tool_count=$(grep -A1 -E '^\s*fn name\(&self\) -> &str \{' src/tools/browser_tools.rs | grep -c '"browser_')
 browser_claim=$(grep -oE '[0-9]+ CDP tools' README.md | head -1 | grep -oE '^[0-9]+')
 
 if [ "$browser_tool_count" = "$browser_claim" ]; then
@@ -54,7 +55,7 @@ if grep -qF "Autonomous browser agent" README.md; then
   ok "README.md has 'Autonomous browser agent' row"
 else
   err "README.md missing 'Autonomous browser agent' row (expected after /browse ship)"
-  err "  fix: add '| Autonomous browser agent | No | No | ...' to the comparison table"
+  err "  fix: add an 'Autonomous browser agent' row to the comparison table"
 fi
 
 # ── Result ───────────────────────────────────────────────────────────────────
