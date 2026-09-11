@@ -64,8 +64,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://openrouter.ai/api/v1",
         key_env: "OPENROUTER_API_KEY",
         extra_headers: &[
-            ("HTTP-Referer", "https://github.com/ForkedInTime/RustyClaw"),
-            ("X-Title", "RustyClaw"),
+            ("HTTP-Referer", "https://github.com/ForkedInTime/OxideClaw"),
+            ("X-Title", "OxideClaw"),
         ],
     },
     ProviderDef {

@@ -1,12 +1,12 @@
-# RustyClaw SDK
+# OxideClaw SDK
 
-Embed RustyClaw in any application. One binary, NDJSON over stdio, zero dependencies.
+Embed OxideClaw in any application. One binary, NDJSON over stdio, zero dependencies.
 
 ```bash
-rustyclaw --headless
+oxideclaw --headless
 ```
 
-This starts a long-running server that reads JSON requests from stdin and writes JSON responses + streaming notifications to stdout. (Editors that speak the Agent Client Protocol should use `rustyclaw acp` instead — see FEATURES.md → Editor Integration.) Pipe it from any language — Python, TypeScript, Go, shell scripts, CI/CD.
+This starts a long-running server that reads JSON requests from stdin and writes JSON responses + streaming notifications to stdout. (Editors that speak the Agent Client Protocol should use `oxideclaw acp` instead — see FEATURES.md → Editor Integration.) Pipe it from any language — Python, TypeScript, Go, shell scripts, CI/CD.
 
 ---
 
@@ -15,18 +15,18 @@ This starts a long-running server that reads JSON requests from stdin and writes
 ### 1. Health check (5 seconds)
 
 ```bash
-(echo '{"id":"1","type":"health/check"}'; sleep 1) | rustyclaw --headless
+(echo '{"id":"1","type":"health/check"}'; sleep 1) | oxideclaw --headless
 ```
 
 ```json
-{"type":"health/check","id":"1","status":"ok","version":"0.3.2","protocol_version":1,"active_sessions":0,"uptime_seconds":0}
+{"type":"health/check","id":"1","status":"ok","version":"0.4.0","protocol_version":1,"active_sessions":0,"uptime_seconds":0}
 ```
 
 ### 2. Ask a question
 
 ```bash
 (echo '{"id":"1","type":"session/start","prompt":"What does the main function do?","max_turns":1}'; sleep 30) \
-  | rustyclaw --headless 2>/dev/null
+  | oxideclaw --headless 2>/dev/null
 ```
 
 You'll see a stream of NDJSON lines:
@@ -45,7 +45,7 @@ You'll see a stream of NDJSON lines:
 
 ```bash
 (echo '{"id":"1","type":"rag/search","query":"authentication","limit":5}'; sleep 1) \
-  | rustyclaw --headless 2>/dev/null
+  | oxideclaw --headless 2>/dev/null
 ```
 
 Returns matching code symbols from the RAG index.
@@ -55,7 +55,7 @@ Returns matching code symbols from the RAG index.
 ## How It Works
 
 ```
-Your App                    RustyClaw
+Your App                    OxideClaw
 ────────                    ─────────
    │                            │
    │──── stdin (NDJSON) ───────>│  Requests
@@ -197,8 +197,8 @@ See [`examples/`](examples/) for runnable scripts:
 
 ## Integration Ideas
 
-- **VS Code extension** — spawn `rustyclaw --headless`, pipe requests
+- **VS Code extension** — spawn `oxideclaw --headless`, pipe requests
 - **CI/CD** — run code review or test generation as a build step
-- **Chat UI** — build a web frontend that talks to RustyClaw over WebSocket (coming Phase C)
+- **Chat UI** — build a web frontend that talks to OxideClaw over WebSocket (coming Phase C)
 - **Scripts** — automate repetitive coding tasks with shell scripts
 - **Monitoring** — poll `health/check` to verify your coding agent is alive

@@ -21,4 +21,4 @@
 contrib/aur/src/
 contrib/aur/pkg/
 contrib/aur/*.pkg.tar.*
-contrib/aur/rustyclaw-*
+contrib/aur/oxideclaw-*

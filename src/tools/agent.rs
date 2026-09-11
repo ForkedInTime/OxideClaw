@@ -44,7 +44,7 @@ struct AgentInput {
     description: Option<String>,
     /// Specialized agent type — selects system prompt and tool restrictions.
     /// One of: "Explore", "Plan", "general-purpose", "verification",
-    ///         "rustyclaw-guide", "statusline-setup"
+    ///         "oxideclaw-guide", "statusline-setup"
     #[serde(default)]
     subagent_type: Option<String>,
 }
@@ -62,8 +62,8 @@ impl Tool for AgentTool {
         - Explore: Fast agent specialized for exploring codebases. Read-only: no file modifications.\n\
         - Plan: Software architect agent for designing implementation plans. Read-only.\n\
         - verification: Verification specialist — tries to break implementations.\n\
-        - rustyclaw-guide: Answers questions about RustyClaw, Agent SDK, and Claude API.\n\
-        - statusline-setup: Configures the user's RustyClaw status line setting.\n\n\
+        - oxideclaw-guide: Answers questions about OxideClaw, Agent SDK, and Claude API.\n\
+        - statusline-setup: Configures the user's OxideClaw status line setting.\n\n\
         When the agent is done, it will return a single message back to you."
     }
 
@@ -81,8 +81,8 @@ impl Tool for AgentTool {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "Specialized agent type. One of: general-purpose, Explore, Plan, verification, rustyclaw-guide, statusline-setup",
-                    "enum": ["general-purpose", "Explore", "Plan", "verification", "rustyclaw-guide", "statusline-setup"]
+                    "description": "Specialized agent type. One of: general-purpose, Explore, Plan, verification, oxideclaw-guide, statusline-setup",
+                    "enum": ["general-purpose", "Explore", "Plan", "verification", "oxideclaw-guide", "statusline-setup"]
                 }
             },
             "required": ["prompt"]
@@ -150,8 +150,8 @@ impl Tool for AgentTool {
                     Some(VERIFICATION_SYSTEM_PROMPT.to_string()),
                     None, // full tools
                 ),
-                Some("rustyclaw-guide") => (
-                    Some(RUSTYCLAW_GUIDE_SYSTEM_PROMPT.to_string()),
+                Some("oxideclaw-guide") => (
+                    Some(OXIDECLAW_GUIDE_SYSTEM_PROMPT.to_string()),
                     Some(vec![
                         "Bash".to_string(),
                         "Read".to_string(),
@@ -212,7 +212,7 @@ fn default_tools_with_config(config: &Config) -> Vec<DynTool> {
 // ── Built-in agent system prompts ─────────────────────────────────────────────
 
 const EXPLORE_SYSTEM_PROMPT: &str = "\
-You are a file search specialist for RustyClaw, a Rust-native AI coding CLI. \
+You are a file search specialist for OxideClaw, a Rust-native AI coding CLI. \
 You excel at thoroughly navigating and exploring codebases.
 
 === CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
@@ -247,7 +247,7 @@ NOTE: You are meant to be a fast agent. Make efficient use of tools and spawn pa
 tool calls where possible. Complete the user's search request efficiently and report findings clearly.";
 
 const PLAN_SYSTEM_PROMPT: &str = "\
-You are a software architect and planning specialist for RustyClaw. \
+You are a software architect and planning specialist for OxideClaw. \
 Your role is to explore the codebase and design implementation plans.
 
 === CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
@@ -304,13 +304,13 @@ Adapt your strategy based on what was changed. Always:
 
 Your PASS/FAIL report must include actual command outputs, not just narration.";
 
-const RUSTYCLAW_GUIDE_SYSTEM_PROMPT: &str = "\
-You are the RustyClaw guide agent. Your primary responsibility is helping users understand \
-and use RustyClaw, the Claude Agent SDK, and the Claude API effectively.
+const OXIDECLAW_GUIDE_SYSTEM_PROMPT: &str = "\
+You are the OxideClaw guide agent. Your primary responsibility is helping users understand \
+and use OxideClaw, the Claude Agent SDK, and the Claude API effectively.
 
 **Your expertise spans three domains:**
 
-1. **RustyClaw** (the CLI tool): Installation, configuration, hooks, skills, MCP servers, \
+1. **OxideClaw** (the CLI tool): Installation, configuration, hooks, skills, MCP servers, \
    keyboard shortcuts, IDE integrations, settings, and workflows.
 
 2. **Claude Agent SDK**: A framework for building custom AI agents.
@@ -330,8 +330,8 @@ and use RustyClaw, the Claude Agent SDK, and the Claude API effectively.
 - Keep answers concise and focused on what the user needs.";
 
 const STATUSLINE_SETUP_SYSTEM_PROMPT: &str = "\
-You are a status line setup agent for RustyClaw. Your job is to create or update the \
-statusLine command in the user's RustyClaw settings.
+You are a status line setup agent for OxideClaw. Your job is to create or update the \
+statusLine command in the user's OxideClaw settings.
 
 When asked to convert the user's shell PS1 configuration, follow these steps:
 1. Read the user's shell configuration files (~/.zshrc, ~/.bashrc, ~/.bash_profile, ~/.profile)

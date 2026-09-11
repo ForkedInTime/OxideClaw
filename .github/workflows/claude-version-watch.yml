@@ -53,8 +53,8 @@ jobs:
             exit 0
           fi
           echo "New Claude Code version detected: v$LATEST (reviewed: v$REVIEWED)"
-          BODY=$(printf '## Claude Code upstream update\n\n| | Version |\n|---|---|\n| Latest npm release | `%s` |\n| Last reviewed in RustyClaw | `%s` |\n\n### What to do\n\n1. Check the [Claude Code changelog](https://github.com/anthropics/claude-code/releases)\n2. Review for anything that affects RustyClaw (new commands, API params, CLAUDE.md format, MCP changes)\n3. Implement relevant changes in RustyClaw\n4. Update BUILT_AGAINST_CLAUDE_VERSION in src/main.rs to `%s`\n5. Close this issue\n\n---\n*Opened automatically by the claude-version-watch workflow.*' "$LATEST" "$REVIEWED" "$LATEST")
+          BODY=$(printf '## Claude Code upstream update\n\n| | Version |\n|---|---|\n| Latest npm release | `%s` |\n| Last reviewed in OxideClaw | `%s` |\n\n### What to do\n\n1. Check the [Claude Code changelog](https://github.com/anthropics/claude-code/releases)\n2. Review for anything that affects OxideClaw (new commands, API params, CLAUDE.md format, MCP changes)\n3. Implement relevant changes in OxideClaw\n4. Update BUILT_AGAINST_CLAUDE_VERSION in src/main.rs to `%s`\n5. Close this issue\n\n---\n*Opened automatically by the claude-version-watch workflow.*' "$LATEST" "$REVIEWED" "$LATEST")
           gh issue create \
-            --title "Claude Code v${LATEST} released -- review for RustyClaw" \
+            --title "Claude Code v${LATEST} released -- review for OxideClaw" \
             --label "upstream-update" \
             --body "$BODY"

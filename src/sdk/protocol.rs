@@ -115,7 +115,7 @@ pub struct RouterDecision {
     pub reason: String,
 }
 
-// ── Requests (Host → RustyClaw) ─────────────────────────────────────────────
+// ── Requests (Host → OxideClaw) ─────────────────────────────────────────────
 
 /// All possible requests from the host.
 #[allow(clippy::large_enum_variant)]
@@ -224,7 +224,7 @@ pub enum SdkRequest {
     },
 }
 
-// ── Responses (RustyClaw → Host, correlated by ID) ──────────────────────────
+// ── Responses (OxideClaw → Host, correlated by ID) ──────────────────────────
 
 /// Responses to specific requests.
 #[allow(dead_code)]
@@ -287,7 +287,7 @@ pub enum SdkResponse {
     },
 }
 
-// ── Notifications (RustyClaw → Host, streamed, no request ID) ───────────────
+// ── Notifications (OxideClaw → Host, streamed, no request ID) ───────────────
 
 /// Streamed events during turn execution.
 #[allow(dead_code)]

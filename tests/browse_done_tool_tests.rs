@@ -1,8 +1,8 @@
-use rustyclaw::api::types::ToolResultContent;
-use rustyclaw::tools::{Tool, ToolContext, browser_tools::BrowseDoneTool};
+use oxideclaw::api::types::ToolResultContent;
+use oxideclaw::tools::{Tool, ToolContext, browser_tools::BrowseDoneTool};
 use serde_json::json;
 
-fn extract_text(output: &rustyclaw::tools::ToolOutput) -> String {
+fn extract_text(output: &oxideclaw::tools::ToolOutput) -> String {
     output
         .content
         .iter()

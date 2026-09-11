@@ -1,6 +1,6 @@
 #[test]
 fn parse_unified_diff_single_hunk() {
-    use rustyclaw::tui::diff::parse_unified_diff;
+    use oxideclaw::tui::diff::parse_unified_diff;
     let diff = "\
 diff --git a/src/main.rs b/src/main.rs
 index abc..def 100644
@@ -26,7 +26,7 @@ index abc..def 100644
 
 #[test]
 fn parse_multi_file_diff() {
-    use rustyclaw::tui::diff::parse_unified_diff;
+    use oxideclaw::tui::diff::parse_unified_diff;
     let diff = "\
 diff --git a/a.rs b/a.rs
 --- a/a.rs

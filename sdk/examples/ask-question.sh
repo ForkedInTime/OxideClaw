@@ -12,7 +12,7 @@ PROMPT="${1:-What does the main function do in this project? Be brief.}"
 EOF
   # Keep stdin open while the model responds
   sleep 30
-) | rustyclaw --headless 2>/dev/null | while IFS= read -r line; do
+) | oxideclaw --headless 2>/dev/null | while IFS= read -r line; do
   TYPE=$(echo "$line" | jq -r '.type // empty')
   case "$TYPE" in
     session/started)

@@ -1,19 +1,19 @@
 #!/bin/bash
-# RustyClaw installer — single-binary Claude Code alternative written in Rust
+# OxideClaw installer — single-binary Claude Code alternative written in Rust
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.3.2
+#   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash -s v0.4.0
 #
-# Installs to ~/.local/bin/rustyclaw (or /usr/local/bin with --global)
+# Installs to ~/.local/bin/oxideclaw (or /usr/local/bin with --global)
 # Supports Linux (x64, arm64, musl) and macOS (Intel, Apple Silicon)
 # For Windows: download .exe from GitHub Releases or use `cargo install --path .`
 
 set -e
 
-REPO="ForkedInTime/RustyClaw"
+REPO="ForkedInTime/OxideClaw"
 VERSION="${1:-latest}"
-INSTALL_DIR="${RUSTYCLAW_INSTALL_DIR:-$HOME/.local/bin}"
+INSTALL_DIR="${OXIDECLAW_INSTALL_DIR:-${RUSTYCLAW_INSTALL_DIR:-$HOME/.local/bin}}"
 GLOBAL=false
 
 # Parse flags
@@ -55,7 +55,7 @@ else
   platform="macos-${arch}"
 fi
 
-ARTIFACT="rustyclaw-${platform}"
+ARTIFACT="oxideclaw-${platform}"
 
 # ── Resolve version ──────────────────────────────────────────────────────────
 
@@ -69,7 +69,7 @@ if [ "$VERSION" = "latest" ]; then
   fi
 fi
 
-echo "Installing RustyClaw ${VERSION} (${platform})..."
+echo "Installing OxideClaw ${VERSION} (${platform})..."
 
 # ── Download ─────────────────────────────────────────────────────────────────
 
@@ -79,16 +79,16 @@ CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -fsSL -o "${TMPDIR}/rustyclaw"    "$DOWNLOAD_URL"
+curl -fsSL -o "${TMPDIR}/oxideclaw"    "$DOWNLOAD_URL"
 curl -fsSL -o "${TMPDIR}/checksum.txt" "$CHECKSUM_URL"
 
 # ── Verify checksum ──────────────────────────────────────────────────────────
 
 EXPECTED=$(cut -d' ' -f1 "${TMPDIR}/checksum.txt")
 if command -v sha256sum &>/dev/null; then
-  ACTUAL=$(sha256sum "${TMPDIR}/rustyclaw" | cut -d' ' -f1)
+  ACTUAL=$(sha256sum "${TMPDIR}/oxideclaw" | cut -d' ' -f1)
 elif command -v shasum &>/dev/null; then
-  ACTUAL=$(shasum -a 256 "${TMPDIR}/rustyclaw" | cut -d' ' -f1)
+  ACTUAL=$(shasum -a 256 "${TMPDIR}/oxideclaw" | cut -d' ' -f1)
 else
   echo "Warning: no sha256sum or shasum found — skipping checksum verification"
   ACTUAL="$EXPECTED"
@@ -106,9 +106,9 @@ echo "Checksum verified."
 
 mkdir -p "$INSTALL_DIR"
 if [ "$GLOBAL" = true ]; then
-  sudo install -m 755 "${TMPDIR}/rustyclaw" "${INSTALL_DIR}/rustyclaw"
+  sudo install -m 755 "${TMPDIR}/oxideclaw" "${INSTALL_DIR}/oxideclaw"
 else
-  install -m 755 "${TMPDIR}/rustyclaw" "${INSTALL_DIR}/rustyclaw"
+  install -m 755 "${TMPDIR}/oxideclaw" "${INSTALL_DIR}/oxideclaw"
 fi
 
 # ── Ensure PATH includes install dir ─────────────────────────────────────────
@@ -135,7 +135,7 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
 fi
 
 echo ""
-echo "  RustyClaw ${VERSION} installed to ${INSTALL_DIR}/rustyclaw"
+echo "  OxideClaw ${VERSION} installed to ${INSTALL_DIR}/oxideclaw"
 echo ""
-echo "  Run:  rustyclaw"
+echo "  Run:  oxideclaw"
 echo ""

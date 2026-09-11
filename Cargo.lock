@@ -2231,6 +2231,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxideclaw"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
+ "clap_complete",
+ "colored",
+ "config",
+ "crossterm",
+ "dirs",
+ "eventsource-stream",
+ "futures-util",
+ "glob",
+ "html2text",
+ "image",
+ "libc",
+ "notify",
+ "rand 0.9.5",
+ "ratatui",
+ "regex",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "self_update",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3068,57 +3119,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rustyclaw"
-version = "0.3.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "clap",
- "clap_complete",
- "colored",
- "config",
- "crossterm",
- "dirs",
- "eventsource-stream",
- "futures-util",
- "glob",
- "html2text",
- "image",
- "libc",
- "notify",
- "rand 0.9.5",
- "ratatui",
- "regex",
- "reqwest 0.12.28",
- "rusqlite",
- "self_update",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "url",
- "uuid",
- "walkdir",
-]
 
 [[package]]
 name = "ryu"

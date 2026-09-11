@@ -160,7 +160,7 @@ pub(super) fn plugin_set_enabled(name: &str, enabled: bool) -> CommandAction {
                 .and_then(|s| std::fs::write(&settings_path, s).ok())
             {
                 Some(_) => CommandAction::Message(format!(
-                    "Plugin '{}' {}. Restart rustyclaw to apply.",
+                    "Plugin '{}' {}. Restart oxideclaw to apply.",
                     name,
                     if enabled { "enabled" } else { "disabled" }
                 )),
@@ -295,7 +295,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
         (
             "lesson 1 — navigating the TUI",
             "Basic navigation",
-            "Welcome to rustyclaw! Here are the essentials:\n\
+            "Welcome to oxideclaw! Here are the essentials:\n\
              \n\
              **Sending messages**\n\
              - Type your message and press Enter\n\
@@ -318,7 +318,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
         (
             "lesson 2 — slash commands",
             "Slash commands",
-            "Slash commands control rustyclaw's behaviour:\n\
+            "Slash commands control oxideclaw's behaviour:\n\
              \n\
              - /help         — full command list\n\
              - /model        — switch AI model\n\
@@ -372,7 +372,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              \n\
              - /session list     — see all saved sessions\n\
              - /resume <id>      — continue an old session\n\
-             - rustyclaw -r      — resume most recent on launch\n\
+             - oxideclaw -r      — resume most recent on launch\n\
              - /export           — save as markdown\n\
              \n\
              Type /powerup 5 for the next lesson.",
@@ -380,7 +380,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
         (
             "lesson 5 — MCP servers",
             "MCP (Model Context Protocol) servers",
-            "MCP servers extend rustyclaw with additional tools:\n\
+            "MCP servers extend oxideclaw with additional tools:\n\
              \n\
              **Configure in ~/.claude/settings.json:**\n\
              ```json\n\
@@ -396,7 +396,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              ```\n\
              \n\
              - /mcp         — list connected servers and tools\n\
-             - rustyclaw mcp list   — from the terminal\n\
+             - oxideclaw mcp list   — from the terminal\n\
              \n\
              Type /powerup 6 for the next lesson.",
         ),
@@ -418,7 +418,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
                uv tool install TTS --python 3.11 \\\n\
                  --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'\n\
              \n\
-             You have completed the rustyclaw power-up course!\n\
+             You have completed the oxideclaw power-up course!\n\
              Type /help any time for the full command reference.",
         ),
     ];
@@ -428,7 +428,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
     let (_, title, content) = lessons[idx];
 
     let header = format!(
-        "**rustyclaw /powerup — {} of {}** — {}\n\n",
+        "**oxideclaw /powerup — {} of {}** — {}\n\n",
         idx + 1,
         lessons.len(),
         title

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal XTTS v2 server for RustyClaw.
+"""Minimal XTTS v2 server for OxideClaw.
 
 Keeps the model loaded in GPU VRAM for fast synthesis.
 Supports both voice cloning (speaker_wav) and built-in speakers.

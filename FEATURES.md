@@ -1,6 +1,6 @@
-# RustyClaw — Complete Feature Reference
+# OxideClaw — Complete Feature Reference
 
-Everything available in RustyClaw, organized by category.
+Everything available in OxideClaw, organized by category.
 
 ---
 
@@ -40,7 +40,7 @@ Set `ANTHROPIC_API_KEY` in your `.env` or environment. All Claude models are sup
 
 ```bash
 ollama pull dolphin3
-rustyclaw
+oxideclaw
 ```
 
 ```
@@ -53,7 +53,7 @@ Models that don't support tool use get automatic text-only fallback. Ollama mode
 
 ### OpenAI-Compatible Providers
 
-RustyClaw supports any OpenAI-compatible API endpoint:
+OxideClaw supports any OpenAI-compatible API endpoint:
 
 | Provider | Config key |
 |----------|-----------|
@@ -67,7 +67,7 @@ RustyClaw supports any OpenAI-compatible API endpoint:
 | OpenAI | `openai` |
 | Generic | `openai-compat` |
 
-Configure in `~/.config/rustyclaw/settings.json`:
+Configure in `~/.config/oxideclaw/settings.json`:
 
 ```json
 {
@@ -159,7 +159,7 @@ Configure in `~/.config/rustyclaw/settings.json`:
 
 ## Tools
 
-RustyClaw includes 30+ built-in tools that the AI agent can use:
+OxideClaw includes 30+ built-in tools that the AI agent can use:
 
 ### File System
 
@@ -295,27 +295,27 @@ Save, resume, search, and export conversations.
 /session export      # export to file
 ```
 
-Sessions are stored in `$XDG_DATA_HOME/rustyclaw/sessions/` (default: `~/.local/share/rustyclaw/sessions/`).
+Sessions are stored in `$XDG_DATA_HOME/oxideclaw/sessions/` (default: `~/.local/share/oxideclaw/sessions/`).
 
 ---
 
 ## SDK / Headless Mode
 
-Embed RustyClaw in editors, CI/CD, scripts, or custom UIs.
+Embed OxideClaw in editors, CI/CD, scripts, or custom UIs.
 
 ```bash
-rustyclaw --headless
+oxideclaw --headless
 ```
 
 Starts a long-running NDJSON server on stdin/stdout. Full protocol reference: [`sdk/`](sdk/).
 
 ```bash
 # Health check
-(echo '{"id":"1","type":"health/check"}'; sleep 1) | rustyclaw --headless
+(echo '{"id":"1","type":"health/check"}'; sleep 1) | oxideclaw --headless
 
 # Ask a question
 (echo '{"id":"1","type":"session/start","prompt":"What is 2+2?","max_turns":1}'; sleep 15) \
-  | rustyclaw --headless 2>/dev/null
+  | oxideclaw --headless 2>/dev/null
 ```
 
 Features: streaming responses, tool approval policies, cost tracking, context health monitoring, RAG search, session management.
@@ -324,19 +324,19 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 
 ## Editor Integration (ACP)
 
-`rustyclaw acp` runs RustyClaw as an [Agent Client Protocol](https://agentclientprotocol.com) agent: JSON-RPC 2.0 over stdio, one line per message. Any ACP client can drive it.
+`oxideclaw acp` runs OxideClaw as an [Agent Client Protocol](https://agentclientprotocol.com) agent: JSON-RPC 2.0 over stdio, one line per message. Any ACP client can drive it.
 
 **Zed** (`settings.json`):
 
 ```json
 {
   "agent_servers": {
-    "RustyClaw": { "command": "rustyclaw", "args": ["acp"] }
+    "OxideClaw": { "command": "oxideclaw", "args": ["acp"] }
   }
 }
 ```
 
-| ACP method / update | RustyClaw behaviour |
+| ACP method / update | OxideClaw behaviour |
 |---------------------|---------------------|
 | `initialize` | Protocol version 1. Advertises `embeddedContext`; no image/audio prompts, no `loadSession`, no HTTP/SSE MCP. |
 | `authenticate` | No-op. Credentials come from the normal chain (`ANTHROPIC_API_KEY`, `ant` profile, settings). |
@@ -375,7 +375,7 @@ Every hook also receives `CLAUDE_HOOK_EVENT`, `CLAUDE_SESSION_ID`, and `CLAUDE_C
       { "matcher": "Bash", "command": "./scripts/guard.sh" }
     ],
     "postToolUse": [
-      { "matcher": "*", "command": "echo \"$TOOL_NAME\" >> ~/.cache/rustyclaw/tool.log" }
+      { "matcher": "*", "command": "echo \"$TOOL_NAME\" >> ~/.cache/oxideclaw/tool.log" }
     ]
   }
 }
@@ -391,7 +391,7 @@ Each hook has a 60-second timeout and runs in its own process group, so a timed-
 
 ## Sandboxing
 
-RustyClaw supports multiple sandbox backends for tool isolation:
+OxideClaw supports multiple sandbox backends for tool isolation:
 
 | Backend | Description |
 |---------|-------------|
@@ -405,7 +405,7 @@ RustyClaw supports multiple sandbox backends for tool isolation:
 
 ### Settings File
 
-`~/.config/rustyclaw/settings.json` (or `$XDG_CONFIG_HOME/rustyclaw/settings.json`):
+`~/.config/oxideclaw/settings.json` (or `$XDG_CONFIG_HOME/oxideclaw/settings.json`):
 
 ```json
 {
@@ -433,15 +433,15 @@ Drop a `CLAUDE.md` or `AGENTS.md` in your project root to give the agent project
 Auto-loaded from (in order):
 1. `$CWD/.env`
 2. `~/.env`
-3. `~/.config/rustyclaw/.env`
+3. `~/.config/oxideclaw/.env`
 
 ### XDG Base Directories
 
 | Purpose | Variable | Default |
 |---------|----------|---------|
-| Config | `$XDG_CONFIG_HOME/rustyclaw/` | `~/.config/rustyclaw/` |
-| Data | `$XDG_DATA_HOME/rustyclaw/` | `~/.local/share/rustyclaw/` |
-| Cache | `$XDG_CACHE_HOME/rustyclaw/` | `~/.cache/rustyclaw/` |
+| Config | `$XDG_CONFIG_HOME/oxideclaw/` | `~/.config/oxideclaw/` |
+| Data | `$XDG_DATA_HOME/oxideclaw/` | `~/.local/share/oxideclaw/` |
+| Cache | `$XDG_CACHE_HOME/oxideclaw/` | `~/.cache/oxideclaw/` |
 
 ---
 

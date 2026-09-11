@@ -1,8 +1,8 @@
-//! RustyClaw library crate — exposes the SDK module for integration tests and embedding.
+//! OxideClaw library crate — exposes the SDK module for integration tests and embedding.
 //!
 //! Modules that depend on the TUI (`tui`, `session`, `spawn`) and compile-time
 //! binary-only env vars (`deeplink`) are excluded — they only compile as part
-//! of the `rustyclaw` binary.
+//! of the `oxideclaw` binary.
 
 pub mod acp;
 pub mod api;

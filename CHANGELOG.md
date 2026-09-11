@@ -1,11 +1,13 @@
 # Changelog
 
-All notable changes to RustyClaw will be documented in this file.
+All notable changes to OxideClaw (formerly RustyClaw) will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-09-11
 
 ### Added
 
@@ -43,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Renamed to OxideClaw.** The crates.io name `rustyclaw` (and several
+  GitHub projects) belong to other people, so the project is now
+  **OxideClaw**: rust is iron oxide, the claw stays. Binary `oxideclaw`,
+  repo `ForkedInTime/OxideClaw` (old URLs redirect), release assets
+  `oxideclaw-*`, env vars `OXIDECLAW_*`, XDG dirs `oxideclaw/`, shadow refs
+  `refs/oxideclaw/sessions/`, deep-link scheme `oxideclaw-cli`.
+  Compatibility: `RUSTYCLAW_*` env vars are still read, a `rustyclaw/`
+  XDG directory is moved to `oxideclaw/` on first run, and legacy shadow
+  refs are moved on startup so `/undo` history survives.
 - **README repositioned.** RustyClaw is presented as a provider-neutral
   coding agent rather than a "Rust port of Claude Code". The comparison
   table now names Claude Code, Codewhale, jcode, and claurst and only claims
@@ -421,9 +432,10 @@ This release contains every fix from the enterprise security audit (PRs #11–#2
 - **Cross-compilation** — CI builds x86_64-gnu, aarch64-gnu, x86_64-musl via `cross`.
 - **Install script** — one-liner install with version pinning.
 
-[Unreleased]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.2...HEAD
-[0.3.2]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/ForkedInTime/RustyClaw/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/ForkedInTime/RustyClaw/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/ForkedInTime/RustyClaw/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ForkedInTime/OxideClaw/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ForkedInTime/OxideClaw/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/ForkedInTime/OxideClaw/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/ForkedInTime/OxideClaw/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/ForkedInTime/OxideClaw/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/ForkedInTime/OxideClaw/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ForkedInTime/OxideClaw/releases/tag/v0.1.0

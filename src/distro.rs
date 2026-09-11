@@ -235,7 +235,7 @@ pub struct MissingTool {
     pub manual_note: Option<String>,
 }
 
-/// Check the tools that rustyclaw uses and return those that are missing.
+/// Check the tools that oxideclaw uses and return those that are missing.
 pub fn find_missing(distro: &Distro) -> Vec<MissingTool> {
     let mut missing = Vec::new();
 

@@ -1,11 +1,11 @@
 //! Deep link protocol handler — port of utils/deepLink/
 //!
-//! Registers a custom URI scheme so external apps can open a rustyclaw session
+//! Registers a custom URI scheme so external apps can open a oxideclaw session
 //! by navigating to: `<protocol>://open?q=<prompt>&cwd=<dir>&repo=<name>`
 //!
 //! The protocol name is derived from the binary name at compile time
-//! (e.g., "rustyclaw" → protocol "rustyclaw-cli"), keeping it configurable
-//! without hardcoding "rustrustyclaw" or any other specific name.
+//! (e.g., "oxideclaw" → protocol "oxideclaw-cli"), keeping it configurable
+//! without hardcoding "some-other-name" or any other specific name.
 //!
 //! Linux: creates a .desktop file and registers via xdg-mime.
 
@@ -17,7 +17,7 @@ const MAX_QUERY_LEN: usize = 5_000;
 /// Maximum allowed cwd path length.
 const MAX_CWD_LEN: usize = 4_096;
 
-/// Returns the registered URL scheme, e.g. "rustyclaw-cli".
+/// Returns the registered URL scheme, e.g. "oxideclaw-cli".
 pub fn protocol_name() -> String {
     format!("{}{}", env!("CARGO_BIN_NAME"), SCHEME_SUFFIX)
 }
@@ -57,7 +57,7 @@ pub fn plan(params: DeepLinkParams, has_tty: bool) -> DeepLinkAction {
     if !has_tty {
         return DeepLinkAction::Refuse(
             "Deep links open an interactive session and need a terminal. Nothing was run. \
-             Re-run `rustyclaw --register-protocol` so the handler opens one, or paste the \
+             Re-run `oxideclaw --register-protocol` so the handler opens one, or paste the \
              prompt into a running session yourself."
                 .to_string(),
         );
@@ -304,6 +304,6 @@ mod tests {
 
     #[test]
     fn the_desktop_entry_opens_a_terminal() {
-        assert!(desktop_entry("/usr/bin/rustyclaw").contains("Terminal=true"));
+        assert!(desktop_entry("/usr/bin/oxideclaw").contains("Terminal=true"));
     }
 }

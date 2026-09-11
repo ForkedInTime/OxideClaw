@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-use rustyclaw::tools::file_read::resolve_path;
+use oxideclaw::tools::file_read::resolve_path;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -117,7 +117,7 @@ fn api_key_helper_stripped_when_settings_file_world_writable() {
     // threat model: any user on the box can drop `"$(malicious)"` in here.
     write_settings_file(&settings_path, "echo sk-test", 0o666);
 
-    let settings = rustyclaw::settings::Settings::load(cwd);
+    let settings = oxideclaw::settings::Settings::load(cwd);
     assert!(
         settings.api_key_helper.is_none(),
         "apiKeyHelper must be stripped when source file is world-writable"
@@ -132,7 +132,7 @@ fn api_key_helper_stripped_when_settings_file_group_writable() {
 
     write_settings_file(&settings_path, "echo sk-test", 0o664);
 
-    let settings = rustyclaw::settings::Settings::load(cwd);
+    let settings = oxideclaw::settings::Settings::load(cwd);
     assert!(
         settings.api_key_helper.is_none(),
         "apiKeyHelper must be stripped when source file is group-writable"
@@ -148,7 +148,7 @@ fn api_key_helper_allowed_when_settings_file_mode_0600() {
     write_settings_file(&settings_path, "echo sk-test", 0o600);
 
     // The file-mode rule, on the file itself.
-    let settings = rustyclaw::settings::Settings::load_file(&settings_path);
+    let settings = oxideclaw::settings::Settings::load_file(&settings_path);
     assert_eq!(
         settings.api_key_helper.as_deref(),
         Some("echo sk-test"),
@@ -167,7 +167,7 @@ fn api_key_helper_from_an_untrusted_project_is_ignored() {
 
     write_settings_file(&settings_path, "echo sk-test", 0o600);
 
-    let settings = rustyclaw::settings::Settings::load(cwd);
+    let settings = oxideclaw::settings::Settings::load(cwd);
     assert!(
         settings.api_key_helper.is_none(),
         "a project apiKeyHelper ran before the user trusted the folder"
@@ -191,7 +191,7 @@ fn api_key_helper_allowed_when_settings_file_mode_0644() {
     // convention. The threat is WRITE, not READ, so this is considered safe.
     write_settings_file(&settings_path, "echo sk-test", 0o644);
 
-    let settings = rustyclaw::settings::Settings::load_file(&settings_path);
+    let settings = oxideclaw::settings::Settings::load_file(&settings_path);
     assert_eq!(
         settings.api_key_helper.as_deref(),
         Some("echo sk-test"),

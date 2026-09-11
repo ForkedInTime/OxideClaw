@@ -14,7 +14,7 @@ pub(super) fn cmd_mcp(args: &str, ctx: &CommandContext) -> CommandAction {
                     Add one: /mcp add <name> <command> [args...]\n\
                     Or for HTTP:  /mcp add <name> <url>\n\n\
                     Example: /mcp add github npx -y @modelcontextprotocol/server-github\n\
-                    Restart rustyclaw after adding servers."
+                    Restart oxideclaw after adding servers."
                         .into(),
                 );
             }
@@ -61,7 +61,7 @@ pub(super) fn cmd_mcp(args: &str, ctx: &CommandContext) -> CommandAction {
         "enable" => mcp_set_disabled(rest, false),
         "disable" => mcp_set_disabled(rest, true),
         "reconnect" => CommandAction::Message(
-            "MCP reconnection requires restarting rustyclaw.\n\
+            "MCP reconnection requires restarting oxideclaw.\n\
                  Exit and relaunch to reconnect all MCP servers."
                 .into(),
         ),
@@ -170,7 +170,7 @@ pub(super) fn mcp_add_server(args: &str) -> CommandAction {
     match serde_json::to_string_pretty(&val) {
         Ok(s) => match crate::config::write_json_atomic(&settings_path, &s) {
             Ok(_) => CommandAction::Message(format!(
-                "MCP server '{}' added to {}\nRestart rustyclaw to connect.",
+                "MCP server '{}' added to {}\nRestart oxideclaw to connect.",
                 name,
                 settings_path.display()
             )),
@@ -203,7 +203,7 @@ pub(super) fn mcp_remove_server(args: &str) -> CommandAction {
     match serde_json::to_string_pretty(&val) {
         Ok(s) => match crate::config::write_json_atomic(&settings_path, &s) {
             Ok(_) => CommandAction::Message(format!(
-                "MCP server '{}' removed from settings.json\nRestart rustyclaw to disconnect.",
+                "MCP server '{}' removed from settings.json\nRestart oxideclaw to disconnect.",
                 name
             )),
             Err(e) => CommandAction::Message(format!("Failed to write settings: {e}")),
@@ -245,7 +245,7 @@ pub(super) fn mcp_set_disabled(args: &str, disabled: bool) -> CommandAction {
             match serde_json::to_string_pretty(&val) {
                 Ok(text) => match std::fs::write(&settings_path, text) {
                     Ok(_) => CommandAction::Message(format!(
-                        "MCP server '{}' {}. Restart rustyclaw to apply.",
+                        "MCP server '{}' {}. Restart oxideclaw to apply.",
                         name,
                         if disabled { "disabled" } else { "enabled" }
                     )),

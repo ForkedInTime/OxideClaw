@@ -2,7 +2,7 @@
 
 #![cfg(unix)]
 
-use rustyclaw::autocommit::{
+use oxideclaw::autocommit::{
     AutoCommitConfig, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo, prune_old_refs, restore_to,
     snapshot_turn,
 };
@@ -19,8 +19,8 @@ fn git_init(path: &Path) {
         .unwrap();
     assert!(s.success());
     for (k, v) in [
-        ("user.name", "rustyclaw-test"),
-        ("user.email", "noreply@rustyclaw.local"),
+        ("user.name", "oxideclaw-test"),
+        ("user.email", "noreply@oxideclaw.local"),
         ("commit.gpgsign", "false"),
     ] {
         Command::new("git")
@@ -214,7 +214,7 @@ fn prune_integration_15_refs_keeps_10() {
     assert_eq!(remaining.lines().count(), 10);
 }
 
-/// Two rustyclaw instances sharing a session id each build their own commit
+/// Two oxideclaw instances sharing a session id each build their own commit
 /// chain in memory and both write the same shadow ref. Before compare-and-swap
 /// the later `update-ref` silently orphaned the other's history — losing exactly
 /// the turns `/undo` exists to reach.

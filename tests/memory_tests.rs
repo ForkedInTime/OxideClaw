@@ -1,5 +1,5 @@
 /// Integration tests for MemoryStore — TDD, written before implementation.
-use rustyclaw::memory::{Category, MemoryStore};
+use oxideclaw::memory::{Category, MemoryStore};
 use tempfile::TempDir;
 
 fn make_store() -> (TempDir, MemoryStore) {
@@ -286,15 +286,15 @@ fn test_build_context_respects_limit() {
 #[test]
 fn test_auto_categorize_decision() {
     assert_eq!(
-        rustyclaw::memory::auto_categorize("we decided to use Postgres"),
+        oxideclaw::memory::auto_categorize("we decided to use Postgres"),
         Category::Decision
     );
     assert_eq!(
-        rustyclaw::memory::auto_categorize("let's use React for the frontend"),
+        oxideclaw::memory::auto_categorize("let's use React for the frontend"),
         Category::Decision
     );
     assert_eq!(
-        rustyclaw::memory::auto_categorize("the team chose Rust over Go"),
+        oxideclaw::memory::auto_categorize("the team chose Rust over Go"),
         Category::Decision
     );
 }
@@ -302,15 +302,15 @@ fn test_auto_categorize_decision() {
 #[test]
 fn test_auto_categorize_preference() {
     assert_eq!(
-        rustyclaw::memory::auto_categorize("prefers dark mode always"),
+        oxideclaw::memory::auto_categorize("prefers dark mode always"),
         Category::Preference
     );
     assert_eq!(
-        rustyclaw::memory::auto_categorize("user likes functional style"),
+        oxideclaw::memory::auto_categorize("user likes functional style"),
         Category::Preference
     );
     assert_eq!(
-        rustyclaw::memory::auto_categorize("always format with rustfmt"),
+        oxideclaw::memory::auto_categorize("always format with rustfmt"),
         Category::Preference
     );
 }
@@ -318,11 +318,11 @@ fn test_auto_categorize_preference() {
 #[test]
 fn test_auto_categorize_pattern() {
     assert_eq!(
-        rustyclaw::memory::auto_categorize("typically wraps errors with anyhow"),
+        oxideclaw::memory::auto_categorize("typically wraps errors with anyhow"),
         Category::Pattern
     );
     assert_eq!(
-        rustyclaw::memory::auto_categorize("usually runs cargo test before commit"),
+        oxideclaw::memory::auto_categorize("usually runs cargo test before commit"),
         Category::Pattern
     );
 }
@@ -330,7 +330,7 @@ fn test_auto_categorize_pattern() {
 #[test]
 fn test_auto_categorize_default() {
     assert_eq!(
-        rustyclaw::memory::auto_categorize("some random text with no signal words"),
+        oxideclaw::memory::auto_categorize("some random text with no signal words"),
         Category::Context
     );
 }

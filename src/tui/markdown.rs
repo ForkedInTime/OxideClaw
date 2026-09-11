@@ -18,7 +18,7 @@ const GRAY: Style = Style::new().fg(Color::DarkGray);
 
 // ── Syntax highlight styles ───────────────────────────────────────────────────
 
-// Keyword: orange-ish (matches rustyclaw accent)
+// Keyword: orange-ish (matches oxideclaw accent)
 const SYN_KW: Style = Style::new().fg(Color::Rgb(255, 140, 50));
 // Type / builtin: cyan
 const SYN_TYPE: Style = Style::new().fg(Color::Rgb(86, 182, 194));

@@ -58,6 +58,6 @@ jobs:
       - name: Install hyperfine
         run: sudo apt-get update && sudo apt-get install -y hyperfine
       - name: Build release binary
-        run: cargo build --release --bin rustyclaw
+        run: cargo build --release --bin oxideclaw
       - name: Run perf smoke test
-        run: bash scripts/perf-smoke.sh target/release/rustyclaw
+        run: bash scripts/perf-smoke.sh target/release/oxideclaw

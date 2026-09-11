@@ -705,7 +705,7 @@ pub(super) fn git_checkpoint(
 
     // Create commit
     let ts = chrono_free_timestamp();
-    let msg = message.unwrap_or("rustyclaw checkpoint");
+    let msg = message.unwrap_or("oxideclaw checkpoint");
     let full_msg = format!("[checkpoint] {msg} ({ts})");
 
     let commit = Command::new("git")

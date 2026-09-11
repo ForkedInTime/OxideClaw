@@ -1121,7 +1121,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 "Plugin/MCP config reloaded — {} server(s) defined in settings.json.\n\
                  \n\
                  Note: MCP server connections are established at startup.\n\
-                 Newly installed plugins require a full restart of rustyclaw to activate.",
+                 Newly installed plugins require a full restart of oxideclaw to activate.",
                 count
             )));
             app.scroll_to_bottom();
@@ -1234,7 +1234,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
             let msg = if removed {
                 format!(
-                    "Plugin '{}' removed. Restart rustyclaw to deactivate.",
+                    "Plugin '{}' removed. Restart oxideclaw to deactivate.",
                     name
                 )
             } else {
@@ -1289,7 +1289,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::system(format!(
                     "/{plugin}:{command} — plugin '{plugin}' is not active.\n\
                      Install it with: /plugin marketplace add <user/{plugin}>\n\
-                     Then restart rustyclaw to activate it."
+                     Then restart oxideclaw to activate it."
                 )));
                 app.scroll_to_bottom();
             }
@@ -1860,7 +1860,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 if crate::voice::xtts_available() && !crate::voice::xtts_server_running() {
                     let _ = crate::voice::ensure_xtts_server().await;
                 }
-                let test_text = "Hello, I am RustyClaw, your personal coding \
+                let test_text = "Hello, I am OxideClaw, your personal coding \
                     assistant. I can help you write, debug, and ship code faster \
                     than ever before.";
                 match crate::voice::speak_default_only(test_text, stop_rx).await {
@@ -1914,7 +1914,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::system(
                     "[undo] auto-commit is disabled in settings",
                 ));
-            } else if !rustyclaw::autocommit::is_git_repo(&config.cwd) {
+            } else if !oxideclaw::autocommit::is_git_repo(&config.cwd) {
                 app.entries.push(ChatEntry::system(
                     "[undo] auto-commit disabled — not a git repo",
                 ));
@@ -1930,7 +1930,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 match n {
                     Some(k) => {
                         let new_pos = session.meta.undo_position.saturating_sub(k as usize);
-                        match rustyclaw::autocommit::restore_to(
+                        match oxideclaw::autocommit::restore_to(
                             &config.cwd,
                             &session.meta.auto_commits,
                             new_pos,
@@ -1976,7 +1976,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             ));
                             positions.push(target_pos);
                         }
-                        labels.push("session base (pre-RustyClaw)".to_string());
+                        labels.push("session base (pre-OxideClaw)".to_string());
                         positions.push(0);
                         app.overlay = Some(crate::tui::app::Overlay::with_items(
                             "undo".to_string(),
@@ -1997,7 +1997,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::system(
                     "[redo] auto-commit is disabled in settings",
                 ));
-            } else if !rustyclaw::autocommit::is_git_repo(&config.cwd) {
+            } else if !oxideclaw::autocommit::is_git_repo(&config.cwd) {
                 app.entries.push(ChatEntry::system(
                     "[redo] auto-commit disabled — not a git repo",
                 ));
@@ -2009,7 +2009,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     Some(k) => {
                         let new_pos = (session.meta.undo_position + k as usize)
                             .min(session.meta.auto_commits.len());
-                        match rustyclaw::autocommit::restore_to(
+                        match oxideclaw::autocommit::restore_to(
                             &config.cwd,
                             &session.meta.auto_commits,
                             new_pos,
@@ -2035,7 +2035,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let mut positions: Vec<usize> = Vec::new();
                         let cur = session.meta.undo_position;
                         let cur_label = if cur == 0 {
-                            "session base (pre-RustyClaw) ← current".to_string()
+                            "session base (pre-OxideClaw) ← current".to_string()
                         } else {
                             format!(
                                 "turn {cur}  ·  {} ← current",
@@ -2107,7 +2107,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::system(msg));
         }
         CommandAction::AutoCommitStatus => {
-            let cwd_ok = rustyclaw::autocommit::is_git_repo(&config.cwd);
+            let cwd_ok = oxideclaw::autocommit::is_git_repo(&config.cwd);
             let msg = format!(
                 "Auto-commit status:\n  \
                  Enabled:        {}\n  \

@@ -347,7 +347,7 @@ impl McpClient {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": { "roots": { "listChanged": false }, "sampling": {} },
             "clientInfo": {
-                "name": "rustyclaw",
+                "name": "oxideclaw",
                 "version": env!("CARGO_PKG_VERSION")
             }
         });

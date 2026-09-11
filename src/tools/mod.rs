@@ -297,7 +297,7 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = parent.join(format!(
-        ".{stem}.rustyclaw-{}-{}.tmp",
+        ".{stem}.oxideclaw-{}-{}.tmp",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -573,7 +573,7 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     // BriefTool — always-on in Rust (no build-time KAIROS flag system)
     tools.push(Arc::new(brief_tool::BriefTool));
 
-    // Agent swarm tools — enabled when RUSTYCLAW_EXPERIMENTAL_AGENT_TEAMS=1
+    // Agent swarm tools — enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1
     if send_message::is_agent_swarms_enabled() {
         tools.push(Arc::new(send_message::SendMessageTool));
         tools.push(Arc::new(team_tools::TeamCreateTool));

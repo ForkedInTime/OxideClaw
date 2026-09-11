@@ -2,7 +2,7 @@ use serde_json::json;
 
 #[test]
 fn parse_ax_tree_nodes() {
-    use rustyclaw::browser::snapshot::parse_ax_nodes;
+    use oxideclaw::browser::snapshot::parse_ax_nodes;
 
     let nodes = json!([
         {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": "Test Page"}, "childIds": ["2", "3"]},
@@ -22,7 +22,7 @@ fn parse_ax_tree_nodes() {
 
 #[test]
 fn filter_non_interactive_nodes() {
-    use rustyclaw::browser::snapshot::parse_ax_nodes;
+    use oxideclaw::browser::snapshot::parse_ax_nodes;
 
     let nodes = json!([
         {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": ""}, "childIds": ["2", "3"]},
@@ -38,7 +38,7 @@ fn filter_non_interactive_nodes() {
 
 #[test]
 fn prefers_backend_dom_node_id_over_ax_node_id() {
-    use rustyclaw::browser::snapshot::parse_ax_nodes;
+    use oxideclaw::browser::snapshot::parse_ax_nodes;
 
     // Real CDP responses include `backendDOMNodeId` (integer) which is the DOM
     // backend ID needed by DOM.resolveNode / DOM.getBoxModel. The AX-tree-local
@@ -63,7 +63,7 @@ fn prefers_backend_dom_node_id_over_ax_node_id() {
 
 #[test]
 fn skips_synthetic_nodes_without_backend_id() {
-    use rustyclaw::browser::snapshot::parse_ax_nodes;
+    use oxideclaw::browser::snapshot::parse_ax_nodes;
 
     // A synthetic AX node has no backendDOMNodeId and no parseable nodeId —
     // it cannot be clicked, so it must be filtered out of the ref map.
@@ -79,7 +79,7 @@ fn skips_synthetic_nodes_without_backend_id() {
 
 #[test]
 fn element_score_button_higher_than_generic() {
-    use rustyclaw::browser::element::score_element;
+    use oxideclaw::browser::element::score_element;
     let button_score = score_element("button", true, true, true);
     let generic_score = score_element("generic", false, false, false);
     assert!(button_score > generic_score);

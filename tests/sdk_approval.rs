@@ -1,6 +1,6 @@
 // tests/sdk_approval.rs
-use rustyclaw::sdk::approval::{ApprovalDecision, PolicyEngine};
-use rustyclaw::sdk::protocol::Policy;
+use oxideclaw::sdk::approval::{ApprovalDecision, PolicyEngine};
+use oxideclaw::sdk::protocol::Policy;
 
 #[test]
 fn test_deny_takes_priority() {

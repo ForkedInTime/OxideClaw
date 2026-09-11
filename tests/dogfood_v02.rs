@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-use rustyclaw::autocommit::{
+use oxideclaw::autocommit::{
     AutoCommitConfig, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo, prune_old_refs, restore_to,
     snapshot_turn,
 };
@@ -37,8 +37,8 @@ fn git_init(path: &Path) {
         .unwrap();
     assert!(s.success());
     for (k, v) in [
-        ("user.name", "rustyclaw-dogfood"),
-        ("user.email", "noreply@rustyclaw.local"),
+        ("user.name", "oxideclaw-dogfood"),
+        ("user.email", "noreply@oxideclaw.local"),
         ("commit.gpgsign", "false"),
     ] {
         Command::new("git")
@@ -178,7 +178,7 @@ fn dogfood_end_to_end_undo_redo_against_real_tree() {
 
 /// Dogfood #2a: After snapshotting, `git log`, `git log --all`, `git branch`,
 /// and `git status` show ZERO evidence of the shadow commits. The only way
-/// to see them is via `git for-each-ref refs/rustyclaw/`.
+/// to see them is via `git for-each-ref refs/oxideclaw/`.
 #[test]
 fn dogfood_shadow_refs_invisible_to_normal_git() {
     let td = TempDir::new().unwrap();
@@ -224,7 +224,7 @@ fn dogfood_shadow_refs_invisible_to_normal_git() {
     // ── B. `git log --all` DOES show shadow commits ──
     //
     //    Documented limitation: --all walks every ref under refs/, including
-    //    refs/rustyclaw/. This is a fundamental git behavior — there is no
+    //    refs/oxideclaw/. This is a fundamental git behavior — there is no
     //    refspace outside of refs/ that `for-each-ref` / `update-ref` can
     //    reach. Every other tool in this space has the identical limitation.
     //    The competitive claim is about plain `git log` / `git branch` /
@@ -244,7 +244,7 @@ fn dogfood_shadow_refs_invisible_to_normal_git() {
     // ── C. `git branch -a` shows zero shadow refs ──
     let branches = git(td.path(), &["branch", "-a"]);
     assert!(
-        !branches.contains("rustyclaw"),
+        !branches.contains("oxideclaw"),
         "git branch -a leaked shadow refs: {branches}"
     );
 
@@ -273,12 +273,12 @@ fn dogfood_shadow_refs_invisible_to_normal_git() {
             SHADOW_REF_PREFIX.trim_end_matches('/'),
         ],
     );
-    assert_eq!(shadow.trim(), "refs/rustyclaw/sessions/invis");
+    assert_eq!(shadow.trim(), "refs/oxideclaw/sessions/invis");
 
     // ── F. The shadow commit chain has exactly 3 commits ──
     let chain = git(
         td.path(),
-        &["log", "--oneline", "refs/rustyclaw/sessions/invis"],
+        &["log", "--oneline", "refs/oxideclaw/sessions/invis"],
     );
     assert_eq!(
         chain.lines().count(),
@@ -345,7 +345,7 @@ fn dogfood_snapshot_preserves_user_index_and_worktree() {
             "ls-tree",
             "-r",
             "--name-only",
-            "refs/rustyclaw/sessions/messy",
+            "refs/oxideclaw/sessions/messy",
         ],
     );
     let files: std::collections::HashSet<&str> = shadow_tree.lines().collect();

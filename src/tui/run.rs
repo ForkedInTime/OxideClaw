@@ -85,7 +85,7 @@ pub async fn run_tui(
     let mut stdout = io::stdout();
     // Clear the visible screen and anchor cursor at top-left so the compact
     // inline viewport always starts at the top of the terminal window —
-    // matching the TS rustyclaw/Ink behaviour where the banner appears right
+    // matching the TS oxideclaw/Ink behaviour where the banner appears right
     // below the launch command regardless of where the cursor was.
     // Previous content remains in the scrollback buffer (not deleted).
     execute!(
@@ -109,7 +109,7 @@ pub async fn run_tui(
 
 /// Compute the inline viewport height for this frame.
 /// On the welcome screen: exactly banner + input + status so the prompt sits
-/// right below the box (matching TS rustyclaw/Ink compact behaviour).
+/// right below the box (matching TS oxideclaw/Ink compact behaviour).
 /// During chat: full terminal height to maximise scroll room.
 fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
     let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
@@ -192,10 +192,10 @@ async fn run_loop(
     if !is_non_anthropic && config.api_key.is_empty() {
         return Err(anyhow::anyhow!(
             "No Anthropic credential found.\n\
-                 RustyClaw checks, in order:\n\
+                 OxideClaw checks, in order:\n\
                    1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
                    2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
-                   3. apiKeyHelper / RUSTYCLAW_API_KEY_FILE_DESCRIPTOR\n\
+                   3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
                    4. ant auth login         shared with Claude Code and the official SDKs\n\
                  To use a local model instead: --model ollama:<name>\n\
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
@@ -396,9 +396,13 @@ async fn run_loop(
         hooks::run_session_start_hooks(hook_cfg, &session.id, &config.cwd).await;
     }
 
-    // Prune old auto-commit shadow refs (keeps the configured number of newest sessions).
+    // Move pre-rename shadow refs first so /undo history survives, then prune
+    // (keeps the configured number of newest sessions).
+    if let Err(e) = oxideclaw::autocommit::migrate_legacy_refs(&config.cwd) {
+        tracing::warn!("autoCommit ref migration failed: {e}");
+    }
     if let Err(e) =
-        rustyclaw::autocommit::prune_old_refs(&config.cwd, config.auto_commit.keep_sessions)
+        oxideclaw::autocommit::prune_old_refs(&config.cwd, config.auto_commit.keep_sessions)
     {
         tracing::warn!("autoCommit startup prune failed: {e}");
     }
@@ -682,7 +686,7 @@ async fn run_loop(
             let model = model_path.clone();
             let tx2 = tx.clone();
             tokio::spawn(async move {
-                let preview_text = "Hi there. This is RustyClaw. Ready whenever you are.";
+                let preview_text = "Hi there. This is OxideClaw. Ready whenever you are.";
                 match crate::voice::speak(preview_text, Some(&model), stop_rx).await {
                     Ok(_) => {}
                     Err(e) => {
@@ -804,7 +808,7 @@ async fn run_loop(
                                 let _ = std::io::stdout().flush();
                                 tokio::spawn(async {
                                     let _ = tokio::process::Command::new("notify-send")
-                                        .args(["rustyclaw", "Task complete"])
+                                        .args(["oxideclaw", "Task complete"])
                                         .spawn();
                                 });
                             }
@@ -889,7 +893,7 @@ async fn run_loop(
                                         }
                                     })
                                     .unwrap_or_default();
-                                match rustyclaw::autocommit::snapshot_turn_raw(
+                                match oxideclaw::autocommit::snapshot_turn_raw(
                                     &config.cwd,
                                     &config.auto_commit.message_prefix,
                                     &session.id,
@@ -898,7 +902,7 @@ async fn run_loop(
                                     &mut session.meta.auto_commits,
                                     &mut session.meta.undo_position,
                                 ) {
-                                    Ok(rustyclaw::autocommit::SnapshotOutcome::Committed { sha, files }) => {
+                                    Ok(oxideclaw::autocommit::SnapshotOutcome::Committed { sha, files }) => {
                                         tracing::info!(
                                             "autoCommit: turn {turn_index} committed ({files} files, sha={})",
                                             &sha[..7.min(sha.len())]
@@ -907,13 +911,13 @@ async fn run_loop(
                                             tracing::warn!("autoCommit: failed to save meta after snapshot: {e}");
                                         }
                                     }
-                                    Ok(rustyclaw::autocommit::SnapshotOutcome::NoChanges) => {
+                                    Ok(oxideclaw::autocommit::SnapshotOutcome::NoChanges) => {
                                         tracing::debug!("autoCommit: turn {turn_index} had no file changes");
                                     }
-                                    Ok(rustyclaw::autocommit::SnapshotOutcome::Disabled { reason }) => {
+                                    Ok(oxideclaw::autocommit::SnapshotOutcome::Disabled { reason }) => {
                                         tracing::debug!("autoCommit: disabled ({reason})");
                                     }
-                                    Ok(rustyclaw::autocommit::SnapshotOutcome::Conflict { reason }) => {
+                                    Ok(oxideclaw::autocommit::SnapshotOutcome::Conflict { reason }) => {
                                         // Must be visible, not just logged: this turn is absent
                                         // from the undo history, so /undo will silently skip it
                                         // if the user is never told.

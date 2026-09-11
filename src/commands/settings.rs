@@ -321,13 +321,13 @@ pub(super) fn cmd_ide(ctx: &CommandContext) -> CommandAction {
     let _ = ctx;
     CommandAction::Message(concat!(
         "IDE Integration\n\n",
-        "rustyclaw runs as a standalone TUI — no IDE plugin required.\n\n",
+        "oxideclaw runs as a standalone TUI — no IDE plugin required.\n\n",
         "For VS Code integration:\n",
-        "  1. Run rustyclaw in the VS Code integrated terminal\n",
+        "  1. Run oxideclaw in the VS Code integrated terminal\n",
         "  2. Full tool access — Bash, Read, Write, Edit, Grep, etc.\n\n",
         "For JetBrains IDEs:\n",
-        "  1. Run rustyclaw in the built-in terminal\n",
-        "  2. Or run rustyclaw in the built-in terminal\n\n",
+        "  1. Run oxideclaw in the built-in terminal\n",
+        "  2. Or run oxideclaw in the built-in terminal\n\n",
         "The LSP tool provides code intelligence directly in the chat:\n",
         "  Use the LSP tool to query language servers for definitions, references, hover docs, etc."
     ).into())

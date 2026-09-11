@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-use rustyclaw::tools::{Tool, ToolContext, bash::BashTool};
+use oxideclaw::tools::{Tool, ToolContext, bash::BashTool};
 use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -28,11 +28,11 @@ fn ctx(dir: &TempDir) -> ToolContext {
 }
 
 /// Flatten a ToolOutput's content blocks into one string.
-fn text(out: &rustyclaw::tools::ToolOutput) -> String {
+fn text(out: &oxideclaw::tools::ToolOutput) -> String {
     out.content
         .iter()
         .map(|c| match c {
-            rustyclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
+            oxideclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
         })
         .collect::<Vec<_>>()
         .join("")

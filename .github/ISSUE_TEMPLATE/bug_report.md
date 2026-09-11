@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in RustyClaw
+about: Report a bug in OxideClaw
 title: ""
 labels: bug
 assignees: ""
@@ -27,7 +27,7 @@ What actually happens.
 ## Environment
 
 - **OS:** (e.g., Arch Linux 6.18)
-- **RustyClaw version:** (`rustyclaw --version`)
+- **OxideClaw version:** (`oxideclaw --version`)
 - **Terminal:** (e.g., Alacritty, Kitty, WezTerm)
 - **Rust version:** (if building from source)
 - **Model:** (e.g., claude-sonnet-4-6, ollama:dolphin3)

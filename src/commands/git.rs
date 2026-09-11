@@ -21,7 +21,7 @@ pub(super) fn cmd_init(ctx: &CommandContext) -> CommandAction {
     CommandAction::SendPrompt(format!(
         "Please analyze this codebase and {}
 
-CLAUDE.md is loaded into every RustyClaw session. It must be concise — only include \
+CLAUDE.md is loaded into every OxideClaw session. It must be concise — only include \
 what Claude would get wrong without it.
 
 ## What to analyze
@@ -59,7 +59,7 @@ Start the file with:
 ```
 # CLAUDE.md
 
-This file provides guidance to RustyClaw when working with code in this repository.
+This file provides guidance to OxideClaw when working with code in this repository.
 ```
 
 Then add only the sections that have real content. Use terse, actionable language.",

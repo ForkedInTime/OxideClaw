@@ -1,4 +1,4 @@
-/// rustyclaw — Rust-native AI coding CLI
+/// oxideclaw — Rust-native AI coding CLI
 /// Entry point
 mod acp;
 mod api;
@@ -95,9 +95,9 @@ enum ThinkingMode {
 
 #[derive(Parser)]
 #[command(
-    name = "rustyclaw",
+    name = "oxideclaw",
     version = VERSION,
-    about = "RustyClaw — Rust-native AI coding CLI",
+    about = "OxideClaw — Rust-native AI coding CLI",
     long_about = None,
 )]
 struct Cli {
@@ -384,10 +384,10 @@ enum McpSubcommand {
     ResetProjectChoices,
 }
 
-/// Safe allowlist of env vars that rustyclaw may load from .env files.
+/// Safe allowlist of env vars that oxideclaw may load from .env files.
 ///
 /// Project `.env` files are **untrusted data** — a malicious repo could ship a
-/// `.env` that sets `PATH`, `LD_PRELOAD`, or `RUSTYCLAW_*_COMMAND` to pivot
+/// `.env` that sets `PATH`, `LD_PRELOAD`, or `OXIDECLAW_*_COMMAND` to pivot
 /// code execution the moment the user opens the folder. We therefore load only
 /// a narrow allowlist of our own API-key and model vars, and specifically NEVER
 /// load anything that could:
@@ -395,7 +395,7 @@ enum McpSubcommand {
 ///   - Redirect config / settings / hook resolution (`CLAUDE_CONFIG_DIR`,
 ///     `XDG_CONFIG_HOME`, `HOME`)
 ///   - Alter any process-spawn path (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
-///     `DYLD_*`, `RUSTYCLAW_*_COMMAND`, sandbox binaries, voice binaries,
+///     `DYLD_*`, `OXIDECLAW_*_COMMAND`, sandbox binaries, voice binaries,
 ///     MCP server argv)
 ///
 /// If a user legitimately needs one of the blocked vars set, they can export
@@ -411,9 +411,11 @@ const SAFE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_PROFILE",
-    "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR",
+    "OXIDECLAW_API_KEY_FILE_DESCRIPTOR",
+    "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR", // pre-rename name, still honoured
     "ANTHROPIC_MODEL",
     // Verbose logging toggle — no exec side-effects
+    "OXIDECLAW_VERBOSE",
     "RUSTYCLAW_VERBOSE",
     // Ollama host — read-only redirect risk, but legitimate common use case
     "OLLAMA_HOST",
@@ -448,6 +450,8 @@ const FORBIDDEN_ENV_KEYS: &[&str] = &[
     "XDG_CACHE_HOME",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS",
+    "OXIDECLAW_SANDBOX_COMMAND",
+    "OXIDECLAW_VOICE_COMMAND",
     "RUSTYCLAW_SANDBOX_COMMAND",
     "RUSTYCLAW_VOICE_COMMAND",
     "GEMINI_CLI_IDE_SERVER_STDIO_COMMAND",
@@ -489,7 +493,7 @@ fn load_dotenv_auto() {
             load_dotenv(&env_path);
             // Warn if project .env exists — it won't leak into tool subprocesses
             eprintln!(
-                "Note: .env detected in project root. Only rustyclaw-specific keys \
+                "Note: .env detected in project root. Only oxideclaw-specific keys \
                  (ANTHROPIC_API_KEY, OLLAMA_HOST, etc.) are loaded. \
                  Project vars are NOT injected into tool execution."
             );
@@ -498,8 +502,8 @@ fn load_dotenv_auto() {
     // 2. ~/.env  — user-global keys
     if let Some(home) = dirs::home_dir() {
         load_dotenv(&home.join(".env"));
-        // 3. ~/.config/rustyclaw/.env  — app-specific config
-        load_dotenv(&home.join(".config").join("rustyclaw").join(".env"));
+        // 3. ~/.config/oxideclaw/.env  — app-specific config
+        load_dotenv(&crate::config::app_dir(&home.join(".config")).join(".env"));
     }
 }
 
@@ -532,7 +536,7 @@ async fn main() -> Result<()> {
 
     // Initialize tracing — write to a log file in TUI mode so logs don't corrupt the screen
     let filter = if cli.verbose { "debug" } else { "warn" };
-    let log_path = std::env::temp_dir().join("rustyclaw.log");
+    let log_path = std::env::temp_dir().join("oxideclaw.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -579,7 +583,7 @@ async fn main() -> Result<()> {
         match cmd {
             Commands::Acp => {} // needs the full config; handled below
             Commands::Version => {
-                println!("rustyclaw {VERSION}");
+                println!("oxideclaw {VERSION}");
                 return Ok(());
             }
             Commands::Mcp { subcommand } => {
@@ -587,11 +591,11 @@ async fn main() -> Result<()> {
             }
             Commands::Completions { shell } => {
                 let mut cmd = <Cli as clap::CommandFactory>::command();
-                clap_complete::generate(*shell, &mut cmd, "rustyclaw", &mut std::io::stdout());
+                clap_complete::generate(*shell, &mut cmd, "oxideclaw", &mut std::io::stdout());
                 return Ok(());
             }
             Commands::Doctor => {
-                println!("rustyclaw doctor — checking installation health…\n");
+                println!("oxideclaw doctor — checking installation health…\n");
                 // API key
                 if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
                     if key.len() >= 4 {
@@ -637,7 +641,7 @@ async fn main() -> Result<()> {
                 } else {
                     println!("  - XTTS v2 not found (optional — needed for TTS)");
                 }
-                println!("\n  rustyclaw v{VERSION}");
+                println!("\n  oxideclaw v{VERSION}");
                 return Ok(());
             }
             Commands::Update => {
@@ -962,7 +966,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // `rustyclaw acp`: Agent Client Protocol over stdio
+    // `oxideclaw acp`: Agent Client Protocol over stdio
     if matches!(cli.command, Some(Commands::Acp)) {
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
         crate::acp::AcpServer::run(config, stdin, tokio::io::stdout()).await?;
@@ -1106,8 +1110,8 @@ async fn self_update() -> Result<()> {
 
     let status = self_update::backends::github::Update::configure()
         .repo_owner("ForkedInTime")
-        .repo_name("RustyClaw")
-        .bin_name("rustyclaw")
+        .repo_name("OxideClaw")
+        .bin_name("oxideclaw")
         .current_version(VERSION)
         .target(&target)
         .asset_matcher(move |assets| pick_release_asset(assets, &target))
@@ -1128,14 +1132,14 @@ async fn self_update() -> Result<()> {
 /// Select the release asset for `target` by **exact** name.
 ///
 /// The library's default heuristic is substring matching, and our asset names
-/// overlap: `linux-x64` is a substring of `rustyclaw-linux-x64-musl` and of
+/// overlap: `linux-x64` is a substring of `oxideclaw-linux-x64-musl` and of
 /// every `.sha256` sidecar. Whichever the API listed first would have been
 /// installed as the binary — possibly a checksum text file.
 fn pick_release_asset(
     assets: &[self_update::update::ReleaseAsset],
     target: &str,
 ) -> Option<self_update::update::ReleaseAsset> {
-    let want = format!("rustyclaw-{target}");
+    let want = format!("oxideclaw-{target}");
     assets.iter().find(|a| a.name() == want).cloned()
 }
 
@@ -1443,31 +1447,31 @@ mod self_update_tests {
     fn picks_exact_asset_even_when_substring_matches_come_first() {
         let a = assets(&[
             "manifest.json",
-            "rustyclaw-linux-x64.sha256",
-            "rustyclaw-linux-x64-musl",
-            "rustyclaw-linux-x64-musl.sha256",
-            "rustyclaw-linux-x64",
+            "oxideclaw-linux-x64.sha256",
+            "oxideclaw-linux-x64-musl",
+            "oxideclaw-linux-x64-musl.sha256",
+            "oxideclaw-linux-x64",
         ]);
         let got = super::pick_release_asset(&a, "linux-x64").expect("asset");
-        assert_eq!(got.name(), "rustyclaw-linux-x64");
+        assert_eq!(got.name(), "oxideclaw-linux-x64");
 
         let got = super::pick_release_asset(&a, "linux-x64-musl").expect("asset");
-        assert_eq!(got.name(), "rustyclaw-linux-x64-musl");
+        assert_eq!(got.name(), "oxideclaw-linux-x64-musl");
     }
 
     #[test]
     fn windows_target_carries_exe_suffix() {
         let a = assets(&[
-            "rustyclaw-windows-x64.exe",
-            "rustyclaw-windows-x64.exe.sha256",
+            "oxideclaw-windows-x64.exe",
+            "oxideclaw-windows-x64.exe.sha256",
         ]);
         let got = super::pick_release_asset(&a, "windows-x64.exe").expect("asset");
-        assert_eq!(got.name(), "rustyclaw-windows-x64.exe");
+        assert_eq!(got.name(), "oxideclaw-windows-x64.exe");
     }
 
     #[test]
     fn missing_asset_is_none_not_a_near_match() {
-        let a = assets(&["rustyclaw-linux-x64.sha256", "rustyclaw-linux-x64-musl"]);
+        let a = assets(&["oxideclaw-linux-x64.sha256", "oxideclaw-linux-x64-musl"]);
         assert!(super::pick_release_asset(&a, "linux-x64").is_none());
     }
 }
@@ -1500,7 +1504,7 @@ mod dotenv_allowlist_tests {
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_PROFILE",
-            "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR",
+            "OXIDECLAW_API_KEY_FILE_DESCRIPTOR",
         ] {
             assert!(
                 SAFE_ENV_KEYS.contains(&key),
@@ -1523,7 +1527,7 @@ mod dotenv_allowlist_tests {
     /// process environment when we run `load_dotenv` against it.
     ///
     /// This is a live, end-to-end test of the loader against a real file.
-    /// We use `RUSTYCLAW_VERBOSE` as the "safe var loaded" probe rather than
+    /// We use `OXIDECLAW_VERBOSE` as the "safe var loaded" probe rather than
     /// `ANTHROPIC_API_KEY` so we don't clobber a real credential.
     #[test]
     fn load_dotenv_blocks_dangerous_vars() {
@@ -1534,15 +1538,15 @@ mod dotenv_allowlist_tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let path = std::env::temp_dir().join(format!("rustyclaw-dotenv-test-{suffix}.env"));
+        let path = std::env::temp_dir().join(format!("oxideclaw-dotenv-test-{suffix}.env"));
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "PATH=/evil/bin").unwrap();
         writeln!(f, "LD_PRELOAD=/evil/libhack.so").unwrap();
         writeln!(f, "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1").unwrap();
         writeln!(f, "CLAUDE_CONFIG_DIR=/tmp/attacker/config").unwrap();
         writeln!(f, "XDG_CONFIG_HOME=/tmp/attacker/xdg").unwrap();
-        writeln!(f, "RUSTYCLAW_SANDBOX_COMMAND=/evil/bwrap").unwrap();
-        writeln!(f, "RUSTYCLAW_VERBOSE=1").unwrap();
+        writeln!(f, "OXIDECLAW_SANDBOX_COMMAND=/evil/bwrap").unwrap();
+        writeln!(f, "OXIDECLAW_VERBOSE=1").unwrap();
         drop(f);
 
         // Snapshot-restore anything we might touch so we don't perturb the
@@ -1550,25 +1554,25 @@ mod dotenv_allowlist_tests {
         let snap_ck = std::env::var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS").ok();
         let snap_cd = std::env::var("CLAUDE_CONFIG_DIR").ok();
         let snap_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let snap_sbox = std::env::var("RUSTYCLAW_SANDBOX_COMMAND").ok();
-        let snap_verb = std::env::var("RUSTYCLAW_VERBOSE").ok();
+        let snap_sbox = std::env::var("OXIDECLAW_SANDBOX_COMMAND").ok();
+        let snap_verb = std::env::var("OXIDECLAW_VERBOSE").ok();
         let original_path = std::env::var("PATH").unwrap_or_default();
 
         unsafe {
             std::env::remove_var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS");
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("RUSTYCLAW_SANDBOX_COMMAND");
-            std::env::remove_var("RUSTYCLAW_VERBOSE");
+            std::env::remove_var("OXIDECLAW_SANDBOX_COMMAND");
+            std::env::remove_var("OXIDECLAW_VERBOSE");
         }
 
         load_dotenv(&path);
 
         // Safe var loaded.
         assert_eq!(
-            std::env::var("RUSTYCLAW_VERBOSE").ok().as_deref(),
+            std::env::var("OXIDECLAW_VERBOSE").ok().as_deref(),
             Some("1"),
-            "safe var RUSTYCLAW_VERBOSE should have been loaded"
+            "safe var OXIDECLAW_VERBOSE should have been loaded"
         );
         // Dangerous vars NOT loaded.
         assert!(
@@ -1584,8 +1588,8 @@ mod dotenv_allowlist_tests {
             "XDG_CONFIG_HOME must NEVER be loaded from .env"
         );
         assert!(
-            std::env::var("RUSTYCLAW_SANDBOX_COMMAND").is_err(),
-            "RUSTYCLAW_SANDBOX_COMMAND must NEVER be loaded from .env"
+            std::env::var("OXIDECLAW_SANDBOX_COMMAND").is_err(),
+            "OXIDECLAW_SANDBOX_COMMAND must NEVER be loaded from .env"
         );
         // PATH must be untouched (loader only sets keys that are NOT already set,
         // but even if PATH were unset we still block it via the allowlist).
@@ -1602,7 +1606,7 @@ mod dotenv_allowlist_tests {
         // Cleanup
         let _ = std::fs::remove_file(&path);
         unsafe {
-            std::env::remove_var("RUSTYCLAW_VERBOSE");
+            std::env::remove_var("OXIDECLAW_VERBOSE");
             if let Some(v) = snap_ck {
                 std::env::set_var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS", v);
             }
@@ -1613,10 +1617,10 @@ mod dotenv_allowlist_tests {
                 std::env::set_var("XDG_CONFIG_HOME", v);
             }
             if let Some(v) = snap_sbox {
-                std::env::set_var("RUSTYCLAW_SANDBOX_COMMAND", v);
+                std::env::set_var("OXIDECLAW_SANDBOX_COMMAND", v);
             }
             if let Some(v) = snap_verb {
-                std::env::set_var("RUSTYCLAW_VERBOSE", v);
+                std::env::set_var("OXIDECLAW_VERBOSE", v);
             }
         }
     }

@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use rustyclaw::tools::{Tool, ToolContext, bash::BashTool};
+use oxideclaw::tools::{Tool, ToolContext, bash::BashTool};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
