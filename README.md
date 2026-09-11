@@ -85,10 +85,10 @@ How it compares with the agents people actually run. Every cell was checked agai
 | Zero-setup codebase index (tree-sitter + FTS5) | ❌ | — | — | — | **✅ 8 languages** |
 | Auto model routing | ❌ | ✅ DeepSeek tiers | — | — | **✅ any provider, by task complexity, `/budget` cap** |
 | Auto-fix loop (lint + tests + retry after every edit) | ❌ | — | — | — | **✅** |
-| Spoken replies in a cloned voice (XTTS v2) | ❌ | — | — | ❌ | **✅** |
+| Spoken replies in a cloned voice | ❌ | ✅ cloud TTS tool (MiMo), on request | — | ❌ | **✅ local XTTS v2, every reply** |
 | Autonomous browser agent (`/browse <goal>`) | ❌ | — | — | — | **✅ 50-step cap, approval gate** |
 | `/redo` after `/undo` | — | — | — | — | **✅** |
-| `/undo` | ✅ `/rewind` | ✅ | — | — | **✅ hidden git refs, clean `git log`** |
+| `/undo` | ✅ `/rewind` | ✅ `/undo`, `/restore` | — | — | **✅ hidden git refs, clean `git log`** |
 | Parallel agents in git worktrees | ✅ | ✅ | ✅ swarm, no worktrees | ✅ | **✅ `spawn`, up to 8** |
 | Voice input (Whisper) | ✅ | — | ✅ | ✅ | **✅** |
 | Browser automation in the binary | via MCP | ✅ | ✅ | — | **✅ 9 CDP tools** |
@@ -99,7 +99,7 @@ How it compares with the agents people actually run. Every cell was checked agai
 | Sandboxed shell (bwrap / firejail) | ✅ | ✅ | — | — | **✅** |
 | CLAUDE.md + AGENTS.md | CLAUDE.md | — | — | ✅ | **✅ both, `/reload`** |
 
-The first seven rows are what you get here and nowhere else. The rest is table stakes, and RustyClaw has it too.
+The first seven rows are where RustyClaw stands apart. The rest is table stakes, and RustyClaw has it too.
 
 ---
 
@@ -130,7 +130,7 @@ rustyclaw spawn "refactor the auth middleware"
 
 ### 🎤 &nbsp; Voice I/O with XTTS v2 cloning
 
-Push-to-talk speech input (Whisper). TTS responses in any voice, including a clone of your own after a 6-second sample. **No other coding agent documents spoken replies, let alone in your own voice.**
+Push-to-talk speech input (Whisper). TTS responses in any voice, including a clone of your own after a 6-second sample. Runs locally through XTTS v2, so your voice never leaves the machine. **No other coding agent speaks every reply, locally, in your own voice.**
 
 ### ♻️ &nbsp; Auto-fix loop
 
