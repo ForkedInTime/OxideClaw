@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.3.1
+#   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.3.2
 #
 # Installs to ~/.local/bin/rustyclaw (or /usr/local/bin with --global)
 # Supports Linux (x64, arm64, musl) and macOS (Intel, Apple Silicon)

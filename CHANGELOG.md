@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-10
+
+Phases 7–15 of the code review. **Upgrade from 0.3.1**: it still has the
+clone-and-own settings hole, the headless deep-link execution and the sub-agent
+plan-mode bypass fixed here.
+
 ### Added
 
 - **SDK: `health/check` now reports `protocol_version`** (currently 1). It
@@ -346,7 +352,8 @@ This release contains every fix from the enterprise security audit (PRs #11–#2
 - **Cross-compilation** — CI builds x86_64-gnu, aarch64-gnu, x86_64-musl via `cross`.
 - **Install script** — one-liner install with version pinning.
 
-[Unreleased]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ForkedInTime/RustyClaw/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ForkedInTime/RustyClaw/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ForkedInTime/RustyClaw/compare/v0.1.0...v0.2.0
