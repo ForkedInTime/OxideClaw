@@ -25,7 +25,7 @@ Check if the server is alive. No API key needed.
   "type": "health/check",
   "id": "1",
   "status": "ok",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "protocol_version": 1,
   "active_sessions": 0,
   "uptime_seconds": 42
