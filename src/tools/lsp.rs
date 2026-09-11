@@ -750,7 +750,9 @@ mod uri_tests {
     #[test]
     fn paths_are_percent_encoded_file_uris() {
         let uri = path_to_uri(std::path::Path::new("/tmp/my project/a b.rs"));
-        assert_eq!(uri, "file:///tmp/my%20project/a%20b.rs");
+        // Windows resolves `/tmp` under a drive letter; the encoding is the point.
+        assert!(uri.starts_with("file:///"), "{uri}");
+        assert!(uri.ends_with("/tmp/my%20project/a%20b.rs"), "{uri}");
         assert!(path_to_uri(std::path::Path::new("/plain/x.rs")).starts_with("file:///"));
     }
 }
