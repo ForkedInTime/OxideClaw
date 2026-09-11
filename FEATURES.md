@@ -100,6 +100,7 @@ Configure in `~/.config/rustyclaw/settings.json`:
 | `/model <name>` | Switch to specific model |
 | `/model default` | Reset to default Claude model |
 | `/model list` | List all available models |
+| `/effort [low\|medium\|high\|max\|off]` | Set the API effort level (`output_config.effort`); prompt nudge on models without it |
 
 ### Session Management
 
@@ -389,6 +390,8 @@ RustyClaw supports multiple sandbox backends for tool isolation:
 |---------|--------|---------|-------------|
 | `model` | any model name | `claude-sonnet-5` | Default model |
 | `showThinkingSummaries` | `true` / `false` | `false` | Show model reasoning |
+| `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables. CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
+| `effort` | `low` / `medium` / `high` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5; older and non-Claude models get a prompt nudge. Set with `/effort` |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
 
 ### CLAUDE.md / AGENTS.md

@@ -151,6 +151,7 @@ impl SdkSession {
                 tools: tool_defs,
                 stream: None,
                 thinking: None,
+                output_config: None,
                 betas: self.config.extra_betas.clone(),
                 session_id: Some(self.session_id.clone()),
             };

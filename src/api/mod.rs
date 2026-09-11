@@ -2,6 +2,7 @@
 pub mod ollama;
 pub mod openai_compat;
 pub mod retry;
+pub mod thinking;
 pub mod types;
 
 use anyhow::{Context, Result, anyhow};

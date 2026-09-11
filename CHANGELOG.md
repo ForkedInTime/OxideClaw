@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Extended thinking works on Claude 5 again.** The request sent
+  `{"type":"enabled","budget_tokens":N}` to every model; Sonnet 5, Opus 5
+  and Fable 5.1 reject that with a 400, and Haiku 4.5 rejects the newer
+  `adaptive` form. The shape is now chosen per model generation, the budget
+  is clamped to the API's `1024 ≤ budget < max_tokens` window, and
+  `--thinking disabled` sends `{"type":"disabled"}` instead of an illegal
+  zero budget. Verified against the live API on all three generations.
+- **`/effort` is a real parameter.** It used to inject a sentence into the
+  prompt. It now sets `output_config.effort` (`low|medium|high|max`) on
+  Claude 4.6+ / Claude 5, persists to settings, and falls back to the prompt
+  nudge only on models without the parameter (Haiku 4.5, Ollama,
+  OpenAI-compatible). `/effort off` clears it.
+
 ### Changed
 
 - **README repositioned.** RustyClaw is presented as a provider-neutral
