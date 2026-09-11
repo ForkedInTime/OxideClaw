@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rustyclaw acp` — Agent Client Protocol.** RustyClaw can now be the
+  agent behind Zed, JetBrains, and any ACP client: `initialize`,
+  `session/new`, `session/prompt` with streamed `session/update`s, tool-call
+  status, `session/request_permission` for tools the policy marks *ask*, and
+  `session/cancel` that stops a running model stream mid-turn. Built on the
+  SDK sidecar's session engine; verified live for a full turn and for a
+  mid-turn cancel.
+- SDK sessions can be cancelled (`CancelSignal`) and report why a turn ended
+  (`TurnEnd`).
+
 ### Fixed
 
 - **Extended thinking works on Claude 5 again.** The request sent

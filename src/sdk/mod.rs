@@ -31,7 +31,7 @@ pub struct SdkServer;
 
 /// A client-supplied working directory must exist; otherwise every tool in
 /// the session fails one call at a time with a confusing path error.
-fn validate_session_cwd(dir: Option<String>) -> Result<Option<PathBuf>, String> {
+pub(crate) fn validate_session_cwd(dir: Option<String>) -> Result<Option<PathBuf>, String> {
     match dir {
         None => Ok(None),
         Some(d) => {
