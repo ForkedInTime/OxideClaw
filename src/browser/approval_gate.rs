@@ -109,6 +109,9 @@ fn button_patterns() -> Vec<String> {
 
 fn form_field_patterns() -> Vec<String> {
     vec![
+        // Accessible-name signals (what the middleware can actually see).
+        r"^name:.*(password|passcode|passphrase|card number|credit card|debit card|cvv|cvc|security code|expir|social security|\bssn\b|\bpin\b|routing number|account number|iban|sort code)"
+            .into(),
         r"^input:type=password$".into(),
         r"^input:autocomplete=cc-(number|exp|csc|name)$".into(),
         r"^input:name=(card|cc|cvv|cvc|pin|ssn)$".into(),
@@ -208,6 +211,16 @@ impl ApprovalGate {
     }
 }
 
+/// Form-field signals for the gate, derived from what the middleware can
+/// see: the field's accessible name. Only `browser_fill` produces one.
+pub fn form_signals_for(tool_name: &str, target_text: &str) -> Vec<String> {
+    if tool_name == "browser_fill" && !target_text.is_empty() {
+        vec![format!("name:{}", target_text.to_lowercase())]
+    } else {
+        Vec::new()
+    }
+}
+
 // ── Middleware bridge ─────────────────────────────────────────────────────────
 
 /// Approval prompt sent to the host (TUI/SDK/voice).
@@ -236,6 +249,10 @@ pub struct ApprovalGateMiddleware {
     /// ref to its real button label so button-text patterns (e.g. "buy now")
     /// can actually match. None in tests where no browser is attached.
     browser_session: Option<Arc<tokio::sync::Mutex<crate::browser::BrowserSession>>>,
+    /// A gated-and-approved `browser_fill` happened on the current page:
+    /// the Enter key that would submit it must be gated as well, or the
+    /// form goes out without any button the text patterns could see.
+    sensitive_fill_pending: AtomicBool,
 }
 
 impl ApprovalGateMiddleware {
@@ -257,6 +274,7 @@ impl ApprovalGateMiddleware {
             user_denied: AtomicBool::new(false),
             voice,
             browser_session: None,
+            sensitive_fill_pending: AtomicBool::new(false),
         }
     }
 
@@ -326,9 +344,18 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             tool_name: tool_name.to_string(),
             url: url.clone(),
             target_text: target_text.clone(),
-            form_field_signals: Vec::new(),
+            form_field_signals: form_signals_for(tool_name, &target_text),
             visible_prices: Vec::new(),
         };
+
+        let is_submit_key = tool_name == "browser_press_key"
+            && matches!(
+                input["key"]
+                    .as_str()
+                    .map(|k| k.to_ascii_lowercase())
+                    .as_deref(),
+                Some("enter") | Some("return")
+            );
 
         // Ask policy: force confirmation for every non-read-only tool.
         let verdict = if self.policy == BrowsePolicy::Ask {
@@ -336,10 +363,17 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                 reason: "ask policy".to_string(),
                 detail: format!("{tool_name} on {url}"),
             }
+        } else if is_submit_key && self.sensitive_fill_pending.load(Ordering::SeqCst) {
+            GateVerdict::RequireConfirmation {
+                reason: "submit after sensitive fill".to_string(),
+                detail: format!("Enter would submit the form holding sensitive data on {url}"),
+            }
         } else {
             // Pattern policy: delegate to the compiled gate.
             self.gate.check(&gate_ctx)
         };
+        let gated_fill = tool_name == "browser_fill"
+            && matches!(verdict, GateVerdict::RequireConfirmation { .. });
 
         match verdict {
             GateVerdict::Allow => {
@@ -398,6 +432,9 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .remove(&key);
+                        if gated_fill {
+                            self.sensitive_fill_pending.store(true, Ordering::SeqCst);
+                        }
                         MiddlewareVerdict::Allow
                     }
                     Some(false) => {
@@ -428,7 +465,108 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         }
     }
 
-    async fn after_tool(&self, _tool_name: &str, _output: &str) {
+    async fn after_tool(&self, tool_name: &str, _output: &str) {
         // Step counting is owned by StepEmitterMiddleware (runs after this middleware).
+        // A navigation leaves the form behind.
+        if tool_name == "browser_navigate" {
+            self.sensitive_fill_pending.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use crate::browser::browse_loop::BrowsePolicy;
+    use serde_json::json;
+    use std::sync::atomic::AtomicU32;
+
+    /// The gate has form-field patterns, but production never fed it a
+    /// signal (`form_field_signals: Vec::new()`), so a fill into a card or
+    /// password field was never gated. Fields are identified by their
+    /// accessible name — the only thing the middleware can see.
+    #[test]
+    fn a_fill_into_a_sensitive_field_requires_confirmation_by_name() {
+        let gate = ApprovalGate::default();
+        for name in ["Card number", "CVV", "Password", "Social Security Number"] {
+            let ctx = GateContext {
+                tool_name: "browser_fill".into(),
+                url: "https://shop.example/account".into(),
+                target_text: name.into(),
+                form_field_signals: form_signals_for("browser_fill", name),
+                visible_prices: vec![],
+            };
+            assert!(
+                matches!(gate.check(&ctx), GateVerdict::RequireConfirmation { .. }),
+                "{name} must be gated"
+            );
+        }
+        let ctx = GateContext {
+            tool_name: "browser_fill".into(),
+            url: "https://shop.example/search".into(),
+            target_text: "Search".into(),
+            form_field_signals: form_signals_for("browser_fill", "Search"),
+            visible_prices: vec![],
+        };
+        assert_eq!(gate.check(&ctx), GateVerdict::Allow);
+    }
+
+    /// Build a middleware with an auto-approving host.
+    fn middleware() -> (Arc<ApprovalGateMiddleware>, tokio::task::JoinHandle<u32>) {
+        let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+        let mw = Arc::new(ApprovalGateMiddleware::new(
+            ApprovalGate::default(),
+            BrowsePolicy::Pattern,
+            Arc::new(tokio::sync::Mutex::new(
+                "https://shop.example/account".into(),
+            )),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            false,
+        ));
+        let host = tokio::spawn(async move {
+            let mut prompts = 0;
+            while let Some(p) = rx.recv().await {
+                prompts += 1;
+                let _ = p.reply.send(true);
+            }
+            prompts
+        });
+        (mw, host)
+    }
+
+    /// Typing a card number and then pressing Enter submits the form
+    /// without ever clicking a button the button-patterns could see.
+    #[tokio::test]
+    async fn enter_after_an_approved_sensitive_fill_is_gated_too() {
+        let (mw, host) = middleware();
+        let fill = json!({"selector": "Card number", "value": "4111"});
+        assert!(matches!(
+            mw.before_tool("browser_fill", &fill).await,
+            MiddlewareVerdict::Allow
+        ));
+        let enter = json!({"key": "Enter"});
+        assert!(matches!(
+            mw.before_tool("browser_press_key", &enter).await,
+            MiddlewareVerdict::Allow
+        ));
+        drop(mw);
+        assert_eq!(
+            host.await.unwrap(),
+            2,
+            "fill and the Enter that submits it must both prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_with_no_sensitive_fill_is_not_gated() {
+        let (mw, host) = middleware();
+        let enter = json!({"key": "Enter"});
+        assert!(matches!(
+            mw.before_tool("browser_press_key", &enter).await,
+            MiddlewareVerdict::Allow
+        ));
+        drop(mw);
+        assert_eq!(host.await.unwrap(), 0);
     }
 }
