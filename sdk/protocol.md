@@ -25,11 +25,16 @@ Check if the server is alive. No API key needed.
   "type": "health/check",
   "id": "1",
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.3.1",
+  "protocol_version": 1,
   "active_sessions": 0,
   "uptime_seconds": 42
 }
 ```
+
+`protocol_version` is the wire-compatibility number. It changes only when a request, response
+or notification shape changes incompatibly; new optional fields do not bump it. Hosts should
+gate on it rather than on `version` (the crate version).
 
 ---
 
