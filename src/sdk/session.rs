@@ -351,65 +351,37 @@ impl SdkSession {
                         tool_use_id: id.clone(),
                     });
 
-                    // Wait for approval with timeout
+                    // Wait for the matching reply; stale replies to earlier
+                    // prompts are skipped rather than treated as this answer.
                     let timeout_secs = self.policy_engine.timeout_seconds();
-                    let approval_result = tokio::time::timeout(
+                    let outcome = await_approval(
+                        &mut self.approval_rx,
+                        &approval_id,
                         std::time::Duration::from_secs(timeout_secs),
-                        self.approval_rx.recv(),
                     )
                     .await;
-
-                    match approval_result {
-                        Ok(Some((received_id, reason))) => {
-                            // Reject mismatched approval IDs — Phase A is single-session,
-                            // but this prevents out-of-order approvals from executing wrong tools.
-                            if received_id != approval_id {
-                                results.push(ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: vec![ToolResultContent::text(format!(
-                                        "Approval ID mismatch: expected {}, got {}",
-                                        approval_id, received_id
-                                    ))],
-                                    is_error: Some(true),
-                                });
-                                continue;
-                            }
-                            if reason.is_some() {
-                                // Denied by host
-                                let deny_msg = reason.unwrap_or_else(|| "Denied by host.".into());
-                                results.push(ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: vec![ToolResultContent::text(deny_msg)],
-                                    is_error: Some(true),
-                                });
-                                continue;
-                            }
-                            // Approved — fall through to execute
-                        }
-                        Ok(None) => {
-                            // Channel closed
-                            results.push(ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: vec![ToolResultContent::text(
-                                    "Approval channel closed.".to_string(),
-                                )],
-                                is_error: Some(true),
-                            });
-                            continue;
-                        }
-                        Err(_) => {
-                            // Timeout
-                            results.push(ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: vec![ToolResultContent::text(format!(
-                                    "Tool '{}' approval timed out after {}s.",
-                                    name, timeout_secs
-                                ))],
-                                is_error: Some(true),
-                            });
-                            continue;
-                        }
+                    let deny_text = match outcome {
+                        ApprovalOutcome::Approved => None,
+                        ApprovalOutcome::Denied(reason) => Some(if reason.is_empty() {
+                            "Denied by host.".to_string()
+                        } else {
+                            reason
+                        }),
+                        ApprovalOutcome::Closed => Some("Approval channel closed.".to_string()),
+                        ApprovalOutcome::TimedOut => Some(format!(
+                            "Tool '{}' approval timed out after {}s.",
+                            name, timeout_secs
+                        )),
+                    };
+                    if let Some(text) = deny_text {
+                        results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: vec![ToolResultContent::text(text)],
+                            is_error: Some(true),
+                        });
+                        continue;
                     }
+                    // Approved — fall through to execute
                 }
 
                 ApprovalDecision::AutoApprove => {
@@ -576,5 +548,82 @@ impl SdkSession {
     /// Send a notification, ignoring channel errors (host may have disconnected).
     fn send_notif(&self, notif: SdkNotification) {
         let _ = self.notif_tx.send(notif);
+    }
+}
+
+/// Outcome of waiting for the host's answer to one approval request.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ApprovalOutcome {
+    Approved,
+    Denied(String),
+    /// Host went away.
+    Closed,
+    TimedOut,
+}
+
+/// Wait for the reply matching `approval_id`. Replies for *other* ids
+/// (late answers to earlier prompts) are discarded, not treated as the
+/// answer to this one — previously one stale reply denied the current
+/// tool and left the real answer queued for the next prompt, cascading.
+pub(crate) async fn await_approval(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Option<String>)>,
+    approval_id: &str,
+    timeout: std::time::Duration,
+) -> ApprovalOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((received_id, reason))) => {
+                if received_id != approval_id {
+                    tracing::debug!("ignoring stale approval reply for {received_id}");
+                    continue;
+                }
+                return match reason {
+                    Some(r) => ApprovalOutcome::Denied(r),
+                    None => ApprovalOutcome::Approved,
+                };
+            }
+            Ok(None) => return ApprovalOutcome::Closed,
+            Err(_) => return ApprovalOutcome::TimedOut,
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_wait_tests {
+    use super::{ApprovalOutcome, await_approval};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_stale_reply_is_skipped_and_the_matching_one_wins() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(("old-id".into(), None)).unwrap();
+        tx.send(("this-id".into(), None)).unwrap();
+        let out = await_approval(&mut rx, "this-id", Duration::from_secs(2)).await;
+        assert_eq!(out, ApprovalOutcome::Approved);
+    }
+
+    #[tokio::test]
+    async fn a_denial_carries_the_hosts_reason() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(("this-id".into(), Some("nope".into()))).unwrap();
+        let out = await_approval(&mut rx, "this-id", Duration::from_secs(2)).await;
+        assert_eq!(out, ApprovalOutcome::Denied("nope".into()));
+    }
+
+    #[tokio::test]
+    async fn only_stale_replies_still_time_out() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(("old-id".into(), None)).unwrap();
+        let out = await_approval(&mut rx, "this-id", Duration::from_millis(200)).await;
+        assert_eq!(out, ApprovalOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_host_is_reported_as_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Option<String>)>();
+        drop(tx);
+        let out = await_approval(&mut rx, "this-id", Duration::from_secs(2)).await;
+        assert_eq!(out, ApprovalOutcome::Closed);
     }
 }

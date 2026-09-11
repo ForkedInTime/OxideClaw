@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 // ── Sub-types ────────────────────────────────────────────────────────────────
 
 /// Tool approval policy — set at session start.
+/// NDJSON protocol version. See `SdkResponse::HealthCheck::protocol_version`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Policy {
     /// Tools that execute silently (no notification).
@@ -263,7 +266,12 @@ pub enum SdkResponse {
     HealthCheck {
         id: String,
         status: String,
+        /// Crate version — informational.
         version: String,
+        /// Wire-compatibility number. Bumped only on a breaking change to
+        /// request/response/notification shapes; additive fields do not
+        /// bump it. Hosts should gate on this, not on `version`.
+        protocol_version: u32,
         active_sessions: usize,
         uptime_seconds: u64,
     },
@@ -401,4 +409,28 @@ pub enum SdkNotification {
         session_id: String,
         result: crate::browser::browse_loop::BrowseResult,
     },
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    /// Editors embedding the sidecar need a number to gate on; the crate
+    /// version says nothing about wire compatibility.
+    #[test]
+    fn health_check_carries_the_protocol_version() {
+        let json = serde_json::to_string(&SdkResponse::HealthCheck {
+            id: "1".into(),
+            status: "ok".into(),
+            version: "x".into(),
+            protocol_version: PROTOCOL_VERSION,
+            active_sessions: 0,
+            uptime_seconds: 0,
+        })
+        .unwrap();
+        assert!(
+            json.contains(&format!("\"protocol_version\":{PROTOCOL_VERSION}")),
+            "{json}"
+        );
+    }
 }

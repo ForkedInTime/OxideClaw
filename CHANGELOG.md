@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SDK: `health/check` now reports `protocol_version`** (currently 1). It
+  changes only on an incompatible wire change; hosts should gate on it
+  rather than on the crate version.
+
 ### Security
 
 - **The browser agent's form-field protections were never wired.** The
@@ -60,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SDK: a late approval reply for an earlier prompt denied the current tool
+  and left the real answer queued**, cascading down every following prompt.
+  Replies for other approval ids are now skipped.
+- **SDK: a malformed request line with a multi-byte character at byte 200
+  crashed the sidecar** (byte-slice preview). Char-safe now. Over-long
+  lines are drained in bounded chunks instead of being buffered whole
+  before the 4 MB check.
 - **The cost dashboard used the wrong prices for every current Claude
   model.** Opus was charged at 3× the published rate and Haiku at ¼, so
   `/budget` stopped a session far too early or far too late. Rates now match

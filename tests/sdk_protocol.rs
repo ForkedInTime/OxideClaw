@@ -169,6 +169,7 @@ fn test_health_check_response_serialize() {
         id: "req-6".into(),
         status: "ok".into(),
         version: "0.1.0".into(),
+        protocol_version: 1,
         active_sessions: 1,
         uptime_seconds: 3600,
     };
