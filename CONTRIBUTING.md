@@ -1,6 +1,6 @@
-# Contributing to RustyClaw
+# Contributing to OxideClaw
 
-Thank you for your interest in contributing to RustyClaw! This document provides guidelines and information for contributors.
+Thank you for your interest in contributing to OxideClaw! This document provides guidelines and information for contributors.
 
 ## Getting Started
 
@@ -14,10 +14,10 @@ Thank you for your interest in contributing to RustyClaw! This document provides
 ### Building from Source
 
 ```bash
-git clone https://github.com/ForkedInTime/RustyClaw.git
-cd RustyClaw
+git clone https://github.com/ForkedInTime/OxideClaw.git
+cd OxideClaw
 cargo build --release
-./target/release/rustyclaw
+./target/release/oxideclaw
 ```
 
 ### Running Tests
@@ -30,13 +30,13 @@ cargo test
 
 ### Reporting Bugs
 
-1. Check [existing issues](https://github.com/ForkedInTime/RustyClaw/issues) first.
+1. Check [existing issues](https://github.com/ForkedInTime/OxideClaw/issues) first.
 2. Open a new issue using the **Bug Report** template.
 3. Include: steps to reproduce, expected behavior, actual behavior, and your environment (OS, Rust version, terminal).
 
 ### Suggesting Features
 
-1. Check [existing issues](https://github.com/ForkedInTime/RustyClaw/issues) for similar requests.
+1. Check [existing issues](https://github.com/ForkedInTime/OxideClaw/issues) for similar requests.
 2. Open a new issue using the **Feature Request** template.
 3. Describe the use case, not just the solution.
 

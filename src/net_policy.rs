@@ -27,7 +27,7 @@ use url::{Host, Url};
 
 /// User agent for every model-driven fetch.
 pub const USER_AGENT: &str = concat!(
-    "Mozilla/5.0 (compatible; rustyclaw/",
+    "Mozilla/5.0 (compatible; oxideclaw/",
     env!("CARGO_PKG_VERSION"),
     ")"
 );

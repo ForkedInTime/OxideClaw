@@ -1,7 +1,7 @@
 //! Agent Client Protocol (ACP) agent — JSON-RPC 2.0 over stdio.
 //!
-//! `rustyclaw acp` lets ACP-capable editors (Zed, JetBrains, and any client
-//! that speaks <https://agentclientprotocol.com>) drive RustyClaw as their
+//! `oxideclaw acp` lets ACP-capable editors (Zed, JetBrains, and any client
+//! that speaks <https://agentclientprotocol.com>) drive OxideClaw as their
 //! coding agent. The agent loop is the SDK sidecar's `SdkSession`; this
 //! module only translates between ACP messages and SDK notifications.
 //!

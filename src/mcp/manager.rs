@@ -1,7 +1,7 @@
 /// McpManager — connects to all MCP servers from settings.json at startup.
 ///
 /// Each server runs independently; failures are logged and skipped so a
-/// broken MCP server never prevents rustyclaw from starting.
+/// broken MCP server never prevents oxideclaw from starting.
 use crate::mcp::client::McpClient;
 use crate::mcp::types::{McpServerConfig, McpServerStatus};
 use crate::settings::Settings;

@@ -1,5 +1,5 @@
-use rustyclaw::browser::browse_loop::BrowsePolicy;
-use rustyclaw::commands::{CommandAction, parse_browse_command};
+use oxideclaw::browser::browse_loop::BrowsePolicy;
+use oxideclaw::commands::{CommandAction, parse_browse_command};
 
 #[test]
 fn parses_plain_browse() {

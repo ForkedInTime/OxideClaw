@@ -1,5 +1,5 @@
 /// Integration tests for detect_phase() — phase-declarative model routing.
-use rustyclaw::router::{Phase, detect_phase};
+use oxideclaw::router::{Phase, detect_phase};
 
 #[test]
 fn test_research_phase() {

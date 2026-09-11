@@ -2,7 +2,7 @@
 ///
 /// Memory is stored in ~/.claude/memory.md (global) and optionally in
 /// ./.claude/memory.md (project-specific).  These files persist across
-/// all rustyclaw sessions so Claude can remember things long-term.
+/// all oxideclaw sessions so Claude can remember things long-term.
 use crate::tools::{Tool, ToolContext, ToolOutput, async_trait};
 use anyhow::Result;
 use std::path::PathBuf;

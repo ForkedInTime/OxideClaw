@@ -71,11 +71,11 @@ pub fn temp_wav_path() -> PathBuf {
 }
 
 /// A per-process scratch file under the temp dir. Fixed names like
-/// `rustyclaw-voice.wav` were shared by every RustyClaw on the machine
+/// `oxideclaw-voice.wav` were shared by every OxideClaw on the machine
 /// (two sessions clobbered each other's audio) and, in a world-writable
 /// temp dir, are the classic pre-created-symlink target.
 pub fn scratch_path(stem: &str, ext: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("rustyclaw-{stem}-{}.{ext}", std::process::id()))
+    std::env::temp_dir().join(format!("oxideclaw-{stem}-{}.{ext}", std::process::id()))
 }
 
 /// JSON body for the XTTS server. Built with serde so newlines, tabs and
@@ -395,12 +395,12 @@ pub fn cuda_available() -> bool {
 
 // ── XTTS v2 server lifecycle ─────────────────────────────────────────────────
 
-/// Find the xtts-server.py script bundled with RustyClaw.
+/// Find the xtts-server.py script bundled with OxideClaw.
 fn xtts_server_script() -> Option<PathBuf> {
     // Check relative to the running binary
     if let Ok(exe) = std::env::current_exe() {
         let exe_dir = exe.parent()?;
-        // release binary: target/release/rustyclaw → ../../scripts/
+        // release binary: target/release/oxideclaw → ../../scripts/
         for candidate in &[
             exe_dir.join("../../scripts/xtts-server.py"),
             exe_dir.join("../scripts/xtts-server.py"),
@@ -442,14 +442,14 @@ pub fn xtts_server_running() -> bool {
 
 /// Start the XTTS v2 background server if not already running.
 /// Returns Ok(port) on success. The server process is detached and persists
-/// until RustyClaw exits or /voice speak off is called.
+/// until OxideClaw exits or /voice speak off is called.
 pub async fn ensure_xtts_server() -> Result<u16> {
     if xtts_server_running() {
         return Ok(XTTS_SERVER_PORT);
     }
 
     let script = xtts_server_script().ok_or_else(|| {
-        anyhow!("xtts-server.py not found. Rebuild RustyClaw or check scripts/ dir.")
+        anyhow!("xtts-server.py not found. Rebuild OxideClaw or check scripts/ dir.")
     })?;
     let python = tts_python()
         .ok_or_else(|| anyhow!("No Python for TTS venv. Run: uv tool install TTS --python 3.11"))?;
@@ -1087,7 +1087,7 @@ pub fn xtts_available() -> bool {
 
 /// Directory where voice clone samples are stored.
 pub fn voice_clone_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local/share/rustyclaw/voice-clone"))
+    dirs::home_dir().map(|h| h.join(".local/share/oxideclaw/voice-clone"))
 }
 
 /// Path to the active voice clone WAV sample.

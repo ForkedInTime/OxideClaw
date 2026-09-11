@@ -1,12 +1,12 @@
 //! Auto-commit loop — per-turn working-tree snapshots on private shadow refs.
 //!
 //! Uses git plumbing (`write-tree`, `commit-tree`, `update-ref`, `read-tree`,
-//! `checkout-index`) under `refs/rustyclaw/sessions/<session-id>`, driven via
+//! `checkout-index`) under `refs/oxideclaw/sessions/<session-id>`, driven via
 //! `std::process::Command` with `GIT_INDEX_FILE` pointed at a temp index so the
 //! user's real `.git/index` is never touched.
 //!
 //! Commits are invisible to normal git tooling (`log`, `status`, `branch`) —
-//! only `git for-each-ref refs/rustyclaw/` sees them. They are strictly local
+//! only `git for-each-ref refs/oxideclaw/` sees them. They are strictly local
 //! (never pushed) and serve as a per-turn undo stack the user can navigate
 //! with `/undo` and `/redo`.
 
@@ -15,7 +15,9 @@ use std::process::{Command, Stdio};
 
 pub use crate::settings::{AutoCommitConfig, DEFAULT_KEEP_SESSIONS, DEFAULT_MESSAGE_PREFIX};
 
-pub const SHADOW_REF_PREFIX: &str = "refs/rustyclaw/sessions/";
+pub const SHADOW_REF_PREFIX: &str = "refs/oxideclaw/sessions/";
+/// Prefix used before the rename; refs found there are moved on startup.
+pub const LEGACY_SHADOW_REF_PREFIX: &str = "refs/rustyclaw/sessions/";
 
 /// Outcome of a single `snapshot_turn` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,16 +259,16 @@ pub fn snapshot_turn(
     );
     let files = count_tree_files(cwd, &tree_sha);
     let body = format!(
-        "\nRustyClaw-Session: {session_id}\nRustyClaw-Turn: {turn_index}\nRustyClaw-Files: {files}\n"
+        "\nOxideClaw-Session: {session_id}\nOxideClaw-Turn: {turn_index}\nOxideClaw-Files: {files}\n"
     );
     let full_msg = format!("{subject}\n{body}");
 
     let mut commit_cmd = git_cmd(cwd);
     commit_cmd
-        .env("GIT_AUTHOR_NAME", "rustyclaw")
-        .env("GIT_AUTHOR_EMAIL", "noreply@rustyclaw.local")
-        .env("GIT_COMMITTER_NAME", "rustyclaw")
-        .env("GIT_COMMITTER_EMAIL", "noreply@rustyclaw.local")
+        .env("GIT_AUTHOR_NAME", "oxideclaw")
+        .env("GIT_AUTHOR_EMAIL", "noreply@oxideclaw.local")
+        .env("GIT_COMMITTER_NAME", "oxideclaw")
+        .env("GIT_COMMITTER_EMAIL", "noreply@oxideclaw.local")
         .args(["commit-tree", &tree_sha, "-m", &full_msg]);
     if let Some(p) = &parent {
         commit_cmd.args(["-p", p]);
@@ -285,7 +287,7 @@ pub fn snapshot_turn(
         // else's work.
         return Ok(SnapshotOutcome::Conflict {
             reason: format!(
-                "another rustyclaw instance wrote to this session's history \
+                "another oxideclaw instance wrote to this session's history \
                  while this turn was being snapshotted (session '{session_id}'). \
                  This turn was not recorded; the working tree is untouched. \
                  Use a distinct session per instance — /undo history is per-session."
@@ -444,7 +446,7 @@ pub fn restore_to(
 
 // ── Prune pipeline ────────────────────────────────────────────────────────────
 
-/// Delete old `refs/rustyclaw/sessions/*` refs, keeping the `keep` newest by
+/// Delete old `refs/oxideclaw/sessions/*` refs, keeping the `keep` newest by
 /// committer date. `keep == 0` disables pruning. Non-fatal: any error is
 /// logged via `tracing::warn!` and the function returns 0.
 /// Choose which shadow refs to delete: keep the `keep` newest, delete the rest.
@@ -469,6 +471,46 @@ pub fn restore_to(
 fn select_refs_to_delete(mut rows: Vec<(i64, String)>, keep: usize) -> Vec<String> {
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     rows.into_iter().skip(keep).map(|(_, r)| r).collect()
+}
+
+/// Move `refs/rustyclaw/sessions/*` to `refs/oxideclaw/sessions/*` so undo
+/// history survives the rename. Returns how many refs moved.
+pub fn migrate_legacy_refs(cwd: &Path) -> anyhow::Result<u32> {
+    if !is_git_repo(cwd) {
+        return Ok(0);
+    }
+    let out = git_cmd(cwd)
+        .args([
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            LEGACY_SHADOW_REF_PREFIX.trim_end_matches('/'),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Ok(0);
+    }
+    let mut moved = 0u32;
+    for line in String::from_utf8(out.stdout)?.lines() {
+        let Some((sha, old)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(rest) = old.strip_prefix(LEGACY_SHADOW_REF_PREFIX) else {
+            continue;
+        };
+        let new = format!("{SHADOW_REF_PREFIX}{rest}");
+        let created = git_cmd(cwd).args(["update-ref", &new, sha]).status();
+        if !matches!(created, Ok(s) if s.success()) {
+            tracing::warn!("autoCommit migrate: could not create {new}");
+            continue;
+        }
+        match git_cmd(cwd).args(["update-ref", "-d", old]).status() {
+            Ok(s) if s.success() => moved += 1,
+            _ => tracing::warn!("autoCommit migrate: could not delete {old}"),
+        }
+    }
+    Ok(moved)
 }
 
 pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
@@ -621,8 +663,8 @@ mod git_detection_tests {
         // core.autocrlf=false prevents Windows git from rewriting "x\n" to
         // "x\r\n" on checkout, which breaks byte-exact fixture assertions.
         for (k, v) in [
-            ("user.name", "rustyclaw-test"),
-            ("user.email", "noreply@rustyclaw.local"),
+            ("user.name", "oxideclaw-test"),
+            ("user.email", "noreply@oxideclaw.local"),
             ("commit.gpgsign", "false"),
             ("core.autocrlf", "false"),
             ("core.safecrlf", "false"),
@@ -718,7 +760,7 @@ mod snapshot_tests {
 
         // Shadow ref points at the new commit.
         let out = git_cmd(td.path())
-            .args(["rev-parse", "refs/rustyclaw/sessions/test-session-1"])
+            .args(["rev-parse", "refs/oxideclaw/sessions/test-session-1"])
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -1091,10 +1133,10 @@ mod prune_tests {
         assert!(tree.status.success());
         let tree_sha = String::from_utf8(tree.stdout).unwrap().trim().to_string();
         let out = git_cmd(cwd)
-            .env("GIT_AUTHOR_NAME", "rustyclaw")
-            .env("GIT_AUTHOR_EMAIL", "noreply@rustyclaw.local")
-            .env("GIT_COMMITTER_NAME", "rustyclaw")
-            .env("GIT_COMMITTER_EMAIL", "noreply@rustyclaw.local")
+            .env("GIT_AUTHOR_NAME", "oxideclaw")
+            .env("GIT_AUTHOR_EMAIL", "noreply@oxideclaw.local")
+            .env("GIT_COMMITTER_NAME", "oxideclaw")
+            .env("GIT_COMMITTER_EMAIL", "noreply@oxideclaw.local")
             .args(["commit-tree", &tree_sha, "-m", subject])
             .output()
             .unwrap();
@@ -1111,6 +1153,43 @@ mod prune_tests {
     }
 
     #[test]
+    fn legacy_refs_are_moved_under_the_new_prefix() {
+        let td = init_test_repo();
+        std::fs::write(td.path().join("x"), "").unwrap();
+        git_cmd(td.path()).args(["add", "x"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "c"])
+            .status()
+            .unwrap();
+        let sha = String::from_utf8(
+            git_cmd(td.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        make_ref(td.path(), &format!("{LEGACY_SHADOW_REF_PREFIX}s1/1"), &sha);
+        make_ref(td.path(), &format!("{LEGACY_SHADOW_REF_PREFIX}s2/1"), &sha);
+        assert_eq!(migrate_legacy_refs(td.path()).unwrap(), 2);
+        let refs = String::from_utf8(
+            git_cmd(td.path())
+                .args(["for-each-ref", "--format=%(refname)"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(refs.contains(&format!("{SHADOW_REF_PREFIX}s1/1")), "{refs}");
+        assert!(refs.contains(&format!("{SHADOW_REF_PREFIX}s2/1")), "{refs}");
+        assert!(!refs.contains("refs/rustyclaw/"), "{refs}");
+        // Idempotent.
+        assert_eq!(migrate_legacy_refs(td.path()).unwrap(), 0);
+    }
+
+    #[test]
     fn prune_keeps_newest_n() {
         let td = init_test_repo();
         std::fs::write(td.path().join("x"), "").unwrap();
@@ -1122,7 +1201,7 @@ mod prune_tests {
 
         for i in 0..5 {
             let sha = make_empty_commit(td.path(), &format!("session-{i}"));
-            make_ref(td.path(), &format!("refs/rustyclaw/sessions/s{i}"), &sha);
+            make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
         }
 
         let deleted = prune_old_refs(td.path(), 3).unwrap();
@@ -1132,7 +1211,7 @@ mod prune_tests {
             .args([
                 "for-each-ref",
                 "--format=%(refname)",
-                "refs/rustyclaw/sessions/",
+                "refs/oxideclaw/sessions/",
             ])
             .output()
             .unwrap();
@@ -1151,7 +1230,7 @@ mod prune_tests {
             .unwrap();
         for i in 0..3 {
             let sha = make_empty_commit(td.path(), &format!("s{i}"));
-            make_ref(td.path(), &format!("refs/rustyclaw/sessions/s{i}"), &sha);
+            make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
         }
         let deleted = prune_old_refs(td.path(), 0).unwrap();
         assert_eq!(deleted, 0);
@@ -1168,7 +1247,7 @@ mod prune_tests {
             .unwrap();
         for i in 0..2 {
             let sha = make_empty_commit(td.path(), &format!("s{i}"));
-            make_ref(td.path(), &format!("refs/rustyclaw/sessions/s{i}"), &sha);
+            make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
         }
         let deleted = prune_old_refs(td.path(), 10).unwrap();
         assert_eq!(deleted, 0);

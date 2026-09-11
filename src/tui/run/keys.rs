@@ -95,7 +95,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     if let Some(target_pos) =
                         target_pos.filter(|&p| p != session.meta.undo_position)
                     {
-                        match rustyclaw::autocommit::restore_to(
+                        match oxideclaw::autocommit::restore_to(
                             &config.cwd,
                             &session.meta.auto_commits,
                             target_pos,
@@ -130,7 +130,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     if let Some(target_pos) =
                         target_pos.filter(|&p| p != session.meta.undo_position)
                     {
-                        match rustyclaw::autocommit::restore_to(
+                        match oxideclaw::autocommit::restore_to(
                             &config.cwd,
                             &session.meta.auto_commits,
                             target_pos,

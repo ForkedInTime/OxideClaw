@@ -1,7 +1,7 @@
 //! Smoke tests for the ToolMiddleware trait.
 
 use async_trait::async_trait;
-use rustyclaw::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
+use oxideclaw::browser::middleware::{MiddlewareVerdict, ToolMiddleware};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 

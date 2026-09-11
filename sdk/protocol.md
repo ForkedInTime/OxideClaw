@@ -1,10 +1,10 @@
-# RustyClaw SDK Protocol Reference
+# OxideClaw SDK Protocol Reference
 
 NDJSON (newline-delimited JSON) over stdio. One JSON object per line.
 
-- **Requests** (host -> RustyClaw): have `"id"` and `"type"` fields
-- **Responses** (RustyClaw -> host): have `"id"` (matching the request) and `"type"` fields
-- **Notifications** (RustyClaw -> host): have `"session_id"` and `"type"` fields, no `"id"`
+- **Requests** (host -> OxideClaw): have `"id"` and `"type"` fields
+- **Responses** (OxideClaw -> host): have `"id"` (matching the request) and `"type"` fields
+- **Notifications** (OxideClaw -> host): have `"session_id"` and `"type"` fields, no `"id"`
 
 ---
 
@@ -150,7 +150,7 @@ Search the codebase index. No API key needed — uses the local SQLite FTS5 inde
 }
 ```
 
-The index must be built first (run `rustyclaw` interactively and use `/rag index`, or the index is built automatically on first run).
+The index must be built first (run `oxideclaw` interactively and use `/rag index`, or the index is built automatically on first run).
 
 ---
 

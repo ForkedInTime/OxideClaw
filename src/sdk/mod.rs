@@ -1,4 +1,4 @@
-//! RustyClaw SDK — headless NDJSON server for embedding.
+//! OxideClaw SDK — headless NDJSON server for embedding.
 //!
 //! `SdkServer::run()` is the main loop: reads requests from a `Transport`,
 //! dispatches to `SdkSession` instances, and forwards notifications/approvals

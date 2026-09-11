@@ -1,5 +1,5 @@
 // tests/sdk_protocol.rs
-use rustyclaw::sdk::protocol::*;
+use oxideclaw::sdk::protocol::*;
 
 #[test]
 fn test_session_start_deserialize() {

@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-use rustyclaw::autofix::{AutoFixAction, AutoFixConfig, AutoFixTrigger, run_auto_fix_check};
+use oxideclaw::autofix::{AutoFixAction, AutoFixConfig, AutoFixTrigger, run_auto_fix_check};
 use std::fs;
 use tempfile::tempdir;
 

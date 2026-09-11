@@ -6,8 +6,8 @@ executable, the wall-clock time of `<tool> --version` (cold start of the
 runtime, N runs, median and p95), and the peak resident set of that process
 (ru_maxrss of the child). Prints a Markdown table.
 
-    scripts/bench.py                      # rustyclaw + whatever rivals are on PATH
-    scripts/bench.py --runs 30 rustyclaw claude codex gemini goose opencode
+    scripts/bench.py                      # oxideclaw + whatever rivals are on PATH
+    scripts/bench.py --runs 30 oxideclaw claude codex gemini goose opencode
 """
 import argparse
 import os
@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-DEFAULT_TOOLS = ["rustyclaw", "claude", "codex", "gemini", "goose", "opencode", "jcode", "codewhale", "claurst", "ante"]
+DEFAULT_TOOLS = ["oxideclaw", "claude", "codex", "gemini", "goose", "opencode", "jcode", "codewhale", "claurst", "ante"]
 
 
 def real_size(path):

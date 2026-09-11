@@ -1,6 +1,6 @@
 /// BriefTool (SendUserMessage) — primary output channel for formatted responses.
 ///
-/// In rustyclaw (TS) this is gated behind the KAIROS build-time feature flag,
+/// In oxideclaw (TS) this is gated behind the KAIROS build-time feature flag,
 /// making it dead code in external builds. In Rust there is no build-time DCE
 /// system, so the tool is always available.
 use crate::tools::{Tool, ToolContext, ToolOutput};

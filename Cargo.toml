@@ -1,19 +1,22 @@
 [package]
-name = "rustyclaw"
-version = "0.3.2"
+name = "oxideclaw"
+version = "0.4.0"
 edition = "2024"
 description = "Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning. Claude, Ollama, and OpenAI-compatible backends."
 license = "Apache-2.0"
-repository = "https://github.com/ForkedInTime/RustyClaw"
+repository = "https://github.com/ForkedInTime/OxideClaw"
 keywords = ["cli", "ai", "coding-agent", "claude", "ollama"]
 categories = ["command-line-utilities", "development-tools"]
+# Keep the crates.io tarball small: images, CI, packaging, and the SDK docs
+# live on GitHub.
+exclude = ["assets/*", ".github/*", "contrib/*", "scripts/*", "sdk/*", ".kilocodeignore", "CLAUDE.md", ".secret/*"]
 
 [lib]
-name = "rustyclaw"
+name = "oxideclaw"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rustyclaw"
+name = "oxideclaw"
 path = "src/main.rs"
 
 [dependencies]

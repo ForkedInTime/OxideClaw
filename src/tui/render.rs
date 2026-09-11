@@ -1,7 +1,7 @@
-/// Render — matches rustyclaw's visual style exactly.
+/// Render — matches oxideclaw's visual style exactly.
 ///
 /// Welcome screen:
-///   ─ rustyclaw v0.1.0 ──────────────────────────────────────────
+///   ─ oxideclaw v0.1.0 ──────────────────────────────────────────
 ///   │  Welcome back, yetipaw!   │  Tips for getting started         │
 ///   │  [logo]                   │  ──────────────────────────────   │
 ///   │  ● sonnet-4-6 · label     │  Recent activity                  │
@@ -24,7 +24,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-// Orange/amber — rustyclaw accent (dark theme default)
+// Orange/amber — oxideclaw accent (dark theme default)
 const ACCENT: Color = Color::Rgb(255, 165, 0);
 const USER_BG: Color = Color::Rgb(30, 30, 35);
 
@@ -148,14 +148,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-// ── Welcome banner — 2-column bordered box matching the TS rustyclaw fork ──────
+// ── Welcome banner — 2-column bordered box matching the TS oxideclaw fork ──────
 
 fn draw_banner(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.accent))
         .title(Span::styled(
-            format!(" rustyclaw v{VERSION} "),
+            format!(" oxideclaw v{VERSION} "),
             Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
         ));
 
@@ -351,7 +351,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     for entry in &app.entries {
         match entry.kind {
             EntryKind::User => {
-                // Full-width dimmed row with dark background — matches rustyclaw
+                // Full-width dimmed row with dark background — matches oxideclaw
                 let first_line = entry.text.lines().next().unwrap_or("");
                 let pad = width.saturating_sub(first_line.len() + 4);
                 let header = format!(" > {}{}", first_line, " ".repeat(pad));
@@ -623,7 +623,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     }
 }
 
-// ── Input line (no border — matches rustyclaw's plain "> " prompt) ────────────
+// ── Input line (no border — matches oxideclaw's plain "> " prompt) ────────────
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeColors) {
     let text_style = Style::default().fg(Color::White);
@@ -695,7 +695,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeC
                     Span::styled(after, text_style),
                 ];
                 if show_placeholder {
-                    spans.push(Span::styled("Message rustyclaw…", suggestion_style));
+                    spans.push(Span::styled("Message oxideclaw…", suggestion_style));
                 } else if let Some(ref sug) = suggestion {
                     spans.push(Span::styled(sug.clone(), suggestion_style));
                 }
@@ -839,7 +839,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         ));
     }
 
-    // Right side: "● model-name" — clean, no token counts (matches rustyclaw)
+    // Right side: "● model-name" — clean, no token counts (matches oxideclaw)
     let right_text = format!("● {} ", app.model_short);
     let right_width = right_text.len() as u16;
     let left_width = area.width.saturating_sub(right_width);

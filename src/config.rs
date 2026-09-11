@@ -710,7 +710,7 @@ impl Config {
         //
         //   ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN → ant auth login profile
         //
-        // RustyClaw's own explicit mechanisms (RUSTYCLAW_API_KEY_FILE_DESCRIPTOR,
+        // OxideClaw's own explicit mechanisms (OXIDECLAW_API_KEY_FILE_DESCRIPTOR,
         // apiKeyHelper) run between the env vars and the profile — see the
         // `ant`-profile fallback further down. Explicit local configuration
         // should beat ambient machine state.
@@ -721,7 +721,7 @@ impl Config {
             cfg.api_key = resolved.credential.secret().to_string();
         }
 
-        // ── RUSTYCLAW_API_KEY_FILE_DESCRIPTOR: read API key from an open fd.
+        // ── OXIDECLAW_API_KEY_FILE_DESCRIPTOR: read API key from an open fd.
         //    Unix-only — Windows uses HANDLEs, not POSIX fds, and the
         //    cross-platform equivalent (handle-based reads) is not worth
         //    the additional complexity for a feature that is principally
@@ -729,7 +729,7 @@ impl Config {
         #[cfg(unix)]
         {
             if cfg.api_key.is_empty()
-                && let Ok(fd_str) = std::env::var("RUSTYCLAW_API_KEY_FILE_DESCRIPTOR")
+                && let Some(fd_str) = app_env("API_KEY_FILE_DESCRIPTOR")
                 && let Ok(fd) = fd_str.parse::<i32>()
             {
                 use std::io::Read;
@@ -789,7 +789,7 @@ impl Config {
         if let Ok(host) = std::env::var("OLLAMA_HOST") {
             cfg.ollama_host = host;
         }
-        if let Ok(v) = std::env::var("RUSTYCLAW_VERBOSE") {
+        if let Some(v) = app_env("VERBOSE") {
             cfg.verbose = v == "1" || v.eq_ignore_ascii_case("true");
         }
         if let Ok(v) = std::env::var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS") {
@@ -917,7 +917,7 @@ impl Config {
     }
 
     /// Load and merge all AGENTS.md files in priority order (same as CLAUDE.md).
-    /// Industry-standard agent configuration — works across RustyClaw, [redacted], [redacted], etc.
+    /// Industry-standard agent configuration — works across OxideClaw, [redacted], [redacted], etc.
     pub fn load_agents_md(cwd: &Path) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1003,16 +1003,16 @@ impl Config {
 
     /// Path to the config directory (XDG-aware).
     ///
-    /// Priority: $CLAUDE_CONFIG_DIR > $XDG_CONFIG_HOME/rustyclaw > ~/.claude
+    /// Priority: $CLAUDE_CONFIG_DIR > $XDG_CONFIG_HOME/oxideclaw > ~/.claude
     /// Falls back to ~/.claude for backward compatibility.
     pub fn claude_dir() -> PathBuf {
         // Explicit override
         if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
             return PathBuf::from(dir);
         }
-        // XDG: use $XDG_CONFIG_HOME/rustyclaw if XDG_CONFIG_HOME is set
+        // XDG: use $XDG_CONFIG_HOME/oxideclaw if XDG_CONFIG_HOME is set
         if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            let xdg_path = PathBuf::from(&xdg).join("rustyclaw");
+            let xdg_path = app_dir(Path::new(&xdg));
             // Use XDG path if it already exists, or if ~/.claude does NOT exist
             let legacy = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -1030,6 +1030,9 @@ impl Config {
     /// Path to the data directory (XDG-aware).
     /// Used for sessions, RAG database, and other persistent data.
     pub fn data_dir() -> PathBuf {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            let _ = app_dir(Path::new(&xdg)); // migrate a legacy directory first
+        }
         compute_data_dir(
             std::env::var("XDG_DATA_HOME").ok().as_deref(),
             Self::claude_dir(),
@@ -1041,7 +1044,7 @@ impl Config {
     #[allow(dead_code)] // available for RAG cache, session cache, etc.
     pub fn cache_dir() -> PathBuf {
         if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-            return PathBuf::from(&xdg).join("rustyclaw");
+            return app_dir(Path::new(&xdg));
         }
         Self::claude_dir().join("cache")
     }
@@ -1103,7 +1106,7 @@ impl Config {
         styles
     }
 
-    /// Build the full system prompt, matching the original rustyclaw prompt structure.
+    /// Build the full system prompt, matching the original oxideclaw prompt structure.
     /// Includes the dynamic `<env>` block (cwd, git, platform, shell, OS).
     pub fn build_system_prompt(&self) -> String {
         let cwd = self.cwd.display().to_string();
@@ -1148,7 +1151,7 @@ impl Config {
             };
 
             let external_prompt = format!(
-                "You are a highly capable AI coding assistant running inside RustyClaw, \
+                "You are a highly capable AI coding assistant running inside OxideClaw, \
                  a terminal-based coding agent.\n\
                  \n\
                  Model: {provider_label}\n\
@@ -1190,7 +1193,7 @@ impl Config {
         }
 
         let base = format!(
-            r#"You are RustyClaw, an interactive CLI agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+            r#"You are OxideClaw, an interactive CLI agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
 
 IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
 IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
@@ -1213,7 +1216,7 @@ IMPORTANT: You must NEVER generate or guess URLs for the user unless you are con
  - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs).
  - Don't create helpers, utilities, or abstractions for one-time operations. Three similar lines of code is better than a premature abstraction.
  - Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, or adding // removed comments for removed code. If something is unused, delete it.
- - If the user asks for help with rustyclaw, tell them to type /help at the input prompt.
+ - If the user asks for help with oxideclaw, tell them to type /help at the input prompt.
 
 # Output efficiency
  - Go straight to the point. Try the simplest approach first. Be extra concise.
@@ -1300,9 +1303,9 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
  - OS Version: {os_version}
  - You are powered by the model {model}.
 
-# RustyClaw session
- - You are running inside RustyClaw, a Rust-native CLI agent. Do NOT try to find or run the rustyclaw binary — you are already running inside it.
- - Slash commands are handled directly by RustyClaw (not by you via tool calls):
+# OxideClaw session
+ - You are running inside OxideClaw, a Rust-native CLI agent. Do NOT try to find or run the oxideclaw binary — you are already running inside it.
+ - Slash commands are handled directly by OxideClaw (not by you via tool calls):
      /help                        — show available commands and tools
      /clear                       — clear conversation history
      /compact                     — summarise conversation to free context space
@@ -1399,6 +1402,98 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
     }
 }
 
+// ── Name-compatibility layer (RustyClaw → OxideClaw, 2026-09) ─────────────────
+
+/// Directory name under `$XDG_*_HOME`.
+pub const APP_DIR_NAME: &str = "oxideclaw";
+/// Directory name used before the rename; moved to `APP_DIR_NAME` on first sight.
+pub const LEGACY_APP_DIR_NAME: &str = "rustyclaw";
+/// Environment-variable prefixes, newest first.
+pub const ENV_PREFIXES: [&str; 2] = ["OXIDECLAW_", "RUSTYCLAW_"];
+
+/// `base/oxideclaw`, migrating a `base/rustyclaw` left by the old name.
+/// Never creates the directory; if the move fails the legacy path is
+/// returned so an existing install keeps working.
+pub fn app_dir(base: &Path) -> PathBuf {
+    let new = base.join(APP_DIR_NAME);
+    let old = base.join(LEGACY_APP_DIR_NAME);
+    if !new.exists() && old.is_dir() {
+        match std::fs::rename(&old, &new) {
+            Ok(()) => tracing::info!("moved {} to {}", old.display(), new.display()),
+            Err(e) => {
+                tracing::warn!("could not move {} to {}: {e}", old.display(), new.display());
+                return old;
+            }
+        }
+    }
+    new
+}
+
+/// `OXIDECLAW_<suffix>`, or `RUSTYCLAW_<suffix>` if only the old name is set.
+pub fn app_env(suffix: &str) -> Option<String> {
+    ENV_PREFIXES
+        .iter()
+        .find_map(|p| std::env::var(format!("{p}{suffix}")).ok())
+}
+
+#[cfg(test)]
+mod rename_compat_tests {
+    use super::*;
+
+    #[test]
+    fn a_legacy_directory_is_moved_to_the_new_name() {
+        let td = tempfile::tempdir().unwrap();
+        let old = td.path().join(LEGACY_APP_DIR_NAME);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("settings.json"), "{}").unwrap();
+        let got = app_dir(td.path());
+        assert_eq!(got, td.path().join(APP_DIR_NAME));
+        assert!(got.join("settings.json").exists(), "contents must move");
+        assert!(!old.exists(), "legacy dir must be gone");
+    }
+
+    #[test]
+    fn an_existing_new_directory_wins_and_legacy_is_untouched() {
+        let td = tempfile::tempdir().unwrap();
+        let old = td.path().join(LEGACY_APP_DIR_NAME);
+        let new = td.path().join(APP_DIR_NAME);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("marker"), "").unwrap();
+        assert_eq!(app_dir(td.path()), new);
+        assert!(old.join("marker").exists());
+    }
+
+    #[test]
+    fn nothing_is_created_when_neither_exists() {
+        let td = tempfile::tempdir().unwrap();
+        let got = app_dir(td.path());
+        assert_eq!(got, td.path().join(APP_DIR_NAME));
+        assert!(!got.exists());
+        assert!(!td.path().join(LEGACY_APP_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn app_env_prefers_the_new_prefix_and_falls_back_to_the_old() {
+        // Unique suffix so parallel tests cannot collide.
+        let sfx = "RENAME_COMPAT_PROBE_7f3a";
+        // SAFETY: test-local variable names nobody else reads.
+        unsafe {
+            std::env::remove_var(format!("OXIDECLAW_{sfx}"));
+            std::env::remove_var(format!("RUSTYCLAW_{sfx}"));
+        }
+        assert_eq!(app_env(sfx), None);
+        unsafe { std::env::set_var(format!("RUSTYCLAW_{sfx}"), "old") };
+        assert_eq!(app_env(sfx).as_deref(), Some("old"));
+        unsafe { std::env::set_var(format!("OXIDECLAW_{sfx}"), "new") };
+        assert_eq!(app_env(sfx).as_deref(), Some("new"));
+        unsafe {
+            std::env::remove_var(format!("OXIDECLAW_{sfx}"));
+            std::env::remove_var(format!("RUSTYCLAW_{sfx}"));
+        }
+    }
+}
+
 /// Pure helper for `Config::data_dir()` — all I/O is injected so the
 /// fallback logic is unit-testable without mutating process env vars.
 ///
@@ -1419,7 +1514,7 @@ fn compute_data_dir(
     exists: impl Fn(&Path) -> bool,
 ) -> PathBuf {
     if let Some(xdg) = xdg_data_home {
-        let xdg_path = PathBuf::from(xdg).join("rustyclaw");
+        let xdg_path = PathBuf::from(xdg).join(APP_DIR_NAME);
         let legacy_sessions = claude_dir.join("sessions");
         if exists(&xdg_path) || !exists(&legacy_sessions) {
             return xdg_path;
@@ -1468,17 +1563,17 @@ mod data_dir_tests {
     fn xdg_set_fresh_install_uses_xdg() {
         let legacy = PathBuf::from("/home/u/.claude");
         let got = compute_data_dir(Some("/home/u/.local/share"), legacy, |_| false);
-        assert_eq!(got, PathBuf::from("/home/u/.local/share/rustyclaw"));
+        assert_eq!(got, PathBuf::from("/home/u/.local/share/oxideclaw"));
     }
 
-    /// XDG set, the XDG path already exists (from a prior RustyClaw run
+    /// XDG set, the XDG path already exists (from a prior OxideClaw run
     /// with XDG active) → use XDG even if legacy sessions also exist.
     /// This matches the "explicit opt-in wins" rule.
     #[test]
     fn xdg_path_already_exists_wins_over_legacy() {
         let legacy = PathBuf::from("/home/u/.claude");
         let legacy_sessions = legacy.join("sessions");
-        let xdg_path = PathBuf::from("/home/u/.local/share/rustyclaw");
+        let xdg_path = PathBuf::from("/home/u/.local/share/oxideclaw");
 
         let got = compute_data_dir(Some("/home/u/.local/share"), legacy.clone(), |p: &Path| {
             p == legacy_sessions || p == xdg_path
@@ -1490,11 +1585,11 @@ mod data_dir_tests {
     }
 
     /// XDG set to an empty string → must still fall through to legacy,
-    /// not join to "/rustyclaw" with an empty prefix.
+    /// not join to "/oxideclaw" with an empty prefix.
     #[test]
     fn empty_xdg_value_is_not_a_valid_path() {
         let legacy = PathBuf::from("/home/u/.claude");
-        // With an empty XDG_DATA_HOME, joining produces "rustyclaw" which
+        // With an empty XDG_DATA_HOME, joining produces "oxideclaw" which
         // is a relative path. compute_data_dir still honours the "legacy
         // sessions exist" guard, so as long as that guard is present the
         // legacy wins. Confirm that behavior.

@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-BIN="${1:-target/release/rustyclaw}"
+BIN="${1:-target/release/oxideclaw}"
 
 if [ ! -x "$BIN" ]; then
   echo "binary not found at $BIN — build it first: cargo build --release" >&2

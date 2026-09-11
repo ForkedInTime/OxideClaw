@@ -1,6 +1,6 @@
 #[test]
 fn parse_yaml_frontmatter_skill() {
-    use rustyclaw::skills::parse_skill_from_content;
+    use oxideclaw::skills::parse_skill_from_content;
     let content = r#"---
 name: scrape-prices
 description: Extract product prices
@@ -16,7 +16,7 @@ Navigate to {{url}} and extract prices. Max pages: {{max_pages}}."#;
     assert_eq!(skill.category.as_deref(), Some("browser"));
     assert_eq!(skill.params.len(), 2);
     // Map order from serde_yaml is insertion-order; assertion is loose for robustness
-    let by_name: std::collections::HashMap<&str, &rustyclaw::skills::SkillParam> =
+    let by_name: std::collections::HashMap<&str, &oxideclaw::skills::SkillParam> =
         skill.params.iter().map(|p| (p.name.as_str(), p)).collect();
     assert!(by_name["url"].required);
     assert_eq!(by_name["max_pages"].default.as_deref(), Some("3"));
@@ -24,7 +24,7 @@ Navigate to {{url}} and extract prices. Max pages: {{max_pages}}."#;
 
 #[test]
 fn expand_named_params() {
-    use rustyclaw::skills::parse_skill_from_content;
+    use oxideclaw::skills::parse_skill_from_content;
     let content = r#"---
 name: test-skill
 description: A test
@@ -42,7 +42,7 @@ Fetch {{url}} and get {{count}} items."#;
 
 #[test]
 fn expand_named_params_uses_defaults() {
-    use rustyclaw::skills::parse_skill_from_content;
+    use oxideclaw::skills::parse_skill_from_content;
     let content = r#"---
 name: test-skill
 description: A test
@@ -60,7 +60,7 @@ Fetch {{url}} and get {{count}} items."#;
 
 #[test]
 fn backward_compat_args_blob() {
-    use rustyclaw::skills::parse_skill_from_content;
+    use oxideclaw::skills::parse_skill_from_content;
     let content = "# Old Skill\nDoes a thing.\n---\nPlease do {{ARGS}}.";
     let skill = parse_skill_from_content(content, "old-skill").unwrap();
     assert!(skill.params.is_empty());
@@ -71,7 +71,7 @@ fn backward_compat_args_blob() {
 
 #[test]
 fn filter_skills_by_category() {
-    use rustyclaw::skills::{Skill, SkillParam};
+    use oxideclaw::skills::{Skill, SkillParam};
     let skills = [
         Skill {
             name: "a".into(),

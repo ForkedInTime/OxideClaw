@@ -22,31 +22,31 @@ jobs:
           # ── Linux ──────────────────────────────────────────────
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: rustyclaw-linux-x64
+            artifact: oxideclaw-linux-x64
             cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: rustyclaw-linux-arm64
+            artifact: oxideclaw-linux-arm64
             cross: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: rustyclaw-linux-x64-musl
+            artifact: oxideclaw-linux-x64-musl
             cross: true
 
           # ── macOS ──────────────────────────────────────────────
           - target: x86_64-apple-darwin
             os: macos-14          # Apple Silicon runner (cross-compiles to x86_64)
-            artifact: rustyclaw-macos-x64
+            artifact: oxideclaw-macos-x64
             cross: false
           - target: aarch64-apple-darwin
             os: macos-14          # Apple Silicon runner
-            artifact: rustyclaw-macos-arm64
+            artifact: oxideclaw-macos-arm64
             cross: false
 
           # ── Windows ────────────────────────────────────────────
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: rustyclaw-windows-x64.exe
+            artifact: oxideclaw-windows-x64.exe
             cross: false
 
     runs-on: ${{ matrix.os }}
@@ -82,14 +82,14 @@ jobs:
       - name: Rename binary (unix)
         if: runner.os != 'Windows'
         run: |
-          cp target/${{ matrix.target }}/release/rustyclaw ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/oxideclaw ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
 
       - name: Rename binary (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "target/${{ matrix.target }}/release/rustyclaw.exe" "${{ matrix.artifact }}"
+          Copy-Item "target/${{ matrix.target }}/release/oxideclaw.exe" "${{ matrix.artifact }}"
 
       - name: Generate checksum (unix)
         if: runner.os != 'Windows'
@@ -143,7 +143,7 @@ jobs:
           SCRIPT
           # Build proper manifest with jq
           echo '{}' > manifest.json
-          for f in rustyclaw-*; do
+          for f in oxideclaw-*; do
             [[ "$f" == *.sha256 ]] && continue
             [[ ! -f "${f}.sha256" ]] && continue
             checksum=$(cut -d' ' -f1 < "${f}.sha256")
@@ -171,6 +171,6 @@ jobs:
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           gh release create "$TAG" \
-            --title "RustyClaw $TAG" \
+            --title "OxideClaw $TAG" \
             --generate-notes \
             release/*

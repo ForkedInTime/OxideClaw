@@ -446,7 +446,7 @@ pub(crate) fn initialize_result() -> Value {
             "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
             "mcpCapabilities": {"http": false, "sse": false},
         },
-        "agentInfo": {"name": "rustyclaw", "title": "RustyClaw", "version": VERSION},
+        "agentInfo": {"name": "oxideclaw", "title": "OxideClaw", "version": VERSION},
         "authMethods": [],
     })
 }
@@ -661,7 +661,7 @@ mod tests {
             r["agentCapabilities"]["mcpCapabilities"]["http"],
             json!(false)
         );
-        assert_eq!(r["agentInfo"]["name"], json!("rustyclaw"));
+        assert_eq!(r["agentInfo"]["name"], json!("oxideclaw"));
         assert_eq!(r["agentInfo"]["version"], json!(VERSION));
         assert_eq!(r["authMethods"], json!([]));
     }

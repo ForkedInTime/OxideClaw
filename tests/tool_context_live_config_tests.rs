@@ -6,7 +6,7 @@
 //! against the OLD model" bug class (a known regression in multiple
 //! competing tools in this space).
 
-use rustyclaw::tools::ToolContext;
+use oxideclaw::tools::ToolContext;
 use std::path::PathBuf;
 
 #[test]

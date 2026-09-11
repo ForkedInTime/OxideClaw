@@ -1,4 +1,4 @@
-/// TUI — split-panel layout matching the original rustyclaw (React/Ink) look.
+/// TUI — split-panel layout matching the original oxideclaw (React/Ink) look.
 /// Left panel: file listing.  Right panel: chat / welcome.
 /// Uses ratatui + crossterm with alternate screen.
 pub mod app;

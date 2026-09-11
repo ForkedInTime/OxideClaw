@@ -203,7 +203,7 @@ impl RagDb {
 
 /// Read the persisted schema version from the `rag_meta` table.
 /// Returns 0 if the row is missing (fresh DB, pre-versioning DB, or one
-/// opened by an older RustyClaw that never wrote the key).
+/// opened by an older OxideClaw that never wrote the key).
 pub(crate) fn read_schema_version(conn: &Connection) -> Result<i64> {
     let v: Option<String> = conn
         .query_row(
@@ -226,13 +226,13 @@ pub(crate) fn read_schema_version(conn: &Connection) -> Result<i64> {
 /// The strategy:
 ///   - Read `rag_meta['schema_version']`. Missing → treat as 0.
 ///   - If 0, this is either a fresh DB or one created by a pre-migration
-///     RustyClaw build. Either way, the v1 shape has already been ensured
+///     OxideClaw build. Either way, the v1 shape has already been ensured
 ///     above by `CREATE TABLE IF NOT EXISTS`, so we can safely jump to 1.
 ///   - For any future version N, add a `from_{N-1}_to_{N}(&conn)?` step
 ///     here and bump `RAG_SCHEMA_VERSION`. Each step runs inside a
 ///     transaction so a partial migration cannot leave the DB wedged.
 ///   - If the persisted version is HIGHER than `RAG_SCHEMA_VERSION` (user
-///     downgraded RustyClaw), we don't fail — we just log and continue
+///     downgraded OxideClaw), we don't fail — we just log and continue
 ///     with the assumption that newer schemas are backward-compatible for
 ///     read. This matches well-behaved tooling in the space and avoids the
 ///     "downgrade destroys your index" failure mode.
@@ -366,7 +366,7 @@ mod tests {
         );
     }
 
-    /// A DB created by an older RustyClaw build (pre-versioning, so no
+    /// A DB created by an older OxideClaw build (pre-versioning, so no
     /// `schema_version` row exists) must be treated as version 0 and
     /// migrated up to current on open. This is the concrete "fallback"
     /// case: old data must keep working after a schema change.
@@ -441,7 +441,7 @@ mod tests {
     }
 
     /// A DB claiming a higher schema_version than this build supports
-    /// must not fail — the user downgraded RustyClaw, and we should keep
+    /// must not fail — the user downgraded OxideClaw, and we should keep
     /// the old data usable rather than crash at startup.
     #[test]
     fn future_version_opens_without_error() {

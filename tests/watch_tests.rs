@@ -1,4 +1,4 @@
-use rustyclaw::watch::scan_markers;
+use oxideclaw::watch::scan_markers;
 
 #[test]
 fn scan_ai_markers() {

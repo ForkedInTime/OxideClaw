@@ -266,7 +266,7 @@ pub struct Settings {
     pub auto_fix: Option<AutoFixSettings>,
 
     /// Auto-commit loop: per-turn working-tree snapshots on private shadow refs
-    /// (`refs/rustyclaw/sessions/<id>`) navigable via `/undo` and `/redo`.
+    /// (`refs/oxideclaw/sessions/<id>`) navigable via `/undo` and `/redo`.
     #[serde(rename = "autoCommit")]
     pub auto_commit: Option<AutoCommitSettings>,
 
@@ -313,7 +313,7 @@ pub struct AutoFixSettings {
 /// Default number of session shadow-ref sets to retain on startup prune.
 pub const DEFAULT_KEEP_SESSIONS: u32 = 10;
 /// Default subject prefix for auto-commit messages.
-pub const DEFAULT_MESSAGE_PREFIX: &str = "rustyclaw";
+pub const DEFAULT_MESSAGE_PREFIX: &str = "oxideclaw";
 
 /// Runtime config for the auto-commit loop. Built from `AutoCommitSettings`
 /// in `Config::load` with out-of-range `keep_sessions` clamped to the default.
@@ -342,7 +342,7 @@ pub struct AutoCommitSettings {
     pub enabled: Option<bool>,
     /// How many session refs to keep on startup prune (default: 10, 0 = unlimited).
     pub keep_sessions: Option<u32>,
-    /// Commit subject prefix (default: "rustyclaw").
+    /// Commit subject prefix (default: "oxideclaw").
     pub message_prefix: Option<String>,
 }
 
@@ -726,7 +726,7 @@ mod auto_commit_key_tests {
             auto_commit: Some(AutoCommitSettings {
                 enabled: Some(true),
                 keep_sessions: Some(10),
-                message_prefix: Some("rustyclaw".to_string()),
+                message_prefix: Some("oxideclaw".to_string()),
             }),
             ..Default::default()
         };

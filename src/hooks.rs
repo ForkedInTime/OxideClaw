@@ -327,7 +327,7 @@ fn cap_env_value(v: &str) -> String {
         .rev()
         .find(|&i| v.is_char_boundary(i))
         .unwrap_or(0);
-    format!("{}…[truncated by rustyclaw]", &v[..cut])
+    format!("{}…[truncated by oxideclaw]", &v[..cut])
 }
 
 /// Read a pipe to EOF, keeping at most `cap` bytes.

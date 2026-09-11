@@ -1,4 +1,4 @@
-use rustyclaw::voice::{strip_browse_prefix, voice_routes_to_browse};
+use oxideclaw::voice::{strip_browse_prefix, voice_routes_to_browse};
 
 #[test]
 fn routes_browse_prefix() {

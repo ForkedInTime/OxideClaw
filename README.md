@@ -1,14 +1,16 @@
 <p align="center">
-  <img src="assets/banner.png" alt="RustyClaw — Claude Code, carved in Rust" width="100%">
+  <img src="assets/banner.png" alt="OxideClaw — Claude Code, carved in Rust" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/ForkedInTime/RustyClaw/releases"><img src="https://img.shields.io/github/v/release/ForkedInTime/RustyClaw?style=flat-square&color=B23616" alt="Release"></a>
-  <a href="https://github.com/ForkedInTime/RustyClaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ForkedInTime/RustyClaw/ci.yml?style=flat-square&label=CI&color=B23616" alt="CI"></a>
+  <a href="https://github.com/ForkedInTime/OxideClaw/releases"><img src="https://img.shields.io/github/v/release/ForkedInTime/OxideClaw?style=flat-square&color=B23616" alt="Release"></a>
+  <a href="https://github.com/ForkedInTime/OxideClaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ForkedInTime/OxideClaw/ci.yml?style=flat-square&label=CI&color=B23616" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-B23616?style=flat-square" alt="License"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2024_edition-F08A3E?style=flat-square&logo=rust" alt="Rust"></a>
-  <a href="https://github.com/ForkedInTime/RustyClaw/stargazers"><img src="https://img.shields.io/github/stars/ForkedInTime/RustyClaw?style=flat-square&color=F08A3E" alt="Stars"></a>
+  <a href="https://github.com/ForkedInTime/OxideClaw/stargazers"><img src="https://img.shields.io/github/stars/ForkedInTime/OxideClaw?style=flat-square&color=F08A3E" alt="Stars"></a>
 </p>
+
+<p align="center"><sub>Formerly <b>RustyClaw</b> (renamed 2026-09-11). Existing installs keep working: config, sessions, index and undo history migrate to the new name on first run.</sub></p>
 
 <h3 align="center">A single-binary coding agent that indexes your repo, routes each task to the cheapest capable model, fixes its own lint and test failures, and answers in your own voice.</h3>
 
@@ -18,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" alt="RustyClaw demo" width="100%">
+  <img src="assets/demo.gif" alt="OxideClaw demo" width="100%">
 </p>
 
 ---
@@ -27,23 +29,23 @@
 
 **Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-WebRequest https://github.com/ForkedInTime/RustyClaw/releases/latest/download/rustyclaw-windows-x64.exe -OutFile rustyclaw.exe
+Invoke-WebRequest https://github.com/ForkedInTime/OxideClaw/releases/latest/download/oxideclaw-windows-x64.exe -OutFile oxideclaw.exe
 ```
-Then move `rustyclaw.exe` somewhere on your `PATH` (e.g. `%USERPROFILE%\bin`).
+Then move `oxideclaw.exe` somewhere on your `PATH` (e.g. `%USERPROFILE%\bin`).
 
 **Arch Linux:**
 ```bash
-git clone https://github.com/ForkedInTime/RustyClaw && cd RustyClaw/contrib/aur && makepkg -si
+git clone https://github.com/ForkedInTime/OxideClaw && cd OxideClaw/contrib/aur && makepkg -si
 ```
 
 **Homebrew (macOS / Linux):**
 ```bash
-brew install ForkedInTime/rustyclaw/rustyclaw
+brew install ForkedInTime/oxideclaw/oxideclaw
 ```
 
 <details>
@@ -51,44 +53,44 @@ brew install ForkedInTime/rustyclaw/rustyclaw
 
 **From source (Rust 2024 edition):**
 ```bash
-git clone https://github.com/ForkedInTime/RustyClaw.git
-cd RustyClaw && cargo build --release
-./target/release/rustyclaw
+git clone https://github.com/ForkedInTime/OxideClaw.git
+cd OxideClaw && cargo build --release
+./target/release/oxideclaw
 ```
 
 **Specific version (Linux/macOS):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ForkedInTime/RustyClaw/main/install.sh | bash -s v0.3.2
+curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash -s v0.4.0
 ```
 
-Pre-built binaries attached to every [release](https://github.com/ForkedInTime/RustyClaw/releases):
+Pre-built binaries attached to every [release](https://github.com/ForkedInTime/OxideClaw/releases):
 - Linux: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`
 - macOS: `x86_64-apple-darwin` (Intel), `aarch64-apple-darwin` (Apple Silicon)
-- Windows: `rustyclaw-windows-x64.exe`
+- Windows: `oxideclaw-windows-x64.exe`
 </details>
 
 **Linux / macOS:**
 ```bash
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.env
-rustyclaw
+oxideclaw
 ```
 
 **Windows (PowerShell):**
 ```powershell
 "ANTHROPIC_API_KEY=sk-ant-..." | Out-File -FilePath $HOME\.env -Encoding utf8 -Append
-rustyclaw
+oxideclaw
 ```
 
 ---
 
-## Why RustyClaw?
+## Why OxideClaw?
 
-RustyClaw is a coding agent, not a port. It talks to Claude, Ollama, and 9 OpenAI-compatible providers, and it builds the things only a native binary makes practical: an on-disk index of your codebase, a router that sends each task to the cheapest model that can handle it, agents that run in parallel git worktrees, a lint-and-test loop that fixes its own mistakes, and spoken answers in your own voice.
+OxideClaw is a coding agent, not a port. It talks to Claude, Ollama, and 9 OpenAI-compatible providers, and it builds the things only a native binary makes practical: an on-disk index of your codebase, a router that sends each task to the cheapest model that can handle it, agents that run in parallel git worktrees, a lint-and-test loop that fixes its own mistakes, and spoken answers in your own voice.
 
 How it compares with the agents people actually run. Every cell was checked against the project's public README and source on 2026-09-11.
 ✅ documented · ❌ not offered · — not documented by the project.
 
-| | Claude Code | Codewhale | jcode | claurst | **RustyClaw** |
+| | Claude Code | Codewhale | jcode | claurst | **OxideClaw** |
 |---|---|---|---|---|---|
 | Runtime | JavaScript (Bun-bundled binary) | Rust | Rust | Rust | **Rust, one static binary** |
 | License | Proprietary | MIT | MIT | GPL-3.0 | **Apache-2.0** |
@@ -106,11 +108,11 @@ How it compares with the agents people actually run. Every cell was checked agai
 | OpenAI-compatible providers | ❌ | ✅ | ✅ | ✅ | **✅ 9 providers** |
 | Lifecycle hooks | ✅ | ✅ | — | ✅ | **✅ 8 events** |
 | MCP servers | ✅ | ✅ | ✅ | ✅ | **✅** |
-| Editor integration (Agent Client Protocol) | via adapter | — | — | ✅ | **✅ `rustyclaw acp`** |
+| Editor integration (Agent Client Protocol) | via adapter | — | — | ✅ | **✅ `oxideclaw acp`** |
 | Sandboxed shell (bwrap / firejail) | ✅ | ✅ | — | — | **✅** |
 | CLAUDE.md + AGENTS.md | CLAUDE.md | — | — | ✅ | **✅ both, `/reload`** |
 
-The first seven rows are where RustyClaw stands apart. The rest is table stakes, and RustyClaw has it too.
+The first seven rows are where OxideClaw stands apart. The rest is table stakes, and OxideClaw has it too.
 
 ---
 
@@ -130,12 +132,12 @@ HAS match "search TOCTOU" — 10 results
 
 ### 💰 &nbsp; Smart model router + live cost dashboard
 
-Simple edits go to Haiku or Ollama. Architecture questions go to Opus. Every token is priced in real time. Cap the bill with `/budget $5` — RustyClaw warns at 80% and stops the loop when the budget is exceeded.
+Simple edits go to Haiku or Ollama. Architecture questions go to Opus. Every token is priced in real time. Cap the bill with `/budget $5` — OxideClaw warns at 80% and stops the loop when the budget is exceeded.
 
 ### 🎭 &nbsp; Parallel agents in git worktrees
 
 ```bash
-rustyclaw spawn "refactor the auth middleware"
+oxideclaw spawn "refactor the auth middleware"
 # runs in an isolated git worktree while you keep working in the main tree
 ```
 
@@ -145,11 +147,11 @@ Push-to-talk speech input (Whisper). TTS responses in any voice, including a clo
 
 ### ♻️ &nbsp; Auto-fix loop
 
-Every `Write`/`Edit` kicks off a lint + test cycle. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — RustyClaw fixes forward.
+Every `Write`/`Edit` kicks off a lint + test cycle. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — OxideClaw fixes forward.
 
 ### ↩️ &nbsp; `/undo` and `/redo` on shadow refs
 
-Every assistant turn silently snapshots the working tree to `refs/rustyclaw/sessions/<id>/<n>`. Invisible to `git log`, `git branch`, `git status`. Never pushed. Use the `/undo` picker or skip straight to a turn with `/undo 3`. **Other tools with undo pollute your history. RustyClaw doesn't.**
+Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`. Invisible to `git log`, `git branch`, `git status`. Never pushed. Use the `/undo` picker or skip straight to a turn with `/undo 3`. **Other tools with undo pollute your history. OxideClaw doesn't.**
 
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 
@@ -161,11 +163,11 @@ Nine CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click
 
 ### 🤖 &nbsp; Autonomous browser mode — `/browse <goal>`
 
-Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July 7` navigates, fills forms, scrolls, reads results, and speaks the answer. 50-step hard cap (configurable), destructive-action approval gate (pauses at payment / delete / OAuth / free-trial-autobill), stagnation detector (escalating nudges when the model is stuck). `rustyclaw browse "<goal>" --json` runs the same loop headless from scripts or CI. `/voice` with prefixes `browse | browser | web | go to | open | shop for | book | order` drives it hands-free with milestone TTS at start, gate trip, and end.
+Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July 7` navigates, fills forms, scrolls, reads results, and speaks the answer. 50-step hard cap (configurable), destructive-action approval gate (pauses at payment / delete / OAuth / free-trial-autobill), stagnation detector (escalating nudges when the model is stuck). `oxideclaw browse "<goal>" --json` runs the same loop headless from scripts or CI. `/voice` with prefixes `browse | browser | web | go to | open | shop for | book | order` drives it hands-free with milestone TTS at start, gate trip, and end.
 
 ### 🦀 &nbsp; Single 19 MB static binary
 
-No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `rustyclaw upgrade` verifies them.
+No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw upgrade` verifies them.
 
 ### 🪝 &nbsp; Lifecycle hooks
 
@@ -177,10 +179,10 @@ Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the too
 
 ### 🧩 &nbsp; Editor integration — Agent Client Protocol
 
-`rustyclaw acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so Zed, JetBrains, and any ACP client can use RustyClaw as their coding agent: streamed replies and thoughts, live tool-call status, permission prompts in the editor's own UI, and mid-turn cancel. In Zed:
+`oxideclaw acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so Zed, JetBrains, and any ACP client can use OxideClaw as their coding agent: streamed replies and thoughts, live tool-call status, permission prompts in the editor's own UI, and mid-turn cancel. In Zed:
 
 ```json
-{ "agent_servers": { "RustyClaw": { "command": "rustyclaw", "args": ["acp"] } } }
+{ "agent_servers": { "OxideClaw": { "command": "oxideclaw", "args": ["acp"] } } }
 ```
 
 ### 🛡️ &nbsp; Sandbox-first execution
@@ -189,7 +191,7 @@ Shell commands can run under `bwrap`, `firejail`, or a `strict` mode (no network
 
 ### 📁 &nbsp; Respects your config like a native tool
 
-XDG Base Directory compliant (`$XDG_CONFIG_HOME/rustyclaw`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME`). Reads **both** `CLAUDE.md` and `AGENTS.md` (3,518 upvotes on the Claude Code repo). Hot-reload with `/reload` — no restart.
+XDG Base Directory compliant (`$XDG_CONFIG_HOME/oxideclaw`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME`). Reads **both** `CLAUDE.md` and `AGENTS.md` (3,518 upvotes on the Claude Code repo). Hot-reload with `/reload` — no restart.
 
 See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ slash commands, every config knob).
 
@@ -199,13 +201,13 @@ See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ sl
 
 ```bash
 # First-run setup
-rustyclaw /init         # generates CLAUDE.md from your repo
-rustyclaw /doctor       # verifies API keys, models, and sandbox
+oxideclaw /init         # generates CLAUDE.md from your repo
+oxideclaw /doctor       # verifies API keys, models, and sandbox
 
 # Day-to-day
-rustyclaw               # interactive TUI
-rustyclaw --headless    # NDJSON stdio for editor/CI embedding (see sdk/)
-rustyclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any ACP client)
+oxideclaw               # interactive TUI
+oxideclaw --headless    # NDJSON stdio for editor/CI embedding (see sdk/)
+oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any ACP client)
 
 # Inside the TUI
 /help                   # interactive command menu
@@ -217,7 +219,7 @@ rustyclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 /undo                   # step back to any previous turn
 ```
 
-`.env` files auto-load from `$CWD/.env`, `~/.env`, or `~/.config/rustyclaw/.env`.
+`.env` files auto-load from `$CWD/.env`, `~/.env`, or `~/.config/oxideclaw/.env`.
 
 ---
 
