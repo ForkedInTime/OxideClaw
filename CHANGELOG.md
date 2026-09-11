@@ -32,11 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is written atomically.
 - `NotebookRead`/`NotebookEdit` and `LSP` panicked on a bare `~` path.
 
-### Changed
+### Removed
 
-- **The cron tools are honest about what they do.** `CronCreate`/`CronList`/
-  `CronDelete` record jobs in `~/.claude/cron_jobs.json`; nothing in RustyClaw
-  runs them. The descriptions now say so.
+- **The cron tools** (`CronCreate`, `CronList`, `CronDelete`). They recorded
+  jobs in `~/.claude/cron_jobs.json` that nothing in RustyClaw ever ran, so a
+  user asking for a recurring reminder got a confident "job created" and then
+  nothing. Rather than build a scheduler for a feature RustyClaw does not
+  sell, the tools are gone. The file, if you have one, is left untouched.
 
 ## [0.3.1] - 2026-09-10
 
