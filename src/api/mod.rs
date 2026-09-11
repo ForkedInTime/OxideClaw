@@ -39,7 +39,9 @@ pub(crate) const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Returns `Ok(None)` on clean end-of-stream. Shared by the Anthropic backend and
 /// the OpenAI-compatible backend (which also serves Ollama), so every streaming path
 /// gets the same stall detection.
-pub(crate) async fn next_sse_event<S, E>(stream: &mut S) -> Result<Option<eventsource_stream::Event>>
+pub(crate) async fn next_sse_event<S, E>(
+    stream: &mut S,
+) -> Result<Option<eventsource_stream::Event>>
 where
     S: futures_util::Stream<Item = std::result::Result<eventsource_stream::Event, E>> + Unpin,
     E: std::fmt::Display,
@@ -98,10 +100,7 @@ impl ClaudeClient {
                 headers.insert("x-api-key", k.parse()?);
             }
             crate::auth::Credential::OAuth(token) => {
-                headers.insert(
-                    header::AUTHORIZATION,
-                    format!("Bearer {token}").parse()?,
-                );
+                headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse()?);
                 credential_betas.push(crate::auth::OAUTH_BETA.to_string());
             }
         }
@@ -552,7 +551,10 @@ mod credential_tests {
     #[test]
     fn api_key_request_betas_pass_through_untouched() {
         let c = ClaudeClient::with_credential(&Credential::ApiKey("k".into())).unwrap();
-        assert_eq!(c.beta_header(&["a".into(), "b".into()]).as_deref(), Some("a,b"));
+        assert_eq!(
+            c.beta_header(&["a".into(), "b".into()]).as_deref(),
+            Some("a,b")
+        );
     }
 
     /// `ClaudeClient::new` is the legacy raw-key entry point — it must stay
@@ -590,7 +592,10 @@ mod sse_idle_tests {
             .expect_err("a stream that never yields must time out, not hang");
 
         let msg = err.to_string();
-        assert!(msg.contains("stalled"), "diagnostic should say stalled: {msg}");
+        assert!(
+            msg.contains("stalled"),
+            "diagnostic should say stalled: {msg}"
+        );
         assert!(
             msg.contains(&SSE_IDLE_TIMEOUT.as_secs().to_string()),
             "diagnostic should report the budget that elapsed: {msg}"
@@ -607,7 +612,9 @@ mod sse_idle_tests {
             Ok::<_, Infallible>(event("late but valid"))
         }));
 
-        let got = next_sse_event(&mut stream).await.expect("must not time out");
+        let got = next_sse_event(&mut stream)
+            .await
+            .expect("must not time out");
         assert_eq!(got.map(|e| e.data).as_deref(), Some("late but valid"));
     }
 

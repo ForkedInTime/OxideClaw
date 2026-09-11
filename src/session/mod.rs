@@ -411,7 +411,6 @@ fn human_session_name() -> String {
         .unwrap_or_else(|| "New session".to_string())
 }
 
-
 /// Ensure every `tool_use` is answered by a `tool_result`.
 ///
 /// The API rejects an assistant turn containing a `tool_use` that no following
@@ -504,40 +503,40 @@ fn repair_dangling_tool_uses(messages: &mut Vec<Message>) -> usize {
 /// behaviour can be tested against an explicit file rather than the global
 /// sessions directory.
 fn parse_message_lines(id: &str, content: &str) -> Result<Vec<Message>> {
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        let total = lines.len();
-        let mut out = Vec::with_capacity(total);
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = lines.len();
+    let mut out = Vec::with_capacity(total);
 
-        for (i, line) in lines.into_iter().enumerate() {
-            match serde_json::from_str::<Message>(line) {
-                Ok(m) => out.push(m),
-                Err(e) => {
-                    // A torn *final* line is the expected shape of a crash
-                    // mid-append: nothing else references it, so dropping it
-                    // recovers the whole session minus one turn. Previously any
-                    // bad line failed the entire load via `collect()`, which
-                    // turned a half-written last line into total loss of the
-                    // conversation — the one thing sessions exist to prevent.
-                    if i + 1 == total {
-                        tracing::warn!(
-                            "session {id}: discarding incomplete final line \
+    for (i, line) in lines.into_iter().enumerate() {
+        match serde_json::from_str::<Message>(line) {
+            Ok(m) => out.push(m),
+            Err(e) => {
+                // A torn *final* line is the expected shape of a crash
+                // mid-append: nothing else references it, so dropping it
+                // recovers the whole session minus one turn. Previously any
+                // bad line failed the entire load via `collect()`, which
+                // turned a half-written last line into total loss of the
+                // conversation — the one thing sessions exist to prevent.
+                if i + 1 == total {
+                    tracing::warn!(
+                        "session {id}: discarding incomplete final line \
                              (likely an interrupted write): {e}"
-                        );
-                        break;
-                    }
-                    // Corruption anywhere else is not a torn write. Skipping it
-                    // could drop a tool_use while keeping its tool_result, which
-                    // the API rejects outright — a subtly broken conversation is
-                    // worse than a clear error.
-                    return Err(anyhow::anyhow!(
-                        "session {id} is corrupt at line {} of {total}: {e}. \
+                    );
+                    break;
+                }
+                // Corruption anywhere else is not a torn write. Skipping it
+                // could drop a tool_use while keeping its tool_result, which
+                // the API rejects outright — a subtly broken conversation is
+                // worse than a clear error.
+                return Err(anyhow::anyhow!(
+                    "session {id} is corrupt at line {} of {total}: {e}. \
                          Refusing to load a partial history — later messages may \
                          depend on it.",
-                        i + 1
-                    ));
-                }
+                    i + 1
+                ));
             }
         }
+    }
     // Recovery above can leave an assistant `tool_use` unanswered (its
     // `tool_result` was the torn line). The API rejects that outright, so repair
     // before the history is ever sent.
@@ -724,10 +723,19 @@ mod durability_tests {
     #[test]
     fn torn_final_line_costs_one_turn_not_the_session() {
         let d = tempfile::tempdir().unwrap();
-        write_jsonl(d.path(), "s", &[msg("one"), msg("two"), msg("three")], Some(14));
+        write_jsonl(
+            d.path(),
+            "s",
+            &[msg("one"), msg("two"), msg("three")],
+            Some(14),
+        );
 
         let got = parse(d.path(), "s").expect("a torn tail must not fail the load");
-        assert_eq!(got.len(), 2, "complete turns survive, the torn one is dropped");
+        assert_eq!(
+            got.len(),
+            2,
+            "complete turns survive, the torn one is dropped"
+        );
     }
 
     /// Corruption that is not a torn tail must fail loudly: silently skipping a
@@ -826,7 +834,11 @@ mod durability_tests {
 
         let n = repair_dangling_tool_uses(&mut msgs);
         assert_eq!(n, 1, "only the missing one is synthesised");
-        assert_eq!(msgs.len(), 2, "must not insert a second consecutive user turn");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "must not insert a second consecutive user turn"
+        );
         let mut got = ids_of_results(&msgs[1]);
         got.sort();
         assert_eq!(got, vec!["toolu_1".to_string(), "toolu_2".to_string()]);

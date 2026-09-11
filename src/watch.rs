@@ -3,9 +3,9 @@
 //! Watches files for changes and scans for action markers (AI:, AGENT:).
 //! Integrates with the TUI event loop via AppEvent.
 
+use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent, EventKind};
 use tokio::sync::mpsc;
 
 /// A marker found in a file.
@@ -58,7 +58,7 @@ pub struct WatchConfig {
     /// Glob patterns to include (e.g. `["*.rs", "*.py"]`). Only `*.<ext>` form
     /// is supported for v1; other patterns pass through unconditionally.
     pub patterns: Vec<String>,
-    pub markers: Vec<String>,      // marker patterns to scan for (e.g. "AI:", "AGENT:")
+    pub markers: Vec<String>, // marker patterns to scan for (e.g. "AI:", "AGENT:")
     /// Debounce window. Reserved — actual debouncing will coalesce rapid
     /// bursts in a follow-up task. Rate-limiting (`rate_limit_ms`) currently
     /// provides the only back-pressure.
@@ -129,8 +129,12 @@ pub fn start_watcher(
 
         for path in &event.paths {
             // Skip non-files and gitignored files
-            if !path.is_file() { continue; }
-            if path.components().any(|c| c.as_os_str() == ".git") { continue; }
+            if !path.is_file() {
+                continue;
+            }
+            if path.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
 
             // Extension filter. Patterns like `*.rs` only — anything else
             // (or an empty list) passes through. Keeps the implementation
@@ -141,7 +145,9 @@ pub fn start_watcher(
                     .and_then(|e| e.to_str())
                     .map(|ext| pattern_exts.iter().any(|p| p == ext))
                     .unwrap_or(false);
-                if !matches { continue; }
+                if !matches {
+                    continue;
+                }
             }
 
             let _ = tx.send(WatchEvent::FileChanged { path: path.clone() });
@@ -166,4 +172,3 @@ pub fn start_watcher(
 
     Ok(watcher)
 }
-

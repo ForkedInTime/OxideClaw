@@ -461,7 +461,11 @@ mod tests {
     #[test]
     fn separators_inside_quotes_do_not_split() {
         let parts = split_compound_command("echo 'a; b && c' \"d | e\"");
-        assert_eq!(parts.len(), 1, "quoted separators must not split: {parts:?}");
+        assert_eq!(
+            parts.len(),
+            1,
+            "quoted separators must not split: {parts:?}"
+        );
     }
 
     /// `PowerShell` was absent from SENSITIVE_TOOLS, so `check_with_input`
@@ -484,7 +488,10 @@ mod tests {
         for tool in ["Bash", "PowerShell"] {
             let input = serde_json::json!({ "command": "whoami" });
             assert!(
-                matches!(state().check_with_input(tool, Some(&input)), CheckResult::Ask),
+                matches!(
+                    state().check_with_input(tool, Some(&input)),
+                    CheckResult::Ask
+                ),
                 "{tool} must require approval"
             );
         }

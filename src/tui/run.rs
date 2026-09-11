@@ -453,8 +453,12 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
         ));
     }
-    let mut client: ApiBackend =
-        ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host)?;
+    let mut client: ApiBackend = ApiBackend::new_with_auth(
+        &config.model,
+        &config.api_key,
+        config.auth_is_oauth,
+        &config.ollama_host,
+    )?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
     let settings = crate::settings::Settings::load(&config.cwd);
@@ -829,7 +833,12 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             system_prompt.clear();
             system_prompt.push_str(&config.build_system_prompt());
-            match ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host) {
+            match ApiBackend::new_with_auth(
+                &config.model,
+                &config.api_key,
+                config.auth_is_oauth,
+                &config.ollama_host,
+            ) {
                 Ok(new_client) => {
                     client = new_client;
                 }
@@ -909,15 +918,13 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                         // Already shown at dispatch time
                     }
                     BrowseProgress::Step { n, action, target } => {
-                        app.entries.push(ChatEntry::system(format!(
-                            "  Step {n}: {action} {target}"
-                        )));
+                        app.entries
+                            .push(ChatEntry::system(format!("  Step {n}: {action} {target}")));
                         app.scroll_to_bottom();
                     }
                     BrowseProgress::Nudge { level, text } => {
-                        app.entries.push(ChatEntry::system(format!(
-                            "  ⚠ Nudge L{level}: {text}"
-                        )));
+                        app.entries
+                            .push(ChatEntry::system(format!("  ⚠ Nudge L{level}: {text}")));
                         app.scroll_to_bottom();
                     }
                     BrowseProgress::ApprovalNeeded { .. } => {
@@ -926,7 +933,8 @@ async fn run_loop(mut config: Config, resume_id: Option<String>) -> Result<()> {
                     BrowseProgress::Completed(result) => {
                         let icon = if result.achieved { "✅" } else { "⚠" };
                         app.entries.push(ChatEntry::system(format!(
-                            "{icon} /browse done ({:?}): {}", result.reason, result.summary
+                            "{icon} /browse done ({:?}): {}",
+                            result.reason, result.summary
                         )));
                         app.scroll_to_bottom();
                         app.finish_loading();
@@ -2040,7 +2048,12 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         );
                         *system_prompt = config.build_system_prompt();
                         // Re-create backend when switching between Anthropic ↔ Ollama
-                        match ApiBackend::new_with_auth(&config.model, &config.api_key, config.auth_is_oauth, &config.ollama_host) {
+                        match ApiBackend::new_with_auth(
+                            &config.model,
+                            &config.api_key,
+                            config.auth_is_oauth,
+                            &config.ollama_host,
+                        ) {
                             Ok(new_client) => {
                                 *client = new_client;
                             }
@@ -4053,14 +4066,22 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         );
                         app.entries.push(ChatEntry::system(msg));
                     }
-                    CommandAction::Browse { goal, policy, max_steps } => {
+                    CommandAction::Browse {
+                        goal,
+                        policy,
+                        max_steps,
+                    } => {
                         // Pattern is the parser's "no flag given" sentinel — substitute
                         // the user's configured default unless they explicitly chose a policy.
-                        let policy = if matches!(policy, crate::browser::browse_loop::BrowsePolicy::Pattern) {
-                            crate::browser::browse_loop::BrowsePolicy::from_settings_str(&config.browse_default_policy)
-                        } else {
-                            policy
-                        };
+                        let policy =
+                            if matches!(policy, crate::browser::browse_loop::BrowsePolicy::Pattern)
+                            {
+                                crate::browser::browse_loop::BrowsePolicy::from_settings_str(
+                                    &config.browse_default_policy,
+                                )
+                            } else {
+                                policy
+                            };
                         let max = max_steps.unwrap_or(config.browse_max_steps);
                         app.entries.push(ChatEntry::system(format!(
                             "🌐 /browse started — goal: {goal} (max {max} steps, policy: {policy:?})"
@@ -4075,7 +4096,8 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.browse_approval_rx = Some(approval_rx);
 
                         // Shared current-URL state
-                        let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+                        let current_url =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
 
                         let cfg = config.clone();
                         let all_tools = tools.to_vec();
@@ -4089,7 +4111,11 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         };
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         tokio::spawn(async move {
-                            let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
+                            let channels = crate::browser::browse_loop::BrowseChannels {
+                                progress_tx,
+                                approval_tx,
+                                cancel,
+                            };
                             let result = crate::browser::browse_loop::run_browse(
                                 browse_req,
                                 &cfg,
@@ -4097,7 +4123,8 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                 current_url,
                                 browser_session,
                                 channels,
-                            ).await;
+                            )
+                            .await;
                             if let Err(e) = result {
                                 eprintln!("Browse error: {e}");
                             }
@@ -4198,13 +4225,10 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         match arg.as_deref() {
                             Some("off") | Some("stop") => {
                                 if app.watcher.take().is_some() {
-                                    app.entries.push(ChatEntry::system(
-                                        "Watch mode stopped.",
-                                    ));
+                                    app.entries.push(ChatEntry::system("Watch mode stopped."));
                                 } else {
-                                    app.entries.push(ChatEntry::system(
-                                        "Watch mode was not active.",
-                                    ));
+                                    app.entries
+                                        .push(ChatEntry::system("Watch mode was not active."));
                                 }
                             }
                             Some("status") => {
@@ -4286,10 +4310,17 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                             let handle = tokio::spawn(async move {
                                                 while let Some(ev) = wrx.recv().await {
                                                     let msg = match ev {
-                                                        crate::watch::WatchEvent::FileChanged { path } => {
-                                                            format!("[watch] changed: {}", path.display())
+                                                        crate::watch::WatchEvent::FileChanged {
+                                                            path,
+                                                        } => {
+                                                            format!(
+                                                                "[watch] changed: {}",
+                                                                path.display()
+                                                            )
                                                         }
-                                                        crate::watch::WatchEvent::MarkerFound { marker } => {
+                                                        crate::watch::WatchEvent::MarkerFound {
+                                                            marker,
+                                                        } => {
                                                             format!(
                                                                 "[watch] {} at {}:{} — {}",
                                                                 marker.kind,
@@ -4333,11 +4364,11 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         }
                         match cmd.output().await {
                             Ok(output) if output.status.success() => {
-                                let diff_text = String::from_utf8_lossy(&output.stdout).into_owned();
+                                let diff_text =
+                                    String::from_utf8_lossy(&output.stdout).into_owned();
                                 if diff_text.trim().is_empty() {
-                                    app.entries.push(ChatEntry::system(
-                                        "No uncommitted changes.",
-                                    ));
+                                    app.entries
+                                        .push(ChatEntry::system("No uncommitted changes."));
                                 } else {
                                     let files = crate::tui::diff::parse_unified_diff(&diff_text);
                                     let summary: String = files
@@ -4358,14 +4389,12 @@ async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             }
                             Ok(output) => {
                                 let stderr = String::from_utf8_lossy(&output.stderr);
-                                app.entries.push(ChatEntry::error(format!(
-                                    "git diff failed: {stderr}"
-                                )));
+                                app.entries
+                                    .push(ChatEntry::error(format!("git diff failed: {stderr}")));
                             }
                             Err(e) => {
-                                app.entries.push(ChatEntry::error(format!(
-                                    "git diff failed: {e}"
-                                )));
+                                app.entries
+                                    .push(ChatEntry::error(format!("git diff failed: {e}")));
                             }
                         }
                         app.scroll_to_bottom();
@@ -5175,8 +5204,7 @@ async fn run_api_task(task: ApiTask) {
 
                     // The duplication guard. Losing a partial response is bad;
                     // showing it twice is worse and corrupts the saved turn.
-                    let streamed =
-                        streamed_any.load(std::sync::atomic::Ordering::Relaxed);
+                    let streamed = streamed_any.load(std::sync::atomic::Ordering::Relaxed);
                     if is_retryable && streamed {
                         tracing::warn!(
                             "not retrying: output already streamed, a retry would \

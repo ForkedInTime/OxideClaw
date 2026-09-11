@@ -72,15 +72,40 @@ fn backward_compat_args_blob() {
 #[test]
 fn filter_skills_by_category() {
     use rustyclaw::skills::{Skill, SkillParam};
-    let skills = [Skill { name: "a".into(), description: String::new(), prompt_template: String::new(),
-                category: Some("browser".into()), params: vec![] },
-        Skill { name: "b".into(), description: String::new(), prompt_template: String::new(),
-                category: Some("code".into()), params: vec![] },
-        Skill { name: "c".into(), description: String::new(), prompt_template: String::new(),
-                category: None, params: vec![] }];
-    let _ = SkillParam { name: "x".into(), required: true, default: None,
-                         description: String::new(), enum_values: None };
-    let browser: Vec<_> = skills.iter().filter(|s| s.category.as_deref() == Some("browser")).collect();
+    let skills = [
+        Skill {
+            name: "a".into(),
+            description: String::new(),
+            prompt_template: String::new(),
+            category: Some("browser".into()),
+            params: vec![],
+        },
+        Skill {
+            name: "b".into(),
+            description: String::new(),
+            prompt_template: String::new(),
+            category: Some("code".into()),
+            params: vec![],
+        },
+        Skill {
+            name: "c".into(),
+            description: String::new(),
+            prompt_template: String::new(),
+            category: None,
+            params: vec![],
+        },
+    ];
+    let _ = SkillParam {
+        name: "x".into(),
+        required: true,
+        default: None,
+        description: String::new(),
+        enum_values: None,
+    };
+    let browser: Vec<_> = skills
+        .iter()
+        .filter(|s| s.category.as_deref() == Some("browser"))
+        .collect();
     assert_eq!(browser.len(), 1);
     assert_eq!(browser[0].name, "a");
 }

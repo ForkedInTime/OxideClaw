@@ -792,7 +792,14 @@ pub fn strip_browse_prefix(transcript: &str) -> String {
     let t = transcript.trim();
     let lower = t.to_lowercase();
     for prefix in &[
-        "browse ", "browser ", "web ", "go to ", "open ", "shop for ", "book ", "order ",
+        "browse ",
+        "browser ",
+        "web ",
+        "go to ",
+        "open ",
+        "shop for ",
+        "book ",
+        "order ",
     ] {
         if lower.starts_with(prefix) {
             return t[prefix.len()..].to_string();
@@ -862,11 +869,8 @@ pub async fn await_voice_approval(timeout_secs: u64) -> bool {
     let _ = record_task.await;
 
     // Transcribe with a 30s timeout and check for affirmative keywords.
-    let transcribe_result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        transcribe(None, None),
-    )
-    .await;
+    let transcribe_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), transcribe(None, None)).await;
     let transcript = match transcribe_result {
         Ok(Ok(text)) => text,
         _ => return false, // timeout or transcription error = deny

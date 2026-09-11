@@ -16,7 +16,12 @@ index abc..def 100644
     assert_eq!(file_diffs.len(), 1);
     assert_eq!(file_diffs[0].path, "src/main.rs");
     assert_eq!(file_diffs[0].hunks.len(), 1);
-    assert!(file_diffs[0].hunks[0].lines.iter().any(|l| l.content.contains("println")));
+    assert!(
+        file_diffs[0].hunks[0]
+            .lines
+            .iter()
+            .any(|l| l.content.contains("println"))
+    );
 }
 
 #[test]
@@ -41,4 +46,3 @@ diff --git a/b.rs b/b.rs
     assert_eq!(files[0].path, "a.rs");
     assert_eq!(files[1].path, "b.rs");
 }
-

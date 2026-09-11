@@ -64,7 +64,12 @@ impl Tool for EnterWorktreeTool {
         let input: EnterInput = serde_json::from_value(input)?;
 
         // Must not already be in a worktree
-        if self.state.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return Ok(ToolOutput::error(
                 "Already in a worktree session. Use ExitWorktree first.",
             ));

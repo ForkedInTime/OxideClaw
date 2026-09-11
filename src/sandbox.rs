@@ -373,8 +373,14 @@ mod tests {
     fn unknown_mode_fails_closed() {
         let err = apply_sandbox("echo hi", "strict-typo", Path::new("/tmp"), false)
             .expect_err("an unrecognised mode must not run the command unsandboxed");
-        assert!(err.contains("strict-typo"), "error should name the bad mode: {err}");
-        assert!(err.contains("strict"), "error should list valid modes: {err}");
+        assert!(
+            err.contains("strict-typo"),
+            "error should name the bad mode: {err}"
+        );
+        assert!(
+            err.contains("strict"),
+            "error should list valid modes: {err}"
+        );
     }
 
     #[test]
@@ -395,10 +401,16 @@ mod tests {
     #[test]
     fn firejail_honours_network_setting() {
         let blocked = firejail_wrap("echo hi", Path::new("/tmp"), false);
-        assert!(blocked.contains("--net=none"), "network must be blocked: {blocked}");
+        assert!(
+            blocked.contains("--net=none"),
+            "network must be blocked: {blocked}"
+        );
 
         let allowed = firejail_wrap("echo hi", Path::new("/tmp"), true);
-        assert!(!allowed.contains("--net=none"), "network must be allowed: {allowed}");
+        assert!(
+            !allowed.contains("--net=none"),
+            "network must be allowed: {allowed}"
+        );
     }
 
     #[test]
@@ -466,7 +478,10 @@ mod tests {
         }
         // The literal forms it does catch still work.
         assert!(strict_check("rm -rf /").is_some());
-        assert!(strict_check("RM -RF /").is_some(), "matching is case-insensitive");
+        assert!(
+            strict_check("RM -RF /").is_some(),
+            "matching is case-insensitive"
+        );
     }
 
     #[test]
@@ -487,7 +502,10 @@ mod tests {
     fn shell_quote_escapes_embedded_single_quotes() {
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
         let wrapped = firejail_wrap("echo 'pwn'", Path::new("/tmp/a b"), true);
-        assert!(wrapped.contains(r#"'/tmp/a b'"#), "cwd must stay quoted: {wrapped}");
+        assert!(
+            wrapped.contains(r#"'/tmp/a b'"#),
+            "cwd must stay quoted: {wrapped}"
+        );
     }
 
     /// PowerShell cannot be wrapped by the namespace modes (they exec /bin/sh),

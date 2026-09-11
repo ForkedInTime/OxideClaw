@@ -7,23 +7,59 @@ use std::collections::HashMap;
 
 /// ARIA roles that are interactive (buttons, links, inputs, etc.)
 const INTERACTIVE_ROLES: &[&str] = &[
-    "button", "link", "textbox", "searchbox", "checkbox", "radio",
-    "combobox", "listbox", "option", "menuitem", "menuitemcheckbox",
-    "menuitemradio", "tab", "switch", "slider", "spinbutton",
-    "scrollbar", "treeitem", "gridcell", "columnheader", "rowheader",
+    "button",
+    "link",
+    "textbox",
+    "searchbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "option",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "tab",
+    "switch",
+    "slider",
+    "spinbutton",
+    "scrollbar",
+    "treeitem",
+    "gridcell",
+    "columnheader",
+    "rowheader",
 ];
 
 /// ARIA roles that carry content worth showing
 const CONTENT_ROLES: &[&str] = &[
-    "heading", "img", "image", "paragraph", "list", "listitem",
-    "table", "row", "cell", "navigation", "banner", "main",
-    "complementary", "contentinfo", "form", "region", "alert",
-    "status", "dialog",
+    "heading",
+    "img",
+    "image",
+    "paragraph",
+    "list",
+    "listitem",
+    "table",
+    "row",
+    "cell",
+    "navigation",
+    "banner",
+    "main",
+    "complementary",
+    "contentinfo",
+    "form",
+    "region",
+    "alert",
+    "status",
+    "dialog",
 ];
 
 /// Roles to always skip
 const SKIP_ROLES: &[&str] = &[
-    "none", "presentation", "generic", "RootWebArea", "InlineTextBox",
+    "none",
+    "presentation",
+    "generic",
+    "RootWebArea",
+    "InlineTextBox",
     "LineBreak",
 ];
 
