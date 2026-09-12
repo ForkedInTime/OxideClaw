@@ -150,8 +150,10 @@ pub fn profile_exists(dir: &Path, profile: &str) -> bool {
 
 pub fn load_config(dir: &Path, profile: &str) -> Result<Option<ProfileConfig>> {
     let path = config_path(dir, profile);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
     serde_json::from_str(&text)
         .map(Some)
@@ -160,8 +162,10 @@ pub fn load_config(dir: &Path, profile: &str) -> Result<Option<ProfileConfig>> {
 
 pub fn load_credentials(dir: &Path, profile: &str) -> Result<Option<ProfileCredentials>> {
     let path = credentials_path(dir, profile);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
     let c: ProfileCredentials =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
@@ -379,5 +383,44 @@ mod tests {
             !delete_profile(d.path(), "work").unwrap(),
             "second delete is a no-op"
         );
+    }
+
+    #[test]
+    fn permission_errors_are_propagated_not_silenced() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Skip test if running as root (can read files with 0o000 permissions)
+            if std::env::var("USER").is_ok_and(|u| u == "root") {
+                return;
+            }
+
+            let d = tmp();
+            std::fs::create_dir_all(d.path().join("credentials")).unwrap();
+            let path = d.path().join("credentials/default.json");
+            std::fs::write(&path, "{}").unwrap();
+
+            // Make file unreadable
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            // Verify it's actually unreadable (detect the error before assertion)
+            let is_unreadable = std::fs::read_to_string(&path).is_err();
+            if !is_unreadable {
+                // Running as root or permissions don't work as expected; skip the test
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                return;
+            }
+
+            // load_credentials should return Err with "read" context, not Ok(None)
+            let err = load_credentials(d.path(), "default").unwrap_err();
+            assert!(
+                err.to_string().contains("read"),
+                "error should mention 'read': {err}"
+            );
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 }
