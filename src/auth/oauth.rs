@@ -545,3 +545,53 @@ pub(crate) mod refresh_tests {
         assert!(s.contains("400") && s.contains("invalid_grant"), "{s}");
     }
 }
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+
+    async fn hit(redirect_uri: &str, query: &str) -> (u16, String) {
+        let resp = reqwest::Client::new()
+            .get(format!("{redirect_uri}?{query}"))
+            .send()
+            .await
+            .unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_valid_callback_yields_the_code_and_a_success_page() {
+        let (listener, redirect) = bind_loopback().await.unwrap();
+        assert!(redirect.starts_with("http://localhost:") && redirect.ends_with("/callback"));
+        let waiter = tokio::spawn(async move {
+            wait_for_code(listener, "st", std::time::Duration::from_secs(5)).await
+        });
+        let (status, body) = hit(&redirect, "code=abc&state=st").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("close this tab"), "{body}");
+        assert_eq!(waiter.await.unwrap().unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn a_state_mismatch_is_rejected_with_a_400_page() {
+        let (listener, redirect) = bind_loopback().await.unwrap();
+        let waiter = tokio::spawn(async move {
+            wait_for_code(listener, "st", std::time::Duration::from_secs(5)).await
+        });
+        let (status, body) = hit(&redirect, "code=abc&state=nope").await;
+        assert_eq!(status, 400);
+        assert!(body.contains("state"), "{body}");
+        let err = waiter.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("state mismatch"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_times_out() {
+        let (listener, _) = bind_loopback().await.unwrap();
+        let err = wait_for_code(listener, "st", std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+    }
+}
