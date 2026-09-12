@@ -512,7 +512,6 @@ pub struct PendingUserQuestion {
     pub input: Vec<char>,
     pub cursor: usize,
     /// Mask the input as it is typed (e.g. pasting an API key).
-    #[allow(dead_code)] // rendering the mask lands with the keystore task's dialog
     pub secret: bool,
 }
 

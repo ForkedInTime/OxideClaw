@@ -1265,12 +1265,177 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             ));
         }
 
-        CommandAction::LoginProvider { prefix, .. } | CommandAction::LogoutProvider(prefix) => {
-            // Implemented in the keystore task.
-            app.entries.push(ChatEntry::system(format!(
-                "Provider key management for '{prefix}' is not available yet."
-            )));
+        CommandAction::LoginProvider {
+            prefix,
+            open_key_page,
+        } => {
+            let Some(p): Option<&'static crate::api::ProviderDef> =
+                crate::api::provider_by_prefix(&prefix)
+            else {
+                return Ok(());
+            };
+            if p.key_env.is_empty() || p.prefix == "openai-compat" {
+                let hint = if p.prefix == "lmstudio" {
+                    "LM Studio needs no key. Set the host in your shell:\n  export LM_STUDIO_HOST=http://localhost:1234/v1\nthen /model lmstudio:<model-name>".to_string()
+                } else {
+                    "The generic endpoint needs the base URL in your shell (never from a file):\n  export OPENAI_BASE_URL=https://host/v1\nStoring OPENAI_API_KEY now…".to_string()
+                };
+                app.entries.push(ChatEntry::system(hint));
+                app.scroll_to_bottom();
+                if p.prefix == "lmstudio" {
+                    return Ok(());
+                }
+            }
+            if open_key_page && !p.key_url.is_empty() {
+                let opened = open_in_browser(p.key_url);
+                app.entries.push(ChatEntry::system(if opened {
+                    format!("Opened {} in your browser.", p.key_url)
+                } else {
+                    format!("Could not open a browser. Keys are at {}", p.key_url)
+                }));
+            }
+            let shadow = config
+                .keystore
+                .source(p.key_env)
+                .filter(|s| *s == crate::auth::keystore::KeySource::ShellEnv);
             app.scroll_to_bottom();
+            let tx2 = tx.clone();
+            let ks_lookup_base = {
+                let ks = config.keystore.lookup();
+                ks("OPENAI_BASE_URL").or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+            };
+            tokio::spawn(async move {
+                use crate::api::KeyValidation;
+                use crate::tui::events::{AppEvent, CredentialChange};
+                let base_url = if p.prefix == "openai-compat" {
+                    ks_lookup_base.unwrap_or_default()
+                } else {
+                    p.base_url.to_string()
+                };
+                let mut question = format!(
+                    "Paste your {} API key ({}).{}",
+                    p.name,
+                    p.key_env,
+                    if p.key_url.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nKeys: {}", p.key_url)
+                    }
+                );
+                for _attempt in 0..3 {
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx2.send(AppEvent::AskUser {
+                        question: question.clone(),
+                        reply,
+                        secret: true,
+                    });
+                    let Some(key) = rx
+                        .await
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        let _ =
+                            tx2.send(AppEvent::SystemMessage("Cancelled — no key stored.".into()));
+                        return;
+                    };
+                    let verdict = if base_url.is_empty() {
+                        KeyValidation::Unverified("no base URL to test against".into())
+                    } else {
+                        crate::api::validate_key(p, &base_url, &key).await
+                    };
+                    if let KeyValidation::Rejected(status) = verdict {
+                        question = format!(
+                            "{} rejected that key (HTTP {status}). Paste it again, or Esc to cancel.",
+                            p.name
+                        );
+                        continue;
+                    }
+                    match crate::auth::keystore::save_key(p.key_env, &key) {
+                        Ok(path) => {
+                            let redacted = crate::auth::Credential::ApiKey(key.clone()).redacted();
+                            let note = match verdict {
+                                KeyValidation::Valid => String::new(),
+                                KeyValidation::Unverified(why) => {
+                                    format!("\n  (could not verify the key: {why})")
+                                }
+                                KeyValidation::Rejected(_) => unreachable!(),
+                            };
+                            let shadow_note = match shadow {
+                                Some(_) => format!(
+                                    "\n  ⚠ {} is also exported in your shell; that value wins on the next launch.",
+                                    p.key_env
+                                ),
+                                None => String::new(),
+                            };
+                            let _ = tx2.send(AppEvent::SystemMessage(format!(
+                                "✓ {} key {redacted} saved to {}{note}{shadow_note}\n  /model {}:{}",
+                                p.name,
+                                path.display(),
+                                p.prefix,
+                                if p.default_model.is_empty() { "<model-name>" } else { p.default_model }
+                            )));
+                            let _ =
+                                tx2.send(AppEvent::CredentialChanged(CredentialChange::Provider {
+                                    prefix: p.prefix.to_string(),
+                                    key_env: p.key_env.to_string(),
+                                    value: Some(key),
+                                }));
+                        }
+                        Err(e) => {
+                            let _ = tx2.send(AppEvent::SystemMessage(format!(
+                                "✗ Could not save the key: {e}"
+                            )));
+                        }
+                    }
+                    return;
+                }
+                let _ = tx2.send(AppEvent::SystemMessage(
+                    "Giving up after three rejected keys.".into(),
+                ));
+            });
+        }
+
+        CommandAction::LogoutProvider(prefix) => {
+            let Some(p): Option<&'static crate::api::ProviderDef> =
+                crate::api::provider_by_prefix(&prefix)
+            else {
+                return Ok(());
+            };
+            if p.key_env.is_empty() {
+                app.entries
+                    .push(ChatEntry::system(format!("{} stores no key.", p.name)));
+                app.scroll_to_bottom();
+                return Ok(());
+            }
+            let msg = match crate::auth::keystore::remove_key(p.key_env) {
+                Ok(true) => format!("Removed the stored {} key.", p.name),
+                Ok(false) => format!("No stored {} key to remove.", p.name),
+                Err(e) => format!("Could not remove the {} key: {e}", p.name),
+            };
+            let shadow = matches!(
+                config.keystore.source(p.key_env),
+                Some(
+                    crate::auth::keystore::KeySource::ShellEnv
+                        | crate::auth::keystore::KeySource::ProjectDotenv
+                        | crate::auth::keystore::KeySource::HomeDotenv
+                )
+            );
+            app.entries.push(ChatEntry::system(if shadow {
+                format!("{msg}\n  ⚠ {} still comes from {}; the provider stays configured until you unset it there.", p.key_env, config.keystore.source(p.key_env).map(|s| s.describe()).unwrap_or("elsewhere"))
+            } else {
+                msg
+            }));
+            app.scroll_to_bottom();
+            if !shadow {
+                let _ = tx.send(crate::tui::events::AppEvent::CredentialChanged(
+                    crate::tui::events::CredentialChange::Provider {
+                        prefix: p.prefix.to_string(),
+                        key_env: p.key_env.to_string(),
+                        value: None,
+                    },
+                ));
+            }
         }
 
         CommandAction::PluginList => {

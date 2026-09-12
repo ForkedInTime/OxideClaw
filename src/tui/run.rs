@@ -993,8 +993,18 @@ async fn run_loop(
                                         ));
                                     }
                                 }
-                                CredentialChange::Provider { .. } => {
-                                    // Keystore wiring lands in the keystore task.
+                                CredentialChange::Provider { prefix, key_env, value } => {
+                                    match value {
+                                        Some(v) => config.keystore.set(&key_env, &v, crate::auth::keystore::KeySource::UserDotenv),
+                                        None => config.keystore.remove(&key_env),
+                                    }
+                                    let current_prefix = config.model.split_once(':').map(|(p, _)| p.to_string());
+                                    if current_prefix.as_deref() == Some(prefix.as_str()) {
+                                        match ApiBackend::from_config(&config) {
+                                            Ok(c) => client = c,
+                                            Err(e) => app.entries.push(ChatEntry::error(format!("Backend error: {e}"))),
+                                        }
+                                    }
                                 }
                             }
                             app.scroll_to_bottom();

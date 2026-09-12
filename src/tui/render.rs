@@ -1153,11 +1153,16 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(Clear, popup);
 
+    let title = if q.secret {
+        " Enter API key "
+    } else {
+        " Claude is asking "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            " Claude is asking ",
+            title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1174,9 +1179,11 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::raw(""));
 
-    // Render the text input row with cursor
-    let before: String = q.input[..q.cursor].iter().collect();
-    let rest: Vec<char> = q.input[q.cursor..].to_vec();
+    // Render the text input row with cursor. Secrets are shown as bullets —
+    // one per character, so the cursor math below is unaffected.
+    let shown: Vec<char> = dialog_input_display(&q.input, q.secret).chars().collect();
+    let before: String = shown[..q.cursor].iter().collect();
+    let rest: Vec<char> = shown[q.cursor..].to_vec();
     let cursor_str = rest.first().map_or(" ", |_| " "); // block cursor
     let (cur_ch, after_str) = if rest.is_empty() {
         (" ".to_string(), String::new())
@@ -1222,6 +1229,27 @@ pub(crate) fn overlay_hint(title: &str, interactive: bool) -> &'static str {
         "help" | "help-commands" => " ↑↓ select · Enter open · 1-9 quick · Esc close ",
         "login" => " ↑↓ select · Enter login · 1-9 quick · Esc close ",
         _ => " ↑↓ select · Enter choose · 1-9 quick · Esc close ",
+    }
+}
+
+/// Input row text for the ask-user dialog. Secrets render as bullets.
+pub(crate) fn dialog_input_display(input: &[char], secret: bool) -> String {
+    if secret {
+        "•".repeat(input.len())
+    } else {
+        input.iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::dialog_input_display;
+
+    #[test]
+    fn secrets_render_as_bullets_of_the_same_length() {
+        let chars: Vec<char> = "gsk_abc".chars().collect();
+        assert_eq!(dialog_input_display(&chars, true), "•••••••");
+        assert_eq!(dialog_input_display(&chars, false), "gsk_abc");
     }
 }
 

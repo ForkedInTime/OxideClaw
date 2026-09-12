@@ -49,6 +49,8 @@ pub struct ProviderDef {
     pub extra_headers: &'static [(&'static str, &'static str)],
     /// A widely available model to offer in the picker ("" = none known).
     pub default_model: &'static str,
+    /// Where to get an API key ("" = no key needed, e.g. local providers).
+    pub key_url: &'static str,
 }
 
 /// All known providers. Order matters for display in `/model` help.
@@ -60,6 +62,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "GROQ_API_KEY",
         extra_headers: &[],
         default_model: "llama-3.3-70b-versatile",
+        key_url: "https://console.groq.com/keys",
     },
     ProviderDef {
         prefix: "openrouter",
@@ -71,6 +74,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
             ("X-Title", "OxideClaw"),
         ],
         default_model: "meta-llama/llama-3.3-70b-instruct",
+        key_url: "https://openrouter.ai/keys",
     },
     ProviderDef {
         prefix: "deepseek",
@@ -79,6 +83,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "DEEPSEEK_API_KEY",
         extra_headers: &[],
         default_model: "deepseek-chat",
+        key_url: "https://platform.deepseek.com/api_keys",
     },
     ProviderDef {
         prefix: "lmstudio",
@@ -87,6 +92,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "",
         extra_headers: &[],
         default_model: "",
+        key_url: "",
     },
     ProviderDef {
         prefix: "together",
@@ -95,6 +101,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "TOGETHER_API_KEY",
         extra_headers: &[],
         default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        key_url: "https://api.together.ai/settings/api-keys",
     },
     ProviderDef {
         prefix: "mistral",
@@ -103,6 +110,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "MISTRAL_API_KEY",
         extra_headers: &[],
         default_model: "mistral-large-latest",
+        key_url: "https://console.mistral.ai/api-keys",
     },
     ProviderDef {
         prefix: "venice",
@@ -111,6 +119,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "VENICE_API_KEY",
         extra_headers: &[],
         default_model: "llama-3.3-70b",
+        key_url: "https://venice.ai/settings/api",
     },
     ProviderDef {
         prefix: "oai",
@@ -119,6 +128,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "OPENAI_API_KEY",
         extra_headers: &[],
         default_model: "gpt-4o",
+        key_url: "https://platform.openai.com/api-keys",
     },
     // Generic escape hatch — user MUST set OPENAI_BASE_URL
     ProviderDef {
@@ -128,6 +138,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         key_env: "OPENAI_API_KEY",
         extra_headers: &[],
         default_model: "",
+        key_url: "",
     },
 ];
 
@@ -161,6 +172,45 @@ pub fn parse_provider_model(model: &str) -> Option<(&'static ProviderDef, &str)>
     let (prefix, bare) = model.split_once(':')?;
     let provider = PROVIDERS.iter().find(|p| p.prefix == prefix)?;
     Some((provider, bare))
+}
+
+/// Look up a provider by its `/model <prefix>:` prefix.
+pub fn provider_by_prefix(prefix: &str) -> Option<&'static ProviderDef> {
+    PROVIDERS.iter().find(|p| p.prefix == prefix)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyValidation {
+    Valid,
+    /// 401 or 403: the provider rejected the key.
+    Rejected(u16),
+    /// Could not tell (network error, no models endpoint, 5xx).
+    Unverified(String),
+}
+
+/// `GET <base_url>/models` with the key. 10 s timeout.
+pub async fn validate_key(provider: &ProviderDef, base_url: &str, key: &str) -> KeyValidation {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return KeyValidation::Unverified(e.to_string()),
+    };
+    let mut req = client
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .bearer_auth(key);
+    for (k, v) in provider.extra_headers {
+        req = req.header(*k, *v);
+    }
+    match req.send().await {
+        Ok(resp) => match resp.status().as_u16() {
+            200 => KeyValidation::Valid,
+            s @ (401 | 403) => KeyValidation::Rejected(s),
+            s => KeyValidation::Unverified(format!("HTTP {s} from {}/models", base_url)),
+        },
+        Err(e) => KeyValidation::Unverified(e.to_string()),
+    }
 }
 
 /// List known provider prefixes — used in /model help text.
@@ -862,5 +912,68 @@ mod provider_detection_tests {
         })
         .unwrap();
         assert_eq!(c.api_key_for_test(), "sk-shared");
+    }
+
+    #[test]
+    fn every_cloud_provider_has_a_key_page() {
+        for p in PROVIDERS {
+            if p.prefix == "lmstudio" || p.prefix == "openai-compat" {
+                assert!(p.key_url.is_empty(), "{}", p.prefix);
+            } else {
+                assert!(
+                    p.key_url.starts_with("https://"),
+                    "{} needs a key page",
+                    p.prefix
+                );
+            }
+        }
+        assert_eq!(provider_by_prefix("groq").map(|p| p.name), Some("Groq"));
+        assert!(provider_by_prefix("nope").is_none());
+    }
+
+    async fn status_server(status_line: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp =
+                    format!("{status_line}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}");
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn validation_maps_status_codes() {
+        let groq = provider_by_prefix("groq").unwrap();
+        let base = status_server("HTTP/1.1 200 OK").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Valid
+        ));
+        let base = status_server("HTTP/1.1 401 Unauthorized").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Rejected(401)
+        ));
+        let base = status_server("HTTP/1.1 403 Forbidden").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Rejected(403)
+        ));
+        let base = status_server("HTTP/1.1 404 Not Found").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Unverified(_)
+        ));
+        assert!(matches!(
+            validate_key(groq, "http://127.0.0.1:1/v1", "k").await,
+            KeyValidation::Unverified(_)
+        ));
     }
 }

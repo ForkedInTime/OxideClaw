@@ -66,7 +66,6 @@ pub enum AppEvent {
 pub enum CredentialChange {
     Anthropic,
     /// `value: None` means the key was removed.
-    #[allow(dead_code)] // constructed by the keystore task
     Provider {
         prefix: String,
         key_env: String,
