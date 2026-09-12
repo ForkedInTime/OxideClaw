@@ -1055,11 +1055,7 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     f.render_widget(Clear, popup);
 
     let title = format!(" {} ", overlay.title);
-    let hint = if overlay.is_interactive() {
-        " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close "
-    } else {
-        " Esc / Enter / q to close  ↑↓ to scroll "
-    };
+    let hint = overlay_hint(&overlay.title, overlay.is_interactive());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.accent))
@@ -1212,4 +1208,34 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
         inner,
     );
+}
+
+/// Footer hint for an overlay: the verb must match what Enter does there.
+pub(crate) fn overlay_hint(title: &str, interactive: bool) -> &'static str {
+    if !interactive {
+        return " Esc / Enter / q to close  ↑↓ to scroll ";
+    }
+    match title {
+        "models" => " ↑↓ select · Enter switch · 1-9 quick · Esc close ",
+        "sessions" => " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close ",
+        "voices" => " ↑↓ select · Enter select · 1-9 quick · Esc close ",
+        "help" | "help-commands" => " ↑↓ select · Enter open · 1-9 quick · Esc close ",
+        _ => " ↑↓ select · Enter choose · 1-9 quick · Esc close ",
+    }
+}
+
+#[cfg(test)]
+mod overlay_hint_tests {
+    use super::overlay_hint;
+
+    #[test]
+    fn the_enter_verb_matches_the_overlay() {
+        assert!(overlay_hint("models", true).contains("Enter switch"));
+        assert!(!overlay_hint("models", true).contains("delete"));
+        assert!(overlay_hint("sessions", true).contains("Enter resume"));
+        assert!(overlay_hint("sessions", true).contains("d delete"));
+        assert!(overlay_hint("voices", true).contains("Enter select"));
+        assert!(overlay_hint("help", true).contains("Enter open"));
+        assert!(overlay_hint("anything", false).contains("Esc"));
+    }
 }

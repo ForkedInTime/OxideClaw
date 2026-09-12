@@ -47,6 +47,8 @@ pub struct ProviderDef {
     pub key_env: &'static str,
     /// Optional extra HTTP headers (e.g. OpenRouter requires HTTP-Referer)
     pub extra_headers: &'static [(&'static str, &'static str)],
+    /// A widely available model to offer in the picker ("" = none known).
+    pub default_model: &'static str,
 }
 
 /// All known providers. Order matters for display in `/model` help.
@@ -57,6 +59,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.groq.com/openai/v1",
         key_env: "GROQ_API_KEY",
         extra_headers: &[],
+        default_model: "llama-3.3-70b-versatile",
     },
     ProviderDef {
         prefix: "openrouter",
@@ -67,6 +70,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
             ("HTTP-Referer", "https://github.com/ForkedInTime/OxideClaw"),
             ("X-Title", "OxideClaw"),
         ],
+        default_model: "meta-llama/llama-3.3-70b-instruct",
     },
     ProviderDef {
         prefix: "deepseek",
@@ -74,6 +78,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.deepseek.com/v1",
         key_env: "DEEPSEEK_API_KEY",
         extra_headers: &[],
+        default_model: "deepseek-chat",
     },
     ProviderDef {
         prefix: "lmstudio",
@@ -81,6 +86,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "http://localhost:1234/v1",
         key_env: "",
         extra_headers: &[],
+        default_model: "",
     },
     ProviderDef {
         prefix: "together",
@@ -88,6 +94,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.together.xyz/v1",
         key_env: "TOGETHER_API_KEY",
         extra_headers: &[],
+        default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     },
     ProviderDef {
         prefix: "mistral",
@@ -95,6 +102,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.mistral.ai/v1",
         key_env: "MISTRAL_API_KEY",
         extra_headers: &[],
+        default_model: "mistral-large-latest",
     },
     ProviderDef {
         prefix: "venice",
@@ -102,6 +110,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.venice.ai/api/v1",
         key_env: "VENICE_API_KEY",
         extra_headers: &[],
+        default_model: "llama-3.3-70b",
     },
     ProviderDef {
         prefix: "oai",
@@ -109,6 +118,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.openai.com/v1",
         key_env: "OPENAI_API_KEY",
         extra_headers: &[],
+        default_model: "gpt-4o",
     },
     // Generic escape hatch — user MUST set OPENAI_BASE_URL
     ProviderDef {
@@ -117,8 +127,24 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "",
         key_env: "OPENAI_API_KEY",
         extra_headers: &[],
+        default_model: "",
     },
 ];
+
+/// Providers that are usable right now, judged from the environment: the
+/// provider's own key is set; OpenAI also accepts `OPENAI_API_KEY`; the generic
+/// endpoint needs `OPENAI_BASE_URL`; LM Studio needs `LM_STUDIO_HOST`.
+pub fn configured_providers(get_env: impl Fn(&str) -> Option<String>) -> Vec<&'static ProviderDef> {
+    let set = |k: &str| get_env(k).is_some_and(|v| !v.trim().is_empty());
+    PROVIDERS
+        .iter()
+        .filter(|p| match p.prefix {
+            "openai-compat" => set("OPENAI_BASE_URL") && set("OPENAI_API_KEY"),
+            "lmstudio" => set("LM_STUDIO_HOST"),
+            _ => set(p.key_env),
+        })
+        .collect()
+}
 
 /// Check if a model string uses any known provider prefix.
 pub fn is_openai_compat_model(model: &str) -> bool {
@@ -723,5 +749,74 @@ impl OpenAiCompatClient {
 
         let (result, _) = parse_oai_stream(resp, on_text).await?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod provider_detection_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| m.get(k).cloned()
+    }
+
+    #[test]
+    fn a_provider_is_configured_when_its_key_is_set() {
+        let got = configured_providers(env(&[("GROQ_API_KEY", "gsk"), ("DEEPSEEK_API_KEY", "dk")]));
+        let prefixes: Vec<_> = got.iter().map(|p| p.prefix).collect();
+        assert_eq!(
+            prefixes,
+            vec!["groq", "deepseek"],
+            "registry order, keyed only"
+        );
+    }
+
+    #[test]
+    fn nothing_is_configured_with_an_empty_environment() {
+        assert!(configured_providers(env(&[])).is_empty());
+        assert!(
+            configured_providers(env(&[("GROQ_API_KEY", "")])).is_empty(),
+            "empty value"
+        );
+    }
+
+    #[test]
+    fn generic_and_local_providers_need_their_url_variables() {
+        let got = configured_providers(env(&[("OPENAI_API_KEY", "sk")]));
+        let prefixes: Vec<_> = got.iter().map(|p| p.prefix).collect();
+        assert_eq!(
+            prefixes,
+            vec!["oai"],
+            "OPENAI_API_KEY alone means OpenAI only"
+        );
+        let got = configured_providers(env(&[
+            ("OPENAI_API_KEY", "sk"),
+            ("OPENAI_BASE_URL", "http://x/v1"),
+        ]));
+        assert!(got.iter().any(|p| p.prefix == "openai-compat"));
+        let got = configured_providers(env(&[("LM_STUDIO_HOST", "http://localhost:1234/v1")]));
+        assert_eq!(
+            got.iter().map(|p| p.prefix).collect::<Vec<_>>(),
+            vec!["lmstudio"]
+        );
+    }
+
+    #[test]
+    fn every_cloud_provider_has_a_default_model_for_the_picker() {
+        for p in PROVIDERS {
+            if p.prefix == "lmstudio" || p.prefix == "openai-compat" {
+                continue;
+            }
+            assert!(
+                !p.default_model.is_empty(),
+                "{} needs a default model",
+                p.prefix
+            );
+        }
     }
 }

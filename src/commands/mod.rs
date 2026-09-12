@@ -589,7 +589,39 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
 
 #[cfg(test)]
 mod model_catalogue_tests {
-    use super::{CommandAction, KNOWN_MODELS, cmd_effort, resolve_model_alias};
+    use super::{
+        CommandAction, KNOWN_MODELS, cmd_effort, provider_picker_entries, resolve_model_alias,
+    };
+
+    /// The picker must show every provider whose key is present, as a
+    /// selectable `prefix:model` row, and nothing for providers without keys.
+    #[test]
+    fn picker_lists_configured_providers_with_a_selectable_model() {
+        let rows = provider_picker_entries(|k| match k {
+            "GROQ_API_KEY" => Some("gsk".into()),
+            "MISTRAL_API_KEY" => Some("m".into()),
+            _ => None,
+        });
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].1, "groq:llama-3.3-70b-versatile");
+        assert!(rows[0].0.contains("Groq"), "{}", rows[0].0);
+        assert_eq!(rows[1].1, "mistral:mistral-large-latest");
+        assert!(provider_picker_entries(|_| None).is_empty());
+    }
+
+    #[test]
+    fn providers_without_a_default_model_get_a_hint_row_not_a_selectable_one() {
+        let rows = provider_picker_entries(|k| {
+            (k == "LM_STUDIO_HOST").then(|| "http://localhost:1234/v1".into())
+        });
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.is_empty(), "no selectable id");
+        assert!(
+            rows[0].0.contains("lmstudio:"),
+            "hint tells the user the prefix: {}",
+            rows[0].0
+        );
+    }
 
     /// `/effort high` must set the API effort level, not inject a prompt —
     /// on Claude 5 the model ignores prose about effort but honours the

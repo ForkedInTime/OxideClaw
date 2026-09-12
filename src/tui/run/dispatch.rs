@@ -154,9 +154,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::ListModels => {
             // Build combined Anthropic + Ollama interactive model picker
             let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+            let providers = crate::commands::provider_picker_entries(|k| std::env::var(k).ok());
             let mut lines = Vec::new();
             let mut ids = Vec::new();
-            let total = crate::commands::KNOWN_MODELS.len() + ollama_models.len();
+            let total = crate::commands::KNOWN_MODELS.len()
+                + providers.iter().filter(|(_, id)| !id.is_empty()).count()
+                + ollama_models.len();
             lines.push(format!("Models ({})\n", total));
             lines.push(format!("Current: {}\n", config.model));
             // Anthropic models
@@ -166,11 +169,26 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 lines.push(format!("  {}. {} — {}{}", i + 1, id, desc, marker));
                 ids.push(id.to_string());
             }
+            // OpenAI-compatible providers with credentials in the environment
+            let mut offset = crate::commands::KNOWN_MODELS.len();
+            if !providers.is_empty() {
+                lines.push(String::new());
+                lines.push("── Providers (API key found) ──".to_string());
+                for (label, id) in &providers {
+                    if id.is_empty() {
+                        lines.push(format!("     {label}"));
+                        continue;
+                    }
+                    let marker = if *id == config.model { " ▶" } else { "" };
+                    lines.push(format!("  {}. {}{}", offset + 1, label, marker));
+                    ids.push(id.clone());
+                    offset += 1;
+                }
+            }
             // Ollama models (if any)
             if !ollama_models.is_empty() {
                 lines.push(String::new());
                 lines.push("── Ollama (local) ──".to_string());
-                let offset = crate::commands::KNOWN_MODELS.len();
                 for (i, m) in ollama_models.iter().enumerate() {
                     let marker = if *m == config.model { " ▶" } else { "" };
                     lines.push(format!("  {}. {}{}", offset + i + 1, m, marker));
@@ -178,7 +196,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
             }
             lines.push(String::new());
-            lines.push("  ↑↓ select · Enter switch · 1-9 quick pick · Esc close".into());
+            lines.push("  Any provider model: /model <prefix>:<name>  (groq, openrouter, deepseek, together, mistral, venice, oai, lmstudio, openai-compat)".into());
             app.overlay = Some(Overlay::with_items("models", lines.join("\n"), ids));
         }
         CommandAction::ListHelp => {

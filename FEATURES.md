@@ -53,32 +53,28 @@ Models that don't support tool use get automatic text-only fallback. Ollama mode
 
 ### OpenAI-Compatible Providers
 
-OxideClaw supports any OpenAI-compatible API endpoint:
+Set the provider's API key in your environment (or in `~/.env`, `~/.config/oxideclaw/.env`, or the project `.env`; keys are on the allowlist) and the provider appears in the `/model` picker with a default model. Any other model on that provider is `/model <prefix>:<model-name>`.
 
-| Provider | Config key |
-|----------|-----------|
-| Groq | `groq` |
-| OpenRouter | `openrouter` |
-| DeepSeek | `deepseek` |
-| LM Studio | `lmstudio` |
-| Together | `together` |
-| Mistral | `mistral` |
-| Venice.ai | `venice` |
-| OpenAI | `openai` |
-| Generic | `openai-compat` |
+| Provider | Prefix | Credential | Picker default |
+|----------|--------|------------|----------------|
+| Groq | `groq` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct` |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| Together AI | `together` | `TOGETHER_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
+| Mistral | `mistral` | `MISTRAL_API_KEY` | `mistral-large-latest` |
+| Venice.ai | `venice` | `VENICE_API_KEY` | `llama-3.3-70b` |
+| OpenAI | `oai` | `OPENAI_API_KEY` | `gpt-4o` |
+| LM Studio (local) | `lmstudio` | `LM_STUDIO_HOST` (e.g. `http://localhost:1234/v1`) | none; `/model lmstudio:<name>` |
+| Any OpenAI-compatible endpoint | `openai-compat` | `OPENAI_BASE_URL` + `OPENAI_API_KEY` | none; `/model openai-compat:<name>` |
 
-Configure in `~/.config/oxideclaw/settings.json`:
-
-```json
-{
-  "providers": {
-    "groq": {
-      "api_key": "gsk_...",
-      "model": "llama-3.3-70b-versatile"
-    }
-  }
-}
+```bash
+export GROQ_API_KEY=gsk_...
+oxideclaw
+/model                       # Groq now listed under "Providers (API key found)"
+/model groq:llama-3.1-8b-instant
 ```
+
+`OPENAI_BASE_URL` and `LM_STUDIO_HOST` are deliberately not loadable from a project `.env` (a repository must not be able to redirect your API traffic); export them in your shell.
 
 ---
 
@@ -97,7 +93,7 @@ Configure in `~/.config/oxideclaw/settings.json`:
 
 | Command | Description |
 |---------|-------------|
-| `/model` | Interactive model picker (Claude + Ollama) |
+| `/model` | Interactive model picker (Claude, Ollama, and every OpenAI-compat provider whose API key is set) |
 | `/model <name>` | Switch to specific model |
 | `/model default` | Reset to default Claude model |
 | `/model list` | List all available models |
@@ -411,8 +407,7 @@ OxideClaw supports multiple sandbox backends for tool isolation:
 {
   "model": "claude-sonnet-5",
   "showThinkingSummaries": true,
-  "spinnerStyle": "themed",
-  "providers": {}
+  "spinnerStyle": "themed"
 }
 ```
 
