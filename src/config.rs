@@ -1905,30 +1905,14 @@ mod auth_handle_tests {
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
-    fn from_config_uses_the_keystore_for_providers() {
-        // from_config's OpenAI-compat lookup falls back to the process env
-        // (by design, for OPENAI_BASE_URL/LM_STUDIO_HOST — see Task 12), so a
-        // developer's real GROQ_API_KEY/OPENAI_API_KEY in the shell would
-        // otherwise make "no key anywhere" false. Clear them for the
-        // duration of this test and restore whatever was there after.
-        // SAFETY: no other test reads these two vars directly from the
-        // process env (the rest go through an explicit closure), so this
-        // mutation cannot race with another test's assertions.
-        let saved: Vec<(&str, Option<String>)> = ["GROQ_API_KEY", "OPENAI_API_KEY"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
-        unsafe {
-            std::env::remove_var("GROQ_API_KEY");
-            std::env::remove_var("OPENAI_API_KEY");
-        }
-
+    fn from_config_builds_an_openai_compat_backend_from_the_keystore() {
+        // The "no key anywhere -> error" case is covered without touching the
+        // process env by client_takes_the_key_from_the_lookup_not_the_process_env
+        // in openai_compat.rs. This test only checks the positive path: a key
+        // set on the keystore (as /login would do) is enough for from_config
+        // to build an OpenAiCompat backend, with no env mutation.
         let mut c = Config::default();
         c.model = "groq:llama-3.3-70b-versatile".into();
-        assert!(
-            crate::api::ApiBackend::from_config(&c).is_err(),
-            "no key anywhere"
-        );
         c.keystore.set(
             "GROQ_API_KEY",
             "gsk",
@@ -1938,14 +1922,5 @@ mod auth_handle_tests {
             crate::api::ApiBackend::from_config(&c).unwrap(),
             crate::api::ApiBackend::OpenAiCompat(_)
         ));
-
-        unsafe {
-            for (k, v) in saved {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
     }
 }
