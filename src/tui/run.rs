@@ -201,12 +201,7 @@ async fn run_loop(
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
         ));
     }
-    let mut client: ApiBackend = ApiBackend::new_with_auth(
-        &config.model,
-        &config.api_key,
-        config.auth_is_oauth,
-        &config.ollama_host,
-    )?;
+    let mut client: ApiBackend = ApiBackend::from_config(&config)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
     let settings = crate::settings::Settings::load(&config.cwd);
@@ -621,12 +616,7 @@ async fn run_loop(
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             system_prompt.clear();
             system_prompt.push_str(&config.build_system_prompt());
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
-            ) {
+            match ApiBackend::from_config(&config) {
                 Ok(new_client) => {
                     client = new_client;
                 }

@@ -188,6 +188,26 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
         for w in &ctx.config.auth_warnings {
             checks.push(format!("⚠ {w}"));
         }
+        if let Some(info) = ctx.config.auth.profile_info() {
+            let who = match (&info.email, &info.organization) {
+                (Some(e), Some(o)) => format!("{e} · org {o}"),
+                (Some(e), None) => e.clone(),
+                (None, Some(o)) => format!("org {o}"),
+                (None, None) => "(no account details stored)".into(),
+            };
+            let expiry = match info.expires_at {
+                Some(t) => {
+                    let left = t - crate::auth::oauth::now_unix();
+                    if left <= 0 {
+                        "expired (refreshes on next request)".to_string()
+                    } else {
+                        format!("expires in {} min", left / 60)
+                    }
+                }
+                None => "no expiry recorded".to_string(),
+            };
+            checks.push(format!("  profile '{}': {who} · {expiry}", info.name));
+        }
     } else {
         checks.push("✗ No Anthropic credential — run /login, or set ANTHROPIC_API_KEY".into());
     }

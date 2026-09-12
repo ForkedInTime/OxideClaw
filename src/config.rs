@@ -141,6 +141,11 @@ pub struct Config {
     #[serde(skip)]
     pub auth_warnings: Vec<String>,
 
+    /// Live credential source for the Anthropic client. A profile handle
+    /// refreshes itself; `api_key` above is only the startup snapshot.
+    #[serde(skip)]
+    pub auth: crate::auth::AuthHandle,
+
     /// Model to use for the main loop.
     /// Use `ollama:<name>` to route to a local Ollama instance instead.
     pub model: String,
@@ -409,6 +414,7 @@ impl Default for Config {
             auth_is_oauth: false,
             auth_source: None,
             auth_warnings: Vec::new(),
+            auth: crate::auth::AuthHandle::none(),
             model: crate::api::default_model().to_string(),
             max_tokens: crate::api::default_max_tokens(),
             max_tokens_by_model: HashMap::new(),
@@ -714,70 +720,7 @@ impl Config {
         // apiKeyHelper) run between the env vars and the profile — see the
         // `ant`-profile fallback further down. Explicit local configuration
         // should beat ambient machine state.
-        if let Some(resolved) = crate::auth::resolve_env() {
-            cfg.auth_is_oauth = resolved.credential.is_oauth();
-            cfg.auth_source = Some(resolved.source.describe());
-            cfg.auth_warnings = resolved.warnings;
-            cfg.api_key = resolved.credential.secret().to_string();
-        }
-
-        // ── OXIDECLAW_API_KEY_FILE_DESCRIPTOR: read API key from an open fd.
-        //    Unix-only — Windows uses HANDLEs, not POSIX fds, and the
-        //    cross-platform equivalent (handle-based reads) is not worth
-        //    the additional complexity for a feature that is principally
-        //    used by POSIX-style keychain helpers anyway.
-        #[cfg(unix)]
-        {
-            if cfg.api_key.is_empty()
-                && let Some(fd_str) = app_env("API_KEY_FILE_DESCRIPTOR")
-                && let Ok(fd) = fd_str.parse::<i32>()
-            {
-                use std::io::Read;
-                use std::os::unix::io::FromRawFd;
-                let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-                let mut buf = String::new();
-                if f.read_to_string(&mut buf).is_ok() {
-                    cfg.api_key = buf.trim().to_string();
-                }
-                std::mem::forget(f); // don't close the fd
-            }
-        }
-
-        // ── apiKeyHelper: run a shell command to get the API key
-        if cfg.api_key.is_empty()
-            && let Some(ref helper_cmd) = cfg.api_key_helper.clone()
-        {
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(helper_cmd)
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !key.is_empty() {
-                        cfg.api_key = key;
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    eprintln!("Warning: apiKeyHelper failed: {stderr}");
-                }
-                Err(e) => {
-                    eprintln!("Warning: apiKeyHelper could not run: {e}");
-                }
-            }
-        }
-
-        // ── Last resort: the active OAuth profile on disk (written by
-        //    `/login` or `ant auth login`). Read natively; refresh is handled
-        //    by the AuthHandle at request time.
-        if cfg.api_key.is_empty()
-            && let Some((resolved, _handle)) = crate::auth::resolve_profile()
-        {
-            cfg.auth_is_oauth = resolved.credential.is_oauth();
-            cfg.auth_source = Some(resolved.source.describe());
-            cfg.api_key = resolved.credential.secret().to_string();
-        }
+        cfg.resolve_anthropic_auth();
 
         // ── Optional env var overrides (env wins over settings files)
         if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
@@ -794,6 +737,93 @@ impl Config {
         }
 
         Ok(cfg)
+    }
+
+    /// Resolve the Anthropic credential chain into `auth` and the snapshot
+    /// fields. Safe to call again mid-session (after /login or /logout).
+    ///
+    ///   ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN → key fd → apiKeyHelper → OAuth profile
+    pub fn resolve_anthropic_auth(&mut self) {
+        self.api_key.clear();
+        self.auth_is_oauth = false;
+        self.auth_source = None;
+        self.auth_warnings.clear();
+        self.auth = crate::auth::AuthHandle::none();
+
+        if let Some(resolved) = crate::auth::resolve_env() {
+            self.auth_is_oauth = resolved.credential.is_oauth();
+            self.auth_source = Some(resolved.source.describe());
+            self.auth_warnings = resolved.warnings;
+            self.api_key = resolved.credential.secret().to_string();
+            self.auth = crate::auth::AuthHandle::static_credential(resolved.credential);
+        }
+
+        // ── OXIDECLAW_API_KEY_FILE_DESCRIPTOR: read API key from an open fd.
+        //    Unix-only — Windows uses HANDLEs, not POSIX fds, and the
+        //    cross-platform equivalent (handle-based reads) is not worth
+        //    the additional complexity for a feature that is principally
+        //    used by POSIX-style keychain helpers anyway.
+        #[cfg(unix)]
+        {
+            if self.api_key.is_empty()
+                && let Some(fd_str) = app_env("API_KEY_FILE_DESCRIPTOR")
+                && let Ok(fd) = fd_str.parse::<i32>()
+            {
+                use std::io::Read;
+                use std::os::unix::io::FromRawFd;
+                let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+                let mut buf = String::new();
+                if f.read_to_string(&mut buf).is_ok() {
+                    self.api_key = buf.trim().to_string();
+                }
+                std::mem::forget(f); // don't close the fd
+                if !self.api_key.is_empty() {
+                    self.auth = crate::auth::AuthHandle::static_credential(
+                        crate::auth::Credential::ApiKey(self.api_key.clone()),
+                    );
+                }
+            }
+        }
+
+        // ── apiKeyHelper: run a shell command to get the API key
+        if self.api_key.is_empty()
+            && let Some(ref helper_cmd) = self.api_key_helper.clone()
+        {
+            match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(helper_cmd)
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !key.is_empty() {
+                        self.api_key = key;
+                        self.auth = crate::auth::AuthHandle::static_credential(
+                            crate::auth::Credential::ApiKey(self.api_key.clone()),
+                        );
+                    }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    eprintln!("Warning: apiKeyHelper failed: {stderr}");
+                }
+                Err(e) => {
+                    eprintln!("Warning: apiKeyHelper could not run: {e}");
+                }
+            }
+        }
+
+        // ── Last resort: the active OAuth profile on disk (written by
+        //    `/login` or `ant auth login`). Read natively; refresh is handled
+        //    by the AuthHandle at request time.
+        if self.api_key.is_empty()
+            && let Some((resolved, handle)) = crate::auth::resolve_profile()
+        {
+            self.auth_is_oauth = true;
+            self.auth_source = Some(resolved.source.describe());
+            self.api_key = resolved.credential.secret().to_string();
+            self.auth = handle;
+        }
     }
 
     /// Return the effective max_tokens for a given model, preferring an
@@ -1831,5 +1861,38 @@ mod atomic_settings_write_tests {
         let path = dir.path().join("deep").join("settings.json");
         write_json_atomic(&path, "{}").unwrap();
         assert!(path.exists());
+    }
+}
+
+#[cfg(test)]
+mod auth_handle_tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_no_auth_handle() {
+        let c = Config::default();
+        assert!(c.auth.is_none());
+        assert!(c.api_key.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn from_config_builds_an_anthropic_backend_from_the_handle() {
+        let mut c = Config::default();
+        c.model = "claude-opus-5".into();
+        c.auth = crate::auth::AuthHandle::static_credential(crate::auth::Credential::OAuth(
+            "tok".into(),
+        ));
+        let b = crate::api::ApiBackend::from_config(&c).unwrap();
+        assert!(matches!(b, crate::api::ApiBackend::Anthropic(_)));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn from_config_builds_ollama_without_any_credential() {
+        let mut c = Config::default();
+        c.model = "ollama:llama3".into();
+        let b = crate::api::ApiBackend::from_config(&c).unwrap();
+        assert!(matches!(b, crate::api::ApiBackend::Ollama(_)));
     }
 }

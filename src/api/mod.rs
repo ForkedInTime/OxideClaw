@@ -71,12 +71,17 @@ pub struct ClaudeClient {
 }
 
 impl ClaudeClient {
-    /// Construct from a static API key.
+    /// Construct from a static API key. Kept as public API for library
+    /// consumers and tests; in-tree callers go through `with_auth` /
+    /// `ApiBackend::from_config` so the credential can self-refresh.
+    #[allow(dead_code)]
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         Self::with_credential(&crate::auth::Credential::ApiKey(api_key.into()))
     }
 
-    /// Construct from a resolved static credential.
+    /// Construct from a resolved static credential. Kept as public API for
+    /// library consumers and tests; see `new` above.
+    #[allow(dead_code)]
     pub fn with_credential(cred: &crate::auth::Credential) -> Result<Self> {
         Self::with_auth(crate::auth::AuthHandle::static_credential(cred.clone()))
     }
@@ -403,6 +408,10 @@ impl ApiBackend {
     /// `api_key` is the credential secret; `is_oauth` selects the wire format
     /// (`Authorization: Bearer` + oauth beta, vs `x-api-key`). Ignored for
     /// Ollama / OpenAI-compat backends, which carry their own auth.
+    ///
+    /// Kept as public API for library consumers and tests; in-tree callers
+    /// use `from_config` so the credential can self-refresh mid-session.
+    #[allow(dead_code)]
     pub fn new_with_auth(
         model: &str,
         api_key: &str,
@@ -417,6 +426,8 @@ impl ApiBackend {
         Self::new(model, api_key, ollama_host)
     }
 
+    /// Kept as public API for library consumers and tests; see `new_with_auth`.
+    #[allow(dead_code)]
     pub fn new(model: &str, api_key: &str, ollama_host: &str) -> Result<Self> {
         if is_ollama_model(model) {
             Ok(Self::Ollama(OllamaClient::new(ollama_host)?))
@@ -424,6 +435,21 @@ impl ApiBackend {
             Ok(Self::OpenAiCompat(OpenAiCompatClient::from_model(model)?))
         } else {
             Ok(Self::Anthropic(ClaudeClient::new(api_key)?))
+        }
+    }
+
+    /// The right backend for `config.model`, using the live credential handle
+    /// for Anthropic and the process environment for other providers.
+    pub fn from_config(config: &crate::config::Config) -> Result<Self> {
+        let model = config.model.as_str();
+        if is_ollama_model(model) {
+            Ok(Self::Ollama(OllamaClient::new(&config.ollama_host)?))
+        } else if is_openai_compat_model(model) {
+            Ok(Self::OpenAiCompat(OpenAiCompatClient::from_model(model)?))
+        } else {
+            Ok(Self::Anthropic(ClaudeClient::with_auth(
+                config.auth.clone(),
+            )?))
         }
     }
 

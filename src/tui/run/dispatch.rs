@@ -135,12 +135,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             *system_prompt = config.build_system_prompt();
             // Re-create backend when switching between Anthropic ↔ Ollama
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
-            ) {
+            match ApiBackend::from_config(config) {
                 Ok(new_client) => {
                     *client = new_client;
                 }
