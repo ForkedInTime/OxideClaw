@@ -399,14 +399,23 @@ impl LoginRequest {
     pub fn for_profile(name: Option<&str>) -> Result<Self> {
         let dir = profile::config_dir()
             .ok_or_else(|| anyhow!("cannot determine the Anthropic config directory"))?;
+        let env_profile = std::env::var("ANTHROPIC_PROFILE").ok();
+        Self::for_profile_in(dir, name, env_profile.as_deref())
+    }
+
+    /// Pure form of [`Self::for_profile`], parameterized on the config
+    /// directory and the `ANTHROPIC_PROFILE` value, for testing without
+    /// touching the real environment.
+    pub fn for_profile_in(
+        dir: PathBuf,
+        name: Option<&str>,
+        env_profile: Option<&str>,
+    ) -> Result<Self> {
         let active_exists = dir.join("active_config").is_file();
         let (profile, activate) = match name.map(str::trim).filter(|n| !n.is_empty()) {
             Some(n) => (n.to_string(), true),
             None => (
-                profile::resolve_profile_name(
-                    &dir,
-                    std::env::var("ANTHROPIC_PROFILE").ok().as_deref(),
-                ),
+                profile::resolve_profile_name(&dir, env_profile),
                 !active_exists,
             ),
         };
@@ -959,6 +968,80 @@ mod login_flow_tests {
             client_id: "cid".into(),
             workspace_id: None,
         }
+    }
+
+    #[test]
+    fn for_profile_in_uses_the_explicit_name_and_activates() {
+        let d = tempfile::tempdir().unwrap();
+        let r = LoginRequest::for_profile_in(d.path().to_path_buf(), Some("work"), None).unwrap();
+        assert_eq!(r.profile, "work");
+        assert!(r.activate);
+    }
+
+    #[test]
+    fn for_profile_in_defaults_to_default_and_activates_when_nothing_active() {
+        let d = tempfile::tempdir().unwrap();
+        let r = LoginRequest::for_profile_in(d.path().to_path_buf(), None, None).unwrap();
+        assert_eq!(r.profile, "default");
+        assert!(r.activate);
+    }
+
+    #[test]
+    fn for_profile_in_follows_the_active_pointer_and_does_not_steal_it() {
+        let d = tempfile::tempdir().unwrap();
+        set_active_profile(d.path(), "team").unwrap();
+        let r = LoginRequest::for_profile_in(d.path().to_path_buf(), None, None).unwrap();
+        assert_eq!(r.profile, "team");
+        assert!(!r.activate);
+    }
+
+    #[test]
+    fn for_profile_in_env_beats_the_active_pointer() {
+        let d = tempfile::tempdir().unwrap();
+        // No active_config: env-selected profile should still activate.
+        let r =
+            LoginRequest::for_profile_in(d.path().to_path_buf(), None, Some("envprof")).unwrap();
+        assert_eq!(r.profile, "envprof");
+        assert!(r.activate);
+
+        // With an active_config present, env still wins on name, but
+        // activation reflects whether something was already active.
+        set_active_profile(d.path(), "team").unwrap();
+        let r =
+            LoginRequest::for_profile_in(d.path().to_path_buf(), None, Some("envprof")).unwrap();
+        assert_eq!(r.profile, "envprof");
+        assert!(!r.activate);
+    }
+
+    #[test]
+    fn for_profile_in_rejects_invalid_characters() {
+        let d = tempfile::tempdir().unwrap();
+        let err = LoginRequest::for_profile_in(d.path().to_path_buf(), Some("bad name!"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("letters, digits, '-', '_' and '.'"), "{err}");
+    }
+
+    #[test]
+    fn for_profile_in_seeds_from_an_existing_config_or_falls_back_to_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = ProfileConfig::user_oauth("cid-x", None, Some("wrkspc_9".into()));
+        cfg.base_url = Some("https://api.test".into());
+        cfg.authentication.console_url = Some("https://console.test".into());
+        save_config(d.path(), "work", &cfg).unwrap();
+
+        let r = LoginRequest::for_profile_in(d.path().to_path_buf(), Some("work"), None).unwrap();
+        assert_eq!(r.base_url, "https://api.test");
+        assert_eq!(r.console_url, "https://console.test");
+        assert_eq!(r.client_id, "cid-x");
+        assert_eq!(r.workspace_id.as_deref(), Some("wrkspc_9"));
+
+        let r2 = LoginRequest::for_profile_in(d.path().to_path_buf(), Some("nonexistent"), None)
+            .unwrap();
+        assert_eq!(r2.base_url, API_BASE);
+        assert_eq!(r2.console_url, CONSOLE_URL);
+        assert_eq!(r2.client_id, client_id());
+        assert_eq!(r2.workspace_id, None);
     }
 
     #[tokio::test]
