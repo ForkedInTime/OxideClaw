@@ -27,6 +27,7 @@
 //! the `oauth-2025-04-20` beta header. Sending both auth headers at once is
 //! rejected, so exactly one is ever set.
 
+pub mod oauth;
 pub mod profile;
 
 use std::time::{Duration, Instant};
