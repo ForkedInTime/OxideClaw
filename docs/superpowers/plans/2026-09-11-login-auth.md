@@ -1388,8 +1388,8 @@ mod auth_header_tests {
 
     const UNAUTHORIZED: &str =
         "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
-    const TOKEN_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 66\r\nconnection: close\r\n\r\n{\"access_token\":\"at-new\",\"refresh_token\":\"rt-new\",\"expires_in\":3600}";
-    const MSG_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 121\r\nconnection: close\r\n\r\n{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"x\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+    const TOKEN_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 68\r\nconnection: close\r\n\r\n{\"access_token\":\"at-new\",\"refresh_token\":\"rt-new\",\"expires_in\":3600}";
+    const MSG_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 141\r\nconnection: close\r\n\r\n{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"x\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
 
     fn req() -> MessagesRequest {
         MessagesRequest {
