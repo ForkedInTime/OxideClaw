@@ -27,6 +27,8 @@
 //! the `oauth-2025-04-20` beta header. Sending both auth headers at once is
 //! rejected, so exactly one is ever set.
 
+pub mod profile;
+
 use std::time::{Duration, Instant};
 
 /// Beta header value required alongside a bearer token.
@@ -223,26 +225,6 @@ const ANT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Directory `ant auth login` writes profiles to.
 ///
-/// `$ANTHROPIC_CONFIG_DIR`, else `~/.config/anthropic` on Unix and
-/// `%APPDATA%\Anthropic` on Windows.
-fn anthropic_config_dir() -> Option<std::path::PathBuf> {
-    if let Ok(dir) = std::env::var("ANTHROPIC_CONFIG_DIR")
-        && !dir.trim().is_empty()
-    {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    #[cfg(windows)]
-    {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|d| std::path::PathBuf::from(d).join("Anthropic"))
-    }
-    #[cfg(not(windows))]
-    {
-        dirs::home_dir().map(|h| h.join(".config").join("anthropic"))
-    }
-}
-
 /// Has `ant auth login` ever stored a profile on this machine?
 ///
 /// This gate exists because **`ant` is a name collision**: Apache Ant owns that
@@ -252,7 +234,7 @@ fn anthropic_config_dir() -> Option<std::path::PathBuf> {
 /// the credentials directory first means we never execute anything unless the
 /// real CLI has actually been used here.
 fn ant_profile_dir_exists() -> bool {
-    profile_dir_exists_at(anthropic_config_dir().as_deref())
+    profile_dir_exists_at(profile::config_dir().as_deref())
 }
 
 /// Pure form of the check, so it can be tested without mutating process-global
