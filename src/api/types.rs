@@ -114,7 +114,7 @@ impl ToolResultContent {
 }
 
 /// Request body for /v1/messages
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,

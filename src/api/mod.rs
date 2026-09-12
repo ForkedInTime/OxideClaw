@@ -61,53 +61,33 @@ where
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // api_key retained for future authenticated-header injection
 pub struct ClaudeClient {
     client: Client,
-    api_key: String,
+    auth: crate::auth::AuthHandle,
     base_url: String,
-    /// Betas the credential itself requires, merged into every request's
-    /// `anthropic-beta`. An OAuth bearer token needs `oauth-2025-04-20`.
-    ///
-    /// This is *not* a default header: `RequestBuilder::header` appends rather
-    /// than replaces, so a default `anthropic-beta` plus a per-request one
-    /// would send the field twice. Merging into the single per-request value
-    /// keeps exactly one.
-    credential_betas: Vec<String>,
     /// Optional sink for retry notices, so a backoff sleep is visible rather
     /// than looking like a hang. Set by the TUI and the headless runner.
     retry_notifier: Option<retry::RetryNotifier>,
 }
 
 impl ClaudeClient {
-    /// Construct from a static API key. Retained for callers that already hold
-    /// a raw key; prefer [`ClaudeClient::with_credential`].
+    /// Construct from a static API key.
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         Self::with_credential(&crate::auth::Credential::ApiKey(api_key.into()))
     }
 
-    /// Construct from a resolved credential, selecting the wire format.
-    ///
-    /// A static key authenticates with `x-api-key`; an OAuth access token uses
-    /// `Authorization: Bearer` plus the `oauth-2025-04-20` beta. Sending both
-    /// auth headers is rejected by the API, so exactly one is set.
+    /// Construct from a resolved static credential.
     pub fn with_credential(cred: &crate::auth::Credential) -> Result<Self> {
-        let api_key = cred.secret().to_string();
+        Self::with_auth(crate::auth::AuthHandle::static_credential(cred.clone()))
+    }
+
+    /// Construct from a credential handle. Authentication headers are set per
+    /// request (never as client defaults) so a refreshed profile token is
+    /// picked up without rebuilding the client.
+    pub fn with_auth(auth: crate::auth::AuthHandle) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert("anthropic-version", ANTHROPIC_VERSION.parse()?);
-
-        let mut credential_betas = Vec::new();
-        match cred {
-            crate::auth::Credential::ApiKey(k) => {
-                headers.insert("x-api-key", k.parse()?);
-            }
-            crate::auth::Credential::OAuth(token) => {
-                headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse()?);
-                credential_betas.push(crate::auth::OAUTH_BETA.to_string());
-            }
-        }
         headers.insert(header::CONTENT_TYPE, "application/json".parse()?);
-
         let client = Client::builder()
             .default_headers(headers)
             // 10s connect timeout — fail fast on dead upstreams instead of
@@ -118,12 +98,10 @@ impl ClaudeClient {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .context("Failed to build HTTP client")?;
-
         Ok(Self {
             client,
-            api_key,
+            auth,
             base_url: ANTHROPIC_API_BASE.to_string(),
-            credential_betas,
             retry_notifier: None,
         })
     }
@@ -148,12 +126,20 @@ impl ClaudeClient {
     /// Merge the request's betas with any the credential requires.
     /// Returns `None` when there are none, so the header is omitted entirely.
     fn beta_header(&self, request_betas: &[String]) -> Option<String> {
-        if request_betas.is_empty() && self.credential_betas.is_empty() {
+        let credential_betas: &[&str] = if self.auth.is_oauth() {
+            &[crate::auth::OAUTH_BETA]
+        } else {
+            &[]
+        };
+        if request_betas.is_empty() && credential_betas.is_empty() {
             return None;
         }
         let mut all: Vec<&str> = Vec::new();
-        for b in request_betas.iter().chain(self.credential_betas.iter()) {
-            let b = b.as_str();
+        for b in request_betas
+            .iter()
+            .map(String::as_str)
+            .chain(credential_betas.iter().copied())
+        {
             if !b.is_empty() && !all.contains(&b) {
                 all.push(b);
             }
@@ -165,35 +151,69 @@ impl ClaudeClient {
         }
     }
 
+    fn apply_auth(
+        builder: reqwest::RequestBuilder,
+        cred: &crate::auth::Credential,
+    ) -> reqwest::RequestBuilder {
+        match cred {
+            crate::auth::Credential::ApiKey(k) => builder.header("x-api-key", k.as_str()),
+            crate::auth::Credential::OAuth(t) => builder.bearer_auth(t),
+        }
+    }
+
+    /// POST `/v1/messages` with the current credential. A 401 on a profile
+    /// credential forces one refresh and one retry; anything else is returned
+    /// to the caller as-is.
+    async fn post_messages(
+        &self,
+        url: &str,
+        request: &MessagesRequest,
+        context: &str,
+    ) -> Result<reqwest::Response> {
+        let betas = self.beta_header(&request.betas);
+        let mut cred = self.auth.credential().await?;
+        for attempt in 0..2 {
+            let resp = retry::send_with_retry(
+                || {
+                    let mut b = Self::apply_auth(self.client.post(url).json(request), &cred);
+                    if let Some(ref b2) = betas {
+                        b = b.header("anthropic-beta", b2.as_str());
+                    }
+                    if let Some(ref sid) = request.session_id {
+                        b = b.header("X-Claude-Code-Session-Id", sid.as_str());
+                    }
+                    b
+                },
+                self.retry_notifier.as_ref(),
+                context,
+            )
+            .await?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && self.auth.is_profile()
+                && attempt == 0
+            {
+                debug!("401 on profile credential — refreshing and retrying once");
+                cred = self.auth.force_refresh().await?;
+                continue;
+            }
+            return Ok(resp);
+        }
+        unreachable!("loop returns on the second attempt")
+    }
+
     /// Non-streaming API call — mirrors callModel() in services/api/claude.ts
     #[allow(dead_code)] // used by SDK/headless mode (non-streaming path)
     pub async fn messages(&self, request: MessagesRequest) -> Result<MessagesResponse> {
         let url = format!("{}/v1/messages", self.base_url);
         debug!("POST {url} model={}", request.model);
-
-        let betas = self.beta_header(&request.betas);
-        let resp = retry::send_with_retry(
-            || {
-                let mut builder = self.client.post(&url).json(&request);
-                if let Some(ref b) = betas {
-                    builder = builder.header("anthropic-beta", b.as_str());
-                }
-                if let Some(ref sid) = request.session_id {
-                    builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
-                }
-                builder
-            },
-            self.retry_notifier.as_ref(),
-            "API request failed",
-        )
-        .await?;
-
+        let resp = self
+            .post_messages(&url, &request, "API request failed")
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!("API error {status}: {body}"));
         }
-
         resp.json::<MessagesResponse>()
             .await
             .context("Failed to parse API response")
@@ -213,22 +233,9 @@ impl ClaudeClient {
 
         // Retrying is safe here and only here: nothing has been handed to
         // `on_text` yet, so a retry cannot duplicate text the user has seen.
-        let betas = self.beta_header(&request.betas);
-        let resp = retry::send_with_retry(
-            || {
-                let mut builder = self.client.post(&url).json(&request);
-                if let Some(ref b) = betas {
-                    builder = builder.header("anthropic-beta", b.as_str());
-                }
-                if let Some(ref sid) = request.session_id {
-                    builder = builder.header("X-Claude-Code-Session-Id", sid.as_str());
-                }
-                builder
-            },
-            self.retry_notifier.as_ref(),
-            "Streaming API request failed",
-        )
-        .await?;
+        let resp = self
+            .post_messages(&url, &request, "Streaming API request failed")
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -511,61 +518,144 @@ impl ApiBackend {
 }
 
 #[cfg(test)]
-mod credential_tests {
+mod auth_header_tests {
     use super::*;
-    use crate::auth::{Credential, OAUTH_BETA};
+    use crate::auth::{AuthHandle, Credential, OAUTH_BETA};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// An OAuth token must go in `Authorization: Bearer`, never `x-api-key` —
-    /// and the request additionally needs the oauth beta or it is rejected.
     #[test]
     fn oauth_credential_adds_the_required_beta() {
         let c = ClaudeClient::with_credential(&Credential::OAuth("tok".into())).unwrap();
         assert_eq!(c.beta_header(&[]).as_deref(), Some(OAUTH_BETA));
     }
 
-    /// A static key needs no extra beta, so the header stays absent when the
-    /// request itself asked for none.
     #[test]
     fn api_key_credential_adds_no_beta() {
-        let c = ClaudeClient::with_credential(&Credential::ApiKey("sk-ant-x".into())).unwrap();
+        let c = ClaudeClient::new("sk-ant-test").unwrap();
         assert_eq!(c.beta_header(&[]), None);
     }
 
-    /// The credential beta must be *merged* into the request's betas, not sent
-    /// as a second `anthropic-beta` header — `RequestBuilder::header` appends.
     #[test]
-    fn request_betas_and_credential_betas_merge_into_one_value() {
+    fn oauth_beta_merges_with_request_betas_without_duplicates() {
         let c = ClaudeClient::with_credential(&Credential::OAuth("tok".into())).unwrap();
         let merged = c.beta_header(&["compact-2026-01-12".into()]).unwrap();
-        assert!(merged.contains("compact-2026-01-12"), "{merged}");
         assert!(merged.contains(OAUTH_BETA), "{merged}");
+        assert!(merged.contains("compact-2026-01-12"), "{merged}");
         assert_eq!(merged.matches(OAUTH_BETA).count(), 1, "{merged}");
-        assert!(!merged.contains(",,"), "{merged}");
-    }
-
-    #[test]
-    fn duplicate_betas_are_collapsed() {
-        let c = ClaudeClient::with_credential(&Credential::OAuth("tok".into())).unwrap();
         let merged = c.beta_header(&[OAUTH_BETA.into()]).unwrap();
         assert_eq!(merged, OAUTH_BETA, "duplicate must collapse: {merged}");
     }
 
-    #[test]
-    fn api_key_request_betas_pass_through_untouched() {
-        let c = ClaudeClient::with_credential(&Credential::ApiKey("k".into())).unwrap();
-        assert_eq!(
-            c.beta_header(&["a".into(), "b".into()]).as_deref(),
-            Some("a,b")
+    /// Scripted server: each accepted connection gets the next response and
+    /// the raw request is stored for inspection.
+    async fn scripted(
+        script: Vec<&'static str>,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (seen2, hits2) = (seen.clone(), hits.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let i = hits2.fetch_add(1, Ordering::SeqCst);
+                let body = *script.get(i).unwrap_or_else(|| script.last().unwrap());
+                let seen3 = seen2.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    seen3
+                        .lock()
+                        .await
+                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen, hits)
+    }
+
+    const UNAUTHORIZED: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+    const TOKEN_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 68\r\nconnection: close\r\n\r\n{\"access_token\":\"at-new\",\"refresh_token\":\"rt-new\",\"expires_in\":3600}";
+    const MSG_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 141\r\nconnection: close\r\n\r\n{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"x\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+
+    fn req() -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-5".into(),
+            max_tokens: 8,
+            messages: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_goes_in_x_api_key_on_every_request() {
+        let (base, seen, _) = scripted(vec![MSG_OK]).await;
+        let mut c = ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(base);
+        c.messages(req()).await.unwrap();
+        let r = seen.lock().await[0].to_lowercase();
+        assert!(r.contains("x-api-key: sk-ant-test"), "{r}");
+        assert!(!r.contains("authorization:"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_401_on_a_profile_forces_one_refresh_and_one_retry() {
+        // Same server answers both /v1/messages and /v1/oauth/token, in order:
+        // messages → 401, token → 200, messages → 200.
+        let (base, seen, hits) = scripted(vec![UNAUTHORIZED, TOKEN_OK, MSG_OK]).await;
+        let d = tempfile::tempdir().unwrap();
+        let creds = crate::auth::profile::ProfileCredentials::new(
+            "at-old",
+            Some("rt-old".into()),
+            Some(9_999_999_999),
+        );
+        let handle = AuthHandle::profile(d.path().to_path_buf(), "default".into(), None, creds)
+            .with_base_url(base.clone());
+        let mut c = ClaudeClient::with_auth(handle).unwrap();
+        c.set_base_url_for_test(base);
+        c.messages(req()).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        let seen = seen.lock().await;
+        assert!(
+            seen[0]
+                .to_lowercase()
+                .contains("authorization: bearer at-old"),
+            "{}",
+            seen[0]
+        );
+        assert!(seen[1].starts_with("POST /v1/oauth/token"), "{}", seen[1]);
+        assert!(
+            seen[2]
+                .to_lowercase()
+                .contains("authorization: bearer at-new"),
+            "{}",
+            seen[2]
+        );
+        assert!(
+            seen[2]
+                .to_lowercase()
+                .contains("anthropic-beta: oauth-2025-04-20"),
+            "{}",
+            seen[2]
         );
     }
 
-    /// `ClaudeClient::new` is the legacy raw-key entry point — it must stay
-    /// equivalent to an explicit ApiKey credential.
-    #[test]
-    fn legacy_new_is_equivalent_to_an_api_key_credential() {
-        let legacy = ClaudeClient::new("sk-ant-x").unwrap();
-        assert_eq!(legacy.beta_header(&[]), None);
-        assert_eq!(legacy.api_key, "sk-ant-x");
+    #[tokio::test]
+    async fn a_401_on_a_static_key_is_not_retried() {
+        let (base, _, hits) = scripted(vec![UNAUTHORIZED]).await;
+        let mut c = ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(base);
+        let err = c.messages(req()).await.unwrap_err().to_string();
+        assert!(err.contains("401"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }
 
