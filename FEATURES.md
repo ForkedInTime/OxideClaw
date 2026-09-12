@@ -106,11 +106,11 @@ OxideClaw never reads another tool's configuration or credential files.
 | Command | Description |
 |---------|-------------|
 | `/model` | Interactive model picker (Claude, Ollama, and every OpenAI-compat provider whose API key is set) |
-| `/login [provider]` | Sign in: Anthropic Console OAuth, or store/validate a provider key |
-| `/logout [provider]` | Remove the active Anthropic profile, or a stored provider key |
 | `/model <name>` | Switch to specific model |
 | `/model default` | Reset to default Claude model |
 | `/model list` | List all available models |
+| `/login [provider]` | Sign in: Anthropic Console OAuth, or store/validate a provider key |
+| `/logout [provider]` | Remove the active Anthropic profile, or a stored provider key |
 | `/effort [low\|medium\|high\|max\|off]` | Set the API effort level (`output_config.effort`); prompt nudge on models without it |
 
 ### Session Management

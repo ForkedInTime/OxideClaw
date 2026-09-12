@@ -195,7 +195,7 @@ async fn run_loop(
                    1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
                    2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
                    3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. /login                 sign in with your Console account (profile shared with the ant CLI and SDKs)\n\
+                   4. /login                 sign in with your Console account (inside oxideclaw)\n\
                  To use a local model instead: --model ollama:<name>\n\
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
         ));
