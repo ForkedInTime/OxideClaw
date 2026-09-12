@@ -80,7 +80,7 @@ oxideclaw
 
 `/login` opens a status board: Anthropic, every OpenAI-compatible provider, and Ollama, each with whether a credential is present and where it came from.
 
-**Anthropic.** `/login anthropic` runs Console OAuth (PKCE) in your browser and stores a profile under `~/.config/anthropic/` (`$ANTHROPIC_CONFIG_DIR`) in the same layout the `ant` CLI, the official SDKs, and Claude Code read, so one login serves all of them. Tokens refresh automatically mid-session. `/login anthropic <name>` creates a named profile; `/login anthropic manual` is for SSH or headless hosts (paste the code the Console shows). `/logout` removes the active profile. Usage on a profile is billed as API usage to the org you picked; this is not a Claude subscription login.
+**Anthropic.** `/login anthropic` runs Console OAuth (PKCE) in your browser and stores a profile under `~/.config/anthropic/` (`$ANTHROPIC_CONFIG_DIR`) in the same layout the `ant` CLI, the official SDKs, and Claude Code read, so one login serves all of them. Tokens refresh automatically mid-session. `/login anthropic <name>` creates a named profile; `/login anthropic manual` is for SSH or headless hosts (paste the code the Console shows — it is rendered as `<code>#<state>`, and OxideClaw verifies that state before exchanging the code). `/logout` removes the active profile. Usage on a profile is billed as API usage to the org you picked; this is not a Claude subscription login.
 
 Resolution order, first match wins: `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → `OXIDECLAW_API_KEY_FILE_DESCRIPTOR` / `apiKeyHelper` → OAuth profile. An exported key shadows the profile; `/doctor` warns when that happens.
 

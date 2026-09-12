@@ -99,7 +99,11 @@ a future OxideClaw-specific ID a one-line change.
 a usable localhost. The redirect URI is the Console's code-display page,
 `<console>/oauth/code/callback?app=anthropic-cli`. The authorize URL is printed.
 The user opens it anywhere, signs in, and pastes the displayed code into the
-existing ask-user dialog. The exchange then proceeds exactly as above, with the
+existing ask-user dialog. The Console's code page renders the value as
+`<code>#<state>`, so the pasted string carries the CSRF state back: OxideClaw
+splits at the first `#`, rejects a state that does not match the one it
+generated for this attempt, and exchanges only the code half (a bare code with
+no `#` is still accepted). The exchange then proceeds exactly as above, with the
 manual redirect URI in the token request.
 
 ### Storage

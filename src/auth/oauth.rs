@@ -262,6 +262,30 @@ pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<String>
     }
 }
 
+/// The Console's manual code page renders `<code>#<state>`, so the pasted
+/// value carries the CSRF state back to us (this mirrors `readManualCode` in
+/// the `ant` CLI). Split it, verify the state, and return the code half. A
+/// bare code with no `#` is accepted as-is.
+pub fn split_manual_code(pasted: &str, expected_state: &str) -> Result<String> {
+    let pasted = pasted.trim();
+    if pasted.is_empty() {
+        return Err(anyhow!("login cancelled"));
+    }
+    let Some((code, state)) = pasted.split_once('#') else {
+        return Ok(pasted.to_string());
+    };
+    if state != expected_state {
+        return Err(anyhow!(
+            "pasted code is from a different login attempt — start /login again"
+        ));
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return Err(anyhow!("login cancelled"));
+    }
+    Ok(code.to_string())
+}
+
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Bind `127.0.0.1:0`. The redirect URI uses `localhost`, which is what the
@@ -574,11 +598,10 @@ pub async fn login_manual(
         org_uuid: org.as_deref(),
         workspace_id: req.workspace_id.as_deref(),
     });
-    let code = prompt(authorize_url)
+    let pasted = prompt(authorize_url)
         .await
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
         .ok_or_else(|| anyhow!("login cancelled"))?;
+    let code = split_manual_code(&pasted, &state)?;
     let tok = exchange_code(
         &req.base_url,
         &req.client_id,
@@ -666,6 +689,25 @@ mod pkce_tests {
             manual_redirect_uri("https://platform.claude.com/"),
             "https://platform.claude.com/oauth/code/callback?app=anthropic-cli"
         );
+    }
+
+    #[test]
+    fn manual_code_splits_on_the_state_fragment() {
+        // Bare code: accepted, trimmed.
+        assert_eq!(split_manual_code("  abc  ", "st").unwrap(), "abc");
+        // `<code>#<state>` with the matching state: only the code half.
+        assert_eq!(split_manual_code("abc#st", "st").unwrap(), "abc");
+        assert_eq!(split_manual_code(" abc#st \n", "st").unwrap(), "abc");
+        // A code carrying someone else's state is refused.
+        let err = split_manual_code("abc#other", "st")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different login attempt"), "{err}");
+        // Empty input is a cancellation, not an exchange.
+        for empty in ["", "   ", "\n", "#st"] {
+            let err = split_manual_code(empty, "st").unwrap_err().to_string();
+            assert!(err.contains("cancelled"), "{empty:?}: {err}");
+        }
     }
 
     #[test]
@@ -1155,14 +1197,23 @@ mod login_flow_tests {
                     authorize_url.contains("oauth%2Fcode%2Fcallback%3Fapp%3Danthropic-cli"),
                     "{authorize_url}"
                 );
-                Some("pasted-code".to_string())
+                // The Console's code page shows `<code>#<state>`; paste both.
+                let state = url::Url::parse(&authorize_url)
+                    .unwrap()
+                    .query_pairs()
+                    .find(|(k, _)| k == "state")
+                    .map(|(_, v)| v.into_owned())
+                    .expect("authorize URL carries a state");
+                Some(format!("pasted-code#{state}"))
             })
         })
         .await
         .unwrap();
         assert_eq!(out.profile, "default");
         let body = seen.lock().await.clone();
-        assert!(body.contains("code=pasted-code"), "{body}");
+        // Only the code half is exchanged — the `#state` suffix is stripped.
+        assert!(body.contains("code=pasted-code&"), "{body}");
+        assert!(!body.contains("%23"), "state fragment leaked into {body}");
         assert!(body.contains("redirect_uri=https%3A%2F%2Fconsole.test%2Foauth%2Fcode%2Fcallback%3Fapp%3Danthropic-cli"), "{body}");
     }
 
