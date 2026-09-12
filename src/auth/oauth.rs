@@ -270,7 +270,22 @@ pub async fn bind_loopback() -> Result<(tokio::net::TcpListener, String)> {
     Ok((listener, format!("http://localhost:{port}/callback")))
 }
 
+fn html_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&#39;".to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
 fn html_page(status: u16, reason: &str, title: &str, detail: &str) -> String {
+    let title = html_escape(title);
+    let detail = html_escape(detail);
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>OxideClaw</title>\
          <body style=\"font-family:system-ui;margin:3rem\"><h1>{title}</h1><p>{detail}</p></body>"
@@ -302,15 +317,20 @@ pub async fn wait_for_code(
             Err(_) => return Err(anyhow!("timed out waiting for the browser callback")),
         };
         let mut buf = vec![0u8; 8192];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let n = match tokio::time::timeout(remaining, sock.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => continue,
+        };
         let head = String::from_utf8_lossy(&buf[..n]);
         let request_line = head.lines().next().unwrap_or("");
         let target = request_line.split_whitespace().nth(1).unwrap_or("");
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if path != "/callback" {
-            let _ = sock
-                .write_all(html_page(404, "Not Found", "Not found", "").as_bytes())
-                .await;
+            let response = html_page(404, "Not Found", "Not found", "");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), sock.write_all(response.as_bytes()))
+                    .await;
             let _ = sock.shutdown().await;
             continue;
         }
@@ -324,7 +344,7 @@ pub async fn wait_for_code(
             ),
             Err(e) => html_page(400, "Bad Request", "Sign-in failed", &e.to_string()),
         };
-        let _ = sock.write_all(page.as_bytes()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), sock.write_all(page.as_bytes())).await;
         let _ = sock.shutdown().await;
         return outcome;
     }
@@ -593,5 +613,71 @@ mod callback_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn other_paths_get_404_and_do_not_consume_the_wait() {
+        let (listener, redirect) = bind_loopback().await.unwrap();
+        let base = redirect.rsplit_once('/').map(|(b, _)| b).unwrap();
+        let waiter = tokio::spawn(async move {
+            wait_for_code(listener, "st", std::time::Duration::from_secs(5)).await
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/favicon.ico"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404);
+        let (status, body) = hit(&redirect, "code=abc&state=st").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("close this tab"), "{body}");
+        assert_eq!(waiter.await.unwrap().unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn reflected_error_description_is_escaped() {
+        let (listener, redirect) = bind_loopback().await.unwrap();
+        let waiter = tokio::spawn(async move {
+            wait_for_code(listener, "st", std::time::Duration::from_secs(5)).await
+        });
+        let (status, body) = hit(
+            &redirect,
+            "error=x&error_description=%3Cscript%3Ealert(1)%3C%2Fscript%3E&state=st",
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(!body.contains("<script>"), "unescaped script in {body}");
+        assert!(
+            body.contains("&lt;script&gt;"),
+            "escaped script not in {body}"
+        );
+        let err = waiter.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("authorization denied"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_does_not_block_the_callback() {
+        let (listener, redirect) = bind_loopback().await.unwrap();
+        let port = redirect
+            .split(':')
+            .nth(2)
+            .and_then(|p| p.split('/').next())
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap();
+        let waiter = tokio::spawn(async move {
+            wait_for_code(listener, "st", std::time::Duration::from_secs(5)).await
+        });
+        let silent = tokio::spawn(async move {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        let _ = silent.await;
+        let (status, _body) = hit(&redirect, "code=abc&state=st").await;
+        assert_eq!(status, 200);
+        assert_eq!(waiter.await.unwrap().unwrap(), "abc");
     }
 }
