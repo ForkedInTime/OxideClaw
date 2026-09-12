@@ -5,7 +5,11 @@
 
 use super::profile::ProfileCredentials;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const CLIENT_ID: &str = "41077d10-94b8-4194-be48-d251e9eb21b4";
 pub const CONSOLE_URL: &str = "https://platform.claude.com";
@@ -162,6 +166,276 @@ pub(crate) async fn parse_token_response(
         ));
     }
     Ok(tok)
+}
+
+fn random_url_safe(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::fill(&mut buf[..]);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// 32 random bytes, base64url without padding (43 chars) — RFC 7636 §4.1.
+pub fn pkce_verifier() -> String {
+    random_url_safe(32)
+}
+
+/// `BASE64URL(SHA256(verifier))` — RFC 7636 §4.2.
+pub fn pkce_challenge_s256(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+pub fn random_state() -> String {
+    random_url_safe(32)
+}
+
+pub struct AuthorizeParams<'a> {
+    pub console_url: &'a str,
+    pub client_id: &'a str,
+    pub redirect_uri: &'a str,
+    pub scope: &'a str,
+    pub state: &'a str,
+    pub code_challenge: &'a str,
+    /// Console auto-selects this org (`?orgUUID=`) when the account belongs to it.
+    pub org_uuid: Option<&'a str>,
+    /// Omitted → Console shows its workspace picker.
+    pub workspace_id: Option<&'a str>,
+}
+
+pub fn build_authorize_url(p: &AuthorizeParams) -> String {
+    let mut u = url::Url::parse(&format!(
+        "{}/oauth/authorize",
+        p.console_url.trim_end_matches('/')
+    ))
+    .expect("static authorize path");
+    {
+        let mut q = u.query_pairs_mut();
+        q.append_pair("client_id", p.client_id)
+            .append_pair("redirect_uri", p.redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("scope", p.scope)
+            .append_pair("state", p.state)
+            .append_pair("code_challenge", p.code_challenge)
+            .append_pair("code_challenge_method", "S256");
+        if let Some(w) = p.workspace_id.filter(|w| !w.is_empty()) {
+            q.append_pair("workspace_id", w);
+        }
+        if let Some(o) = p.org_uuid.filter(|o| !o.is_empty()) {
+            q.append_pair("orgUUID", o);
+        }
+    }
+    u.to_string()
+}
+
+/// Console-hosted "copy this code" page for hosts with no usable localhost.
+/// The `app=anthropic-cli` query is part of the client's registered redirect.
+pub fn manual_redirect_uri(console_url: &str) -> String {
+    format!(
+        "{}/oauth/code/callback?app=anthropic-cli",
+        console_url.trim_end_matches('/')
+    )
+}
+
+/// Extract the authorization code from a callback query string, enforcing
+/// `state` (CSRF guard) and surfacing the server's `error` when present.
+pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<String> {
+    let q: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+    if let Some(e) = q.get("error") {
+        let desc = q.get("error_description").map(String::as_str).unwrap_or("");
+        return Err(anyhow!("authorization denied: {e}: {desc}"));
+    }
+    if q.get("state").map(String::as_str) != Some(expected_state) {
+        return Err(anyhow!(
+            "state mismatch in OAuth callback (possible CSRF) — do not retry in this browser session"
+        ));
+    }
+    match q.get("code") {
+        Some(c) if !c.is_empty() => Ok(c.clone()),
+        _ => Err(anyhow!("OAuth callback did not include a code")),
+    }
+}
+
+pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bind `127.0.0.1:0`. The redirect URI uses `localhost`, which is what the
+/// OAuth client has registered.
+pub async fn bind_loopback() -> Result<(tokio::net::TcpListener, String)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind OAuth callback listener")?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, format!("http://localhost:{port}/callback")))
+}
+
+fn html_page(status: u16, reason: &str, title: &str, detail: &str) -> String {
+    let body = format!(
+        "<!doctype html><meta charset=utf-8><title>OxideClaw</title>\
+         <body style=\"font-family:system-ui;margin:3rem\"><h1>{title}</h1><p>{detail}</p></body>"
+    );
+    format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/html; charset=utf-8\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Serve exactly one HTTP request on `listener`, answer the browser, and
+/// return the authorization code. Requests for other paths (favicon, etc.)
+/// get a 404 and do not consume the wait.
+pub async fn wait_for_code(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("timed out waiting for the browser callback"));
+        }
+        let (mut sock, _) = match tokio::time::timeout(remaining, listener.accept()).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => return Err(anyhow!("callback listener: {e}")),
+            Err(_) => return Err(anyhow!("timed out waiting for the browser callback")),
+        };
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let head = String::from_utf8_lossy(&buf[..n]);
+        let request_line = head.lines().next().unwrap_or("");
+        let target = request_line.split_whitespace().nth(1).unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if path != "/callback" {
+            let _ = sock
+                .write_all(html_page(404, "Not Found", "Not found", "").as_bytes())
+                .await;
+            let _ = sock.shutdown().await;
+            continue;
+        }
+        let outcome = parse_callback_query(query, expected_state);
+        let page = match &outcome {
+            Ok(_) => html_page(
+                200,
+                "OK",
+                "Signed in to OxideClaw",
+                "You can close this tab and return to the terminal.",
+            ),
+            Err(e) => html_page(400, "Bad Request", "Sign-in failed", &e.to_string()),
+        };
+        let _ = sock.write_all(page.as_bytes()).await;
+        let _ = sock.shutdown().await;
+        return outcome;
+    }
+}
+
+#[cfg(test)]
+mod pkce_tests {
+    use super::*;
+
+    #[test]
+    fn s256_challenge_matches_rfc_7636_appendix_b() {
+        assert_eq!(
+            pkce_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn verifier_and_state_are_url_safe_and_long_enough() {
+        for s in [pkce_verifier(), random_state()] {
+            assert!(s.len() >= 43, "{s}");
+            assert!(
+                s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{s}"
+            );
+        }
+        assert_ne!(pkce_verifier(), pkce_verifier());
+    }
+
+    #[test]
+    fn authorize_url_carries_every_required_parameter() {
+        let p = AuthorizeParams {
+            console_url: "https://platform.claude.com",
+            client_id: "cid",
+            redirect_uri: "http://localhost:4242/callback",
+            scope: SCOPE,
+            state: "st",
+            code_challenge: "ch",
+            org_uuid: None,
+            workspace_id: None,
+        };
+        let u = url::Url::parse(&build_authorize_url(&p)).unwrap();
+        assert_eq!(u.path(), "/oauth/authorize");
+        let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "cid");
+        assert_eq!(q["redirect_uri"], "http://localhost:4242/callback");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["scope"], SCOPE);
+        assert_eq!(q["state"], "st");
+        assert_eq!(q["code_challenge"], "ch");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert!(!q.contains_key("orgUUID") && !q.contains_key("workspace_id"));
+    }
+
+    #[test]
+    fn authorize_url_adds_org_and_workspace_hints_when_known() {
+        let p = AuthorizeParams {
+            console_url: "https://platform.claude.com/",
+            client_id: "cid",
+            redirect_uri: "r",
+            scope: SCOPE,
+            state: "st",
+            code_challenge: "ch",
+            org_uuid: Some("org-1"),
+            workspace_id: Some("wrkspc_01"),
+        };
+        let u = url::Url::parse(&build_authorize_url(&p)).unwrap();
+        let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(q["orgUUID"], "org-1");
+        assert_eq!(q["workspace_id"], "wrkspc_01");
+        assert!(!u.as_str().contains("com//oauth"), "trailing slash trimmed");
+    }
+
+    #[test]
+    fn manual_redirect_is_the_console_code_page() {
+        assert_eq!(
+            manual_redirect_uri("https://platform.claude.com/"),
+            "https://platform.claude.com/oauth/code/callback?app=anthropic-cli"
+        );
+    }
+
+    #[test]
+    fn callback_query_parsing() {
+        assert_eq!(
+            parse_callback_query("code=abc&state=st", "st").unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            parse_callback_query("state=st&code=a%2Bb", "st").unwrap(),
+            "a+b"
+        );
+        let e = parse_callback_query("code=abc&state=other", "st")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("state"), "{e}");
+        let e = parse_callback_query("state=st", "st")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("code"), "{e}");
+        let e = parse_callback_query(
+            "error=access_denied&error_description=User%20declined&state=st",
+            "st",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("access_denied") && e.contains("User declined"),
+            "{e}"
+        );
+    }
 }
 
 #[cfg(test)]
