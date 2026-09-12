@@ -433,9 +433,9 @@ async fn main() -> Result<()> {
     }
 
     // Load .env files before anything else so API keys are available
-    // to Config::load() and all downstream code.
-    let keystore = crate::auth::keystore::load_dotenv_auto();
-    let _ = &keystore; // Task 12 stores this on Config
+    // to Config::load() and all downstream code. Config::load() picks this
+    // up via `keystore::snapshot()`.
+    crate::auth::keystore::load_dotenv_auto();
 
     let cli = Cli::parse();
 

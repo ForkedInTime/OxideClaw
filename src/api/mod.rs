@@ -445,7 +445,11 @@ impl ApiBackend {
         if is_ollama_model(model) {
             Ok(Self::Ollama(OllamaClient::new(&config.ollama_host)?))
         } else if is_openai_compat_model(model) {
-            Ok(Self::OpenAiCompat(OpenAiCompatClient::from_model(model)?))
+            let ks = config.keystore.lookup();
+            let lookup = |k: &str| ks(k).or_else(|| std::env::var(k).ok());
+            Ok(Self::OpenAiCompat(OpenAiCompatClient::from_model_with(
+                model, &lookup,
+            )?))
         } else {
             Ok(Self::Anthropic(ClaudeClient::with_auth(
                 config.auth.clone(),

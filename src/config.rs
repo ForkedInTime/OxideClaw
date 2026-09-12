@@ -146,6 +146,10 @@ pub struct Config {
     #[serde(skip)]
     pub auth: crate::auth::AuthHandle,
 
+    /// Provider API keys with their source, built once at startup.
+    #[serde(skip)]
+    pub keystore: crate::auth::keystore::Keystore,
+
     /// Model to use for the main loop.
     /// Use `ollama:<name>` to route to a local Ollama instance instead.
     pub model: String,
@@ -415,6 +419,7 @@ impl Default for Config {
             auth_source: None,
             auth_warnings: Vec::new(),
             auth: crate::auth::AuthHandle::none(),
+            keystore: Default::default(),
             model: crate::api::default_model().to_string(),
             max_tokens: crate::api::default_max_tokens(),
             max_tokens_by_model: HashMap::new(),
@@ -503,8 +508,10 @@ impl Default for Config {
 }
 
 impl Config {
+    #[allow(clippy::field_reassign_with_default)]
     pub fn load() -> Result<Self> {
         let mut cfg = Config::default();
+        cfg.keystore = crate::auth::keystore::snapshot();
 
         // ── Settings files: global (~/.claude/settings.json) → project (./.claude/settings.json)
         // Project wins; env vars applied after (higher priority than settings files).
@@ -1894,5 +1901,51 @@ mod auth_handle_tests {
         c.model = "ollama:llama3".into();
         let b = crate::api::ApiBackend::from_config(&c).unwrap();
         assert!(matches!(b, crate::api::ApiBackend::Ollama(_)));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn from_config_uses_the_keystore_for_providers() {
+        // from_config's OpenAI-compat lookup falls back to the process env
+        // (by design, for OPENAI_BASE_URL/LM_STUDIO_HOST — see Task 12), so a
+        // developer's real GROQ_API_KEY/OPENAI_API_KEY in the shell would
+        // otherwise make "no key anywhere" false. Clear them for the
+        // duration of this test and restore whatever was there after.
+        // SAFETY: no other test reads these two vars directly from the
+        // process env (the rest go through an explicit closure), so this
+        // mutation cannot race with another test's assertions.
+        let saved: Vec<(&str, Option<String>)> = ["GROQ_API_KEY", "OPENAI_API_KEY"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+
+        let mut c = Config::default();
+        c.model = "groq:llama-3.3-70b-versatile".into();
+        assert!(
+            crate::api::ApiBackend::from_config(&c).is_err(),
+            "no key anywhere"
+        );
+        c.keystore.set(
+            "GROQ_API_KEY",
+            "gsk",
+            crate::auth::keystore::KeySource::UserDotenv,
+        );
+        assert!(matches!(
+            crate::api::ApiBackend::from_config(&c).unwrap(),
+            crate::api::ApiBackend::OpenAiCompat(_)
+        ));
+
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
     }
 }

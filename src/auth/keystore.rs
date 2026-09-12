@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Safe allowlist of env vars that oxideclaw may load from .env files.
 ///
@@ -151,6 +152,17 @@ pub fn user_env_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| crate::config::app_dir(&h.join(".config")).join(".env"))
 }
 
+/// The keystore built by `load_dotenv_auto()`, snapshotted for `Config::load()`
+/// call sites that run after startup (see `snapshot`).
+static LOADED: OnceLock<Keystore> = OnceLock::new();
+
+/// The keystore most recently built by `load_dotenv_auto()`, or an empty one
+/// if it has not run (library consumers that never call it fall back to the
+/// process env at each call site instead).
+pub fn snapshot() -> Keystore {
+    LOADED.get().cloned().unwrap_or_default()
+}
+
 /// Search the usual locations in priority order and build the keystore.
 /// Must run once at startup before the async runtime spawns threads.
 pub fn load_dotenv_auto() -> Keystore {
@@ -179,6 +191,7 @@ pub fn load_dotenv_auto() -> Keystore {
             load_one(&user, KeySource::UserDotenv, &mut ks);
         }
     }
+    let _ = LOADED.set(ks.clone());
     ks
 }
 
@@ -386,5 +399,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn snapshot_is_empty_before_load_and_is_a_copy() {
+        // Does NOT call load_dotenv_auto() — that mutates the process env,
+        // which would leak into every other test in this binary. Before
+        // anything ever populates LOADED, snapshot() must hand back an empty
+        // keystore rather than panicking.
+        assert!(snapshot().get("GROQ_API_KEY").is_none());
+        let mut a = snapshot();
+        a.set("GROQ_API_KEY", "g", KeySource::UserDotenv);
+        // Mutating the copy must not affect a fresh snapshot.
+        assert!(snapshot().get("GROQ_API_KEY").is_none());
     }
 }
