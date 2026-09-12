@@ -95,6 +95,11 @@ pub struct ToolContext {
     /// to their internal snapshot.
     pub live_model: Option<String>,
     pub live_api_key: Option<String>,
+    /// The *live* Anthropic auth handle. `/login` and `/logout` re-resolve the
+    /// config and install a brand-new handle, so a handle captured when the
+    /// tools were built is dead. Tools that authenticate to Anthropic
+    /// (`WebSearch`) or launch a nested engine (`Agent`) must prefer this.
+    pub live_auth: Option<crate::auth::AuthHandle>,
     pub live_ollama_host: Option<String>,
     /// The permission gate of the executor running this tool. A tool that
     /// launches a nested engine (`Agent`) must hand it on so every
@@ -135,6 +140,7 @@ impl ToolContext {
             read_cache: None,
             live_model: None,
             live_api_key: None,
+            live_auth: None,
             live_ollama_host: None,
             permission_gate: None,
             agent_depth: 0,
@@ -521,9 +527,8 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     let mut tools = default_tools(net);
 
     tools.push(Arc::new(web_search::WebSearchTool {
-        api_key: config.api_key.clone(),
+        auth: config.auth.clone(),
         model: config.model.clone(),
-        auth_is_oauth: config.auth_is_oauth,
     }));
     tools.push(Arc::new(agent::AgentTool {
         config: config.clone(),
