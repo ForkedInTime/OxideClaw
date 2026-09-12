@@ -507,7 +507,9 @@ async fn main() -> Result<()> {
                         println!("  \u{2713} ANTHROPIC_API_KEY set ({}…)", &key[..4]);
                     }
                 } else {
-                    println!("  \u{2717} ANTHROPIC_API_KEY not set");
+                    println!(
+                        "  \u{2717} No Anthropic credential — run /login inside oxideclaw, or set ANTHROPIC_API_KEY"
+                    );
                 }
                 // Config dir
                 let config_dir = config::Config::claude_dir();
@@ -602,7 +604,7 @@ async fn main() -> Result<()> {
                     || crate::api::is_openai_compat_model(&config.model);
                 if !is_non_anthropic && config.api_key.is_empty() {
                     eprintln!(
-                        "Error: ANTHROPIC_API_KEY not set for model: {}",
+                        "Error: No Anthropic credential for model: {} — run /login inside oxideclaw, or set ANTHROPIC_API_KEY",
                         config.model
                     );
                     std::process::exit(1);

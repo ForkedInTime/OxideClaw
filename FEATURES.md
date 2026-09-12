@@ -76,6 +76,18 @@ oxideclaw
 
 `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are deliberately not loadable from a project `.env` (a repository must not be able to redirect your API traffic); export them in your shell.
 
+### Authentication
+
+`/login` opens a status board: Anthropic, every OpenAI-compatible provider, and Ollama, each with whether a credential is present and where it came from.
+
+**Anthropic.** `/login anthropic` runs Console OAuth (PKCE) in your browser and stores a profile under `~/.config/anthropic/` (`$ANTHROPIC_CONFIG_DIR`) in the same layout the `ant` CLI, the official SDKs, and Claude Code read, so one login serves all of them. Tokens refresh automatically mid-session. `/login anthropic <name>` creates a named profile; `/login anthropic manual` is for SSH or headless hosts (paste the code the Console shows). `/logout` removes the active profile. Usage on a profile is billed as API usage to the org you picked; this is not a Claude subscription login.
+
+Resolution order, first match wins: `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → `OXIDECLAW_API_KEY_FILE_DESCRIPTOR` / `apiKeyHelper` → OAuth profile. An exported key shadows the profile; `/doctor` warns when that happens.
+
+**Providers.** `/login groq` (or any prefix) opens a masked prompt, validates the key against the provider, and saves it to `~/.config/oxideclaw/.env` (0600). `/login groq open` opens the provider's key page first. `/logout groq` removes it. Keys exported in your shell win over the stored file. `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are never read from a file: export them in your shell.
+
+OxideClaw never reads another tool's configuration or credential files.
+
 ---
 
 ## Slash Commands
@@ -94,6 +106,8 @@ oxideclaw
 | Command | Description |
 |---------|-------------|
 | `/model` | Interactive model picker (Claude, Ollama, and every OpenAI-compat provider whose API key is set) |
+| `/login [provider]` | Sign in: Anthropic Console OAuth, or store/validate a provider key |
+| `/logout [provider]` | Remove the active Anthropic profile, or a stored provider key |
 | `/model <name>` | Switch to specific model |
 | `/model default` | Reset to default Claude model |
 | `/model list` | List all available models |

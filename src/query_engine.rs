@@ -55,7 +55,7 @@ impl QueryEngine {
                    1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
                    2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
                    3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. ant auth login         shared with Claude Code and the official SDKs\n\
+                   4. /login                 sign in with your Console account (profile shared with the ant CLI and SDKs)\n\
                  To use a local model instead: --model ollama:<name>\n\
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
             ));
