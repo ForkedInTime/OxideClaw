@@ -318,7 +318,6 @@ pub enum CommandAction {
         manual: bool,
     },
     /// Masked key entry for an OpenAI-compatible provider.
-    #[allow(dead_code)] // open_key_page consumed by the keystore task
     LoginProvider { prefix: String, open_key_page: bool },
     /// Remove the active Anthropic profile.
     LogoutAnthropic,

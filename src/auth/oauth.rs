@@ -437,6 +437,11 @@ impl LoginRequest {
     /// Pure form of [`Self::for_profile`], parameterized on the config
     /// directory and the `ANTHROPIC_PROFILE` value, for testing without
     /// touching the real environment.
+    ///
+    /// When the profile already has a config on disk, its `client_id` wins over
+    /// `ANTHROPIC_OAUTH_CLIENT_ID` — a re-login stays on the client the profile
+    /// was created with, as in `ant`. The env var only seeds a brand-new
+    /// profile.
     pub fn for_profile_in(
         dir: PathBuf,
         name: Option<&str>,
