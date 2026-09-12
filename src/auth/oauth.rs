@@ -3,11 +3,15 @@
 
 #![allow(dead_code)] // Task 4 and lib consumers will use these items
 
+use super::profile;
 use super::profile::ProfileCredentials;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -350,6 +354,234 @@ pub async fn wait_for_code(
     }
 }
 
+/// Redeem an authorization code. Form-encoded, as `ant` does.
+pub async fn exchange_code(
+    base_url: &str,
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<TokenResponse> {
+    let resp = http()?
+        .post(format!("{}/v1/oauth/token", base_url.trim_end_matches('/')))
+        .header("anthropic-beta", OAUTH_BETA)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("state", state),
+        ])
+        .send()
+        .await
+        .context("token exchange request")?;
+    parse_token_response(resp, "code exchange").await
+}
+
+#[derive(Debug, Clone)]
+pub struct LoginRequest {
+    pub dir: PathBuf,
+    pub profile: String,
+    /// Write `active_config` after success.
+    pub activate: bool,
+    pub base_url: String,
+    pub console_url: String,
+    pub client_id: String,
+    pub workspace_id: Option<String>,
+}
+
+impl LoginRequest {
+    /// `name` given → that profile, activated. Otherwise the profile that
+    /// would be used today (`ANTHROPIC_PROFILE` → active → default), and it
+    /// becomes active only when nothing is active yet — mirrors `ant`.
+    pub fn for_profile(name: Option<&str>) -> Result<Self> {
+        let dir = profile::config_dir()
+            .ok_or_else(|| anyhow!("cannot determine the Anthropic config directory"))?;
+        let active_exists = dir.join("active_config").is_file();
+        let (profile, activate) = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => (n.to_string(), true),
+            None => (
+                profile::resolve_profile_name(
+                    &dir,
+                    std::env::var("ANTHROPIC_PROFILE").ok().as_deref(),
+                ),
+                !active_exists,
+            ),
+        };
+        if !profile
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(anyhow!(
+                "profile name may contain only letters, digits, '-', '_' and '.'"
+            ));
+        }
+        let existing = profile::load_config(&dir, &profile).ok().flatten();
+        Ok(Self {
+            dir,
+            profile,
+            activate,
+            base_url: existing
+                .as_ref()
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(|| API_BASE.to_string()),
+            console_url: existing
+                .as_ref()
+                .and_then(|c| c.authentication.console_url.clone())
+                .unwrap_or_else(|| CONSOLE_URL.to_string()),
+            client_id: existing
+                .as_ref()
+                .and_then(|c| c.authentication.client_id.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(client_id),
+            workspace_id: existing.and_then(|c| c.workspace_id),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginOutcome {
+    pub profile: String,
+    pub organization: Option<String>,
+    pub email: Option<String>,
+    pub workspace: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+/// Write the profile config (merged over any existing one) and credentials,
+/// then activate if requested.
+pub fn persist(req: &LoginRequest, tok: TokenResponse) -> Result<LoginOutcome> {
+    let creds = tok.into_credentials(now_unix());
+    let mut cfg = profile::load_config(&req.dir, &req.profile)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| profile::ProfileConfig::user_oauth(&req.client_id, None, None));
+    cfg.authentication.kind = profile::AUTH_TYPE_USER_OAUTH.into();
+    cfg.authentication.client_id = Some(req.client_id.clone());
+    if req.console_url != CONSOLE_URL {
+        cfg.authentication.console_url = Some(req.console_url.clone());
+    }
+    if req.base_url != API_BASE {
+        cfg.base_url = Some(req.base_url.clone());
+    }
+    if creds.organization_uuid.is_some() {
+        cfg.organization_id = creds.organization_uuid.clone();
+    }
+    if creds.workspace_id.is_some() {
+        cfg.workspace_id = creds.workspace_id.clone();
+    }
+    if cfg.version.is_empty() {
+        cfg.version = profile::CONFIG_FILE_VERSION.into();
+    }
+    profile::save_config(&req.dir, &req.profile, &cfg)?;
+    profile::save_credentials(&req.dir, &req.profile, &creds)?;
+    if req.activate {
+        profile::set_active_profile(&req.dir, &req.profile)?;
+    }
+    Ok(LoginOutcome {
+        profile: req.profile.clone(),
+        organization: creds.organization_name,
+        email: creds.account_email,
+        workspace: creds.workspace_name,
+        expires_at: creds.expires_at,
+    })
+}
+
+fn org_hint(req: &LoginRequest) -> Option<String> {
+    profile::load_config(&req.dir, &req.profile)
+        .ok()
+        .flatten()
+        .and_then(|c| c.organization_id)
+}
+
+/// Browser flow: loopback listener, authorize page in the browser, wait for
+/// the callback, exchange, persist. `open_url` returns whether a browser was
+/// launched; when it fails the URL is reported through `progress` and the
+/// listener keeps waiting so the user can open it by hand.
+pub async fn login_browser(
+    req: &LoginRequest,
+    open_url: impl Fn(&str) -> bool,
+    progress: impl Fn(String),
+) -> Result<LoginOutcome> {
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge_s256(&verifier);
+    let state = random_state();
+    let (listener, redirect_uri) = bind_loopback().await?;
+    let org = org_hint(req);
+    let authorize_url = build_authorize_url(&AuthorizeParams {
+        console_url: &req.console_url,
+        client_id: &req.client_id,
+        redirect_uri: &redirect_uri,
+        scope: SCOPE,
+        state: &state,
+        code_challenge: &challenge,
+        org_uuid: org.as_deref(),
+        workspace_id: req.workspace_id.as_deref(),
+    });
+    if open_url(&authorize_url) {
+        progress(format!(
+            "Opened the browser to sign in. Waiting for the callback on {redirect_uri} (up to 5 minutes)…\nIf nothing opened, visit:\n  {authorize_url}"
+        ));
+    } else {
+        progress(format!(
+            "Could not open a browser. Open this URL on this machine:\n  {authorize_url}\nWaiting for the callback on {redirect_uri} (up to 5 minutes)…"
+        ));
+    }
+    let code = wait_for_code(listener, &state, CALLBACK_TIMEOUT).await?;
+    progress("Callback received — exchanging the code for a token…".into());
+    let tok = exchange_code(
+        &req.base_url,
+        &req.client_id,
+        &code,
+        &verifier,
+        &redirect_uri,
+        &state,
+    )
+    .await?;
+    persist(req, tok)
+}
+
+/// Manual flow for hosts without a usable localhost: the Console shows the
+/// code on a page and the user pastes it into `prompt`, which receives the
+/// authorize URL to display and returns the pasted code (or `None` to cancel).
+pub async fn login_manual(
+    req: &LoginRequest,
+    prompt: impl FnOnce(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>,
+) -> Result<LoginOutcome> {
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge_s256(&verifier);
+    let state = random_state();
+    let redirect_uri = manual_redirect_uri(&req.console_url);
+    let org = org_hint(req);
+    let authorize_url = build_authorize_url(&AuthorizeParams {
+        console_url: &req.console_url,
+        client_id: &req.client_id,
+        redirect_uri: &redirect_uri,
+        scope: SCOPE,
+        state: &state,
+        code_challenge: &challenge,
+        org_uuid: org.as_deref(),
+        workspace_id: req.workspace_id.as_deref(),
+    });
+    let code = prompt(authorize_url)
+        .await
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| anyhow!("login cancelled"))?;
+    let tok = exchange_code(
+        &req.base_url,
+        &req.client_id,
+        &code,
+        &verifier,
+        &redirect_uri,
+        &state,
+    )
+    .await?;
+    persist(req, tok)
+}
+
 #[cfg(test)]
 mod pkce_tests {
     use super::*;
@@ -679,5 +911,188 @@ mod callback_tests {
         let (status, _body) = hit(&redirect, "code=abc&state=st").await;
         assert_eq!(status, 200);
         assert_eq!(waiter.await.unwrap().unwrap(), "abc");
+    }
+}
+
+#[cfg(test)]
+mod login_flow_tests {
+    use super::*;
+    use crate::auth::profile::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Token endpoint stub that records the last form body.
+    async fn token_server(body: &'static str) -> (String, Arc<tokio::sync::Mutex<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                *seen2.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    const TOKEN_JSON: &str = r#"{"access_token":"at","refresh_token":"rt","expires_in":3600,
+        "scope":"user:inference","organization":{"uuid":"org-1","name":"Kubereva"},
+        "account":{"uuid":"acc","email_address":"a@example.com"},
+        "workspace":{"id":"wrkspc_01","name":"default"}}"#;
+
+    fn req(dir: &std::path::Path, base: &str) -> LoginRequest {
+        LoginRequest {
+            dir: dir.to_path_buf(),
+            profile: "default".into(),
+            activate: true,
+            base_url: base.into(),
+            console_url: "https://console.test".into(),
+            client_id: "cid".into(),
+            workspace_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_posts_the_form_grant() {
+        let (base, seen) = token_server(TOKEN_JSON).await;
+        let t = exchange_code(
+            &base,
+            "cid",
+            "code1",
+            "ver",
+            "http://localhost:1/callback",
+            "st",
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.access_token, "at");
+        let r = seen.lock().await.clone();
+        assert!(
+            r.to_lowercase()
+                .contains("content-type: application/x-www-form-urlencoded"),
+            "{r}"
+        );
+        assert!(
+            r.to_lowercase()
+                .contains("anthropic-beta: oauth-2025-04-20"),
+            "{r}"
+        );
+        let body = r.split("\r\n\r\n").nth(1).unwrap();
+        let q: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(q["grant_type"], "authorization_code");
+        assert_eq!(q["code"], "code1");
+        assert_eq!(q["code_verifier"], "ver");
+        assert_eq!(q["client_id"], "cid");
+        assert_eq!(q["redirect_uri"], "http://localhost:1/callback");
+        assert_eq!(q["state"], "st");
+    }
+
+    #[test]
+    fn persist_writes_both_files_and_activates() {
+        let d = tempfile::tempdir().unwrap();
+        let tok: TokenResponse = serde_json::from_str(TOKEN_JSON).unwrap();
+        let out = persist(&req(d.path(), "http://unused"), tok).unwrap();
+        assert_eq!(out.organization.as_deref(), Some("Kubereva"));
+        assert_eq!(out.email.as_deref(), Some("a@example.com"));
+        let cfg = load_config(d.path(), "default").unwrap().unwrap();
+        assert_eq!(cfg.authentication.kind, "user_oauth");
+        assert_eq!(cfg.authentication.client_id.as_deref(), Some("cid"));
+        assert_eq!(cfg.organization_id.as_deref(), Some("org-1"));
+        assert_eq!(cfg.workspace_id.as_deref(), Some("wrkspc_01"));
+        let creds = load_credentials(d.path(), "default").unwrap().unwrap();
+        assert_eq!(creds.access_token, "at");
+        assert!(creds.expires_at.unwrap() > now_unix() + 3000);
+        assert_eq!(resolve_profile_name(d.path(), None), "default");
+    }
+
+    #[test]
+    fn persist_does_not_steal_the_active_pointer_unless_asked() {
+        let d = tempfile::tempdir().unwrap();
+        set_active_profile(d.path(), "work").unwrap();
+        let tok: TokenResponse = serde_json::from_str(TOKEN_JSON).unwrap();
+        let mut r = req(d.path(), "http://unused");
+        r.activate = false;
+        persist(&r, tok).unwrap();
+        assert_eq!(resolve_profile_name(d.path(), None), "work");
+    }
+
+    #[tokio::test]
+    async fn browser_flow_end_to_end_with_a_simulated_browser() {
+        let (base, _) = token_server(TOKEN_JSON).await;
+        let d = tempfile::tempdir().unwrap();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened2 = opened.clone();
+        // "Browser": parse the authorize URL and immediately hit the redirect
+        // with a code and the same state, like Console would.
+        let open = move |authorize_url: &str| -> bool {
+            opened2.fetch_add(1, Ordering::SeqCst);
+            let u = url::Url::parse(authorize_url).unwrap();
+            let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+            let target = format!("{}?code=c1&state={}", q["redirect_uri"], q["state"]);
+            tokio::spawn(async move {
+                let _ = reqwest::get(target).await;
+            });
+            true
+        };
+        let msgs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m2 = msgs.clone();
+        let out = login_browser(&req(d.path(), &base), open, move |s| {
+            m2.lock().unwrap().push(s)
+        })
+        .await
+        .unwrap();
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert_eq!(out.email.as_deref(), Some("a@example.com"));
+        assert!(profile_exists(d.path(), "default"));
+        assert!(
+            msgs.lock().unwrap().iter().any(|m| m.contains("Waiting")),
+            "{msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_flow_uses_the_console_code_page_and_the_prompt() {
+        let (base, seen) = token_server(TOKEN_JSON).await;
+        let d = tempfile::tempdir().unwrap();
+        let out = login_manual(&req(d.path(), &base), |authorize_url| {
+            Box::pin(async move {
+                assert!(
+                    authorize_url.contains("oauth%2Fcode%2Fcallback%3Fapp%3Danthropic-cli"),
+                    "{authorize_url}"
+                );
+                Some("pasted-code".to_string())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.profile, "default");
+        let body = seen.lock().await.clone();
+        assert!(body.contains("code=pasted-code"), "{body}");
+        assert!(body.contains("redirect_uri=https%3A%2F%2Fconsole.test%2Foauth%2Fcode%2Fcallback%3Fapp%3Danthropic-cli"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn manual_flow_cancelled_at_the_prompt_is_an_error_not_a_hang() {
+        let d = tempfile::tempdir().unwrap();
+        let err = login_manual(&req(d.path(), "http://unused"), |_| {
+            Box::pin(async { None })
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!profile_exists(d.path(), "default"));
     }
 }
