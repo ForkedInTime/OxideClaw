@@ -75,6 +75,18 @@ impl KeySource {
     }
 }
 
+/// Does a key from `source` sit *above* `~/.config/oxideclaw/.env` — the file
+/// `/login <provider>` writes and `/logout <provider>` edits? If so, saving or
+/// removing the stored key does not change which value the next launch uses,
+/// and the user has to be told where the winning value actually comes from.
+/// Only `UserDotenv` (and "no key at all") is not a shadow.
+pub fn shadows_user_file(source: Option<KeySource>) -> bool {
+    matches!(
+        source,
+        Some(KeySource::ShellEnv | KeySource::ProjectDotenv | KeySource::HomeDotenv)
+    )
+}
+
 #[derive(Clone, Default)]
 pub struct Keystore {
     entries: HashMap<String, (String, KeySource)>,
@@ -412,5 +424,16 @@ mod tests {
         a.set("GROQ_API_KEY", "g", KeySource::UserDotenv);
         // Mutating the copy must not affect a fresh snapshot.
         assert!(snapshot().get("GROQ_API_KEY").is_none());
+    }
+
+    /// The file `/login` writes is the *lowest* precedence source, so every
+    /// other source shadows it — not just the shell.
+    #[test]
+    fn every_source_above_the_user_file_shadows_it() {
+        assert!(shadows_user_file(Some(KeySource::ShellEnv)));
+        assert!(shadows_user_file(Some(KeySource::ProjectDotenv)));
+        assert!(shadows_user_file(Some(KeySource::HomeDotenv)));
+        assert!(!shadows_user_file(Some(KeySource::UserDotenv)));
+        assert!(!shadows_user_file(None));
     }
 }

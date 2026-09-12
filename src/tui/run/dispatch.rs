@@ -1290,10 +1290,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     format!("Could not open a browser. Keys are at {}", p.key_url)
                 }));
             }
+            // A project `.env` or `~/.env` outranks the file we are about to
+            // write just as surely as the shell does — warn for all three.
             let shadow = config
                 .keystore
                 .source(p.key_env)
-                .filter(|s| *s == crate::auth::keystore::KeySource::ShellEnv);
+                .filter(|s| crate::auth::keystore::shadows_user_file(Some(*s)));
             app.scroll_to_bottom();
             let tx2 = tx.clone();
             let ks_lookup_base = {
@@ -1358,9 +1360,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                 KeyValidation::Rejected(_) => unreachable!(),
                             };
                             let shadow_note = match shadow {
-                                Some(_) => format!(
-                                    "\n  ⚠ {} is also exported in your shell; that value wins on the next launch.",
-                                    p.key_env
+                                Some(src) => format!(
+                                    "\n  ⚠ {} also comes from {}; that value wins on the next launch.",
+                                    p.key_env,
+                                    src.describe()
                                 ),
                                 None => String::new(),
                             };
@@ -1407,14 +1410,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 Ok(false) => format!("No stored {} key to remove.", p.name),
                 Err(e) => format!("Could not remove the {} key: {e}", p.name),
             };
-            let shadow = matches!(
-                config.keystore.source(p.key_env),
-                Some(
-                    crate::auth::keystore::KeySource::ShellEnv
-                        | crate::auth::keystore::KeySource::ProjectDotenv
-                        | crate::auth::keystore::KeySource::HomeDotenv
-                )
-            );
+            let shadow =
+                crate::auth::keystore::shadows_user_file(config.keystore.source(p.key_env));
             app.entries.push(ChatEntry::system(if shadow {
                 format!("{msg}\n  ⚠ {} still comes from {}; the provider stays configured until you unset it there.", p.key_env, config.keystore.source(p.key_env).map(|s| s.describe()).unwrap_or("elsewhere"))
             } else {
