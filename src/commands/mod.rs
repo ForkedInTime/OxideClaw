@@ -15,6 +15,7 @@ mod agents;
 mod catalogue;
 mod git;
 mod help;
+mod login;
 mod mcp;
 mod plugins;
 mod session;
@@ -129,6 +130,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
 // ── Model catalogue ───────────────────────────────────────────────────────────
 
 /// What the run-loop should do after a slash command is dispatched.
+#[derive(Debug)]
 pub enum CommandAction {
     /// Display a system message in the chat panel
     Message(String),
@@ -308,6 +310,20 @@ pub enum CommandAction {
     /// `None` = show the full `git diff`.
     /// `Some(path)` = show `git diff -- <path>`.
     ShowDiff(Option<String>),
+    /// `/login` with no arguments: the credential status board.
+    LoginBoard,
+    /// Console OAuth for Anthropic (browser, or paste-the-code when `manual`).
+    LoginAnthropic {
+        profile: Option<String>,
+        manual: bool,
+    },
+    /// Masked key entry for an OpenAI-compatible provider.
+    #[allow(dead_code)] // open_key_page consumed by the keystore task
+    LoginProvider { prefix: String, open_key_page: bool },
+    /// Remove the active Anthropic profile.
+    LogoutAnthropic,
+    /// Remove a stored provider key.
+    LogoutProvider(String),
     /// Command not recognised — show error
     Unknown(String),
 }
@@ -446,12 +462,8 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         }
         "export" => cmd_export(ctx),
         "mcp" => cmd_mcp(args, ctx),
-        "login" | "logout" => CommandAction::Message(
-            "Auth is env-driven: set ANTHROPIC_API_KEY for Claude, or set the matching key \
-             (GROQ_API_KEY, OPENROUTER_API_KEY, …) and switch with /model <provider>:<name>. \
-             No login state to manage."
-                .into(),
-        ),
+        "login" => login::cmd_login(args),
+        "logout" => login::cmd_logout(args),
         "theme" => cmd_theme(args, ctx),
         "fast" => CommandAction::Message(
             "Streaming is always on. Use /model haiku for the lowest-latency tier, or /router \

@@ -511,6 +511,9 @@ pub struct PendingUserQuestion {
     /// User's answer (typed in the dialog)
     pub input: Vec<char>,
     pub cursor: usize,
+    /// Mask the input as it is typed (e.g. pasting an API key).
+    #[allow(dead_code)] // rendering the mask lands with the keystore task's dialog
+    pub secret: bool,
 }
 
 // ── Watcher handle ────────────────────────────────────────────────────────────
@@ -1393,12 +1396,17 @@ impl App {
                     reply,
                 });
             }
-            AppEvent::AskUser { question, reply } => {
+            AppEvent::AskUser {
+                question,
+                reply,
+                secret,
+            } => {
                 self.pending_user_question = Some(PendingUserQuestion {
                     question,
                     reply,
                     input: Vec::new(),
                     cursor: 0,
+                    secret,
                 });
             }
             AppEvent::SetPlanMode(enabled) => {
@@ -1446,6 +1454,10 @@ impl App {
                 self.is_loading = false;
                 self.turn_start = None;
                 self.scroll_to_bottom();
+            }
+            AppEvent::CredentialChanged(_) => {
+                // Handled in run.rs's event loop (needs &mut Config/&mut ApiBackend,
+                // which App doesn't own) before falling through to `app.apply`.
             }
         }
     }

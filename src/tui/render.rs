@@ -1220,6 +1220,7 @@ pub(crate) fn overlay_hint(title: &str, interactive: bool) -> &'static str {
         "sessions" => " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close ",
         "voices" => " ↑↓ select · Enter select · 1-9 quick · Esc close ",
         "help" | "help-commands" => " ↑↓ select · Enter open · 1-9 quick · Esc close ",
+        "login" => " ↑↓ select · Enter login · 1-9 quick · Esc close ",
         _ => " ↑↓ select · Enter choose · 1-9 quick · Esc close ",
     }
 }
@@ -1236,6 +1237,7 @@ mod overlay_hint_tests {
         assert!(overlay_hint("sessions", true).contains("d delete"));
         assert!(overlay_hint("voices", true).contains("Enter select"));
         assert!(overlay_hint("help", true).contains("Enter open"));
+        assert!(overlay_hint("login", true).contains("Enter login"));
         assert!(overlay_hint("anything", false).contains("Esc"));
     }
 }

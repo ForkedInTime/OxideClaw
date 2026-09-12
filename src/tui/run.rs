@@ -971,6 +971,34 @@ async fn run_loop(
                                 }
                             });
                         }
+                        AppEvent::CredentialChanged(change) => {
+                            use crate::tui::events::CredentialChange;
+                            match change {
+                                CredentialChange::Anthropic => {
+                                    config.resolve_anthropic_auth();
+                                    for w in &config.auth_warnings {
+                                        app.entries.push(ChatEntry::system(format!("⚠ {w}")));
+                                    }
+                                    let is_anthropic = !crate::api::is_ollama_model(&config.model)
+                                        && !crate::api::is_openai_compat_model(&config.model);
+                                    if is_anthropic {
+                                        match ApiBackend::from_config(&config) {
+                                            Ok(c) => client = c,
+                                            Err(e) => app.entries.push(ChatEntry::error(format!("Backend error: {e}"))),
+                                        }
+                                    }
+                                    if config.auth.is_none() {
+                                        app.entries.push(ChatEntry::system(
+                                            "No Anthropic credential is active now. Run /login anthropic, or set ANTHROPIC_API_KEY.",
+                                        ));
+                                    }
+                                }
+                                CredentialChange::Provider { .. } => {
+                                    // Keystore wiring lands in the keystore task.
+                                }
+                            }
+                            app.scroll_to_bottom();
+                        }
                         other => app.apply(other),
                     }
                     match rx.try_recv() {

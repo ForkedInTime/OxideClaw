@@ -1156,16 +1156,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
 
         CommandAction::OpenBrowser(url) => {
-            // Try platform-specific openers
-            let opened = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .spawn()
-                .is_ok()
-                || std::process::Command::new("open").arg(&url).spawn().is_ok()
-                || std::process::Command::new("cmd.exe")
-                    .args(["/C", "start", &url])
-                    .spawn()
-                    .is_ok();
+            let opened = open_in_browser(&url);
             let msg = if opened {
                 format!("Opened in browser: {}", url)
             } else {
@@ -1177,6 +1168,106 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
+
+        CommandAction::LoginBoard => {
+            // Replaced by the interactive board in the board task.
+            app.entries.push(ChatEntry::system(
+                "/login anthropic — sign in to Anthropic\n/login <provider> — store a provider key\n/logout — remove",
+            ));
+            app.scroll_to_bottom();
+        }
+
+        CommandAction::LoginAnthropic { profile, manual } => {
+            let req = match crate::auth::oauth::LoginRequest::for_profile(profile.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    app.entries.push(ChatEntry::error(format!("/login: {e}")));
+                    app.scroll_to_bottom();
+                    return Ok(());
+                }
+            };
+            app.entries.push(ChatEntry::system(format!(
+                "Signing in to Anthropic (profile '{}')…",
+                req.profile
+            )));
+            app.scroll_to_bottom();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                use crate::tui::events::{AppEvent, CredentialChange};
+                let progress_tx = tx2.clone();
+                let progress = move |s: String| {
+                    let _ = progress_tx.send(AppEvent::SystemMessage(s));
+                };
+                let result = if manual {
+                    let ask_tx = tx2.clone();
+                    crate::auth::oauth::login_manual(&req, move |authorize_url| {
+                        Box::pin(async move {
+                            let (reply, rx) = tokio::sync::oneshot::channel();
+                            let _ = ask_tx.send(AppEvent::AskUser {
+                                question: format!(
+                                    "Open this URL anywhere, sign in, and paste the code shown:\n{authorize_url}"
+                                ),
+                                reply,
+                                secret: false,
+                            });
+                            rx.await.ok().filter(|s| !s.trim().is_empty())
+                        })
+                    })
+                    .await
+                } else {
+                    crate::auth::oauth::login_browser(&req, open_in_browser, progress).await
+                };
+                match result {
+                    Ok(out) => {
+                        let who = match (&out.email, &out.organization) {
+                            (Some(e), Some(o)) => format!("{e} · org {o}"),
+                            (Some(e), None) => e.clone(),
+                            (None, Some(o)) => format!("org {o}"),
+                            (None, None) => String::new(),
+                        };
+                        let _ = tx2.send(AppEvent::SystemMessage(format!(
+                            "✓ Signed in to Anthropic as profile '{}' {who}",
+                            out.profile
+                        )));
+                        let _ = tx2.send(AppEvent::CredentialChanged(CredentialChange::Anthropic));
+                    }
+                    Err(e) => {
+                        let _ = tx2.send(AppEvent::SystemMessage(format!("✗ Login failed: {e}")));
+                    }
+                }
+            });
+        }
+
+        CommandAction::LogoutAnthropic => {
+            let msg = match crate::auth::profile::config_dir() {
+                None => "Cannot determine the Anthropic config directory.".to_string(),
+                Some(dir) => {
+                    let name = crate::auth::profile::resolve_profile_name(
+                        &dir,
+                        std::env::var("ANTHROPIC_PROFILE").ok().as_deref(),
+                    );
+                    match crate::auth::profile::delete_profile(&dir, &name) {
+                        Ok(true) => format!("Removed OAuth profile '{name}'."),
+                        Ok(false) => format!("No OAuth profile '{name}' to remove."),
+                        Err(e) => format!("Could not remove profile '{name}': {e}"),
+                    }
+                }
+            };
+            app.entries.push(ChatEntry::system(msg));
+            app.scroll_to_bottom();
+            let _ = tx.send(crate::tui::events::AppEvent::CredentialChanged(
+                crate::tui::events::CredentialChange::Anthropic,
+            ));
+        }
+
+        CommandAction::LoginProvider { prefix, .. } | CommandAction::LogoutProvider(prefix) => {
+            // Implemented in the keystore task.
+            app.entries.push(ChatEntry::system(format!(
+                "Provider key management for '{prefix}' is not available yet."
+            )));
+            app.scroll_to_bottom();
+        }
+
         CommandAction::PluginList => {
             let plugins_path = dirs::home_dir()
                 .unwrap_or_default()
@@ -2511,4 +2602,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Best-effort platform opener. Returns whether a launcher was spawned.
+pub(crate) fn open_in_browser(url: &str) -> bool {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .is_ok()
+        || std::process::Command::new("open").arg(url).spawn().is_ok()
+        || std::process::Command::new("cmd.exe")
+            .args(["/C", "start", url])
+            .spawn()
+            .is_ok()
 }

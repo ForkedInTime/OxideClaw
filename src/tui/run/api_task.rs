@@ -62,7 +62,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
     let tx_ask = tx.clone();
     tokio::spawn(async move {
         while let Some((question, reply)) = ask_rx.recv().await {
-            let _ = tx_ask.send(AppEvent::AskUser { question, reply });
+            let _ = tx_ask.send(AppEvent::AskUser {
+                question,
+                reply,
+                secret: false,
+            });
         }
     });
 
