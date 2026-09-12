@@ -1175,11 +1175,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
 
         CommandAction::LoginBoard => {
-            // Replaced by the interactive board in the board task.
-            app.entries.push(ChatEntry::system(
-                "/login anthropic — sign in to Anthropic\n/login <provider> — store a provider key\n/logout — remove",
-            ));
-            app.scroll_to_bottom();
+            let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+            let (lines, ids) = crate::commands::login::board_rows(config, &ollama_models);
+            app.overlay = Some(Overlay::with_items("login", lines.join("\n"), ids));
         }
 
         CommandAction::LoginAnthropic { profile, manual } => {
@@ -1269,9 +1267,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             prefix,
             open_key_page,
         } => {
-            let Some(p): Option<&'static crate::api::ProviderDef> =
-                crate::api::provider_by_prefix(&prefix)
-            else {
+            let Some(p) = crate::api::provider_by_prefix(&prefix) else {
                 return Ok(());
             };
             if p.key_env.is_empty() || p.prefix == "openai-compat" {
@@ -1397,9 +1393,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
 
         CommandAction::LogoutProvider(prefix) => {
-            let Some(p): Option<&'static crate::api::ProviderDef> =
-                crate::api::provider_by_prefix(&prefix)
-            else {
+            let Some(p) = crate::api::provider_by_prefix(&prefix) else {
                 return Ok(());
             };
             if p.key_env.is_empty() {

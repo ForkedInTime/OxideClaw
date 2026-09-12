@@ -15,7 +15,7 @@ mod agents;
 mod catalogue;
 mod git;
 mod help;
-mod login;
+pub mod login;
 mod mcp;
 mod plugins;
 mod session;
