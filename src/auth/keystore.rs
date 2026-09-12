@@ -6,18 +6,45 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Keys that may be loaded from a `.env` file. Copied from `main.rs`; the
-/// comments there about `ANTHROPIC_BASE_URL` apply unchanged.
+/// Safe allowlist of env vars that oxideclaw may load from .env files.
+///
+/// Project `.env` files are **untrusted data** — a malicious repo could ship a
+/// `.env` that sets `PATH`, `LD_PRELOAD`, or `OXIDECLAW_*_COMMAND` to pivot
+/// code execution the moment the user opens the folder. We therefore load only
+/// a narrow allowlist of our own API-key and model vars, and specifically NEVER
+/// load anything that could:
+///   - Bypass permission prompts (`CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS`)
+///   - Redirect config / settings / hook resolution (`CLAUDE_CONFIG_DIR`,
+///     `XDG_CONFIG_HOME`, `HOME`)
+///   - Alter any process-spawn path (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+///     `DYLD_*`, `OXIDECLAW_*_COMMAND`, sandbox binaries, voice binaries,
+///     MCP server argv)
+///
+/// If a user legitimately needs one of the blocked vars set, they can export
+/// it in their shell — project `.env` is not the right place.
 pub const SAFE_ENV_KEYS: &[&str] = &[
+    // Anthropic credentials. The whole documented resolution chain must be
+    // settable from .env, not just the API key — otherwise a project that
+    // authenticates with an OAuth token silently falls back to whatever key
+    // happens to be in the ambient environment.
+    //
+    // ANTHROPIC_BASE_URL is deliberately NOT here: it redirects every API call,
+    // so a hostile .env could point credentials at an attacker-controlled host.
+    // OPENAI_BASE_URL and LM_STUDIO_HOST are excluded for the same reason —
+    // they would let a project `.env` redirect an OpenAI-compat provider's
+    // requests (and any credentials sent with them) to an attacker's host.
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_PROFILE",
     "OXIDECLAW_API_KEY_FILE_DESCRIPTOR",
-    "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR",
+    "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR", // pre-rename name, still honoured
     "ANTHROPIC_MODEL",
+    // Verbose logging toggle — no exec side-effects
     "OXIDECLAW_VERBOSE",
     "RUSTYCLAW_VERBOSE",
+    // Ollama host — read-only redirect risk, but legitimate common use case
     "OLLAMA_HOST",
+    // OpenAI-compat provider keys
     "OPENAI_API_KEY",
     "GROQ_API_KEY",
     "DEEPSEEK_API_KEY",
@@ -234,7 +261,8 @@ pub fn remove_key_at(path: &Path, key: &str) -> Result<bool> {
     };
     let had = existing.lines().any(|l| is_line_for(l, key));
     if had {
-        write_env(path, &remove_line(&existing, key))?;
+        write_env(path, &remove_line(&existing, key))
+            .with_context(|| format!("write {}", path.display()))?;
     }
     Ok(had)
 }

@@ -1395,7 +1395,7 @@ mod dotenv_allowlist_tests {
         for k in FORBIDDEN_ENV_KEYS {
             assert!(
                 !SAFE_ENV_KEYS.contains(k),
-                "{k} is in SAFE_ENV_KEYS but must be forbidden — see threat model in SAFE_ENV_KEYS doc"
+                "{k} is in SAFE_ENV_KEYS but must be forbidden — see threat model in crate::auth::keystore::SAFE_ENV_KEYS doc"
             );
         }
     }
@@ -1435,7 +1435,7 @@ mod dotenv_allowlist_tests {
     /// We use `OXIDECLAW_VERBOSE` as the "safe var parsed" probe rather than
     /// `ANTHROPIC_API_KEY` so we don't clobber a real credential.
     #[test]
-    fn load_dotenv_blocks_dangerous_vars() {
+    fn parse_dotenv_blocks_dangerous_vars() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let suffix = format!(
