@@ -287,6 +287,9 @@ pub fn split_manual_code(pasted: &str, expected_state: &str) -> Result<String> {
 }
 
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long one accepted connection may stay silent before we drop it and go
+/// back to accepting. Bounds each peer, never the overall wait.
+pub const PER_CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bind `127.0.0.1:0`. The redirect URI uses `localhost`, which is what the
 /// OAuth client has registered.
@@ -345,8 +348,12 @@ pub async fn wait_for_code(
             Err(_) => return Err(anyhow!("timed out waiting for the browser callback")),
         };
         let mut buf = vec![0u8; 8192];
+        // Bound each connection separately: a peer that connects and then says
+        // nothing (a port scanner, a browser pre-connect) must not hold the
+        // whole five-minute wait hostage. Drop it and keep listening.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let n = match tokio::time::timeout(remaining, sock.read(&mut buf)).await {
+        let read_budget = remaining.min(PER_CONNECTION_READ_TIMEOUT);
+        let n = match tokio::time::timeout(read_budget, sock.read(&mut buf)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) | Err(_) => continue,
         };
@@ -938,8 +945,16 @@ mod callback_tests {
         assert!(err.contains("authorization denied"), "{err}");
     }
 
+    /// A peer that connects and never speaks — and never hangs up — used to
+    /// pin the read to the whole remaining five minutes, so the real callback
+    /// behind it in the accept backlog was never served. Each connection now
+    /// gets its own short budget.
     #[tokio::test]
-    async fn a_silent_connection_does_not_block_the_callback() {
+    async fn a_silent_connection_that_stays_open_does_not_block_the_callback() {
+        assert!(
+            PER_CONNECTION_READ_TIMEOUT < std::time::Duration::from_secs(15),
+            "this test waits out one per-connection budget in real time"
+        );
         let (listener, redirect) = bind_loopback().await.unwrap();
         let port = redirect
             .split(':')
@@ -947,18 +962,19 @@ mod callback_tests {
             .and_then(|p| p.split('/').next())
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap();
+        // Overall deadline far beyond the per-connection budget: if the read
+        // were still bounded by `remaining`, this test would hang, not fail.
         let waiter = tokio::spawn(async move {
-            wait_for_code(listener, "st", std::time::Duration::from_secs(5)).await
+            wait_for_code(listener, "st", std::time::Duration::from_secs(240)).await
         });
-        let silent = tokio::spawn(async move {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
-        let _ = silent.await;
+
+        // Held for the whole test: the socket is never dropped, never written to.
+        let _silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        // Give the waiter time to accept the silent peer first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         let (status, _body) = hit(&redirect, "code=abc&state=st").await;
         assert_eq!(status, 200);
         assert_eq!(waiter.await.unwrap().unwrap(), "abc");
