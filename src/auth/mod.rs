@@ -26,6 +26,7 @@
 
 #![allow(dead_code)] // AuthHandle and friends: Task 5 wires them into the HTTP client
 
+pub mod keystore;
 pub mod oauth;
 pub mod profile;
 
