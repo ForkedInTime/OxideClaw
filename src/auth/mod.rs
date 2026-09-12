@@ -13,24 +13,21 @@
 //!
 //! First match wins.
 //!
-//! **Why shell out to `ant` for the profile rather than parsing its JSON.**
-//! Tokens minted by `ant auth login` are short-lived and must be refreshed.
-//! `ant auth print-credentials --access-token` is the documented way to hand
-//! the active credential to a non-SDK client, and it *refreshes the token if
-//! needed* before printing. Reading `credentials/<profile>.json` directly would
-//! mean reimplementing OAuth refresh against an on-disk format that is an
-//! implementation detail. Shelling out keeps us on a supported interface and
-//! gets refresh for free.
+//! **Profiles are read natively.** `ant auth login` (and OxideClaw's own
+//! `/login`) store `credentials/<profile>.json` under the Anthropic config
+//! dir. We read that file directly and refresh the short-lived token
+//! ourselves (see [`oauth`]), so the `ant` binary is never required. This
+//! also sidesteps the Apache Ant name collision on PATH.
 //!
 //! **Wire format differs by credential kind.** A static key goes in `x-api-key`;
 //! an OAuth token goes in `Authorization: Bearer` *and* additionally requires
 //! the `oauth-2025-04-20` beta header. Sending both auth headers at once is
 //! rejected, so exactly one is ever set.
 
+#![allow(dead_code)] // AuthHandle and friends: Task 5 wires them into the HTTP client
+
 pub mod oauth;
 pub mod profile;
-
-use std::time::{Duration, Instant};
 
 /// Beta header value required alongside a bearer token.
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
@@ -75,8 +72,8 @@ impl Credential {
 pub enum CredentialSource {
     ApiKeyEnv,
     AuthTokenEnv,
-    /// `ant auth print-credentials`, for the named profile (or the active one).
-    AntProfile(Option<String>),
+    /// `credentials/<profile>.json` under the Anthropic config dir.
+    Profile(String),
 }
 
 impl CredentialSource {
@@ -84,8 +81,7 @@ impl CredentialSource {
         match self {
             CredentialSource::ApiKeyEnv => "ANTHROPIC_API_KEY".into(),
             CredentialSource::AuthTokenEnv => "ANTHROPIC_AUTH_TOKEN".into(),
-            CredentialSource::AntProfile(None) => "ant auth login (active profile)".into(),
-            CredentialSource::AntProfile(Some(p)) => format!("ant auth login (profile '{p}')"),
+            CredentialSource::Profile(p) => format!("OAuth profile '{p}'"),
         }
     }
 }
@@ -98,15 +94,244 @@ pub struct Resolved {
     pub warnings: Vec<String>,
 }
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// Details for `/doctor` and the login board. Never contains a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub name: String,
+    pub organization: Option<String>,
+    pub email: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+struct ProfileState {
+    dir: PathBuf,
+    name: String,
+    client_id: String,
+    base_url: String,
+    /// In-memory copy; std mutex so `snapshot()` is sync and cheap.
+    creds: Mutex<profile::ProfileCredentials>,
+    /// Serialises refreshes so concurrent requests share one round trip.
+    refresh_gate: tokio::sync::Mutex<()>,
+}
+
+enum AuthInner {
+    None,
+    Static(Credential),
+    // Boxed: `ProfileState` is much larger than the other variants.
+    Profile(Box<ProfileState>),
+}
+
+/// A cloneable credential source consulted per request. A static key is
+/// returned as-is; a profile refreshes itself when under the threshold.
+#[derive(Clone)]
+pub struct AuthHandle {
+    inner: Arc<AuthInner>,
+}
+
+impl Default for AuthHandle {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl std::fmt::Debug for AuthHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &*self.inner {
+            AuthInner::None => write!(f, "AuthHandle(none)"),
+            AuthInner::Static(Credential::ApiKey(_)) => write!(f, "AuthHandle(api-key)"),
+            AuthInner::Static(Credential::OAuth(_)) => write!(f, "AuthHandle(oauth-token)"),
+            AuthInner::Profile(p) => write!(f, "AuthHandle(profile '{}')", p.name),
+        }
+    }
+}
+
+impl AuthHandle {
+    pub fn none() -> Self {
+        Self {
+            inner: Arc::new(AuthInner::None),
+        }
+    }
+
+    pub fn static_credential(c: Credential) -> Self {
+        Self {
+            inner: Arc::new(AuthInner::Static(c)),
+        }
+    }
+
+    pub fn profile(
+        dir: PathBuf,
+        name: String,
+        cfg: Option<profile::ProfileConfig>,
+        creds: profile::ProfileCredentials,
+    ) -> Self {
+        let client_id = cfg
+            .as_ref()
+            .and_then(|c| c.authentication.client_id.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(oauth::client_id);
+        let base_url = cfg
+            .as_ref()
+            .and_then(|c| c.base_url.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| oauth::API_BASE.to_string());
+        Self {
+            inner: Arc::new(AuthInner::Profile(Box::new(ProfileState {
+                dir,
+                name,
+                client_id,
+                base_url,
+                creds: Mutex::new(creds),
+                refresh_gate: tokio::sync::Mutex::new(()),
+            }))),
+        }
+    }
+
+    /// Test seam: point the refresh at a local server.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(self, base_url: String) -> Self {
+        match Arc::try_unwrap(self.inner) {
+            Ok(AuthInner::Profile(mut p)) => {
+                p.base_url = base_url;
+                Self {
+                    inner: Arc::new(AuthInner::Profile(p)),
+                }
+            }
+            Ok(other) => Self {
+                inner: Arc::new(other),
+            },
+            Err(arc) => Self { inner: arc },
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(&*self.inner, AuthInner::None)
+    }
+
+    pub fn is_profile(&self) -> bool {
+        matches!(&*self.inner, AuthInner::Profile(_))
+    }
+
+    pub fn is_oauth(&self) -> bool {
+        match &*self.inner {
+            AuthInner::None => false,
+            AuthInner::Static(c) => c.is_oauth(),
+            AuthInner::Profile(_) => true,
+        }
+    }
+
+    /// Current credential without refreshing. Sync and lock-cheap.
+    pub fn snapshot(&self) -> Option<Credential> {
+        match &*self.inner {
+            AuthInner::None => None,
+            AuthInner::Static(c) => Some(c.clone()),
+            AuthInner::Profile(p) => {
+                let creds = p.creds.lock().unwrap_or_else(|e| e.into_inner());
+                Some(Credential::OAuth(creds.access_token.clone()))
+            }
+        }
+    }
+
+    pub fn profile_info(&self) -> Option<ProfileInfo> {
+        let AuthInner::Profile(p) = &*self.inner else {
+            return None;
+        };
+        let c = p.creds.lock().unwrap_or_else(|e| e.into_inner());
+        Some(ProfileInfo {
+            name: p.name.clone(),
+            organization: c.organization_name.clone(),
+            email: c.account_email.clone(),
+            expires_at: c.expires_at,
+        })
+    }
+
+    /// Credential for the next request, refreshing a stale profile first.
+    pub async fn credential(&self) -> anyhow::Result<Credential> {
+        match &*self.inner {
+            AuthInner::None => Err(anyhow::anyhow!(
+                "No Anthropic credential. Run /login, or set ANTHROPIC_API_KEY."
+            )),
+            AuthInner::Static(c) => Ok(c.clone()),
+            AuthInner::Profile(p) => {
+                let stale = {
+                    let c = p.creds.lock().unwrap_or_else(|e| e.into_inner());
+                    oauth::needs_refresh(c.expires_at, oauth::now_unix())
+                };
+                if stale {
+                    self.refresh_profile(p, false).await?;
+                }
+                Ok(self.snapshot().expect("profile always has a token"))
+            }
+        }
+    }
+
+    /// Refresh regardless of expiry (after a 401). Static handles are a no-op.
+    pub async fn force_refresh(&self) -> anyhow::Result<Credential> {
+        if let AuthInner::Profile(p) = &*self.inner {
+            self.refresh_profile(p, true).await?;
+        }
+        self.credential().await
+    }
+
+    async fn refresh_profile(&self, p: &ProfileState, force: bool) -> anyhow::Result<()> {
+        let _gate = p.refresh_gate.lock().await;
+        // Another request may have refreshed while we waited for the gate.
+        let (refresh_token, still_stale) = {
+            let c = p.creds.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                c.refresh_token.clone(),
+                force || oauth::needs_refresh(c.expires_at, oauth::now_unix()),
+            )
+        };
+        if !still_stale {
+            return Ok(());
+        }
+        let Some(rt) = refresh_token.filter(|r| !r.is_empty()) else {
+            return Err(anyhow::anyhow!(
+                "OAuth profile '{}' has expired and stores no refresh token. Run /login.",
+                p.name
+            ));
+        };
+        let tok = oauth::refresh_access_token(&p.base_url, &p.client_id, &rt)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}. Run /login to sign in again."))?;
+        let mut fresh = tok.into_credentials(oauth::now_unix());
+        {
+            let mut c = p.creds.lock().unwrap_or_else(|e| e.into_inner());
+            // Server may omit metadata on refresh; keep what we had.
+            if fresh.refresh_token.is_none() {
+                fresh.refresh_token = c.refresh_token.clone();
+            }
+            if fresh.organization_name.is_none() {
+                fresh.organization_name = c.organization_name.clone();
+                fresh.organization_uuid = c.organization_uuid.clone();
+            }
+            if fresh.account_email.is_none() {
+                fresh.account_email = c.account_email.clone();
+            }
+            if fresh.workspace_id.is_none() {
+                fresh.workspace_id = c.workspace_id.clone();
+                fresh.workspace_name = c.workspace_name.clone();
+            }
+            *c = fresh.clone();
+        }
+        if let Err(e) = profile::save_credentials(&p.dir, &p.name, &fresh) {
+            tracing::warn!("refreshed token could not be saved to disk: {e}");
+        }
+        Ok(())
+    }
+}
+
 /// Injection seam so resolution can be tested without mutating process env
 /// (which races under the parallel test harness) or requiring `ant` on PATH.
 pub trait AuthEnv {
     fn var(&self, key: &str) -> Option<String>;
-    /// Active access token via `ant auth print-credentials --access-token`.
-    fn ant_access_token(&self) -> Option<String>;
-    /// Whether an `ant` profile exists at all — used only to warn that an env
-    /// var is shadowing it.
-    fn ant_profile_present(&self) -> bool {
+    /// Access token from the active profile's credentials file (no refresh).
+    fn profile_access_token(&self) -> Option<String>;
+    /// Whether any profile exists — used only for the shadowing warning.
+    fn profile_present(&self) -> bool {
         false
     }
 }
@@ -169,11 +394,10 @@ fn resolve_stage(env: &impl AuthEnv, allow_profile: bool) -> Option<Resolved> {
     }
 
     if let Some(key) = api_key {
-        if env.ant_profile_present() {
+        if env.profile_present() {
             warnings.push(
-                "ANTHROPIC_API_KEY is shadowing your `ant auth login` profile — requests will \
-                 use the key's org/workspace, not the profile's. Unset the variable to use the \
-                 profile."
+                "ANTHROPIC_API_KEY is shadowing your OAuth profile — requests will use the \
+                 key's org/workspace, not the profile's. Unset the variable to use the profile."
                     .into(),
             );
         }
@@ -192,10 +416,11 @@ fn resolve_stage(env: &impl AuthEnv, allow_profile: bool) -> Option<Resolved> {
         });
     }
 
-    if allow_profile && let Some(token) = non_empty(env.ant_access_token()) {
+    if allow_profile && let Some(token) = non_empty(env.profile_access_token()) {
+        let name = profile.unwrap_or_else(|| "default".to_string());
         return Some(Resolved {
             credential: Credential::OAuth(token),
-            source: CredentialSource::AntProfile(profile),
+            source: CredentialSource::Profile(name),
             warnings,
         });
     }
@@ -208,103 +433,55 @@ pub fn resolve_env() -> Option<Resolved> {
     resolve_env_with(&ProcessAuthEnv)
 }
 
-/// The `ant` profile only, against the real process environment.
-pub fn resolve_profile() -> Option<Resolved> {
-    let env = ProcessAuthEnv;
-    non_empty(env.ant_access_token()).map(|token| Resolved {
-        credential: Credential::OAuth(token),
-        source: CredentialSource::AntProfile(non_empty(env.var("ANTHROPIC_PROFILE"))),
-        warnings: Vec::new(),
-    })
+/// The active profile as a refreshing handle, or `None` when no profile exists.
+pub fn load_profile_handle() -> Option<AuthHandle> {
+    let dir = profile::config_dir()?;
+    let name = profile::resolve_profile_name(
+        dir.as_path(),
+        std::env::var("ANTHROPIC_PROFILE").ok().as_deref(),
+    );
+    let creds = match profile::load_credentials(&dir, &name) {
+        Ok(Some(c)) => c,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("ignoring unreadable profile '{name}': {e}");
+            return None;
+        }
+    };
+    let cfg = profile::load_config(&dir, &name).ok().flatten();
+    Some(AuthHandle::profile(dir, name, cfg, creds))
 }
 
-/// The real environment: process env vars plus the `ant` CLI.
+/// The real environment: process env vars plus profile files on disk.
 pub struct ProcessAuthEnv;
-
-/// `ant` is a local CLI, but a wedged binary must not hang startup forever.
-const ANT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Directory `ant auth login` writes profiles to.
-///
-/// Has `ant auth login` ever stored a profile on this machine?
-///
-/// This gate exists because **`ant` is a name collision**: Apache Ant owns that
-/// binary name on many systems, including the Windows CI image. Spawning
-/// whatever `ant` happens to be on PATH is both wrong and slow — running an
-/// unrelated build tool on every startup where no API key is set. Checking for
-/// the credentials directory first means we never execute anything unless the
-/// real CLI has actually been used here.
-fn ant_profile_dir_exists() -> bool {
-    profile_dir_exists_at(profile::config_dir().as_deref())
-}
-
-/// Pure form of the check, so it can be tested without mutating process-global
-/// env. `set_var` races under the parallel test harness — the whole point of
-/// the `AuthEnv` seam above is to avoid exactly that.
-fn profile_dir_exists_at(config_dir: Option<&std::path::Path>) -> bool {
-    config_dir.is_some_and(|d| d.join("credentials").is_dir())
-}
 
 impl AuthEnv for ProcessAuthEnv {
     fn var(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
     }
-
-    fn ant_access_token(&self) -> Option<String> {
-        if !ant_profile_dir_exists() {
-            return None;
-        }
-        // `--access-token` is required: the bare form prints the whole
-        // credentials JSON, which as an Authorization header yields an empty
-        // response or an HTTP/2 protocol error rather than an obvious failure.
-        run_ant(&["auth", "print-credentials", "--access-token"])
+    fn profile_access_token(&self) -> Option<String> {
+        load_profile_handle()
+            .and_then(|h| h.snapshot())
+            .map(|c| c.secret().to_string())
     }
-
-    fn ant_profile_present(&self) -> bool {
-        ant_profile_dir_exists()
+    fn profile_present(&self) -> bool {
+        profile::config_dir().is_some_and(|d| d.join("credentials").is_dir())
     }
 }
 
-/// Run `ant` with a wall-clock bound, returning trimmed stdout on success.
-///
-/// Absent `ant` is the common case, not an error — it just means this source
-/// does not apply.
-fn run_ant(args: &[&str]) -> Option<String> {
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("ant")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let deadline = Instant::now() + ANT_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracing::warn!("`ant {}` timed out after {ANT_TIMEOUT:?}", args.join(" "));
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
-    }
-
-    let out = child.wait_with_output().ok()?;
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if token.is_empty() { None } else { Some(token) }
+/// Profile stage, as a handle (so refresh works), against the real environment.
+pub fn resolve_profile() -> Option<(Resolved, AuthHandle)> {
+    let h = load_profile_handle()?;
+    let info = h.profile_info()?;
+    let token = h.snapshot()?;
+    Some((
+        Resolved {
+            credential: token,
+            source: CredentialSource::Profile(info.name),
+            warnings: Vec::new(),
+        },
+        h,
+    ))
 }
 
 /// Resolve against the real process environment, full documented chain.
@@ -321,7 +498,7 @@ mod tests {
     #[derive(Default)]
     struct FakeEnv {
         vars: HashMap<String, String>,
-        ant_token: Option<String>,
+        profile_token: Option<String>,
         profile_present: bool,
     }
 
@@ -330,8 +507,8 @@ mod tests {
             self.vars.insert(k.into(), v.into());
             self
         }
-        fn with_ant(mut self, token: &str) -> Self {
-            self.ant_token = Some(token.into());
+        fn with_profile(mut self, token: &str) -> Self {
+            self.profile_token = Some(token.into());
             self.profile_present = true;
             self
         }
@@ -341,10 +518,10 @@ mod tests {
         fn var(&self, key: &str) -> Option<String> {
             self.vars.get(key).cloned()
         }
-        fn ant_access_token(&self) -> Option<String> {
-            self.ant_token.clone()
+        fn profile_access_token(&self) -> Option<String> {
+            self.profile_token.clone()
         }
-        fn ant_profile_present(&self) -> bool {
+        fn profile_present(&self) -> bool {
             self.profile_present
         }
     }
@@ -371,24 +548,27 @@ mod tests {
 
     #[test]
     fn ant_profile_is_third() {
-        let r = resolve_with(&FakeEnv::default().with_ant("sk-ant-oat01-abc")).unwrap();
-        assert_eq!(r.credential, Credential::OAuth("sk-ant-oat01-abc".into()));
-        assert_eq!(r.source, CredentialSource::AntProfile(None));
+        let r = resolve_with(&FakeEnv::default().with_profile("tok")).unwrap();
+        assert_eq!(r.credential, Credential::OAuth("tok".into()));
+        assert_eq!(r.source, CredentialSource::Profile("default".into()));
     }
 
     #[test]
     fn profile_name_is_recorded_when_set() {
-        let env = FakeEnv::default()
-            .with_ant("tok")
-            .with("ANTHROPIC_PROFILE", "work");
-        let r = resolve_with(&env).unwrap();
-        assert_eq!(r.source, CredentialSource::AntProfile(Some("work".into())));
+        let r = resolve_with(
+            &FakeEnv::default()
+                .with("ANTHROPIC_PROFILE", "work")
+                .with_profile("tok"),
+        )
+        .unwrap();
+        assert_eq!(r.source, CredentialSource::Profile("work".into()));
+        assert_eq!(r.source.describe(), "OAuth profile 'work'");
     }
 
     #[test]
     fn full_order_is_respected() {
         let env = FakeEnv::default()
-            .with_ant("from-profile")
+            .with_profile("from-profile")
             .with("ANTHROPIC_AUTH_TOKEN", "from-token")
             .with("ANTHROPIC_API_KEY", "from-key");
         assert_eq!(
@@ -397,7 +577,7 @@ mod tests {
         );
 
         let env = FakeEnv::default()
-            .with_ant("from-profile")
+            .with_profile("from-profile")
             .with("ANTHROPIC_AUTH_TOKEN", "from-token");
         assert_eq!(
             resolve_with(&env).unwrap().credential,
@@ -410,7 +590,7 @@ mod tests {
     #[test]
     fn shadowed_profile_is_warned_about() {
         let env = FakeEnv::default()
-            .with_ant("tok")
+            .with_profile("tok")
             .with("ANTHROPIC_API_KEY", "sk-ant-key");
         let r = resolve_with(&env).unwrap();
         assert_eq!(r.source, CredentialSource::ApiKeyEnv);
@@ -464,36 +644,6 @@ mod tests {
         );
     }
 
-    /// Regression: `ant` collides with Apache Ant, which ships on the Windows
-    /// CI image. Spawning a bare `ant` from PATH on every credential-less
-    /// startup ran an unrelated build tool and stalled the process long enough
-    /// to fail the headless SDK test. Nothing may be executed unless the real
-    /// CLI has actually stored a profile here.
-    ///
-    /// Pure over the directory — no `set_var`, so it cannot race other tests.
-    #[test]
-    fn no_subprocess_when_no_profile_directory_exists() {
-        let empty = tempfile::tempdir().unwrap();
-        assert!(
-            !profile_dir_exists_at(Some(empty.path())),
-            "a config dir with no credentials/ must not trigger a spawn"
-        );
-        assert!(
-            !profile_dir_exists_at(None),
-            "no config dir at all must not trigger a spawn"
-        );
-    }
-
-    #[test]
-    fn profile_directory_is_detected_when_present() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
-        assert!(
-            profile_dir_exists_at(Some(dir.path())),
-            "credentials/ present ⇒ the real CLI has been used here"
-        );
-    }
-
     #[test]
     fn redacted_never_leaks_the_whole_secret() {
         let key = Credential::ApiKey("sk-ant-super-secret-value".into());
@@ -503,5 +653,73 @@ mod tests {
 
         let tok = Credential::OAuth("sk-ant-oat01-secret".into());
         assert!(tok.redacted().contains("OAuth token"));
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use crate::auth::profile::*;
+
+    #[test]
+    fn static_handle_never_refreshes_and_snapshots_itself() {
+        let h = AuthHandle::static_credential(Credential::ApiKey("sk-ant-1".into()));
+        assert!(!h.is_oauth() && !h.is_profile() && !h.is_none());
+        assert_eq!(h.snapshot(), Some(Credential::ApiKey("sk-ant-1".into())));
+        let h = AuthHandle::static_credential(Credential::OAuth("tok".into()));
+        assert!(h.is_oauth());
+        assert!(AuthHandle::none().is_none());
+        assert_eq!(AuthHandle::none().snapshot(), None);
+    }
+
+    #[test]
+    fn profile_handle_exposes_info_without_the_secret() {
+        let d = tempfile::tempdir().unwrap();
+        let mut creds = ProfileCredentials::new("at", Some("rt".into()), Some(9_999_999_999));
+        creds.organization_name = Some("Kubereva".into());
+        creds.account_email = Some("a@example.com".into());
+        let h = AuthHandle::profile(d.path().to_path_buf(), "default".into(), None, creds);
+        assert!(h.is_oauth() && h.is_profile());
+        let info = h.profile_info().unwrap();
+        assert_eq!(info.name, "default");
+        assert_eq!(info.organization.as_deref(), Some("Kubereva"));
+        assert_eq!(info.email.as_deref(), Some("a@example.com"));
+        assert_eq!(info.expires_at, Some(9_999_999_999));
+        assert!(
+            !format!("{h:?}").contains("at"),
+            "debug must not leak the token"
+        );
+        assert_eq!(h.snapshot(), Some(Credential::OAuth("at".into())));
+    }
+
+    #[tokio::test]
+    async fn profile_handle_refreshes_and_rewrites_the_file_when_stale() {
+        let (base, _, hits) = crate::auth::oauth::refresh_tests::capture_server(
+            "HTTP/1.1 200 OK",
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":3600}"#,
+        )
+        .await;
+        let d = tempfile::tempdir().unwrap();
+        let creds = ProfileCredentials::new("at-old", Some("rt-old".into()), Some(1)); // long expired
+        save_credentials(d.path(), "default", &creds).unwrap();
+        let h = AuthHandle::profile(d.path().to_path_buf(), "default".into(), None, creds)
+            .with_base_url(base);
+        let c = h.credential().await.unwrap();
+        assert_eq!(c, Credential::OAuth("at-new".into()));
+        let on_disk = load_credentials(d.path(), "default").unwrap().unwrap();
+        assert_eq!(on_disk.access_token, "at-new");
+        assert_eq!(on_disk.refresh_token.as_deref(), Some("rt-new"));
+        // A second call is served from memory: no second HTTP hit.
+        let _ = h.credential().await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_without_refresh_token_says_to_login() {
+        let d = tempfile::tempdir().unwrap();
+        let creds = ProfileCredentials::new("at-old", None, Some(1));
+        let h = AuthHandle::profile(d.path().to_path_buf(), "default".into(), None, creds);
+        let err = h.credential().await.unwrap_err().to_string();
+        assert!(err.contains("/login"), "{err}");
     }
 }

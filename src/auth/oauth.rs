@@ -172,7 +172,7 @@ pub(crate) mod refresh_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// One-shot HTTP server: records the request, replies with `body`.
-    pub(super) async fn capture_server(
+    pub(crate) async fn capture_server(
         status_line: &'static str,
         body: &'static str,
     ) -> (String, Arc<tokio::sync::Mutex<String>>, Arc<AtomicUsize>) {

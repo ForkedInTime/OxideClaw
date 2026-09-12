@@ -189,9 +189,7 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
             checks.push(format!("⚠ {w}"));
         }
     } else {
-        checks.push(
-            "✗ No Anthropic credential — set ANTHROPIC_API_KEY, or run `ant auth login`".into(),
-        );
+        checks.push("✗ No Anthropic credential — run /login, or set ANTHROPIC_API_KEY".into());
     }
 
     // cwd / git / config
