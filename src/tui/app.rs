@@ -914,6 +914,24 @@ impl App {
         self.follow_bottom = true;
     }
 
+    /// Route a bracketed paste. While an ask-user dialog is open it owns the
+    /// keyboard, so the paste must land there too — otherwise the text (often
+    /// an API key) silently fills the chat prompt behind the dialog and the
+    /// next Enter sends it to the model. The dialog is single-line, so line
+    /// breaks are dropped.
+    pub fn paste_text(&mut self, text: &str) {
+        if let Some(q) = &mut self.pending_user_question {
+            for ch in text.chars().filter(|c| *c != '\r' && *c != '\n') {
+                q.input.insert(q.cursor, ch);
+                q.cursor += 1;
+            }
+            return;
+        }
+        for ch in text.chars() {
+            self.insert_char(ch);
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -1663,5 +1681,69 @@ mod trim_entries_tests {
             (MAX_ENTRIES * 3 - 1).to_string(),
             "newest content must always be retained"
         );
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"))
+    }
+
+    fn ask_secret(app: &mut App) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        app.pending_user_question = Some(PendingUserQuestion {
+            question: "Paste your API key".into(),
+            reply: tx,
+            input: Vec::new(),
+            cursor: 0,
+            secret: true,
+        });
+        rx
+    }
+
+    #[test]
+    fn paste_goes_to_the_open_secret_dialog_not_the_chat_prompt() {
+        let mut app = app();
+        let _rx = ask_secret(&mut app);
+
+        app.paste_text("gsk_abc\n");
+
+        let q = app.pending_user_question.as_ref().unwrap();
+        assert_eq!(q.input.iter().collect::<String>(), "gsk_abc");
+        assert_eq!(q.cursor, 7);
+        assert!(
+            app.input.is_empty(),
+            "the key must never land in the chat prompt: {:?}",
+            app.input
+        );
+    }
+
+    #[test]
+    fn paste_respects_the_dialog_cursor_and_drops_line_breaks() {
+        let mut app = app();
+        let _rx = ask_secret(&mut app);
+        app.paste_text("ac");
+        if let Some(q) = &mut app.pending_user_question {
+            q.cursor = 1;
+        }
+
+        app.paste_text("b\r\nd");
+
+        let q = app.pending_user_question.as_ref().unwrap();
+        assert_eq!(q.input.iter().collect::<String>(), "abdc");
+        assert_eq!(q.cursor, 3);
+    }
+
+    #[test]
+    fn paste_without_a_dialog_still_fills_the_chat_prompt() {
+        let mut app = app();
+
+        app.paste_text("hello");
+
+        assert_eq!(app.input.iter().collect::<String>(), "hello");
+        assert_eq!(app.cursor, 5);
     }
 }
