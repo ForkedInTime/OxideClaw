@@ -105,17 +105,26 @@ pub fn anthropic_status(config: &Config) -> String {
 }
 
 pub fn provider_status(p: &ProviderDef, keystore: &Keystore) -> String {
+    provider_status_with(p, keystore, &|k| std::env::var(k).ok())
+}
+
+/// Same as [`provider_status`], but with the process-env lookup injected so
+/// tests can exercise the `lmstudio` / `openai-compat` branches without
+/// mutating (or depending on) the real shell environment.
+pub fn provider_status_with(
+    p: &ProviderDef,
+    keystore: &Keystore,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> String {
     match p.prefix {
         "lmstudio" => {
-            return match std::env::var("LM_STUDIO_HOST") {
-                Ok(h) if !h.trim().is_empty() => format!("host {h} (shell env)"),
+            return match env("LM_STUDIO_HOST") {
+                Some(h) if !h.trim().is_empty() => format!("host {h} (shell env)"),
                 _ => "needs LM_STUDIO_HOST in your shell".to_string(),
             };
         }
         "openai-compat" => {
-            let url = std::env::var("OPENAI_BASE_URL")
-                .ok()
-                .filter(|u| !u.trim().is_empty());
+            let url = env("OPENAI_BASE_URL").filter(|u| !u.trim().is_empty());
             let key = keystore.source("OPENAI_API_KEY");
             return match (url, key) {
                 (Some(u), Some(s)) => format!("{u} · key via {}", s.describe()),
@@ -316,14 +325,53 @@ mod board_tests {
 
     #[test]
     fn provider_rows_show_source_or_the_key_page() {
+        let no_env: &dyn Fn(&str) -> Option<String> = &|_| None;
+
         let mut ks = Keystore::default();
         ks.set("GROQ_API_KEY", "g", KeySource::ShellEnv);
         let groq = crate::api::provider_by_prefix("groq").unwrap();
-        assert_eq!(provider_status(groq, &ks), "key via shell env");
+        assert_eq!(provider_status_with(groq, &ks, no_env), "key via shell env");
         let deepseek = crate::api::provider_by_prefix("deepseek").unwrap();
-        assert!(provider_status(deepseek, &ks).contains("platform.deepseek.com/api_keys"));
+        assert!(
+            provider_status_with(deepseek, &ks, no_env).contains("platform.deepseek.com/api_keys")
+        );
         let lm = crate::api::provider_by_prefix("lmstudio").unwrap();
-        assert!(provider_status(lm, &ks).contains("LM_STUDIO_HOST"));
+        assert!(provider_status_with(lm, &ks, no_env).contains("LM_STUDIO_HOST"));
+    }
+
+    #[test]
+    fn lmstudio_row_reports_the_injected_host_without_touching_the_process_env() {
+        let ks = Keystore::default();
+        let lm = crate::api::provider_by_prefix("lmstudio").unwrap();
+        let env: &dyn Fn(&str) -> Option<String> =
+            &|k| (k == "LM_STUDIO_HOST").then(|| "http://localhost:1234/v1".to_string());
+        let s = provider_status_with(lm, &ks, env);
+        assert!(
+            s.contains("http://localhost:1234/v1") && s.contains("shell env"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn openai_compat_row_reports_the_injected_base_url_and_key_state() {
+        let compat = crate::api::provider_by_prefix("openai-compat").unwrap();
+        let env: &dyn Fn(&str) -> Option<String> =
+            &|k| (k == "OPENAI_BASE_URL").then(|| "https://host/v1".to_string());
+
+        let ks_without_key = Keystore::default();
+        let s = provider_status_with(compat, &ks_without_key, env);
+        assert!(
+            s.contains("https://host/v1") && s.contains("no OPENAI_API_KEY"),
+            "{s}"
+        );
+
+        let mut ks_with_key = Keystore::default();
+        ks_with_key.set("OPENAI_API_KEY", "k", KeySource::ShellEnv);
+        let s = provider_status_with(compat, &ks_with_key, env);
+        assert!(
+            s.contains("https://host/v1") && s.contains("key via"),
+            "{s}"
+        );
     }
 
     #[test]
