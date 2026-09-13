@@ -227,7 +227,8 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 
 # Inside the TUI
 /help                   # interactive command menu
-/model                  # pick a model (Claude + Ollama + 9 OpenAI-compat providers)
+/login                  # sign in: Anthropic Console OAuth, or store a provider key
+/model                  # pick a model: Claude, Ollama, and every OpenAI-compat provider whose API key is set
 /rag search <query>     # semantic codebase search
 /budget $5              # cap the bill
 /voice                  # voice I/O + TTS picker

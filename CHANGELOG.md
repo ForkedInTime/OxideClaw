@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/login`.** Sign in to Anthropic from inside the TUI with Console OAuth (PKCE,
+  loopback callback, `/login anthropic manual` for SSH and headless hosts). The
+  profile is written in the layout the `ant` CLI, the official SDKs, and Claude
+  Code read, so one login serves all of them; the `ant` binary is no longer
+  required. Tokens refresh automatically mid-session, including for sub-agents
+  and web search. Console OAuth is billed as API usage to the org you pick; it is
+  not a Claude subscription login.
+- **Provider keys.** `/login groq` (or any OpenAI-compatible prefix) opens a masked
+  prompt, validates the key against the provider, and stores it in
+  `~/.config/oxideclaw/.env` (0600). `/login <provider> open` opens the key page
+  first. `/logout <provider>` removes it. Keys exported in your shell still win.
+- **`/login` board.** One overlay showing Anthropic, every provider, and Ollama with
+  whether a credential is present and where it came from. `/doctor` lists stored
+  provider keys and the active OAuth profile.
+- **Model picker** lists every OpenAI-compatible provider whose key is set, with a
+  default model per provider.
+
+### Changed
+
+- Startup hints, `/help`, and the system prompt point at `/login` instead of an
+  external CLI. Authentication is documented in FEATURES.md.
+
+### Fixed
+
+- The browser launcher no longer inherits the terminal, so opening a URL cannot
+  paint over the TUI or swallow the next keystrokes.
+- `.env` files can no longer be read with a silent "not found" on permission
+  errors; the error is reported.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

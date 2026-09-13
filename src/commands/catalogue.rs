@@ -98,6 +98,28 @@ pub(super) fn cmd_model(args: &str, _ctx: &CommandContext) -> CommandAction {
     }
 }
 
+/// Picker rows for OpenAI-compatible providers that have credentials in the
+/// environment: `(label, model id)`; providers without a known default
+/// model get a hint row with an empty id.
+pub fn provider_picker_entries(get_env: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    crate::api::configured_providers(get_env)
+        .into_iter()
+        .map(|p| {
+            if p.default_model.is_empty() {
+                (
+                    format!("{} — type /model {}:<model-name>", p.name, p.prefix),
+                    String::new(),
+                )
+            } else {
+                (
+                    format!("{} — {}", p.name, p.default_model),
+                    format!("{}:{}", p.prefix, p.default_model),
+                )
+            }
+        })
+        .collect()
+}
+
 /// Resolve common model shorthands to full Anthropic model IDs.
 /// e.g. "opus" → "claude-opus-5", "sonnet" → "claude-sonnet-5"
 pub fn resolve_model_alias(model: &str) -> String {

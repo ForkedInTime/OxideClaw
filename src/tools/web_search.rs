@@ -11,27 +11,38 @@ const WEB_SEARCH_BETA: &str = "web-search-2025-03-05";
 const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct WebSearchTool {
-    pub api_key: String,
+    /// Auth handle captured when the tools were built. `/login` installs a new
+    /// handle on the config, so this one can go stale — `execute` prefers
+    /// `ctx.live_auth` and falls back to this.
+    pub auth: crate::auth::AuthHandle,
     pub model: String,
-    /// `api_key` is an OAuth access token: send `Authorization: Bearer` +
-    /// the oauth beta instead of `x-api-key` (the API rejects both at once).
-    pub auth_is_oauth: bool,
 }
 
 impl WebSearchTool {
+    /// The handle that decides this request's credential: the live one the run
+    /// loop published this turn, else our build-time snapshot.
+    fn auth_for<'a>(&'a self, ctx: &'a ToolContext) -> &'a crate::auth::AuthHandle {
+        ctx.live_auth.as_ref().unwrap_or(&self.auth)
+    }
+
     /// The request headers, with the credential in the wire format the
     /// credential kind requires. Mirrors `api::AnthropicClient::with_credential`.
-    fn headers(&self) -> Vec<(&'static str, String)> {
+    /// An OAuth token in `x-api-key` is a guaranteed 401, and the API rejects
+    /// `x-api-key` and `Authorization` together, so exactly one goes on.
+    fn headers(cred: &crate::auth::Credential) -> Vec<(&'static str, String)> {
         let mut betas = vec![WEB_SEARCH_BETA];
         let mut h: Vec<(&'static str, String)> = vec![
             ("anthropic-version", "2023-06-01".into()),
             ("content-type", "application/json".into()),
         ];
-        if self.auth_is_oauth {
-            h.push(("authorization", format!("Bearer {}", self.api_key)));
-            betas.push(crate::auth::OAUTH_BETA);
-        } else {
-            h.push(("x-api-key", self.api_key.clone()));
+        match cred {
+            crate::auth::Credential::OAuth(t) => {
+                h.push(("authorization", format!("Bearer {t}")));
+                betas.push(crate::auth::OAUTH_BETA);
+            }
+            crate::auth::Credential::ApiKey(k) => {
+                h.push(("x-api-key", k.clone()));
+            }
         }
         h.push(("anthropic-beta", betas.join(",")));
         h
@@ -82,8 +93,16 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: WebSearchInput = serde_json::from_value(input)?;
+
+        // Read the credential per request: a `/login` mid-session replaces the
+        // handle, and an OAuth profile rotates its token underneath us.
+        let Some(cred) = self.auth_for(ctx).snapshot() else {
+            return Ok(ToolOutput::error(
+                "Web search needs an Anthropic credential. Run /login, or set ANTHROPIC_API_KEY.",
+            ));
+        };
 
         // Build the web_search tool definition for the Anthropic beta API
         let mut web_search_tool = json!({
@@ -110,7 +129,7 @@ impl Tool for WebSearchTool {
 
         let client = reqwest::Client::builder().timeout(SEARCH_TIMEOUT).build()?;
         let mut request = client.post("https://api.anthropic.com/v1/messages");
-        for (name, value) in self.headers() {
+        for (name, value) in Self::headers(&cred) {
             request = request.header(name, value);
         }
         let response = request.json(&request_body).send().await?;
@@ -164,18 +183,26 @@ impl Tool for WebSearchTool {
 mod tests {
     use super::*;
 
+    use crate::auth::{AuthHandle, Credential};
+
     fn header<'a>(h: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
         h.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())
     }
 
+    fn tool(auth: AuthHandle) -> WebSearchTool {
+        WebSearchTool {
+            auth,
+            model: "m".into(),
+        }
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(std::path::PathBuf::from("/tmp"))
+    }
+
     #[test]
     fn static_key_goes_in_x_api_key() {
-        let t = WebSearchTool {
-            api_key: "sk-ant-x".into(),
-            model: "m".into(),
-            auth_is_oauth: false,
-        };
-        let h = t.headers();
+        let h = WebSearchTool::headers(&Credential::ApiKey("sk-ant-x".into()));
         assert_eq!(header(&h, "x-api-key"), Some("sk-ant-x"));
         assert_eq!(header(&h, "authorization"), None);
         assert_eq!(header(&h, "anthropic-beta"), Some("web-search-2025-03-05"));
@@ -185,16 +212,49 @@ mod tests {
     /// credential chain was useless for WebSearch.
     #[test]
     fn oauth_token_goes_in_bearer_with_the_oauth_beta() {
-        let t = WebSearchTool {
-            api_key: "tok".into(),
-            model: "m".into(),
-            auth_is_oauth: true,
-        };
-        let h = t.headers();
+        let h = WebSearchTool::headers(&Credential::OAuth("tok".into()));
         assert_eq!(header(&h, "authorization"), Some("Bearer tok"));
         assert_eq!(header(&h, "x-api-key"), None);
         let beta = header(&h, "anthropic-beta").unwrap();
         assert!(beta.contains("web-search-2025-03-05"), "{beta}");
         assert!(beta.contains(crate::auth::OAUTH_BETA), "{beta}");
+    }
+
+    /// The startup handle is dead after `/login`; the header must come from
+    /// the handle the run loop publishes on the context.
+    #[test]
+    fn the_live_handle_beats_the_build_time_one() {
+        let t = tool(AuthHandle::static_credential(Credential::ApiKey(
+            "sk-ant-stale".into(),
+        )));
+        let mut c = ctx();
+
+        // No live handle published: fall back to our own.
+        let h = WebSearchTool::headers(&t.auth_for(&c).snapshot().unwrap());
+        assert_eq!(header(&h, "x-api-key"), Some("sk-ant-stale"));
+
+        // After /login the run loop publishes the new OAuth handle.
+        c.live_auth = Some(AuthHandle::static_credential(Credential::OAuth(
+            "fresh-token".into(),
+        )));
+        let live = t.auth_for(&c);
+        assert!(live.is_oauth());
+        let h = WebSearchTool::headers(&live.snapshot().unwrap());
+        assert_eq!(header(&h, "authorization"), Some("Bearer fresh-token"));
+        assert_eq!(header(&h, "x-api-key"), None);
+    }
+
+    /// With no credential anywhere the tool reports, it does not send a
+    /// request with an empty key.
+    #[tokio::test]
+    async fn no_credential_is_a_tool_error_not_a_bare_request() {
+        let t = tool(AuthHandle::none());
+        let out = t
+            .execute(json!({"query": "anything"}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        let text = format!("{:?}", out.content);
+        assert!(text.contains("/login"), "{text}");
     }
 }

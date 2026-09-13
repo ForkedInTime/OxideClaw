@@ -149,6 +149,25 @@ pub(super) fn cmd_files(ctx: &CommandContext) -> CommandAction {
     ))
 }
 
+/// One line naming every provider with a stored key and where it came from,
+/// or a hint line when there are none.
+pub(super) fn provider_key_lines(keystore: &crate::auth::keystore::Keystore) -> Vec<String> {
+    let configured: Vec<String> = crate::api::PROVIDERS
+        .iter()
+        .filter(|p| !p.key_env.is_empty())
+        .filter_map(|p| {
+            keystore
+                .source(p.key_env)
+                .map(|s| format!("{} ({})", p.name, s.describe()))
+        })
+        .collect();
+    if configured.is_empty() {
+        vec!["· No provider keys stored — /login <provider> to add one".into()]
+    } else {
+        vec![format!("✓ Provider keys: {}", configured.join(", "))]
+    }
+}
+
 pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     use crate::distro::{Distro, build_install_command, find_missing};
 
@@ -188,11 +207,30 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
         for w in &ctx.config.auth_warnings {
             checks.push(format!("⚠ {w}"));
         }
+        if let Some(info) = ctx.config.auth.profile_info() {
+            let who = match (&info.email, &info.organization) {
+                (Some(e), Some(o)) => format!("{e} · org {o}"),
+                (Some(e), None) => e.clone(),
+                (None, Some(o)) => format!("org {o}"),
+                (None, None) => "(no account details stored)".into(),
+            };
+            let expiry = match info.expires_at {
+                Some(t) => {
+                    let left = t - crate::auth::oauth::now_unix();
+                    if left <= 0 {
+                        "expired (refreshes on next request)".to_string()
+                    } else {
+                        format!("expires in {} min", left / 60)
+                    }
+                }
+                None => "no expiry recorded".to_string(),
+            };
+            checks.push(format!("  profile '{}': {who} · {expiry}", info.name));
+        }
     } else {
-        checks.push(
-            "✗ No Anthropic credential — set ANTHROPIC_API_KEY, or run `ant auth login`".into(),
-        );
+        checks.push("✗ No Anthropic credential — run /login, or set ANTHROPIC_API_KEY".into());
     }
+    checks.extend(provider_key_lines(&ctx.config.keystore));
 
     // cwd / git / config
     if ctx.config.cwd.exists() {
@@ -584,4 +622,27 @@ pub(super) fn cmd_stats(ctx: &CommandContext) -> CommandAction {
         format!("Pricing: ${price_in}/M in, ${price_out}/M out"),
     ];
     CommandAction::Message(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::provider_key_lines;
+    use crate::auth::keystore::{KeySource, Keystore};
+
+    #[test]
+    fn provider_lines_name_each_configured_provider_and_its_source() {
+        let mut ks = Keystore::default();
+        ks.set("GROQ_API_KEY", "g", KeySource::UserDotenv);
+        ks.set("MISTRAL_API_KEY", "m", KeySource::ShellEnv);
+        let lines = provider_key_lines(&ks);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("Groq (~/.config/oxideclaw/.env)"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("Mistral (shell env)"), "{}", lines[0]);
+        let none = provider_key_lines(&Keystore::default());
+        assert!(none[0].contains("/login <provider>"), "{}", none[0]);
+    }
 }

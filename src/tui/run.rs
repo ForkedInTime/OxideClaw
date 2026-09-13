@@ -191,22 +191,16 @@ async fn run_loop(
         || crate::api::is_openai_compat_model(&config.model);
     if !is_non_anthropic && config.api_key.is_empty() {
         return Err(anyhow::anyhow!(
-            "No Anthropic credential found.\n\
-                 OxideClaw checks, in order:\n\
+            "No Anthropic credential found. Run `oxideclaw` with a local model, or set one of:\n\
                    1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
                    2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
                    3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. ant auth login         shared with Claude Code and the official SDKs\n\
+                   4. /login                 sign in with your Console account (inside oxideclaw)\n\
                  To use a local model instead: --model ollama:<name>\n\
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
         ));
     }
-    let mut client: ApiBackend = ApiBackend::new_with_auth(
-        &config.model,
-        &config.api_key,
-        config.auth_is_oauth,
-        &config.ollama_host,
-    )?;
+    let mut client: ApiBackend = ApiBackend::from_config(&config)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
     let settings = crate::settings::Settings::load(&config.cwd);
@@ -621,12 +615,7 @@ async fn run_loop(
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             system_prompt.clear();
             system_prompt.push_str(&config.build_system_prompt());
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
-            ) {
+            match ApiBackend::from_config(&config) {
                 Ok(new_client) => {
                     client = new_client;
                 }
@@ -981,6 +970,44 @@ async fn run_loop(
                                 }
                             });
                         }
+                        AppEvent::CredentialChanged(change) => {
+                            use crate::tui::events::CredentialChange;
+                            match change {
+                                CredentialChange::Anthropic => {
+                                    config.resolve_anthropic_auth();
+                                    for w in &config.auth_warnings {
+                                        app.entries.push(ChatEntry::system(format!("⚠ {w}")));
+                                    }
+                                    let is_anthropic = !crate::api::is_ollama_model(&config.model)
+                                        && !crate::api::is_openai_compat_model(&config.model);
+                                    if is_anthropic {
+                                        match ApiBackend::from_config(&config) {
+                                            Ok(c) => client = c,
+                                            Err(e) => app.entries.push(ChatEntry::error(format!("Backend error: {e}"))),
+                                        }
+                                    }
+                                    if config.auth.is_none() {
+                                        app.entries.push(ChatEntry::system(
+                                            "No Anthropic credential is active now. Run /login anthropic, or set ANTHROPIC_API_KEY.",
+                                        ));
+                                    }
+                                }
+                                CredentialChange::Provider { prefix, key_env, value } => {
+                                    match value {
+                                        Some(v) => config.keystore.set(&key_env, &v, crate::auth::keystore::KeySource::UserDotenv),
+                                        None => config.keystore.remove(&key_env),
+                                    }
+                                    let current_prefix = config.model.split_once(':').map(|(p, _)| p.to_string());
+                                    if current_prefix.as_deref() == Some(prefix.as_str()) {
+                                        match ApiBackend::from_config(&config) {
+                                            Ok(c) => client = c,
+                                            Err(e) => app.entries.push(ChatEntry::error(format!("Backend error: {e}"))),
+                                        }
+                                    }
+                                }
+                            }
+                            app.scroll_to_bottom();
+                        }
                         other => app.apply(other),
                     }
                     match rx.try_recv() {
@@ -1036,9 +1063,7 @@ async fn run_loop(
                         }
                     }
                     Event::Paste(text) => {
-                        for ch in text.chars() {
-                            app.insert_char(ch);
-                        }
+                        app.paste_text(&text);
                     }
                     Event::Resize(cols, rows) => {
                         last_term_cols = cols;

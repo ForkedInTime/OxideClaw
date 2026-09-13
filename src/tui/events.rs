@@ -42,7 +42,11 @@ pub enum AppEvent {
     AskUser {
         question: String,
         reply: oneshot::Sender<String>,
+        /// Render the answer as bullets (API keys).
+        secret: bool,
     },
+    /// A login or logout finished; the run loop re-resolves credentials.
+    CredentialChanged(CredentialChange),
     /// A tool (EnterPlanMode/ExitPlanMode) toggled plan mode
     SetPlanMode(bool),
     // ToggleBriefMode was here — removed: brief mode is toggled directly in
@@ -56,4 +60,15 @@ pub enum AppEvent {
     PluginInstallDone { success: bool, message: String },
     /// GitHub upgrade check completed
     UpgradeCheckDone { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialChange {
+    Anthropic,
+    /// `value: None` means the key was removed.
+    Provider {
+        prefix: String,
+        key_env: String,
+        value: Option<String>,
+    },
 }
