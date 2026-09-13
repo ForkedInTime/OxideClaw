@@ -2765,15 +2765,94 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
     Ok(())
 }
 
-/// Best-effort platform opener. Returns whether a launcher was spawned.
-pub(crate) fn open_in_browser(url: &str) -> bool {
-    std::process::Command::new("xdg-open")
+/// Spawn `program` (with `args`, followed by `url`) to open a browser, with
+/// stdin/stdout/stderr all detached from the TUI. This keeps the child
+/// process (or a wrapper script it execs, e.g. `xdg-open`) from printing
+/// over the TUI's screen or stealing keystrokes typed into the terminal.
+/// Returns whether the launcher was spawned.
+pub(crate) fn open_in_browser_with(program: &str, args: &[&str], url: &str) -> bool {
+    std::process::Command::new(program)
+        .args(args)
         .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .is_ok()
-        || std::process::Command::new("open").arg(url).spawn().is_ok()
-        || std::process::Command::new("cmd.exe")
-            .args(["/C", "start", url])
-            .spawn()
-            .is_ok()
+}
+
+/// Best-effort platform opener. Returns whether a launcher was spawned.
+pub(crate) fn open_in_browser(url: &str) -> bool {
+    open_in_browser_with("xdg-open", &[], url)
+        || open_in_browser_with("open", &[], url)
+        || open_in_browser_with("cmd.exe", &["/C", "start"], url)
+}
+
+#[cfg(test)]
+mod browser_launch_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn detaches_stdio_from_launched_browser() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("fake-launcher.sh");
+        let marker_path = dir.path().join("marker.txt");
+
+        let script = format!(
+            "#!/bin/sh\n\
+             stdin_data=$(cat)\n\
+             if test -t 1; then tty_result=yes; else tty_result=no; fi\n\
+             printf 'stdin=%s;tty=%s;url=%s' \"$stdin_data\" \"$tty_result\" \"$1\" > {}\n",
+            marker_path.display()
+        );
+
+        {
+            let mut f = std::fs::File::create(&script_path).expect("write script");
+            f.write_all(script.as_bytes()).expect("write script bytes");
+        }
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let ok = open_in_browser_with(
+            script_path.to_str().unwrap(),
+            &[],
+            "https://example.invalid/x",
+        );
+        assert!(ok, "expected spawn of fake launcher to succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&marker_path)
+                && !s.is_empty()
+            {
+                contents = s;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            contents.contains("stdin=;"),
+            "expected empty stdin, got: {contents:?}"
+        );
+        assert!(
+            contents.contains("tty=no;"),
+            "expected non-tty stdout, got: {contents:?}"
+        );
+        assert!(
+            contents.contains("url=https://example.invalid/x"),
+            "expected url to be passed through, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_launcher_returns_false() {
+        assert!(!open_in_browser_with("/nonexistent/launcher-xyz", &[], "u"));
+    }
 }
