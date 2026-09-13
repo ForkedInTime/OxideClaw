@@ -2791,13 +2791,13 @@ pub(crate) fn open_in_browser(url: &str) -> bool {
 #[cfg(test)]
 mod browser_launch_tests {
     use super::*;
-    use std::io::Write as _;
-    use std::time::{Duration, Instant};
 
     #[cfg(unix)]
     #[test]
     fn detaches_stdio_from_launched_browser() {
+        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("fake-launcher.sh");
