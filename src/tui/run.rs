@@ -165,6 +165,29 @@ fn make_terminal(vp_h: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     }
 }
 
+/// The chat notice for a session that starts on an Anthropic model with no
+/// credential. `None` when nothing is missing, or when the model is served
+/// by Ollama / an OpenAI-compatible provider (those resolve their own keys).
+///
+/// This is a notice, never an exit: the only in-app way to obtain a
+/// credential is /login, which the user cannot reach if startup aborts.
+fn missing_credential_notice(model: &str, has_credential: bool) -> Option<String> {
+    let is_non_anthropic =
+        crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
+    if is_non_anthropic || has_credential {
+        return None;
+    }
+    Some(
+        "No Anthropic credential found. Sign in to get started:\n\
+           /login                  sign in with your Anthropic Console account\n\
+           /login anthropic manual if a browser cannot open on this host\n\
+         Or set one before launching: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, \
+         apiKeyHelper, or OXIDECLAW_API_KEY_FILE_DESCRIPTOR.\n\
+         For a local or other cloud model: /model, or --model ollama:<name>, --model groq:<name>, ..."
+            .to_string(),
+    )
+}
+
 // ── Plugin install async task ─────────────────────────────────────────────────
 
 async fn run_loop(
@@ -185,21 +208,11 @@ async fn run_loop(
     let mut last_term_cols = init_cols;
     let mut last_term_rows = init_rows; // cached — updated only on Resize events
     let mut system_prompt = config.build_system_prompt();
-    // Validate Anthropic API key only when the initial model is Anthropic.
-    // Ollama + OpenAI-compat providers manage their own credentials elsewhere.
-    let is_non_anthropic = crate::api::is_ollama_model(&config.model)
-        || crate::api::is_openai_compat_model(&config.model);
-    if !is_non_anthropic && config.api_key.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No Anthropic credential found. Run `oxideclaw` with a local model, or set one of:\n\
-                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
-                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
-                   3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. /login                 sign in with your Console account (inside oxideclaw)\n\
-                 To use a local model instead: --model ollama:<name>\n\
-                 Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
-        ));
-    }
+    // A missing Anthropic credential is NOT fatal here: the session must
+    // open so the user can run /login. The client builds with no auth and
+    // the first prompt fails with the same pointer; a successful /login
+    // arrives as `CredentialChanged::Anthropic` and rebuilds the client.
+    let credential_notice = missing_credential_notice(&config.model, !config.api_key.is_empty());
     let mut client: ApiBackend = ApiBackend::from_config(&config)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
@@ -251,6 +264,9 @@ async fn run_loop(
 
     let mut app = App::new(&config.model, &config.cwd);
     app.browser_session = browser_session_for_app;
+    if let Some(notice) = credential_notice {
+        app.entries.push(ChatEntry::system(notice));
+    }
     // A deep link's prompt lands in the input box for the user to read and
     // send (or not) — it is never submitted on their behalf.
     if let Some(text) = initial_input {
@@ -1288,5 +1304,30 @@ mod short_id_tests {
             "日本語のセッション"[..24].to_string()
         );
         assert_eq!(short_id("", 8), "");
+    }
+}
+
+#[cfg(test)]
+mod missing_credential_notice_tests {
+    use super::missing_credential_notice;
+
+    /// An Anthropic model with no credential must NOT abort startup: the
+    /// notice tells the user to run /login from inside the session.
+    #[test]
+    fn anthropic_without_credential_points_at_login() {
+        let n = missing_credential_notice("claude-sonnet-5", false).expect("notice");
+        assert!(n.contains("/login"), "{n}");
+        assert!(n.contains("ANTHROPIC_API_KEY"), "{n}");
+    }
+
+    #[test]
+    fn anthropic_with_credential_is_silent() {
+        assert!(missing_credential_notice("claude-sonnet-5", true).is_none());
+    }
+
+    #[test]
+    fn local_and_compat_models_never_need_an_anthropic_credential() {
+        assert!(missing_credential_notice("ollama:llama3", false).is_none());
+        assert!(missing_credential_notice("groq:llama-3.3-70b", false).is_none());
     }
 }

@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Starting on an Anthropic model with no credential no longer exits before the
+  TUI opens. The old error told you to run `/login` inside oxideclaw, but
+  oxideclaw refused to start, so a first-time user could never sign in. The
+  session now opens with a notice pointing at `/login`; sending a prompt before
+  signing in returns the same pointer in the chat. Headless modes (`-p`,
+  `browse`) still fail fast, since there is no `/login` to run there.
 - The browser launcher no longer inherits the terminal, so opening a URL cannot
   paint over the TUI or swallow the next keystrokes.
 - `.env` files can no longer be read with a silent "not found" on permission
