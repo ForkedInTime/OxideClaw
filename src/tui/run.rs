@@ -127,13 +127,7 @@ fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
         .clamp(1, 8);
 
     if show_banner {
-        // Must mirror the banner_h formula in render::draw() exactly.
-        const LOGO_H: u16 = 6; // LOGO.len() in render.rs
-        let left_h = LOGO_H + 7; // welcome + blank + logo + blank + model + cwd + blank + tagline
-        let sess_h = (app.recent_sessions.len() as u16).min(4) * 2;
-        let right_h = 6 + sess_h;
-        let banner_h = left_h.max(right_h) + 2;
-        (banner_h + input_h + status_h).min(term_rows)
+        (crate::tui::render::banner_height(app) + input_h + status_h).min(term_rows)
     } else {
         term_rows
     }
@@ -165,27 +159,21 @@ fn make_terminal(vp_h: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     }
 }
 
-/// The chat notice for a session that starts on an Anthropic model with no
+/// The welcome-banner hint for a session on an Anthropic model with no
 /// credential. `None` when nothing is missing, or when the model is served
 /// by Ollama / an OpenAI-compatible provider (those resolve their own keys).
 ///
-/// This is a notice, never an exit: the only in-app way to obtain a
+/// This is a hint, never an exit: the only in-app way to obtain a
 /// credential is /login, which the user cannot reach if startup aborts.
-fn missing_credential_notice(model: &str, has_credential: bool) -> Option<String> {
+/// Kept to one short line so it fits the banner's left column; the full
+/// list of alternatives is in the error a credential-less prompt returns.
+fn missing_credential_notice(model: &str, has_credential: bool) -> Option<&'static str> {
     let is_non_anthropic =
         crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
     if is_non_anthropic || has_credential {
         return None;
     }
-    Some(
-        "No Anthropic credential found. Sign in to get started:\n\
-           /login                  sign in with your Anthropic Console account\n\
-           /login anthropic manual if a browser cannot open on this host\n\
-         Or set one before launching: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, \
-         apiKeyHelper, or OXIDECLAW_API_KEY_FILE_DESCRIPTOR.\n\
-         For a local or other cloud model: /model, or --model ollama:<name>, --model groq:<name>, ..."
-            .to_string(),
-    )
+    Some("⚠ Not signed in — type /login to sign in")
 }
 
 // ── Plugin install async task ─────────────────────────────────────────────────
@@ -209,10 +197,10 @@ async fn run_loop(
     let mut last_term_rows = init_rows; // cached — updated only on Resize events
     let mut system_prompt = config.build_system_prompt();
     // A missing Anthropic credential is NOT fatal here: the session must
-    // open so the user can run /login. The client builds with no auth and
-    // the first prompt fails with the same pointer; a successful /login
-    // arrives as `CredentialChanged::Anthropic` and rebuilds the client.
-    let credential_notice = missing_credential_notice(&config.model, !config.api_key.is_empty());
+    // open so the user can run /login. The client builds with no auth, the
+    // welcome banner shows a hint (see the per-frame refresh in the main
+    // loop), the first prompt fails with the same pointer, and a successful
+    // /login arrives as `CredentialChanged::Anthropic` and rebuilds the client.
     let mut client: ApiBackend = ApiBackend::from_config(&config)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
@@ -264,9 +252,6 @@ async fn run_loop(
 
     let mut app = App::new(&config.model, &config.cwd);
     app.browser_session = browser_session_for_app;
-    if let Some(notice) = credential_notice {
-        app.entries.push(ChatEntry::system(notice));
-    }
     // A deep link's prompt lands in the input box for the user to read and
     // send (or not) — it is never submitted on their behalf.
     if let Some(text) = initial_input {
@@ -760,6 +745,9 @@ async fn run_loop(
         // `app.entries` reaches the renderer through here, so this single call is
         // sufficient — no need to police ~40 individual push sites.
         app.trim_entries();
+        // Cheap (two prefix checks), and it tracks /login, /logout and /model
+        // without every one of those sites having to remember the banner.
+        app.credential_hint = missing_credential_notice(&config.model, !config.auth.is_none());
 
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
@@ -1317,7 +1305,6 @@ mod missing_credential_notice_tests {
     fn anthropic_without_credential_points_at_login() {
         let n = missing_credential_notice("claude-sonnet-5", false).expect("notice");
         assert!(n.contains("/login"), "{n}");
-        assert!(n.contains("ANTHROPIC_API_KEY"), "{n}");
     }
 
     #[test]

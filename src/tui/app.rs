@@ -614,6 +614,9 @@ pub struct App {
 
     /// True until the first user message is sent (shows welcome screen)
     pub show_welcome: bool,
+    /// One-line welcome-banner hint when the active Anthropic model has no
+    /// credential. Recomputed every frame by run_loop; `None` hides the line.
+    pub credential_hint: Option<&'static str>,
 
     /// True when vim editing mode is enabled
     pub vim_enabled: bool,
@@ -799,6 +802,7 @@ impl App {
             session_name: String::new(),
             recent_sessions: Vec::new(),
             show_welcome: true,
+            credential_hint: None,
             vim_enabled: false,
             vim_normal: false,
             vim_pending: None,

@@ -107,18 +107,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .sum();
     let input_height = visual_lines.clamp(1, 8);
 
-    // Banner height — must match viewport_height() in run.rs exactly.
-    // border top+bottom = 2; left col = logo + 4 header/model/cwd lines;
-    // right col = 6 fixed lines + 2 per session (max 4 sessions shown).
-    let banner_h = if show_banner {
-        let logo_h = LOGO.len() as u16;
-        let left_h = logo_h + 7; // welcome + blank + logo + blank + model + cwd + blank + tagline
-        let sess_h = (app.recent_sessions.len() as u16).min(4) * 2;
-        let right_h = 6 + sess_h;
-        left_h.max(right_h) + 2
-    } else {
-        0
-    };
+    let banner_h = if show_banner { banner_height(app) } else { 0 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -149,6 +138,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 // ── Welcome banner — 2-column bordered box matching the TS oxideclaw fork ──────
+
+/// Rows the welcome banner occupies, border included. The single source of
+/// truth for both `draw()` and `run::viewport_height()`: the inline viewport
+/// is sized from this, so the two must never disagree.
+///
+/// border top+bottom = 2; left col = welcome + blank + logo + blank + model +
+/// cwd (+ credential hint) + blank + tagline; right col = 6 fixed lines +
+/// 2 per recent session (max 4 shown).
+pub(crate) fn banner_height(app: &App) -> u16 {
+    let logo_h = LOGO.len() as u16;
+    let hint_h = u16::from(app.credential_hint.is_some());
+    let left_h = logo_h + 7 + hint_h;
+    let sess_h = (app.recent_sessions.len() as u16).min(4) * 2;
+    let right_h = 6 + sess_h;
+    left_h.max(right_h) + 2
+}
 
 fn draw_banner(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     let block = Block::default()
@@ -235,6 +240,12 @@ fn draw_banner_left(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         format!("  {cwd_display}"),
         Style::default().fg(Color::DarkGray),
     )));
+    if let Some(hint) = app.credential_hint {
+        lines.push(Line::from(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     lines.push(Line::raw("")); // space before tagline
     lines.push(Line::from(Span::styled(
         "  Grip your codebase.",
