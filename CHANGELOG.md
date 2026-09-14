@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outcomes) instead of grey, and the welcome banner stays on screen through the
   whole login exchange; it now hides on the first real chat content rather than
   on the first status line.
+- The welcome logo is a pixel **O** for OxideClaw; it had still been the RustyClaw R.
+- Growing the inline viewport (welcome screen → first status line) erases the old
+  frame first, so the banner no longer appears twice.
 - Startup hints, `/help`, and the system prompt point at `/login` instead of an
   external CLI. Authentication is documented in FEATURES.md.
 

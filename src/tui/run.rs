@@ -762,6 +762,14 @@ async fn run_loop(
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             if needed != current_vp_h {
+                // Erase the old inline frame first. A new inline viewport
+                // starts at the cursor, which sits inside the old frame, so
+                // without this the old rows stay on screen above the new
+                // ones and the banner appears twice when it survives the
+                // resize (the compact welcome → full-height sign-in case).
+                // clear() on an inline viewport also parks the cursor at
+                // the frame's top-left, so the new frame begins there.
+                terminal.clear()?;
                 drop(terminal);
                 terminal = make_terminal(needed)?;
                 current_vp_h = needed;

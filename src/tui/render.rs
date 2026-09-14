@@ -30,15 +30,15 @@ const USER_BG: Color = Color::Rgb(30, 30, 35);
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Logo: pixel-R + small fork ──► claw scratch marks.
+// Logo: pixel-O (OxideClaw) + small fork ──► claw scratch marks.
 // Claw = 3 cascading ╲╲╲ rows (each shifted right) — looks like a claw strike,
 // NOT a fork (no tines, no converging, no handle — parallel diagonal slashes).
 const LOGO: &[&str] = &[
-    "████  ╷╷╷  ╲╲╲  ", // R top  + fork tines + claw strike row 1
-    "█   █ └┼┘   ╲╲╲ ", // R bowl + fork neck  + claw strike row 2 (shifted →)
-    "████   │ ──► ╲╲╲", // R mid  + fork + ──► + claw strike row 3 (rightmost)
-    "█  █            ", // R left + right legs
-    "█   █           ", // R legs spread
+    " ███  ╷╷╷  ╲╲╲  ", // O top  + fork tines + claw strike row 1
+    "█   █ └┼┘   ╲╲╲ ", // O side + fork neck  + claw strike row 2 (shifted →)
+    "█   █  │ ──► ╲╲╲", // O side + fork + ──► + claw strike row 3 (rightmost)
+    "█   █           ", // O side
+    " ███            ", // O bottom
     "                ", // base
 ];
 const LOGO_COLOR: Color = Color::Rgb(240, 120, 60);
