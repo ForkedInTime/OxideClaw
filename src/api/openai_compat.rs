@@ -47,6 +47,10 @@ pub struct ProviderDef {
     pub key_env: &'static str,
     /// Optional extra HTTP headers (e.g. OpenRouter requires HTTP-Referer)
     pub extra_headers: &'static [(&'static str, &'static str)],
+    /// A widely available model to offer in the picker ("" = none known).
+    pub default_model: &'static str,
+    /// Where to get an API key ("" = no key needed, e.g. local providers).
+    pub key_url: &'static str,
 }
 
 /// All known providers. Order matters for display in `/model` help.
@@ -57,6 +61,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.groq.com/openai/v1",
         key_env: "GROQ_API_KEY",
         extra_headers: &[],
+        default_model: "llama-3.3-70b-versatile",
+        key_url: "https://console.groq.com/keys",
     },
     ProviderDef {
         prefix: "openrouter",
@@ -67,6 +73,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
             ("HTTP-Referer", "https://github.com/ForkedInTime/OxideClaw"),
             ("X-Title", "OxideClaw"),
         ],
+        default_model: "meta-llama/llama-3.3-70b-instruct",
+        key_url: "https://openrouter.ai/keys",
     },
     ProviderDef {
         prefix: "deepseek",
@@ -74,6 +82,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.deepseek.com/v1",
         key_env: "DEEPSEEK_API_KEY",
         extra_headers: &[],
+        default_model: "deepseek-chat",
+        key_url: "https://platform.deepseek.com/api_keys",
     },
     ProviderDef {
         prefix: "lmstudio",
@@ -81,6 +91,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "http://localhost:1234/v1",
         key_env: "",
         extra_headers: &[],
+        default_model: "",
+        key_url: "",
     },
     ProviderDef {
         prefix: "together",
@@ -88,6 +100,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.together.xyz/v1",
         key_env: "TOGETHER_API_KEY",
         extra_headers: &[],
+        default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        key_url: "https://api.together.ai/settings/api-keys",
     },
     ProviderDef {
         prefix: "mistral",
@@ -95,6 +109,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.mistral.ai/v1",
         key_env: "MISTRAL_API_KEY",
         extra_headers: &[],
+        default_model: "mistral-large-latest",
+        key_url: "https://console.mistral.ai/api-keys",
     },
     ProviderDef {
         prefix: "venice",
@@ -102,6 +118,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.venice.ai/api/v1",
         key_env: "VENICE_API_KEY",
         extra_headers: &[],
+        default_model: "llama-3.3-70b",
+        key_url: "https://venice.ai/settings/api",
     },
     ProviderDef {
         prefix: "oai",
@@ -109,6 +127,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "https://api.openai.com/v1",
         key_env: "OPENAI_API_KEY",
         extra_headers: &[],
+        default_model: "gpt-4o",
+        key_url: "https://platform.openai.com/api-keys",
     },
     // Generic escape hatch — user MUST set OPENAI_BASE_URL
     ProviderDef {
@@ -117,8 +137,25 @@ pub static PROVIDERS: &[ProviderDef] = &[
         base_url: "",
         key_env: "OPENAI_API_KEY",
         extra_headers: &[],
+        default_model: "",
+        key_url: "",
     },
 ];
+
+/// Providers that are usable right now, judged from the environment: the
+/// provider's own key is set; OpenAI also accepts `OPENAI_API_KEY`; the generic
+/// endpoint needs `OPENAI_BASE_URL`; LM Studio needs `LM_STUDIO_HOST`.
+pub fn configured_providers(get_env: impl Fn(&str) -> Option<String>) -> Vec<&'static ProviderDef> {
+    let set = |k: &str| get_env(k).is_some_and(|v| !v.trim().is_empty());
+    PROVIDERS
+        .iter()
+        .filter(|p| match p.prefix {
+            "openai-compat" => set("OPENAI_BASE_URL") && set("OPENAI_API_KEY"),
+            "lmstudio" => set("LM_STUDIO_HOST"),
+            _ => set(p.key_env),
+        })
+        .collect()
+}
 
 /// Check if a model string uses any known provider prefix.
 pub fn is_openai_compat_model(model: &str) -> bool {
@@ -135,6 +172,45 @@ pub fn parse_provider_model(model: &str) -> Option<(&'static ProviderDef, &str)>
     let (prefix, bare) = model.split_once(':')?;
     let provider = PROVIDERS.iter().find(|p| p.prefix == prefix)?;
     Some((provider, bare))
+}
+
+/// Look up a provider by its `/model <prefix>:` prefix.
+pub fn provider_by_prefix(prefix: &str) -> Option<&'static ProviderDef> {
+    PROVIDERS.iter().find(|p| p.prefix == prefix)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyValidation {
+    Valid,
+    /// 401 or 403: the provider rejected the key.
+    Rejected(u16),
+    /// Could not tell (network error, no models endpoint, 5xx).
+    Unverified(String),
+}
+
+/// `GET <base_url>/models` with the key. 10 s timeout.
+pub async fn validate_key(provider: &ProviderDef, base_url: &str, key: &str) -> KeyValidation {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return KeyValidation::Unverified(e.to_string()),
+    };
+    let mut req = client
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .bearer_auth(key);
+    for (k, v) in provider.extra_headers {
+        req = req.header(*k, *v);
+    }
+    match req.send().await {
+        Ok(resp) => match resp.status().as_u16() {
+            200 => KeyValidation::Valid,
+            s @ (401 | 403) => KeyValidation::Rejected(s),
+            s => KeyValidation::Unverified(format!("HTTP {s} from {}/models", base_url)),
+        },
+        Err(e) => KeyValidation::Unverified(e.to_string()),
+    }
 }
 
 /// List known provider prefixes — used in /model help text.
@@ -534,37 +610,54 @@ pub struct OpenAiCompatClient {
     retry_notifier: Option<super::retry::RetryNotifier>,
 }
 
+impl std::fmt::Debug for OpenAiCompatClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("provider_name", &self.provider_name)
+            .field("no_tools", &self.no_tools.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 impl OpenAiCompatClient {
     /// Create a client for a specific provider prefix + model string.
     /// Resolves base_url from the provider registry and API key from env vars.
     pub fn from_model(model: &str) -> Result<Self> {
+        Self::from_model_with(model, &|k| std::env::var(k).ok())
+    }
+
+    /// Build a client with credentials from `lookup` (the keystore in the
+    /// TUI; the process env for the SDK and tests).
+    pub fn from_model_with(model: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let (provider, _bare) = parse_provider_model(model)
             .ok_or_else(|| anyhow!("Unknown provider prefix in '{model}'"))?;
 
         // Resolve base URL
         let base_url = if provider.prefix == "openai-compat" {
             // Generic escape hatch: MUST have OPENAI_BASE_URL set
-            std::env::var("OPENAI_BASE_URL").map_err(|_| {
+            lookup("OPENAI_BASE_URL").ok_or_else(|| {
                 anyhow!(
-                    "openai-compat: requires OPENAI_BASE_URL env var.\n\
+                    "openai-compat: requires OPENAI_BASE_URL in your shell.\n\
                      Set it to your endpoint, e.g.:\n  \
                      export OPENAI_BASE_URL=http://localhost:8080/v1"
                 )
             })?
         } else if provider.prefix == "lmstudio" {
             // LM Studio: allow override via LM_STUDIO_HOST
-            std::env::var("LM_STUDIO_HOST").unwrap_or_else(|_| provider.base_url.to_string())
+            lookup("LM_STUDIO_HOST").unwrap_or_else(|| provider.base_url.to_string())
         } else {
             provider.base_url.to_string()
         };
 
-        // Resolve API key: provider-specific env var → OPENAI_API_KEY fallback → empty
+        // Resolve API key: provider-specific key → OPENAI_API_KEY fallback → empty
         let api_key = if provider.key_env.is_empty() {
             // Local providers (LM Studio) don't need a key
             String::new()
         } else {
-            std::env::var(provider.key_env)
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            lookup(provider.key_env)
+                .or_else(|| lookup("OPENAI_API_KEY"))
                 .unwrap_or_default()
         };
 
@@ -612,6 +705,11 @@ impl OpenAiCompatClient {
     #[allow(dead_code)]
     pub fn tools_disabled(&self) -> bool {
         self.no_tools.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn api_key_for_test(&self) -> &str {
+        &self.api_key
     }
 
     /// See `ClaudeClient::set_retry_notifier`.
@@ -723,5 +821,159 @@ impl OpenAiCompatClient {
 
         let (result, _) = parse_oai_stream(resp, on_text).await?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod provider_detection_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| m.get(k).cloned()
+    }
+
+    #[test]
+    fn a_provider_is_configured_when_its_key_is_set() {
+        let got = configured_providers(env(&[("GROQ_API_KEY", "gsk"), ("DEEPSEEK_API_KEY", "dk")]));
+        let prefixes: Vec<_> = got.iter().map(|p| p.prefix).collect();
+        assert_eq!(
+            prefixes,
+            vec!["groq", "deepseek"],
+            "registry order, keyed only"
+        );
+    }
+
+    #[test]
+    fn nothing_is_configured_with_an_empty_environment() {
+        assert!(configured_providers(env(&[])).is_empty());
+        assert!(
+            configured_providers(env(&[("GROQ_API_KEY", "")])).is_empty(),
+            "empty value"
+        );
+    }
+
+    #[test]
+    fn generic_and_local_providers_need_their_url_variables() {
+        let got = configured_providers(env(&[("OPENAI_API_KEY", "sk")]));
+        let prefixes: Vec<_> = got.iter().map(|p| p.prefix).collect();
+        assert_eq!(
+            prefixes,
+            vec!["oai"],
+            "OPENAI_API_KEY alone means OpenAI only"
+        );
+        let got = configured_providers(env(&[
+            ("OPENAI_API_KEY", "sk"),
+            ("OPENAI_BASE_URL", "http://x/v1"),
+        ]));
+        assert!(got.iter().any(|p| p.prefix == "openai-compat"));
+        let got = configured_providers(env(&[("LM_STUDIO_HOST", "http://localhost:1234/v1")]));
+        assert_eq!(
+            got.iter().map(|p| p.prefix).collect::<Vec<_>>(),
+            vec!["lmstudio"]
+        );
+    }
+
+    #[test]
+    fn every_cloud_provider_has_a_default_model_for_the_picker() {
+        for p in PROVIDERS {
+            if p.prefix == "lmstudio" || p.prefix == "openai-compat" {
+                continue;
+            }
+            assert!(
+                !p.default_model.is_empty(),
+                "{} needs a default model",
+                p.prefix
+            );
+        }
+    }
+
+    #[test]
+    fn client_takes_the_key_from_the_lookup_not_the_process_env() {
+        let c = OpenAiCompatClient::from_model_with("groq:llama-3.3-70b-versatile", &|k| {
+            (k == "GROQ_API_KEY").then(|| "gsk_from_store".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.api_key_for_test(), "gsk_from_store");
+        let err = OpenAiCompatClient::from_model_with("groq:x", &|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("GROQ_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn openai_key_is_the_fallback_for_every_cloud_provider() {
+        let c = OpenAiCompatClient::from_model_with("mistral:mistral-large-latest", &|k| {
+            (k == "OPENAI_API_KEY").then(|| "sk-shared".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.api_key_for_test(), "sk-shared");
+    }
+
+    #[test]
+    fn every_cloud_provider_has_a_key_page() {
+        for p in PROVIDERS {
+            if p.prefix == "lmstudio" || p.prefix == "openai-compat" {
+                assert!(p.key_url.is_empty(), "{}", p.prefix);
+            } else {
+                assert!(
+                    p.key_url.starts_with("https://"),
+                    "{} needs a key page",
+                    p.prefix
+                );
+            }
+        }
+        assert_eq!(provider_by_prefix("groq").map(|p| p.name), Some("Groq"));
+        assert!(provider_by_prefix("nope").is_none());
+    }
+
+    async fn status_server(status_line: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp =
+                    format!("{status_line}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}");
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn validation_maps_status_codes() {
+        let groq = provider_by_prefix("groq").unwrap();
+        let base = status_server("HTTP/1.1 200 OK").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Valid
+        ));
+        let base = status_server("HTTP/1.1 401 Unauthorized").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Rejected(401)
+        ));
+        let base = status_server("HTTP/1.1 403 Forbidden").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Rejected(403)
+        ));
+        let base = status_server("HTTP/1.1 404 Not Found").await;
+        assert!(matches!(
+            validate_key(groq, &base, "k").await,
+            KeyValidation::Unverified(_)
+        ));
+        assert!(matches!(
+            validate_key(groq, "http://127.0.0.1:1/v1", "k").await,
+            KeyValidation::Unverified(_)
+        ));
     }
 }

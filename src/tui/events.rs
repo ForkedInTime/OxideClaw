@@ -38,11 +38,18 @@ pub enum AppEvent {
     },
     /// Informational notice from the harness (not from Claude)
     SystemMessage(String),
+    /// A sign-in flow's progress and outcome — rendered in the accent colour
+    /// so it reads as part of the login, not as a dim status line.
+    AuthMessage(String),
     /// Claude called AskUserQuestion — show a text-input dialog
     AskUser {
         question: String,
         reply: oneshot::Sender<String>,
+        /// Render the answer as bullets (API keys).
+        secret: bool,
     },
+    /// A login or logout finished; the run loop re-resolves credentials.
+    CredentialChanged(CredentialChange),
     /// A tool (EnterPlanMode/ExitPlanMode) toggled plan mode
     SetPlanMode(bool),
     // ToggleBriefMode was here — removed: brief mode is toggled directly in
@@ -56,4 +63,19 @@ pub enum AppEvent {
     PluginInstallDone { success: bool, message: String },
     /// GitHub upgrade check completed
     UpgradeCheckDone { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialChange {
+    Anthropic,
+    /// `/login anthropic key` stored (`Some`) or `/logout` removed (`None`)
+    /// an API key in the user `.env`; the keystore must learn of it before
+    /// the Anthropic auth chain re-runs.
+    AnthropicKey(Option<String>),
+    /// `value: None` means the key was removed.
+    Provider {
+        prefix: String,
+        key_env: String,
+        value: Option<String>,
+    },
 }

@@ -55,19 +55,13 @@ impl QueryEngine {
                    1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
                    2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
                    3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. ant auth login         shared with Claude Code and the official SDKs\n\
+                   4. /login                 sign in with your Console account (inside oxideclaw)\n\
                  To use a local model instead: --model ollama:<name>\n\
                  Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
             ));
         }
 
-        let mut client = ApiBackend::new_with_auth(
-            &config.model,
-            &config.api_key,
-            config.auth_is_oauth,
-            &config.ollama_host,
-        )
-        .context("Failed to create API client")?;
+        let mut client = ApiBackend::from_config(&config).context("Failed to create API client")?;
         // Headless: retry notices go to stderr so they never contaminate
         // stdout, which carries the machine-readable result in --json modes.
         client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
@@ -404,6 +398,7 @@ impl QueryEngine {
         // Publish live provider snapshot for AgentTool / spawn sub-agents.
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
+        ctx.live_auth = Some(self.config.auth.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
         ctx.middlewares = self.middlewares.clone();
         ctx.permission_gate = Some(self.gate.clone());

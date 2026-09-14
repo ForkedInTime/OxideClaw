@@ -62,7 +62,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
     let tx_ask = tx.clone();
     tokio::spawn(async move {
         while let Some((question, reply)) = ask_rx.recv().await {
-            let _ = tx_ask.send(AppEvent::AskUser { question, reply });
+            let _ = tx_ask.send(AppEvent::AskUser {
+                question,
+                reply,
+                secret: false,
+            });
         }
     });
 
@@ -383,6 +387,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 // sub-agents inherit `/model` changes made mid-session.
                 ctx.live_model = Some(config.model.clone());
                 ctx.live_api_key = Some(config.api_key.clone());
+                ctx.live_auth = Some(config.auth.clone());
                 ctx.live_ollama_host = Some(config.ollama_host.clone());
                 // One gate per turn (autonomy can change between turns via
                 // /autonomy). Published on the context so `Agent` children

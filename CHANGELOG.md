@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/login`.** Sign in to Anthropic from inside the TUI with Console OAuth (PKCE,
+  loopback callback, `/login anthropic manual` for SSH and headless hosts). The
+  profile is written in the layout the `ant` CLI, the official SDKs, and Claude
+  Code read, so one login serves all of them; the `ant` binary is no longer
+  required. Tokens refresh automatically mid-session, including for sub-agents
+  and web search. Console OAuth is billed as API usage to the org you pick; it is
+  not a Claude subscription login.
+- **Provider keys.** `/login groq` (or any OpenAI-compatible prefix) opens a masked
+  prompt, validates the key against the provider, and stores it in
+  `~/.config/oxideclaw/.env` (0600). `/login <provider> open` opens the key page
+  first. `/logout <provider>` removes it. Keys exported in your shell still win.
+- **`/login` board.** One overlay showing Anthropic, every provider, and Ollama with
+  whether a credential is present and where it came from. `/doctor` lists stored
+  provider keys and the active OAuth profile.
+- **Model picker** lists every OpenAI-compatible provider whose key is set, with a
+  default model per provider.
+- **`/login anthropic key`.** Paste an Anthropic API key into a masked prompt; it is
+  checked against the API, stored in `~/.config/oxideclaw/.env` (0600), and live in
+  the same session. `/logout` removes it. For people who have a Console key but no
+  shell profile or `.env` to put it in.
+- **First run asks how to sign in.** Starting on an Anthropic model with no
+  credential opens the `/login` board over the welcome screen instead of exiting.
+  The board's Anthropic section offers Console OAuth or an API key and says up
+  front that Claude Pro/Max subscriptions cannot be used from a third-party tool.
+
+### Changed
+
+- Sign-in messages are drawn in the theme's accent colour (green ✓ / red ✗ for
+  outcomes) instead of grey, and the welcome banner stays on screen through the
+  whole login exchange; it now hides on the first real chat content rather than
+  on the first status line.
+- The welcome logo is a pixel **O** for OxideClaw; it had still been the RustyClaw R.
+- Growing the inline viewport (welcome screen → first status line) erases the old
+  frame first, so the banner no longer appears twice.
+- Startup hints, `/help`, and the system prompt point at `/login` instead of an
+  external CLI. Authentication is documented in FEATURES.md.
+
+### Fixed
+
+- Starting on an Anthropic model with no credential no longer exits before the
+  TUI opens. The old error told you to run `/login` inside oxideclaw, but
+  oxideclaw refused to start, so a first-time user could never sign in. The
+  welcome screen now opens with a "Not signed in — type /login" hint; sending a
+  prompt before signing in returns the full list of alternatives in the chat. Headless modes (`-p`,
+  `browse`) still fail fast, since there is no `/login` to run there.
+- The browser launcher no longer inherits the terminal, so opening a URL cannot
+  paint over the TUI or swallow the next keystrokes.
+- `.env` files can no longer be read with a silent "not found" on permission
+  errors; the error is reported.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

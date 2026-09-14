@@ -162,6 +162,10 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.pending_help_command = Some(val);
                     } else if title == "voices" {
                         app.pending_voice_model = Some(val);
+                    } else if title == "login" {
+                        if !val.is_empty() {
+                            app.pending_help_command = Some(val);
+                        }
                     } else {
                         app.pending_resume = Some(val);
                     }
@@ -193,6 +197,10 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.pending_help_command = Some(val);
                     } else if title == "voices" {
                         app.pending_voice_model = Some(val);
+                    } else if title == "login" {
+                        if !val.is_empty() {
+                            app.pending_help_command = Some(val);
+                        }
                     } else {
                         app.pending_resume = Some(val);
                     }

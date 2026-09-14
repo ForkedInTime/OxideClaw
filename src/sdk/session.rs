@@ -96,13 +96,7 @@ impl SdkSession {
         approval_tx: mpsc::UnboundedSender<SdkNotification>,
         approval_rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
     ) -> Result<Self> {
-        let client = ApiBackend::new_with_auth(
-            &config.model,
-            &config.api_key,
-            config.auth_is_oauth,
-            &config.ollama_host,
-        )
-        .context("Failed to create API client")?;
+        let client = ApiBackend::from_config(&config).context("Failed to create API client")?;
         let system_prompt = config.build_system_prompt();
         let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -370,6 +364,7 @@ impl SdkSession {
         // Publish live provider snapshot for AgentTool / spawn sub-agents.
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
+        ctx.live_auth = Some(self.config.auth.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
 
         let mut results = Vec::new();

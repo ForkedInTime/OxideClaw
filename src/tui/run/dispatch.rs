@@ -135,12 +135,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             *system_prompt = config.build_system_prompt();
             // Re-create backend when switching between Anthropic ↔ Ollama
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
-            ) {
+            match ApiBackend::from_config(config) {
                 Ok(new_client) => {
                     *client = new_client;
                 }
@@ -154,9 +149,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::ListModels => {
             // Build combined Anthropic + Ollama interactive model picker
             let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+            let providers = {
+                let ks = config.keystore.lookup();
+                crate::commands::provider_picker_entries(|k| {
+                    ks(k).or_else(|| std::env::var(k).ok())
+                })
+            };
             let mut lines = Vec::new();
             let mut ids = Vec::new();
-            let total = crate::commands::KNOWN_MODELS.len() + ollama_models.len();
+            let total = crate::commands::KNOWN_MODELS.len()
+                + providers.iter().filter(|(_, id)| !id.is_empty()).count()
+                + ollama_models.len();
             lines.push(format!("Models ({})\n", total));
             lines.push(format!("Current: {}\n", config.model));
             // Anthropic models
@@ -166,11 +169,26 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 lines.push(format!("  {}. {} — {}{}", i + 1, id, desc, marker));
                 ids.push(id.to_string());
             }
+            // OpenAI-compatible providers with credentials in the environment
+            let mut offset = crate::commands::KNOWN_MODELS.len();
+            if !providers.is_empty() {
+                lines.push(String::new());
+                lines.push("── Providers (API key found) ──".to_string());
+                for (label, id) in &providers {
+                    if id.is_empty() {
+                        lines.push(format!("     {label}"));
+                        continue;
+                    }
+                    let marker = if *id == config.model { " ▶" } else { "" };
+                    lines.push(format!("  {}. {}{}", offset + 1, label, marker));
+                    ids.push(id.clone());
+                    offset += 1;
+                }
+            }
             // Ollama models (if any)
             if !ollama_models.is_empty() {
                 lines.push(String::new());
                 lines.push("── Ollama (local) ──".to_string());
-                let offset = crate::commands::KNOWN_MODELS.len();
                 for (i, m) in ollama_models.iter().enumerate() {
                     let marker = if *m == config.model { " ▶" } else { "" };
                     lines.push(format!("  {}. {}{}", offset + i + 1, m, marker));
@@ -178,7 +196,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
             }
             lines.push(String::new());
-            lines.push("  ↑↓ select · Enter switch · 1-9 quick pick · Esc close".into());
+            lines.push("  Any provider model: /model <prefix>:<name>  (groq, openrouter, deepseek, together, mistral, venice, oai, lmstudio, openai-compat)".into());
             app.overlay = Some(Overlay::with_items("models", lines.join("\n"), ids));
         }
         CommandAction::ListHelp => {
@@ -1143,16 +1161,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
 
         CommandAction::OpenBrowser(url) => {
-            // Try platform-specific openers
-            let opened = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .spawn()
-                .is_ok()
-                || std::process::Command::new("open").arg(&url).spawn().is_ok()
-                || std::process::Command::new("cmd.exe")
-                    .args(["/C", "start", &url])
-                    .spawn()
-                    .is_ok();
+            let opened = open_in_browser(&url);
             let msg = if opened {
                 format!("Opened in browser: {}", url)
             } else {
@@ -1164,6 +1173,349 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
+
+        CommandAction::LoginBoard => {
+            let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+            let (lines, ids) = crate::commands::login::board_rows(config, &ollama_models);
+            app.overlay = Some(Overlay::with_items("login", lines.join("\n"), ids));
+        }
+
+        CommandAction::LoginAnthropic { profile, manual } => {
+            let req = match crate::auth::oauth::LoginRequest::for_profile(profile.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    app.entries.push(ChatEntry::error(format!("/login: {e}")));
+                    app.scroll_to_bottom();
+                    return Ok(());
+                }
+            };
+            app.entries.push(ChatEntry::auth(format!(
+                "Signing in to Anthropic (profile '{}')…",
+                req.profile
+            )));
+            app.scroll_to_bottom();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                use crate::tui::events::{AppEvent, CredentialChange};
+                let progress_tx = tx2.clone();
+                let progress = move |s: String| {
+                    let _ = progress_tx.send(AppEvent::AuthMessage(s));
+                };
+                let result = if manual {
+                    let ask_tx = tx2.clone();
+                    crate::auth::oauth::login_manual(&req, move |authorize_url| {
+                        Box::pin(async move {
+                            let (reply, rx) = tokio::sync::oneshot::channel();
+                            let _ = ask_tx.send(AppEvent::AskUser {
+                                question: format!(
+                                    "Open this URL anywhere, sign in, and paste the code shown:\n{authorize_url}"
+                                ),
+                                reply,
+                                secret: false,
+                            });
+                            rx.await.ok().filter(|s| !s.trim().is_empty())
+                        })
+                    })
+                    .await
+                } else {
+                    crate::auth::oauth::login_browser(&req, open_in_browser, progress).await
+                };
+                match result {
+                    Ok(out) => {
+                        let who = match (&out.email, &out.organization) {
+                            (Some(e), Some(o)) => format!("{e} · org {o}"),
+                            (Some(e), None) => e.clone(),
+                            (None, Some(o)) => format!("org {o}"),
+                            (None, None) => String::new(),
+                        };
+                        let _ = tx2.send(AppEvent::AuthMessage(format!(
+                            "✓ Signed in to Anthropic as profile '{}' {who}",
+                            out.profile
+                        )));
+                        let _ = tx2.send(AppEvent::CredentialChanged(CredentialChange::Anthropic));
+                    }
+                    Err(e) => {
+                        let _ = tx2.send(AppEvent::AuthMessage(format!("✗ Login failed: {e}")));
+                    }
+                }
+            });
+        }
+
+        CommandAction::LogoutAnthropic => {
+            let mut msg = match crate::auth::profile::config_dir() {
+                None => "Cannot determine the Anthropic config directory.".to_string(),
+                Some(dir) => {
+                    let name = crate::auth::profile::resolve_profile_name(
+                        &dir,
+                        std::env::var("ANTHROPIC_PROFILE").ok().as_deref(),
+                    );
+                    match crate::auth::profile::delete_profile(&dir, &name) {
+                        Ok(true) => format!("Removed OAuth profile '{name}'."),
+                        Ok(false) => format!("No OAuth profile '{name}' to remove."),
+                        Err(e) => format!("Could not remove profile '{name}': {e}"),
+                    }
+                }
+            };
+            // A key stored by `/login anthropic key` is a credential too.
+            match crate::auth::keystore::remove_key("ANTHROPIC_API_KEY") {
+                Ok(true) => msg.push_str("\nRemoved the stored Anthropic API key."),
+                Ok(false) => {}
+                Err(e) => msg.push_str(&format!("\nCould not remove the stored API key: {e}")),
+            }
+            if crate::auth::keystore::shadows_user_file(config.keystore.source("ANTHROPIC_API_KEY"))
+            {
+                msg.push_str("\n  ⚠ ANTHROPIC_API_KEY still comes from your shell or a .env file; unset it there to sign out fully.");
+            }
+            app.entries.push(ChatEntry::auth(msg));
+            app.scroll_to_bottom();
+            let _ = tx.send(crate::tui::events::AppEvent::CredentialChanged(
+                crate::tui::events::CredentialChange::AnthropicKey(None),
+            ));
+        }
+
+        CommandAction::LoginAnthropicKey => {
+            let shadow = config
+                .keystore
+                .source("ANTHROPIC_API_KEY")
+                .filter(|s| crate::auth::keystore::shadows_user_file(Some(*s)));
+            app.entries.push(ChatEntry::auth(
+                "Storing an Anthropic API key (billed as API usage to its org).",
+            ));
+            app.scroll_to_bottom();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                use crate::api::KeyValidation;
+                use crate::tui::events::{AppEvent, CredentialChange};
+                let mut question = "Paste your Anthropic API key (ANTHROPIC_API_KEY).\nKeys: https://console.anthropic.com/settings/keys".to_string();
+                for _attempt in 0..3 {
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx2.send(AppEvent::AskUser {
+                        question: question.clone(),
+                        reply,
+                        secret: true,
+                    });
+                    let Some(key) = rx
+                        .await
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        let _ =
+                            tx2.send(AppEvent::AuthMessage("Cancelled — no key stored.".into()));
+                        return;
+                    };
+                    let verdict = crate::api::validate_anthropic_key(&key).await;
+                    if let KeyValidation::Rejected(status) = verdict {
+                        question = format!(
+                            "Anthropic rejected that key (HTTP {status}). Paste it again, or Esc to cancel."
+                        );
+                        continue;
+                    }
+                    match crate::auth::keystore::save_key("ANTHROPIC_API_KEY", &key) {
+                        Ok(path) => {
+                            let redacted = crate::auth::Credential::ApiKey(key.clone()).redacted();
+                            let note = match verdict {
+                                KeyValidation::Valid => String::new(),
+                                KeyValidation::Unverified(why) => {
+                                    format!("\n  (could not verify the key: {why})")
+                                }
+                                KeyValidation::Rejected(_) => unreachable!(),
+                            };
+                            let shadow_note = match shadow {
+                                Some(src) => format!(
+                                    "\n  ⚠ ANTHROPIC_API_KEY also comes from {}; that value wins on the next launch.",
+                                    src.describe()
+                                ),
+                                None => String::new(),
+                            };
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
+                                "✓ Anthropic API key {redacted} saved to {}{note}{shadow_note}",
+                                path.display()
+                            )));
+                            let _ = tx2.send(AppEvent::CredentialChanged(
+                                CredentialChange::AnthropicKey(Some(key)),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
+                                "✗ Could not save the key: {e}"
+                            )));
+                        }
+                    }
+                    return;
+                }
+                let _ = tx2.send(AppEvent::AuthMessage(
+                    "Giving up after three rejected keys.".into(),
+                ));
+            });
+        }
+
+        CommandAction::LoginProvider {
+            prefix,
+            open_key_page,
+        } => {
+            let Some(p) = crate::api::provider_by_prefix(&prefix) else {
+                return Ok(());
+            };
+            if p.key_env.is_empty() || p.prefix == "openai-compat" {
+                let hint = if p.prefix == "lmstudio" {
+                    "LM Studio needs no key. Set the host in your shell:\n  export LM_STUDIO_HOST=http://localhost:1234/v1\nthen /model lmstudio:<model-name>".to_string()
+                } else {
+                    "The generic endpoint needs the base URL in your shell (never from a file):\n  export OPENAI_BASE_URL=https://host/v1\nStoring OPENAI_API_KEY now…".to_string()
+                };
+                app.entries.push(ChatEntry::auth(hint));
+                app.scroll_to_bottom();
+                if p.prefix == "lmstudio" {
+                    return Ok(());
+                }
+            }
+            if open_key_page && !p.key_url.is_empty() {
+                let opened = open_in_browser(p.key_url);
+                app.entries.push(ChatEntry::auth(if opened {
+                    format!("Opened {} in your browser.", p.key_url)
+                } else {
+                    format!("Could not open a browser. Keys are at {}", p.key_url)
+                }));
+            }
+            // A project `.env` or `~/.env` outranks the file we are about to
+            // write just as surely as the shell does — warn for all three.
+            let shadow = config
+                .keystore
+                .source(p.key_env)
+                .filter(|s| crate::auth::keystore::shadows_user_file(Some(*s)));
+            app.scroll_to_bottom();
+            let tx2 = tx.clone();
+            let ks_lookup_base = {
+                let ks = config.keystore.lookup();
+                ks("OPENAI_BASE_URL").or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+            };
+            tokio::spawn(async move {
+                use crate::api::KeyValidation;
+                use crate::tui::events::{AppEvent, CredentialChange};
+                let base_url = if p.prefix == "openai-compat" {
+                    ks_lookup_base.unwrap_or_default()
+                } else {
+                    p.base_url.to_string()
+                };
+                let mut question = format!(
+                    "Paste your {} API key ({}).{}",
+                    p.name,
+                    p.key_env,
+                    if p.key_url.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nKeys: {}", p.key_url)
+                    }
+                );
+                for _attempt in 0..3 {
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx2.send(AppEvent::AskUser {
+                        question: question.clone(),
+                        reply,
+                        secret: true,
+                    });
+                    let Some(key) = rx
+                        .await
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        let _ =
+                            tx2.send(AppEvent::AuthMessage("Cancelled — no key stored.".into()));
+                        return;
+                    };
+                    let verdict = if base_url.is_empty() {
+                        KeyValidation::Unverified("no base URL to test against".into())
+                    } else {
+                        crate::api::validate_key(p, &base_url, &key).await
+                    };
+                    if let KeyValidation::Rejected(status) = verdict {
+                        question = format!(
+                            "{} rejected that key (HTTP {status}). Paste it again, or Esc to cancel.",
+                            p.name
+                        );
+                        continue;
+                    }
+                    match crate::auth::keystore::save_key(p.key_env, &key) {
+                        Ok(path) => {
+                            let redacted = crate::auth::Credential::ApiKey(key.clone()).redacted();
+                            let note = match verdict {
+                                KeyValidation::Valid => String::new(),
+                                KeyValidation::Unverified(why) => {
+                                    format!("\n  (could not verify the key: {why})")
+                                }
+                                KeyValidation::Rejected(_) => unreachable!(),
+                            };
+                            let shadow_note = match shadow {
+                                Some(src) => format!(
+                                    "\n  ⚠ {} also comes from {}; that value wins on the next launch.",
+                                    p.key_env,
+                                    src.describe()
+                                ),
+                                None => String::new(),
+                            };
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
+                                "✓ {} key {redacted} saved to {}{note}{shadow_note}\n  /model {}:{}",
+                                p.name,
+                                path.display(),
+                                p.prefix,
+                                if p.default_model.is_empty() { "<model-name>" } else { p.default_model }
+                            )));
+                            let _ =
+                                tx2.send(AppEvent::CredentialChanged(CredentialChange::Provider {
+                                    prefix: p.prefix.to_string(),
+                                    key_env: p.key_env.to_string(),
+                                    value: Some(key),
+                                }));
+                        }
+                        Err(e) => {
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
+                                "✗ Could not save the key: {e}"
+                            )));
+                        }
+                    }
+                    return;
+                }
+                let _ = tx2.send(AppEvent::AuthMessage(
+                    "Giving up after three rejected keys.".into(),
+                ));
+            });
+        }
+
+        CommandAction::LogoutProvider(prefix) => {
+            let Some(p) = crate::api::provider_by_prefix(&prefix) else {
+                return Ok(());
+            };
+            if p.key_env.is_empty() {
+                app.entries
+                    .push(ChatEntry::system(format!("{} stores no key.", p.name)));
+                app.scroll_to_bottom();
+                return Ok(());
+            }
+            let msg = match crate::auth::keystore::remove_key(p.key_env) {
+                Ok(true) => format!("Removed the stored {} key.", p.name),
+                Ok(false) => format!("No stored {} key to remove.", p.name),
+                Err(e) => format!("Could not remove the {} key: {e}", p.name),
+            };
+            let shadow =
+                crate::auth::keystore::shadows_user_file(config.keystore.source(p.key_env));
+            app.entries.push(ChatEntry::system(if shadow {
+                format!("{msg}\n  ⚠ {} still comes from {}; the provider stays configured until you unset it there.", p.key_env, config.keystore.source(p.key_env).map(|s| s.describe()).unwrap_or("elsewhere"))
+            } else {
+                msg
+            }));
+            app.scroll_to_bottom();
+            if !shadow {
+                let _ = tx.send(crate::tui::events::AppEvent::CredentialChanged(
+                    crate::tui::events::CredentialChange::Provider {
+                        prefix: p.prefix.to_string(),
+                        key_env: p.key_env.to_string(),
+                        value: None,
+                    },
+                ));
+            }
+        }
+
         CommandAction::PluginList => {
             let plugins_path = dirs::home_dir()
                 .unwrap_or_default()
@@ -2498,4 +2850,96 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Spawn `program` (with `args`, followed by `url`) to open a browser, with
+/// stdin/stdout/stderr all detached from the TUI. This keeps the child
+/// process (or a wrapper script it execs, e.g. `xdg-open`) from printing
+/// over the TUI's screen or stealing keystrokes typed into the terminal.
+/// Returns whether the launcher was spawned.
+pub(crate) fn open_in_browser_with(program: &str, args: &[&str], url: &str) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Best-effort platform opener. Returns whether a launcher was spawned.
+pub(crate) fn open_in_browser(url: &str) -> bool {
+    open_in_browser_with("xdg-open", &[], url)
+        || open_in_browser_with("open", &[], url)
+        || open_in_browser_with("cmd.exe", &["/C", "start"], url)
+}
+
+#[cfg(test)]
+mod browser_launch_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn detaches_stdio_from_launched_browser() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("fake-launcher.sh");
+        let marker_path = dir.path().join("marker.txt");
+
+        let script = format!(
+            "#!/bin/sh\n\
+             stdin_data=$(cat)\n\
+             if test -t 1; then tty_result=yes; else tty_result=no; fi\n\
+             printf 'stdin=%s;tty=%s;url=%s' \"$stdin_data\" \"$tty_result\" \"$1\" > {}\n",
+            marker_path.display()
+        );
+
+        {
+            let mut f = std::fs::File::create(&script_path).expect("write script");
+            f.write_all(script.as_bytes()).expect("write script bytes");
+        }
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let ok = open_in_browser_with(
+            script_path.to_str().unwrap(),
+            &[],
+            "https://example.invalid/x",
+        );
+        assert!(ok, "expected spawn of fake launcher to succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&marker_path)
+                && !s.is_empty()
+            {
+                contents = s;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            contents.contains("stdin=;"),
+            "expected empty stdin, got: {contents:?}"
+        );
+        assert!(
+            contents.contains("tty=no;"),
+            "expected non-tty stdout, got: {contents:?}"
+        );
+        assert!(
+            contents.contains("url=https://example.invalid/x"),
+            "expected url to be passed through, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_launcher_returns_false() {
+        assert!(!open_in_browser_with("/nonexistent/launcher-xyz", &[], "u"));
+    }
 }

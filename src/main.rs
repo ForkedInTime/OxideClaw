@@ -384,56 +384,10 @@ enum McpSubcommand {
     ResetProjectChoices,
 }
 
-/// Safe allowlist of env vars that oxideclaw may load from .env files.
-///
-/// Project `.env` files are **untrusted data** — a malicious repo could ship a
-/// `.env` that sets `PATH`, `LD_PRELOAD`, or `OXIDECLAW_*_COMMAND` to pivot
-/// code execution the moment the user opens the folder. We therefore load only
-/// a narrow allowlist of our own API-key and model vars, and specifically NEVER
-/// load anything that could:
-///   - Bypass permission prompts (`CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS`)
-///   - Redirect config / settings / hook resolution (`CLAUDE_CONFIG_DIR`,
-///     `XDG_CONFIG_HOME`, `HOME`)
-///   - Alter any process-spawn path (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
-///     `DYLD_*`, `OXIDECLAW_*_COMMAND`, sandbox binaries, voice binaries,
-///     MCP server argv)
-///
-/// If a user legitimately needs one of the blocked vars set, they can export
-/// it in their shell — project `.env` is not the right place.
-const SAFE_ENV_KEYS: &[&str] = &[
-    // Anthropic credentials. The whole documented resolution chain must be
-    // settable from .env, not just the API key — otherwise a project that
-    // authenticates with an OAuth token silently falls back to whatever key
-    // happens to be in the ambient environment.
-    //
-    // ANTHROPIC_BASE_URL is deliberately NOT here: it redirects every API call,
-    // so a hostile .env could point credentials at an attacker-controlled host.
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_PROFILE",
-    "OXIDECLAW_API_KEY_FILE_DESCRIPTOR",
-    "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR", // pre-rename name, still honoured
-    "ANTHROPIC_MODEL",
-    // Verbose logging toggle — no exec side-effects
-    "OXIDECLAW_VERBOSE",
-    "RUSTYCLAW_VERBOSE",
-    // Ollama host — read-only redirect risk, but legitimate common use case
-    "OLLAMA_HOST",
-    // OpenAI-compat provider keys
-    "OPENAI_API_KEY",
-    "GROQ_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "MISTRAL_API_KEY",
-    "OPENROUTER_API_KEY",
-    "TOGETHER_API_KEY",
-    "XAI_API_KEY",
-    "VENICE_API_KEY",
-];
-
 /// Env vars that MUST NEVER be loaded from `.env` files because doing so
 /// would allow a malicious repo to bypass security controls or redirect
 /// process execution. This is a belt-and-braces check on top of the
-/// allowlist in [`SAFE_ENV_KEYS`].
+/// allowlist in [`crate::auth::keystore::SAFE_ENV_KEYS`].
 ///
 /// Kept as a separate constant so the intent (and the threat model) stay
 /// explicit in code reviews.
@@ -457,56 +411,6 @@ const FORBIDDEN_ENV_KEYS: &[&str] = &[
     "GEMINI_CLI_IDE_SERVER_STDIO_COMMAND",
 ];
 
-/// Load KEY=VALUE pairs from a .env file into the process environment.
-/// Only sets vars from SAFE_ENV_KEYS that are NOT already set.
-/// Skips blank lines and lines starting with #.
-fn load_dotenv(path: &std::path::Path) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some((key, val)) = line.split_once('=') {
-            let key = key.trim();
-            let val = val.trim().trim_matches('"').trim_matches('\'');
-            if !key.is_empty() && SAFE_ENV_KEYS.contains(&key) && std::env::var(key).is_err() {
-                // SAFETY: single-threaded at this point — called before tokio runtime starts
-                unsafe {
-                    std::env::set_var(key, val);
-                }
-            }
-        }
-    }
-}
-
-/// Search common locations for .env files and load them in priority order.
-/// Later sources do NOT override earlier ones (env already set always wins).
-fn load_dotenv_auto() {
-    // 1. CWD/.env  — project-local keys (highest priority, filtered to safe keys only)
-    if let Ok(cwd) = std::env::current_dir() {
-        let env_path = cwd.join(".env");
-        if env_path.exists() {
-            load_dotenv(&env_path);
-            // Warn if project .env exists — it won't leak into tool subprocesses
-            eprintln!(
-                "Note: .env detected in project root. Only oxideclaw-specific keys \
-                 (ANTHROPIC_API_KEY, OLLAMA_HOST, etc.) are loaded. \
-                 Project vars are NOT injected into tool execution."
-            );
-        }
-    }
-    // 2. ~/.env  — user-global keys
-    if let Some(home) = dirs::home_dir() {
-        load_dotenv(&home.join(".env"));
-        // 3. ~/.config/oxideclaw/.env  — app-specific config
-        load_dotenv(&crate::config::app_dir(&home.join(".config")).join(".env"));
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Suppress broken-pipe errors — these happen when stdout is piped to `head`
@@ -529,8 +433,9 @@ async fn main() -> Result<()> {
     }
 
     // Load .env files before anything else so API keys are available
-    // to Config::load() and all downstream code.
-    load_dotenv_auto();
+    // to Config::load() and all downstream code. Config::load() picks this
+    // up via `keystore::snapshot()`.
+    crate::auth::keystore::load_dotenv_auto();
 
     let cli = Cli::parse();
 
@@ -602,7 +507,9 @@ async fn main() -> Result<()> {
                         println!("  \u{2713} ANTHROPIC_API_KEY set ({}…)", &key[..4]);
                     }
                 } else {
-                    println!("  \u{2717} ANTHROPIC_API_KEY not set");
+                    println!(
+                        "  \u{2717} No Anthropic credential — run /login inside oxideclaw, or set ANTHROPIC_API_KEY"
+                    );
                 }
                 // Config dir
                 let config_dir = config::Config::claude_dir();
@@ -697,7 +604,7 @@ async fn main() -> Result<()> {
                     || crate::api::is_openai_compat_model(&config.model);
                 if !is_non_anthropic && config.api_key.is_empty() {
                     eprintln!(
-                        "Error: ANTHROPIC_API_KEY not set for model: {}",
+                        "Error: No Anthropic credential for model: {} — run /login inside oxideclaw, or set ANTHROPIC_API_KEY",
                         config.model
                     );
                     std::process::exit(1);
@@ -1478,7 +1385,8 @@ mod self_update_tests {
 
 #[cfg(test)]
 mod dotenv_allowlist_tests {
-    use super::{FORBIDDEN_ENV_KEYS, SAFE_ENV_KEYS, load_dotenv};
+    use super::FORBIDDEN_ENV_KEYS;
+    use crate::auth::keystore::{SAFE_ENV_KEYS, parse_dotenv};
     use std::io::Write;
 
     /// Every var the threat model says must be blocked must NOT appear in
@@ -1489,7 +1397,7 @@ mod dotenv_allowlist_tests {
         for k in FORBIDDEN_ENV_KEYS {
             assert!(
                 !SAFE_ENV_KEYS.contains(k),
-                "{k} is in SAFE_ENV_KEYS but must be forbidden — see threat model in SAFE_ENV_KEYS doc"
+                "{k} is in SAFE_ENV_KEYS but must be forbidden — see threat model in crate::auth::keystore::SAFE_ENV_KEYS doc"
             );
         }
     }
@@ -1523,14 +1431,13 @@ mod dotenv_allowlist_tests {
         );
     }
 
-    /// A malicious .env that sets dangerous vars must not leak into the
-    /// process environment when we run `load_dotenv` against it.
-    ///
-    /// This is a live, end-to-end test of the loader against a real file.
-    /// We use `OXIDECLAW_VERBOSE` as the "safe var loaded" probe rather than
+    /// A malicious .env that sets dangerous vars must not survive
+    /// `parse_dotenv` — this is the belt-and-braces check on top of the
+    /// allowlist itself, run against a real file on disk.
+    /// We use `OXIDECLAW_VERBOSE` as the "safe var parsed" probe rather than
     /// `ANTHROPIC_API_KEY` so we don't clobber a real credential.
     #[test]
-    fn load_dotenv_blocks_dangerous_vars() {
+    fn parse_dotenv_blocks_dangerous_vars() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let suffix = format!(
@@ -1549,79 +1456,26 @@ mod dotenv_allowlist_tests {
         writeln!(f, "OXIDECLAW_VERBOSE=1").unwrap();
         drop(f);
 
-        // Snapshot-restore anything we might touch so we don't perturb the
-        // test harness's own environment.
-        let snap_ck = std::env::var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS").ok();
-        let snap_cd = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        let snap_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let snap_sbox = std::env::var("OXIDECLAW_SANDBOX_COMMAND").ok();
-        let snap_verb = std::env::var("OXIDECLAW_VERBOSE").ok();
-        let original_path = std::env::var("PATH").unwrap_or_default();
+        let parsed = parse_dotenv(&std::fs::read_to_string(&path).unwrap());
 
-        unsafe {
-            std::env::remove_var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS");
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("OXIDECLAW_SANDBOX_COMMAND");
-            std::env::remove_var("OXIDECLAW_VERBOSE");
+        // Safe var parsed.
+        assert!(
+            parsed.contains(&("OXIDECLAW_VERBOSE".to_string(), "1".to_string())),
+            "safe var OXIDECLAW_VERBOSE should have been parsed: {parsed:?}"
+        );
+        // Dangerous vars NOT parsed.
+        for (key, _) in &parsed {
+            assert!(
+                !FORBIDDEN_ENV_KEYS.contains(&key.as_str()),
+                "{key} must NEVER be loaded from .env"
+            );
         }
-
-        load_dotenv(&path);
-
-        // Safe var loaded.
         assert_eq!(
-            std::env::var("OXIDECLAW_VERBOSE").ok().as_deref(),
-            Some("1"),
-            "safe var OXIDECLAW_VERBOSE should have been loaded"
-        );
-        // Dangerous vars NOT loaded.
-        assert!(
-            std::env::var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS").is_err(),
-            "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS must NEVER be loaded from .env"
-        );
-        assert!(
-            std::env::var("CLAUDE_CONFIG_DIR").is_err(),
-            "CLAUDE_CONFIG_DIR must NEVER be loaded from .env"
-        );
-        assert!(
-            std::env::var("XDG_CONFIG_HOME").is_err(),
-            "XDG_CONFIG_HOME must NEVER be loaded from .env"
-        );
-        assert!(
-            std::env::var("OXIDECLAW_SANDBOX_COMMAND").is_err(),
-            "OXIDECLAW_SANDBOX_COMMAND must NEVER be loaded from .env"
-        );
-        // PATH must be untouched (loader only sets keys that are NOT already set,
-        // but even if PATH were unset we still block it via the allowlist).
-        assert_eq!(
-            std::env::var("PATH").unwrap_or_default(),
-            original_path,
-            "PATH must NEVER be overwritten from .env"
-        );
-        assert!(
-            std::env::var("LD_PRELOAD").ok().as_deref() != Some("/evil/libhack.so"),
-            "LD_PRELOAD must NEVER be loaded from .env"
+            parsed.len(),
+            1,
+            "only the allowlisted key should survive parsing: {parsed:?}"
         );
 
-        // Cleanup
         let _ = std::fs::remove_file(&path);
-        unsafe {
-            std::env::remove_var("OXIDECLAW_VERBOSE");
-            if let Some(v) = snap_ck {
-                std::env::set_var("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS", v);
-            }
-            if let Some(v) = snap_cd {
-                std::env::set_var("CLAUDE_CONFIG_DIR", v);
-            }
-            if let Some(v) = snap_xdg {
-                std::env::set_var("XDG_CONFIG_HOME", v);
-            }
-            if let Some(v) = snap_sbox {
-                std::env::set_var("OXIDECLAW_SANDBOX_COMMAND", v);
-            }
-            if let Some(v) = snap_verb {
-                std::env::set_var("OXIDECLAW_VERBOSE", v);
-            }
-        }
     }
 }

@@ -138,6 +138,11 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
         &[
             ("/model", "interactive model picker"),
             (
+                "/login",
+                "sign in: Anthropic OAuth, or store a provider key",
+            ),
+            ("/logout", "remove the Anthropic profile or a provider key"),
+            (
                 "/effort",
                 "set effort (low, medium, high, max, off) — output_config.effort on Claude 4.6+/5",
             ),

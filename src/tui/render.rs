@@ -30,15 +30,15 @@ const USER_BG: Color = Color::Rgb(30, 30, 35);
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Logo: pixel-R + small fork ──► claw scratch marks.
+// Logo: pixel-O (OxideClaw) + small fork ──► claw scratch marks.
 // Claw = 3 cascading ╲╲╲ rows (each shifted right) — looks like a claw strike,
 // NOT a fork (no tines, no converging, no handle — parallel diagonal slashes).
 const LOGO: &[&str] = &[
-    "████  ╷╷╷  ╲╲╲  ", // R top  + fork tines + claw strike row 1
-    "█   █ └┼┘   ╲╲╲ ", // R bowl + fork neck  + claw strike row 2 (shifted →)
-    "████   │ ──► ╲╲╲", // R mid  + fork + ──► + claw strike row 3 (rightmost)
-    "█  █            ", // R left + right legs
-    "█   █           ", // R legs spread
+    " ███  ╷╷╷  ╲╲╲  ", // O top  + fork tines + claw strike row 1
+    "█   █ └┼┘   ╲╲╲ ", // O side + fork neck  + claw strike row 2 (shifted →)
+    "█   █  │ ──► ╲╲╲", // O side + fork + ──► + claw strike row 3 (rightmost)
+    "█   █           ", // O side
+    " ███            ", // O bottom
     "                ", // base
 ];
 const LOGO_COLOR: Color = Color::Rgb(240, 120, 60);
@@ -90,10 +90,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // avoiding 8+ separate theme_colors() calls per frame.
     let tc = theme_colors(&app.theme);
 
-    // Welcome screen — shown when no chat entries exist yet.
-    // Automatically hides when any content is pushed (commands, messages, etc.)
-    // and reappears after /clear (which empties entries).
-    let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
+    let show_banner = banner_visible(app);
 
     // Collect input to String once — reused in both height calc and draw_input.
     let full_input: String = app.input.iter().collect();
@@ -107,18 +104,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .sum();
     let input_height = visual_lines.clamp(1, 8);
 
-    // Banner height — must match viewport_height() in run.rs exactly.
-    // border top+bottom = 2; left col = logo + 4 header/model/cwd lines;
-    // right col = 6 fixed lines + 2 per session (max 4 sessions shown).
-    let banner_h = if show_banner {
-        let logo_h = LOGO.len() as u16;
-        let left_h = logo_h + 7; // welcome + blank + logo + blank + model + cwd + blank + tagline
-        let sess_h = (app.recent_sessions.len() as u16).min(4) * 2;
-        let right_h = 6 + sess_h;
-        left_h.max(right_h) + 2
-    } else {
-        0
-    };
+    let banner_h = if show_banner { banner_height(app) } else { 0 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -149,6 +135,35 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 // ── Welcome banner — 2-column bordered box matching the TS oxideclaw fork ──────
+
+/// Whether the welcome banner is on screen. It stays through sign-in
+/// (`Auth` entries) and short status lines (`System`), so the logo heads
+/// every login interaction, and hides once real chat content exists. It
+/// reappears after /clear, which empties the entries.
+pub(crate) fn banner_visible(app: &App) -> bool {
+    app.show_welcome
+        && app.streaming.is_empty()
+        && app
+            .entries
+            .iter()
+            .all(|e| matches!(e.kind, EntryKind::Auth | EntryKind::System))
+}
+
+/// Rows the welcome banner occupies, border included. The single source of
+/// truth for both `draw()` and `run::viewport_height()`: the inline viewport
+/// is sized from this, so the two must never disagree.
+///
+/// border top+bottom = 2; left col = welcome + blank + logo + blank + model +
+/// cwd (+ credential hint) + blank + tagline; right col = 6 fixed lines +
+/// 2 per recent session (max 4 shown).
+pub(crate) fn banner_height(app: &App) -> u16 {
+    let logo_h = LOGO.len() as u16;
+    let hint_h = u16::from(app.credential_hint.is_some());
+    let left_h = logo_h + 7 + hint_h;
+    let sess_h = (app.recent_sessions.len() as u16).min(4) * 2;
+    let right_h = 6 + sess_h;
+    left_h.max(right_h) + 2
+}
 
 fn draw_banner(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     let block = Block::default()
@@ -235,6 +250,12 @@ fn draw_banner_left(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         format!("  {cwd_display}"),
         Style::default().fg(Color::DarkGray),
     )));
+    if let Some(hint) = app.credential_hint {
+        lines.push(Line::from(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     lines.push(Line::raw("")); // space before tagline
     lines.push(Line::from(Span::styled(
         "  Grip your codebase.",
@@ -495,6 +516,24 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                     lines.push(Line::from(Span::styled(
                         format!("  {raw}"),
                         Style::default().fg(Color::Gray),
+                    )));
+                }
+                lines.push(Line::raw(""));
+            }
+
+            EntryKind::Auth => {
+                for raw in entry.text.lines() {
+                    let t = raw.trim_start();
+                    let color = if t.starts_with('✓') {
+                        Color::Green
+                    } else if t.starts_with('✗') {
+                        Color::Red
+                    } else {
+                        tc.accent
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  {raw}"),
+                        Style::default().fg(color),
                     )));
                 }
                 lines.push(Line::raw(""));
@@ -1055,11 +1094,7 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     f.render_widget(Clear, popup);
 
     let title = format!(" {} ", overlay.title);
-    let hint = if overlay.is_interactive() {
-        " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close "
-    } else {
-        " Esc / Enter / q to close  ↑↓ to scroll "
-    };
+    let hint = overlay_hint(&overlay.title, overlay.is_interactive());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.accent))
@@ -1157,11 +1192,16 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(Clear, popup);
 
+    let title = if q.secret {
+        " Enter API key "
+    } else {
+        " Claude is asking "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            " Claude is asking ",
+            title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1178,9 +1218,11 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::raw(""));
 
-    // Render the text input row with cursor
-    let before: String = q.input[..q.cursor].iter().collect();
-    let rest: Vec<char> = q.input[q.cursor..].to_vec();
+    // Render the text input row with cursor. Secrets are shown as bullets —
+    // one per character, so the cursor math below is unaffected.
+    let shown: Vec<char> = dialog_input_display(&q.input, q.secret).chars().collect();
+    let before: String = shown[..q.cursor].iter().collect();
+    let rest: Vec<char> = shown[q.cursor..].to_vec();
     let cursor_str = rest.first().map_or(" ", |_| " "); // block cursor
     let (cur_ch, after_str) = if rest.is_empty() {
         (" ".to_string(), String::new())
@@ -1212,4 +1254,97 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
         inner,
     );
+}
+
+/// Footer hint for an overlay: the verb must match what Enter does there.
+pub(crate) fn overlay_hint(title: &str, interactive: bool) -> &'static str {
+    if !interactive {
+        return " Esc / Enter / q to close  ↑↓ to scroll ";
+    }
+    match title {
+        "models" => " ↑↓ select · Enter switch · 1-9 quick · Esc close ",
+        "sessions" => " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close ",
+        "voices" => " ↑↓ select · Enter select · 1-9 quick · Esc close ",
+        "help" | "help-commands" => " ↑↓ select · Enter open · 1-9 quick · Esc close ",
+        "login" => " ↑↓ select · Enter login · 1-9 quick · Esc close ",
+        _ => " ↑↓ select · Enter choose · 1-9 quick · Esc close ",
+    }
+}
+
+/// Input row text for the ask-user dialog. Secrets render as bullets.
+pub(crate) fn dialog_input_display(input: &[char], secret: bool) -> String {
+    if secret {
+        "•".repeat(input.len())
+    } else {
+        input.iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::dialog_input_display;
+
+    #[test]
+    fn secrets_render_as_bullets_of_the_same_length() {
+        let chars: Vec<char> = "gsk_abc".chars().collect();
+        assert_eq!(dialog_input_display(&chars, true), "•••••••");
+        assert_eq!(dialog_input_display(&chars, false), "gsk_abc");
+    }
+}
+
+#[cfg(test)]
+mod overlay_hint_tests {
+    use super::overlay_hint;
+
+    #[test]
+    fn the_enter_verb_matches_the_overlay() {
+        assert!(overlay_hint("models", true).contains("Enter switch"));
+        assert!(!overlay_hint("models", true).contains("delete"));
+        assert!(overlay_hint("sessions", true).contains("Enter resume"));
+        assert!(overlay_hint("sessions", true).contains("d delete"));
+        assert!(overlay_hint("voices", true).contains("Enter select"));
+        assert!(overlay_hint("help", true).contains("Enter open"));
+        assert!(overlay_hint("login", true).contains("Enter login"));
+        assert!(overlay_hint("anything", false).contains("Esc"));
+    }
+}
+
+#[cfg(test)]
+mod banner_visible_tests {
+    use super::banner_visible;
+    use crate::tui::app::{App, ChatEntry};
+
+    fn app() -> App {
+        App::new("claude-sonnet-5", std::path::Path::new("/tmp"))
+    }
+
+    #[test]
+    fn empty_chat_shows_the_banner() {
+        assert!(banner_visible(&app()));
+    }
+
+    /// The logo heads every login interaction: sign-in lines and short
+    /// status notices do not evict it.
+    #[test]
+    fn auth_and_system_entries_keep_the_banner() {
+        let mut a = app();
+        a.entries.push(ChatEntry::auth("Signing in to Anthropic…"));
+        a.entries.push(ChatEntry::system("Codebase indexed"));
+        assert!(banner_visible(&a));
+    }
+
+    #[test]
+    fn real_chat_content_hides_the_banner() {
+        let mut a = app();
+        a.entries.push(ChatEntry::auth("✓ Signed in"));
+        a.entries.push(ChatEntry::user("hello"));
+        assert!(!banner_visible(&a));
+    }
+
+    #[test]
+    fn show_welcome_false_hides_it_regardless() {
+        let mut a = app();
+        a.show_welcome = false;
+        assert!(!banner_visible(&a));
+    }
 }

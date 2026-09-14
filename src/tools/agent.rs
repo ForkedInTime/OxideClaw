@@ -20,6 +20,36 @@ pub struct AgentTool {
 }
 
 impl AgentTool {
+    /// The provider config the child engine runs under.
+    ///
+    /// Our own `self.config` is a snapshot taken at tool-build time and goes
+    /// stale the moment the user runs `/model foo` — or `/login` — mid-session.
+    /// The run loop republishes the live provider choice through `ToolContext`
+    /// each turn, so prefer that. `ApiBackend::from_config` authenticates from
+    /// `auth`, not `api_key`, so the handle is what actually decides whether
+    /// the child can talk to Anthropic at all; `api_key` is kept in step for
+    /// the tools that still read the bare string.
+    fn sub_config(&self, ctx: &ToolContext) -> Config {
+        let mut sub = self.config.clone();
+        if let Some(ref m) = ctx.live_model {
+            sub.model = m.clone();
+        }
+        if let Some(ref k) = ctx.live_api_key {
+            sub.api_key = k.clone();
+        }
+        if let Some(ref h) = ctx.live_auth {
+            sub.auth = h.clone();
+            sub.auth_is_oauth = h.is_oauth();
+            if let Some(c) = h.snapshot() {
+                sub.api_key = c.secret().to_string();
+            }
+        }
+        if let Some(ref h) = ctx.live_ollama_host {
+            sub.ollama_host = h.clone();
+        }
+        sub
+    }
+
     /// The child engine inherits the executor's permission gate (so its
     /// Bash/Write/Edit prompt the same human, or fail closed the same way)
     /// and sits one level deeper in the launch chain.
@@ -105,23 +135,7 @@ impl Tool for AgentTool {
         }
 
         // Build config for sub-agent, potentially with restricted tools.
-        //
-        // Our own `self.config` is a snapshot taken at tool-build time and
-        // goes stale the moment the user runs `/model foo` mid-session. The
-        // run loop publishes the live provider choice through `ToolContext`
-        // each turn — prefer it so sub-agents actually run against the
-        // currently-active provider instead of silently falling back to the
-        // startup model. (Known regression in multiple competing tools.)
-        let mut sub_config = self.config.clone();
-        if let Some(ref m) = ctx.live_model {
-            sub_config.model = m.clone();
-        }
-        if let Some(ref k) = ctx.live_api_key {
-            sub_config.api_key = k.clone();
-        }
-        if let Some(ref h) = ctx.live_ollama_host {
-            sub_config.ollama_host = h.clone();
-        }
+        let mut sub_config = self.sub_config(ctx);
 
         // Apply subagent_type: override system prompt + restrict tools as needed
         let (system_prompt_override, allowed_tools): (Option<String>, Option<Vec<String>>) =
@@ -449,6 +463,46 @@ mod tests {
         assert!(
             !refused.exists(),
             "no gate on the context → headless → refused"
+        );
+    }
+
+    /// After `/login`, the run loop publishes a new `AuthHandle`. The child
+    /// must inherit *that*, not the dead one captured when the tools were
+    /// built — `ApiBackend::from_config` reads `auth`, so a stale handle means
+    /// the sub-agent authenticates as whoever was signed in at startup.
+    #[test]
+    fn the_child_inherits_the_live_auth_handle_not_the_startup_one() {
+        let mut startup = config();
+        startup.auth = crate::auth::AuthHandle::static_credential(crate::auth::Credential::ApiKey(
+            "sk-ant-stale".into(),
+        ));
+        startup.api_key = "sk-ant-stale".into();
+        let tool = AgentTool { config: startup };
+
+        // No live handle: the startup snapshot still applies.
+        let ctx = ToolContext::new(std::env::temp_dir());
+        let sub = tool.sub_config(&ctx);
+        assert!(!sub.auth.is_oauth());
+        assert_eq!(sub.api_key, "sk-ant-stale");
+
+        // /login happened this session: the fresh OAuth handle wins.
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        let live = crate::auth::AuthHandle::static_credential(crate::auth::Credential::OAuth(
+            "fresh-token".into(),
+        ));
+        ctx.live_api_key = Some("sk-ant-stale".into()); // the stale string publisher
+        ctx.live_auth = Some(live.clone());
+
+        let sub = tool.sub_config(&ctx);
+        assert!(sub.auth.is_oauth(), "child must use the OAuth handle");
+        assert!(sub.auth_is_oauth);
+        assert_eq!(
+            sub.auth.snapshot().map(|c| c.secret().to_string()),
+            live.snapshot().map(|c| c.secret().to_string()),
+        );
+        assert_eq!(
+            sub.api_key, "fresh-token",
+            "the bare-string readers must see the live credential too"
         );
     }
 }

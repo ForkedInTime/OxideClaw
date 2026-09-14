@@ -112,7 +112,9 @@ pub async fn run_tui(
 /// right below the box (matching TS oxideclaw/Ink compact behaviour).
 /// During chat: full terminal height to maximise scroll room.
 fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
-    let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
+    // Compact only while the banner is alone; once sign-in lines sit under
+    // it the chat needs the room.
+    let compact = crate::tui::render::banner_visible(app) && app.entries.is_empty();
     let status_h = 1u16;
 
     let usable_w = term_cols.saturating_sub(2) as usize;
@@ -126,14 +128,8 @@ fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
         .sum::<u16>()
         .clamp(1, 8);
 
-    if show_banner {
-        // Must mirror the banner_h formula in render::draw() exactly.
-        const LOGO_H: u16 = 6; // LOGO.len() in render.rs
-        let left_h = LOGO_H + 7; // welcome + blank + logo + blank + model + cwd + blank + tagline
-        let sess_h = (app.recent_sessions.len() as u16).min(4) * 2;
-        let right_h = 6 + sess_h;
-        let banner_h = left_h.max(right_h) + 2;
-        (banner_h + input_h + status_h).min(term_rows)
+    if compact {
+        (crate::tui::render::banner_height(app) + input_h + status_h).min(term_rows)
     } else {
         term_rows
     }
@@ -165,6 +161,23 @@ fn make_terminal(vp_h: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     }
 }
 
+/// The welcome-banner hint for a session on an Anthropic model with no
+/// credential. `None` when nothing is missing, or when the model is served
+/// by Ollama / an OpenAI-compatible provider (those resolve their own keys).
+///
+/// This is a hint, never an exit: the only in-app way to obtain a
+/// credential is /login, which the user cannot reach if startup aborts.
+/// Kept to one short line so it fits the banner's left column; the full
+/// list of alternatives is in the error a credential-less prompt returns.
+fn missing_credential_notice(model: &str, has_credential: bool) -> Option<&'static str> {
+    let is_non_anthropic =
+        crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
+    if is_non_anthropic || has_credential {
+        return None;
+    }
+    Some("⚠ Not signed in — type /login to sign in")
+}
+
 // ── Plugin install async task ─────────────────────────────────────────────────
 
 async fn run_loop(
@@ -185,28 +198,12 @@ async fn run_loop(
     let mut last_term_cols = init_cols;
     let mut last_term_rows = init_rows; // cached — updated only on Resize events
     let mut system_prompt = config.build_system_prompt();
-    // Validate Anthropic API key only when the initial model is Anthropic.
-    // Ollama + OpenAI-compat providers manage their own credentials elsewhere.
-    let is_non_anthropic = crate::api::is_ollama_model(&config.model)
-        || crate::api::is_openai_compat_model(&config.model);
-    if !is_non_anthropic && config.api_key.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No Anthropic credential found.\n\
-                 OxideClaw checks, in order:\n\
-                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
-                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
-                   3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. ant auth login         shared with Claude Code and the official SDKs\n\
-                 To use a local model instead: --model ollama:<name>\n\
-                 Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
-        ));
-    }
-    let mut client: ApiBackend = ApiBackend::new_with_auth(
-        &config.model,
-        &config.api_key,
-        config.auth_is_oauth,
-        &config.ollama_host,
-    )?;
+    // A missing Anthropic credential is NOT fatal here: the session must
+    // open so the user can run /login. The client builds with no auth, the
+    // welcome banner shows a hint (see the per-frame refresh in the main
+    // loop), the first prompt fails with the same pointer, and a successful
+    // /login arrives as `CredentialChanged::Anthropic` and rebuilds the client.
+    let mut client: ApiBackend = ApiBackend::from_config(&config)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
     let settings = crate::settings::Settings::load(&config.cwd);
@@ -257,6 +254,14 @@ async fn run_loop(
 
     let mut app = App::new(&config.model, &config.cwd);
     app.browser_session = browser_session_for_app;
+    // First run with nothing to authenticate with: ask how, right away. The
+    // board is the same one /login opens; Enter puts a row's command in the
+    // input. The banner hint covers anyone who closes it.
+    if missing_credential_notice(&config.model, !config.auth.is_none()).is_some() {
+        let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+        let (lines, ids) = crate::commands::login::board_rows(&config, &ollama_models);
+        app.overlay = Some(Overlay::with_items("login", lines.join("\n"), ids));
+    }
     // A deep link's prompt lands in the input box for the user to read and
     // send (or not) — it is never submitted on their behalf.
     if let Some(text) = initial_input {
@@ -621,12 +626,7 @@ async fn run_loop(
                 crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
             system_prompt.clear();
             system_prompt.push_str(&config.build_system_prompt());
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
-            ) {
+            match ApiBackend::from_config(&config) {
                 Ok(new_client) => {
                     client = new_client;
                 }
@@ -755,10 +755,21 @@ async fn run_loop(
         // `app.entries` reaches the renderer through here, so this single call is
         // sufficient — no need to police ~40 individual push sites.
         app.trim_entries();
+        // Cheap (two prefix checks), and it tracks /login, /logout and /model
+        // without every one of those sites having to remember the banner.
+        app.credential_hint = missing_credential_notice(&config.model, !config.auth.is_none());
 
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             if needed != current_vp_h {
+                // Erase the old inline frame first. A new inline viewport
+                // starts at the cursor, which sits inside the old frame, so
+                // without this the old rows stay on screen above the new
+                // ones and the banner appears twice when it survives the
+                // resize (the compact welcome → full-height sign-in case).
+                // clear() on an inline viewport also parks the cursor at
+                // the frame's top-left, so the new frame begins there.
+                terminal.clear()?;
                 drop(terminal);
                 terminal = make_terminal(needed)?;
                 current_vp_h = needed;
@@ -981,6 +992,50 @@ async fn run_loop(
                                 }
                             });
                         }
+                        AppEvent::CredentialChanged(change) => {
+                            use crate::tui::events::CredentialChange;
+                            match change {
+                                CredentialChange::Anthropic | CredentialChange::AnthropicKey(_) => {
+                                    if let CredentialChange::AnthropicKey(value) = change {
+                                        match value {
+                                            Some(v) => config.keystore.set("ANTHROPIC_API_KEY", &v, crate::auth::keystore::KeySource::UserDotenv),
+                                            None => config.keystore.remove("ANTHROPIC_API_KEY"),
+                                        }
+                                    }
+                                    config.resolve_anthropic_auth();
+                                    for w in &config.auth_warnings {
+                                        app.entries.push(ChatEntry::system(format!("⚠ {w}")));
+                                    }
+                                    let is_anthropic = !crate::api::is_ollama_model(&config.model)
+                                        && !crate::api::is_openai_compat_model(&config.model);
+                                    if is_anthropic {
+                                        match ApiBackend::from_config(&config) {
+                                            Ok(c) => client = c,
+                                            Err(e) => app.entries.push(ChatEntry::error(format!("Backend error: {e}"))),
+                                        }
+                                    }
+                                    if config.auth.is_none() {
+                                        app.entries.push(ChatEntry::system(
+                                            "No Anthropic credential is active now. Run /login anthropic, or set ANTHROPIC_API_KEY.",
+                                        ));
+                                    }
+                                }
+                                CredentialChange::Provider { prefix, key_env, value } => {
+                                    match value {
+                                        Some(v) => config.keystore.set(&key_env, &v, crate::auth::keystore::KeySource::UserDotenv),
+                                        None => config.keystore.remove(&key_env),
+                                    }
+                                    let current_prefix = config.model.split_once(':').map(|(p, _)| p.to_string());
+                                    if current_prefix.as_deref() == Some(prefix.as_str()) {
+                                        match ApiBackend::from_config(&config) {
+                                            Ok(c) => client = c,
+                                            Err(e) => app.entries.push(ChatEntry::error(format!("Backend error: {e}"))),
+                                        }
+                                    }
+                                }
+                            }
+                            app.scroll_to_bottom();
+                        }
                         other => app.apply(other),
                     }
                     match rx.try_recv() {
@@ -1036,9 +1091,7 @@ async fn run_loop(
                         }
                     }
                     Event::Paste(text) => {
-                        for ch in text.chars() {
-                            app.insert_char(ch);
-                        }
+                        app.paste_text(&text);
                     }
                     Event::Resize(cols, rows) => {
                         last_term_cols = cols;
@@ -1263,5 +1316,29 @@ mod short_id_tests {
             "日本語のセッション"[..24].to_string()
         );
         assert_eq!(short_id("", 8), "");
+    }
+}
+
+#[cfg(test)]
+mod missing_credential_notice_tests {
+    use super::missing_credential_notice;
+
+    /// An Anthropic model with no credential must NOT abort startup: the
+    /// notice tells the user to run /login from inside the session.
+    #[test]
+    fn anthropic_without_credential_points_at_login() {
+        let n = missing_credential_notice("claude-sonnet-5", false).expect("notice");
+        assert!(n.contains("/login"), "{n}");
+    }
+
+    #[test]
+    fn anthropic_with_credential_is_silent() {
+        assert!(missing_credential_notice("claude-sonnet-5", true).is_none());
+    }
+
+    #[test]
+    fn local_and_compat_models_never_need_an_anthropic_credential() {
+        assert!(missing_credential_notice("ollama:llama3", false).is_none());
+        assert!(missing_credential_notice("groq:llama-3.3-70b", false).is_none());
     }
 }
