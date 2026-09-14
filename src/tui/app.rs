@@ -371,6 +371,7 @@ pub enum EntryKind {
     ToolResult,
     Error,
     System,        // Short status messages — dim italic (e.g. "TTS stopped.")
+    Auth,          // Sign-in progress/outcome — accent colour, keeps the welcome banner
     CommandOutput, // Readable multi-line command output — /doctor, /voice, /help, etc.
 }
 
@@ -414,6 +415,12 @@ impl ChatEntry {
     pub fn system(t: impl Into<String>) -> Self {
         Self {
             kind: EntryKind::System,
+            text: t.into(),
+        }
+    }
+    pub fn auth(t: impl Into<String>) -> Self {
+        Self {
+            kind: EntryKind::Auth,
             text: t.into(),
         }
     }
@@ -1444,6 +1451,10 @@ impl App {
             }
             AppEvent::SystemMessage(msg) => {
                 self.entries.push(ChatEntry::system(msg));
+                self.scroll_to_bottom();
+            }
+            AppEvent::AuthMessage(msg) => {
+                self.entries.push(ChatEntry::auth(msg));
                 self.scroll_to_bottom();
             }
             AppEvent::VoiceTranscription(text) => {

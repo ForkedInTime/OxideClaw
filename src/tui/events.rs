@@ -38,6 +38,9 @@ pub enum AppEvent {
     },
     /// Informational notice from the harness (not from Claude)
     SystemMessage(String),
+    /// A sign-in flow's progress and outcome — rendered in the accent colour
+    /// so it reads as part of the login, not as a dim status line.
+    AuthMessage(String),
     /// Claude called AskUserQuestion — show a text-input dialog
     AskUser {
         question: String,
@@ -65,6 +68,10 @@ pub enum AppEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialChange {
     Anthropic,
+    /// `/login anthropic key` stored (`Some`) or `/logout` removed (`None`)
+    /// an API key in the user `.env`; the keystore must learn of it before
+    /// the Anthropic auth chain re-runs.
+    AnthropicKey(Option<String>),
     /// `value: None` means the key was removed.
     Provider {
         prefix: String,

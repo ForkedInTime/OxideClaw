@@ -112,7 +112,9 @@ pub async fn run_tui(
 /// right below the box (matching TS oxideclaw/Ink compact behaviour).
 /// During chat: full terminal height to maximise scroll room.
 fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
-    let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
+    // Compact only while the banner is alone; once sign-in lines sit under
+    // it the chat needs the room.
+    let compact = crate::tui::render::banner_visible(app) && app.entries.is_empty();
     let status_h = 1u16;
 
     let usable_w = term_cols.saturating_sub(2) as usize;
@@ -126,7 +128,7 @@ fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
         .sum::<u16>()
         .clamp(1, 8);
 
-    if show_banner {
+    if compact {
         (crate::tui::render::banner_height(app) + input_h + status_h).min(term_rows)
     } else {
         term_rows
@@ -252,6 +254,14 @@ async fn run_loop(
 
     let mut app = App::new(&config.model, &config.cwd);
     app.browser_session = browser_session_for_app;
+    // First run with nothing to authenticate with: ask how, right away. The
+    // board is the same one /login opens; Enter puts a row's command in the
+    // input. The banner hint covers anyone who closes it.
+    if missing_credential_notice(&config.model, !config.auth.is_none()).is_some() {
+        let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+        let (lines, ids) = crate::commands::login::board_rows(&config, &ollama_models);
+        app.overlay = Some(Overlay::with_items("login", lines.join("\n"), ids));
+    }
     // A deep link's prompt lands in the input box for the user to read and
     // send (or not) — it is never submitted on their behalf.
     if let Some(text) = initial_input {
@@ -977,7 +987,13 @@ async fn run_loop(
                         AppEvent::CredentialChanged(change) => {
                             use crate::tui::events::CredentialChange;
                             match change {
-                                CredentialChange::Anthropic => {
+                                CredentialChange::Anthropic | CredentialChange::AnthropicKey(_) => {
+                                    if let CredentialChange::AnthropicKey(value) = change {
+                                        match value {
+                                            Some(v) => config.keystore.set("ANTHROPIC_API_KEY", &v, crate::auth::keystore::KeySource::UserDotenv),
+                                            None => config.keystore.remove("ANTHROPIC_API_KEY"),
+                                        }
+                                    }
                                     config.resolve_anthropic_auth();
                                     for w in &config.auth_warnings {
                                         app.entries.push(ChatEntry::system(format!("⚠ {w}")));

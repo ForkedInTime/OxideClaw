@@ -470,6 +470,23 @@ impl AuthEnv for ProcessAuthEnv {
     }
 }
 
+/// The process environment with the in-app keystore layered on top, so a key
+/// stored by `/login anthropic key` is live in the same session without an
+/// `env::set_var` after threads exist. Profiles still come from disk.
+pub struct KeystoreAuthEnv(pub keystore::Keystore);
+
+impl AuthEnv for KeystoreAuthEnv {
+    fn var(&self, key: &str) -> Option<String> {
+        (self.0.lookup())(key).or_else(|| std::env::var(key).ok())
+    }
+    fn profile_access_token(&self) -> Option<String> {
+        ProcessAuthEnv.profile_access_token()
+    }
+    fn profile_present(&self) -> bool {
+        ProcessAuthEnv.profile_present()
+    }
+}
+
 /// Profile stage, as a handle (so refresh works), against the real environment.
 pub fn resolve_profile() -> Option<(Resolved, AuthHandle)> {
     let h = load_profile_handle()?;
@@ -722,5 +739,43 @@ mod handle_tests {
         let h = AuthHandle::profile(d.path().to_path_buf(), "default".into(), None, creds);
         let err = h.credential().await.unwrap_err().to_string();
         assert!(err.contains("/login"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod keystore_env_tests {
+    use super::{AuthEnv, KeystoreAuthEnv, resolve_env_with};
+    use crate::auth::keystore::{KeySource, Keystore};
+
+    /// A key stored by `/login anthropic key` must be visible to the auth
+    /// chain in the same session, with no process-env mutation.
+    #[test]
+    fn keystore_key_resolves_without_touching_the_process_env() {
+        let mut ks = Keystore::default();
+        ks.set(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-from-keystore",
+            KeySource::UserDotenv,
+        );
+        let env = KeystoreAuthEnv(ks);
+        assert_eq!(
+            env.var("ANTHROPIC_API_KEY").as_deref(),
+            Some("sk-ant-from-keystore")
+        );
+        let resolved = resolve_env_with(&env).expect("resolves from the keystore");
+        assert_eq!(resolved.credential.secret(), "sk-ant-from-keystore");
+        assert!(
+            std::env::var("ANTHROPIC_API_KEY")
+                .map(|v| v != "sk-ant-from-keystore")
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn unknown_keys_fall_through_to_the_process_env() {
+        let env = KeystoreAuthEnv(Keystore::default());
+        // PATH is set in any test process; a key the keystore lacks must
+        // still be answered by the environment.
+        assert_eq!(env.var("PATH"), std::env::var("PATH").ok());
     }
 }

@@ -21,6 +21,30 @@ pub use openai_compat::{
 pub use types::*;
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
+
+/// `GET /v1/models` with the key. 10 s timeout. Same verdicts as
+/// `validate_key` so the two key flows can share their retry loop.
+pub async fn validate_anthropic_key(key: &str) -> KeyValidation {
+    let client = match Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return KeyValidation::Unverified(e.to_string()),
+    };
+    let req = client
+        .get(format!("{ANTHROPIC_API_BASE}/v1/models"))
+        .header("x-api-key", key)
+        .header("anthropic-version", ANTHROPIC_VERSION);
+    match req.send().await {
+        Ok(resp) => match resp.status().as_u16() {
+            200 => KeyValidation::Valid,
+            s @ (401 | 403) => KeyValidation::Rejected(s),
+            s => KeyValidation::Unverified(format!("HTTP {s} from {ANTHROPIC_API_BASE}/v1/models")),
+        },
+        Err(e) => KeyValidation::Unverified(e.to_string()),
+    }
+}
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 8096;

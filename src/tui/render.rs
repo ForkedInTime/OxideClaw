@@ -90,10 +90,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // avoiding 8+ separate theme_colors() calls per frame.
     let tc = theme_colors(&app.theme);
 
-    // Welcome screen — shown when no chat entries exist yet.
-    // Automatically hides when any content is pushed (commands, messages, etc.)
-    // and reappears after /clear (which empties entries).
-    let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
+    let show_banner = banner_visible(app);
 
     // Collect input to String once — reused in both height calc and draw_input.
     let full_input: String = app.input.iter().collect();
@@ -138,6 +135,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 // ── Welcome banner — 2-column bordered box matching the TS oxideclaw fork ──────
+
+/// Whether the welcome banner is on screen. It stays through sign-in
+/// (`Auth` entries) and short status lines (`System`), so the logo heads
+/// every login interaction, and hides once real chat content exists. It
+/// reappears after /clear, which empties the entries.
+pub(crate) fn banner_visible(app: &App) -> bool {
+    app.show_welcome
+        && app.streaming.is_empty()
+        && app
+            .entries
+            .iter()
+            .all(|e| matches!(e.kind, EntryKind::Auth | EntryKind::System))
+}
 
 /// Rows the welcome banner occupies, border included. The single source of
 /// truth for both `draw()` and `run::viewport_height()`: the inline viewport
@@ -506,6 +516,24 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                     lines.push(Line::from(Span::styled(
                         format!("  {raw}"),
                         Style::default().fg(Color::Gray),
+                    )));
+                }
+                lines.push(Line::raw(""));
+            }
+
+            EntryKind::Auth => {
+                for raw in entry.text.lines() {
+                    let t = raw.trim_start();
+                    let color = if t.starts_with('✓') {
+                        Color::Green
+                    } else if t.starts_with('✗') {
+                        Color::Red
+                    } else {
+                        tc.accent
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  {raw}"),
+                        Style::default().fg(color),
                     )));
                 }
                 lines.push(Line::raw(""));
@@ -1278,5 +1306,45 @@ mod overlay_hint_tests {
         assert!(overlay_hint("help", true).contains("Enter open"));
         assert!(overlay_hint("login", true).contains("Enter login"));
         assert!(overlay_hint("anything", false).contains("Esc"));
+    }
+}
+
+#[cfg(test)]
+mod banner_visible_tests {
+    use super::banner_visible;
+    use crate::tui::app::{App, ChatEntry};
+
+    fn app() -> App {
+        App::new("claude-sonnet-5", std::path::Path::new("/tmp"))
+    }
+
+    #[test]
+    fn empty_chat_shows_the_banner() {
+        assert!(banner_visible(&app()));
+    }
+
+    /// The logo heads every login interaction: sign-in lines and short
+    /// status notices do not evict it.
+    #[test]
+    fn auth_and_system_entries_keep_the_banner() {
+        let mut a = app();
+        a.entries.push(ChatEntry::auth("Signing in to Anthropic…"));
+        a.entries.push(ChatEntry::system("Codebase indexed"));
+        assert!(banner_visible(&a));
+    }
+
+    #[test]
+    fn real_chat_content_hides_the_banner() {
+        let mut a = app();
+        a.entries.push(ChatEntry::auth("✓ Signed in"));
+        a.entries.push(ChatEntry::user("hello"));
+        assert!(!banner_visible(&a));
+    }
+
+    #[test]
+    fn show_welcome_false_hides_it_regardless() {
+        let mut a = app();
+        a.show_welcome = false;
+        assert!(!banner_visible(&a));
     }
 }

@@ -317,6 +317,8 @@ pub enum CommandAction {
         profile: Option<String>,
         manual: bool,
     },
+    /// Masked entry of an Anthropic API key, stored in the user `.env`.
+    LoginAnthropicKey,
     /// Masked key entry for an OpenAI-compatible provider.
     LoginProvider { prefix: String, open_key_page: bool },
     /// Remove the active Anthropic profile.

@@ -1189,7 +1189,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     return Ok(());
                 }
             };
-            app.entries.push(ChatEntry::system(format!(
+            app.entries.push(ChatEntry::auth(format!(
                 "Signing in to Anthropic (profile '{}')…",
                 req.profile
             )));
@@ -1199,7 +1199,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 use crate::tui::events::{AppEvent, CredentialChange};
                 let progress_tx = tx2.clone();
                 let progress = move |s: String| {
-                    let _ = progress_tx.send(AppEvent::SystemMessage(s));
+                    let _ = progress_tx.send(AppEvent::AuthMessage(s));
                 };
                 let result = if manual {
                     let ask_tx = tx2.clone();
@@ -1228,21 +1228,21 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             (None, Some(o)) => format!("org {o}"),
                             (None, None) => String::new(),
                         };
-                        let _ = tx2.send(AppEvent::SystemMessage(format!(
+                        let _ = tx2.send(AppEvent::AuthMessage(format!(
                             "✓ Signed in to Anthropic as profile '{}' {who}",
                             out.profile
                         )));
                         let _ = tx2.send(AppEvent::CredentialChanged(CredentialChange::Anthropic));
                     }
                     Err(e) => {
-                        let _ = tx2.send(AppEvent::SystemMessage(format!("✗ Login failed: {e}")));
+                        let _ = tx2.send(AppEvent::AuthMessage(format!("✗ Login failed: {e}")));
                     }
                 }
             });
         }
 
         CommandAction::LogoutAnthropic => {
-            let msg = match crate::auth::profile::config_dir() {
+            let mut msg = match crate::auth::profile::config_dir() {
                 None => "Cannot determine the Anthropic config directory.".to_string(),
                 Some(dir) => {
                     let name = crate::auth::profile::resolve_profile_name(
@@ -1256,11 +1256,98 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     }
                 }
             };
-            app.entries.push(ChatEntry::system(msg));
+            // A key stored by `/login anthropic key` is a credential too.
+            match crate::auth::keystore::remove_key("ANTHROPIC_API_KEY") {
+                Ok(true) => msg.push_str("\nRemoved the stored Anthropic API key."),
+                Ok(false) => {}
+                Err(e) => msg.push_str(&format!("\nCould not remove the stored API key: {e}")),
+            }
+            if crate::auth::keystore::shadows_user_file(config.keystore.source("ANTHROPIC_API_KEY"))
+            {
+                msg.push_str("\n  ⚠ ANTHROPIC_API_KEY still comes from your shell or a .env file; unset it there to sign out fully.");
+            }
+            app.entries.push(ChatEntry::auth(msg));
             app.scroll_to_bottom();
             let _ = tx.send(crate::tui::events::AppEvent::CredentialChanged(
-                crate::tui::events::CredentialChange::Anthropic,
+                crate::tui::events::CredentialChange::AnthropicKey(None),
             ));
+        }
+
+        CommandAction::LoginAnthropicKey => {
+            let shadow = config
+                .keystore
+                .source("ANTHROPIC_API_KEY")
+                .filter(|s| crate::auth::keystore::shadows_user_file(Some(*s)));
+            app.entries.push(ChatEntry::auth(
+                "Storing an Anthropic API key (billed as API usage to its org).",
+            ));
+            app.scroll_to_bottom();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                use crate::api::KeyValidation;
+                use crate::tui::events::{AppEvent, CredentialChange};
+                let mut question = "Paste your Anthropic API key (ANTHROPIC_API_KEY).\nKeys: https://console.anthropic.com/settings/keys".to_string();
+                for _attempt in 0..3 {
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx2.send(AppEvent::AskUser {
+                        question: question.clone(),
+                        reply,
+                        secret: true,
+                    });
+                    let Some(key) = rx
+                        .await
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        let _ =
+                            tx2.send(AppEvent::AuthMessage("Cancelled — no key stored.".into()));
+                        return;
+                    };
+                    let verdict = crate::api::validate_anthropic_key(&key).await;
+                    if let KeyValidation::Rejected(status) = verdict {
+                        question = format!(
+                            "Anthropic rejected that key (HTTP {status}). Paste it again, or Esc to cancel."
+                        );
+                        continue;
+                    }
+                    match crate::auth::keystore::save_key("ANTHROPIC_API_KEY", &key) {
+                        Ok(path) => {
+                            let redacted = crate::auth::Credential::ApiKey(key.clone()).redacted();
+                            let note = match verdict {
+                                KeyValidation::Valid => String::new(),
+                                KeyValidation::Unverified(why) => {
+                                    format!("\n  (could not verify the key: {why})")
+                                }
+                                KeyValidation::Rejected(_) => unreachable!(),
+                            };
+                            let shadow_note = match shadow {
+                                Some(src) => format!(
+                                    "\n  ⚠ ANTHROPIC_API_KEY also comes from {}; that value wins on the next launch.",
+                                    src.describe()
+                                ),
+                                None => String::new(),
+                            };
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
+                                "✓ Anthropic API key {redacted} saved to {}{note}{shadow_note}",
+                                path.display()
+                            )));
+                            let _ = tx2.send(AppEvent::CredentialChanged(
+                                CredentialChange::AnthropicKey(Some(key)),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
+                                "✗ Could not save the key: {e}"
+                            )));
+                        }
+                    }
+                    return;
+                }
+                let _ = tx2.send(AppEvent::AuthMessage(
+                    "Giving up after three rejected keys.".into(),
+                ));
+            });
         }
 
         CommandAction::LoginProvider {
@@ -1276,7 +1363,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 } else {
                     "The generic endpoint needs the base URL in your shell (never from a file):\n  export OPENAI_BASE_URL=https://host/v1\nStoring OPENAI_API_KEY now…".to_string()
                 };
-                app.entries.push(ChatEntry::system(hint));
+                app.entries.push(ChatEntry::auth(hint));
                 app.scroll_to_bottom();
                 if p.prefix == "lmstudio" {
                     return Ok(());
@@ -1284,7 +1371,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
             if open_key_page && !p.key_url.is_empty() {
                 let opened = open_in_browser(p.key_url);
-                app.entries.push(ChatEntry::system(if opened {
+                app.entries.push(ChatEntry::auth(if opened {
                     format!("Opened {} in your browser.", p.key_url)
                 } else {
                     format!("Could not open a browser. Keys are at {}", p.key_url)
@@ -1334,7 +1421,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .filter(|s| !s.is_empty())
                     else {
                         let _ =
-                            tx2.send(AppEvent::SystemMessage("Cancelled — no key stored.".into()));
+                            tx2.send(AppEvent::AuthMessage("Cancelled — no key stored.".into()));
                         return;
                     };
                     let verdict = if base_url.is_empty() {
@@ -1367,7 +1454,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                 ),
                                 None => String::new(),
                             };
-                            let _ = tx2.send(AppEvent::SystemMessage(format!(
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
                                 "✓ {} key {redacted} saved to {}{note}{shadow_note}\n  /model {}:{}",
                                 p.name,
                                 path.display(),
@@ -1382,14 +1469,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                 }));
                         }
                         Err(e) => {
-                            let _ = tx2.send(AppEvent::SystemMessage(format!(
+                            let _ = tx2.send(AppEvent::AuthMessage(format!(
                                 "✗ Could not save the key: {e}"
                             )));
                         }
                     }
                     return;
                 }
-                let _ = tx2.send(AppEvent::SystemMessage(
+                let _ = tx2.send(AppEvent::AuthMessage(
                     "Giving up after three rejected keys.".into(),
                 ));
             });

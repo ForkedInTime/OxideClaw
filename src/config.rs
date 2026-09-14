@@ -761,7 +761,8 @@ impl Config {
     ///
     ///   ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN → key fd → apiKeyHelper → OAuth profile
     pub fn resolve_anthropic_auth(&mut self) {
-        self.resolve_anthropic_auth_with(&crate::auth::ProcessAuthEnv);
+        let env = crate::auth::KeystoreAuthEnv(self.keystore.clone());
+        self.resolve_anthropic_auth_with(&env);
     }
 
     /// `resolve_anthropic_auth` with the environment injected, so tests can

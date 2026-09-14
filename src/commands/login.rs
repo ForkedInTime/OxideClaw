@@ -18,6 +18,7 @@ fn usage(bad: &str) -> String {
          /login                      status board\n\
          /login anthropic [profile]  Console OAuth (profile names go here, e.g. /login anthropic {bad})\n\
          /login anthropic manual     paste-the-code flow for SSH / headless\n\
+         /login anthropic key        paste an API key (stored in ~/.config/oxideclaw/.env)\n\
          /login <provider> [open]    store an API key: {}\n\
          /logout [anthropic|<provider>]",
         provider_words().join(", ")
@@ -37,6 +38,7 @@ pub(super) fn cmd_login(args: &str) -> CommandAction {
                 profile: None,
                 manual: true,
             },
+            Some("key") => CommandAction::LoginAnthropicKey,
             Some(p) => CommandAction::LoginAnthropic {
                 profile: Some(p.to_string()),
                 manual: false,
@@ -101,8 +103,23 @@ pub fn anthropic_status(config: &Config) -> String {
                 .unwrap_or("apiKeyHelper / file descriptor")
         );
     }
-    "not signed in · Enter to sign in with your Console account".to_string()
+    "not signed in".to_string()
 }
+
+/// The row text for the API-key option: where a stored key lives, or how to
+/// get one.
+fn anthropic_key_status(config: &Config) -> String {
+    match config.keystore.source("ANTHROPIC_API_KEY") {
+        Some(src) => format!("ANTHROPIC_API_KEY via {}", src.describe()),
+        None => "paste a key from console.anthropic.com".to_string(),
+    }
+}
+
+/// One line that answers "API or subscription?" before anyone asks. Consumer
+/// (Pro/Max) OAuth is licensed to Anthropic's own apps; using it from a
+/// third-party tool is against the consumer terms and has cost people their
+/// accounts, so it is not offered — see the design spec's non-goals.
+pub const SUBSCRIPTION_NOTE: &str = "Claude Pro/Max subscriptions cannot be used here (Anthropic's terms) — pick 1 or 2, billed as API usage";
 
 pub fn provider_status(p: &ProviderDef, keystore: &Keystore) -> String {
     provider_status_with(p, keystore, &|k| std::env::var(k).ok())
@@ -151,13 +168,22 @@ pub fn provider_status_with(
 pub fn board_rows(config: &Config, ollama_models: &[String]) -> (Vec<String>, Vec<String>) {
     let mut lines = vec!["Credentials\n".to_string()];
     let mut ids = Vec::new();
+    lines.push("── Anthropic ──".to_string());
     let mut n = 1;
     lines.push(format!(
         "  {n}. {:<14} {}",
-        "Anthropic",
+        "Console OAuth",
         anthropic_status(config)
     ));
     ids.push("/login anthropic".to_string());
+    n += 1;
+    lines.push(format!(
+        "  {n}. {:<14} {}",
+        "API key",
+        anthropic_key_status(config)
+    ));
+    ids.push("/login anthropic key".to_string());
+    lines.push(format!("  {SUBSCRIPTION_NOTE}"));
     lines.push(String::new());
     lines.push("── OpenAI-compatible providers ──".to_string());
     for p in crate::api::PROVIDERS {
@@ -210,6 +236,18 @@ mod parse_tests {
     #[test]
     fn bare_login_opens_the_board() {
         assert!(matches!(parse("/login"), CommandAction::LoginBoard));
+    }
+
+    #[test]
+    fn anthropic_key_is_its_own_flow_not_a_profile_name() {
+        assert!(matches!(
+            parse("/login anthropic key"),
+            CommandAction::LoginAnthropicKey
+        ));
+        assert!(matches!(
+            parse("/login claude key"),
+            CommandAction::LoginAnthropicKey
+        ));
     }
 
     #[test]
@@ -379,13 +417,20 @@ mod board_tests {
         let c = crate::config::Config::default();
         let (lines, ids) = board_rows(&c, &["llama3".into()]);
         assert_eq!(ids[0], "/login anthropic");
-        assert_eq!(ids[1], "/login groq");
-        assert_eq!(ids.len(), 1 + crate::api::PROVIDERS.len() + 1);
+        assert_eq!(ids[1], "/login anthropic key");
+        assert_eq!(ids[2], "/login groq");
+        assert_eq!(ids.len(), 2 + crate::api::PROVIDERS.len() + 1);
         assert_eq!(ids.last().unwrap(), "", "Ollama row is informational");
         assert!(
-            lines.iter().any(|l| l.starts_with("  1. Anthropic")),
+            lines.iter().any(|l| l.starts_with("  1. Console OAuth")),
             "{lines:?}"
         );
+        assert!(
+            lines.iter().any(|l| l.starts_with("  2. API key")),
+            "{lines:?}"
+        );
+        // The board answers "API or subscription?" up front.
+        assert!(lines.iter().any(|l| l.contains("Pro/Max")), "{lines:?}");
         assert!(
             lines
                 .iter()

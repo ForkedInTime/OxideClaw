@@ -25,9 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider keys and the active OAuth profile.
 - **Model picker** lists every OpenAI-compatible provider whose key is set, with a
   default model per provider.
+- **`/login anthropic key`.** Paste an Anthropic API key into a masked prompt; it is
+  checked against the API, stored in `~/.config/oxideclaw/.env` (0600), and live in
+  the same session. `/logout` removes it. For people who have a Console key but no
+  shell profile or `.env` to put it in.
+- **First run asks how to sign in.** Starting on an Anthropic model with no
+  credential opens the `/login` board over the welcome screen instead of exiting.
+  The board's Anthropic section offers Console OAuth or an API key and says up
+  front that Claude Pro/Max subscriptions cannot be used from a third-party tool.
 
 ### Changed
 
+- Sign-in messages are drawn in the theme's accent colour (green ✓ / red ✗ for
+  outcomes) instead of grey, and the welcome banner stays on screen through the
+  whole login exchange; it now hides on the first real chat content rather than
+  on the first status line.
 - Startup hints, `/help`, and the system prompt point at `/login` instead of an
   external CLI. Authentication is documented in FEATURES.md.
 
