@@ -139,7 +139,18 @@ pub fn strict_check(cmd: &str) -> Option<String> {
         ),
     ];
     for (pattern, desc) in patterns {
-        if low.contains(pattern) {
+        // Patterns are compared lowercased (the `chmod -R` ones never matched
+        // lowercased input). One aimed at `/` must hit `/` itself, not any
+        // absolute path: a bare substring blocked `rm -rf /tmp/build`.
+        let pattern = pattern.to_lowercase();
+        let hit = low.match_indices(&pattern).any(|(at, m)| {
+            !pattern.ends_with('/')
+                || low[at + m.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '*'))
+        });
+        if hit {
             return Some(format!(
                 "Blocked by strict sandbox: {} (matched '{}')",
                 desc, pattern
@@ -484,6 +495,11 @@ mod tests {
         }
         // The literal forms it does catch still work.
         assert!(strict_check("rm -rf /").is_some());
+        assert!(strict_check("rm -rf / --no-preserve-root").is_some());
+        assert!(strict_check("sudo rm -rf /*").is_some());
+        assert!(strict_check("chmod -R 777 /").is_some());
+        assert!(strict_check("rm -rf /tmp/build").is_none());
+        assert!(strict_check("rm -rf /home/u/proj/target && ls").is_none());
         assert!(
             strict_check("RM -RF /").is_some(),
             "matching is case-insensitive"

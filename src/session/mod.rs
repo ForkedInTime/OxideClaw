@@ -99,6 +99,25 @@ impl Session {
         Ok((s, messages))
     }
 
+    /// Turn this into a copy under a new id: new files holding the same
+    /// history. Later writes go to the copy and the original is untouched.
+    /// (Changing only `id` left `path` and `meta.id` on the original, so a
+    /// "fork" appended to and renamed the session it forked from.)
+    pub async fn fork(&mut self, messages: &[Message]) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let origin: String = self.id.chars().take(8).collect();
+        self.meta.name = format!("fork-of-{origin}");
+        self.meta.id = id.clone();
+        self.meta.created_at = unix_now();
+        // Undo history lives on the original's shadow ref.
+        self.meta.auto_commits.clear();
+        self.meta.undo_position = 0;
+        self.path = Self::jsonl_path(&id);
+        self.id = id;
+        self.meta.save().await?;
+        self.overwrite(messages).await
+    }
+
     /// Append new messages to the session file.
     pub async fn append(&mut self, new_messages: &[Message]) -> Result<()> {
         if new_messages.is_empty() {

@@ -744,7 +744,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         }
 
         (Backspace, _) => app.backspace(),
-        (Delete, _) => {
+        (Delete, _) if app.cursor < app.input.len() => {
+            // Forward delete; at the end of input there is nothing to delete
+            // (cursor_right + backspace removed the previous char there).
             app.cursor_right();
             app.backspace();
         }

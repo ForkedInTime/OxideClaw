@@ -440,10 +440,10 @@ impl QueryEngine {
                     );
                 }
 
-                // Pre-tool-use hooks (emit event if requested)
-                if self.include_hook_events
-                    && self.stream_json_output
-                    && let Some(hook_cfg) = &self.config.hooks
+                // Pre-tool-use hooks always run: they are the user's guards,
+                // and `-p`, sub-agents and /spawn skipped them unless hook
+                // events were being streamed. Only the event is optional.
+                if let Some(hook_cfg) = &self.config.hooks
                     && !self.config.disable_all_hooks
                 {
                     let args = serde_json::to_string(input).unwrap_or_default();
@@ -455,13 +455,15 @@ impl QueryEngine {
                         &self.config.cwd,
                     )
                     .await;
-                    let event = serde_json::json!({
-                        "type": "hook_event",
-                        "hook": "preToolUse",
-                        "tool": name,
-                        "continue": hook_result.should_continue,
-                    });
-                    println!("{}", event);
+                    if self.include_hook_events && self.stream_json_output {
+                        let event = serde_json::json!({
+                            "type": "hook_event",
+                            "hook": "preToolUse",
+                            "tool": name,
+                            "continue": hook_result.should_continue,
+                        });
+                        println!("{}", event);
+                    }
                     if !hook_result.should_continue {
                         let msg = hook_result
                             .stop_reason

@@ -359,10 +359,12 @@ async fn run_loop(
         Some(ref id) => {
             match Session::resume(id).await {
                 Ok((mut s, loaded_messages)) => {
-                    // --fork-session: assign a new UUID so we don't overwrite the original
-                    if config.fork_session {
-                        s.id = uuid::Uuid::new_v4().to_string();
-                        s.meta.name = format!("fork-of-{}", &id[..8.min(id.len())]);
+                    // --fork-session: continue in a copy; the original is untouched.
+                    if config.fork_session
+                        && let Err(e) = s.fork(&loaded_messages).await
+                    {
+                        app.entries
+                            .push(ChatEntry::error(format!("Could not fork session: {e}")));
                     }
                     // Restore chat entries for display
                     let display = entries_from_messages(&loaded_messages);

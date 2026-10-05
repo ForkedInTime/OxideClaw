@@ -56,6 +56,16 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::Clear => {
             messages.clear();
             messages.shrink_to_fit();
+            // New turns go to a fresh session; the cleared one stays
+            // resumable. Keeping the old session with a stale saved_count
+            // left new turns unsaved until history outgrew it, then skipped
+            // the first N of them.
+            if !config.no_session_persistence
+                && let Ok(fresh) = Session::new().await
+            {
+                *session = fresh;
+            }
+            *saved_count = 0;
             app.clear();
             app.pending_screen_clear = true;
             // Refresh recent sessions so the welcome banner is up-to-date
@@ -1303,7 +1313,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             };
             app.entries
                 .push(ChatEntry::system(format!("{label} — indexing codebase …")));
-            app.start_loading();
+            // No spinner: indexing runs in the background and reports back
+            // with a SystemMessage, which never cleared `is_loading`, so the
+            // spinner ran forever and swallowed typing.
             app.scroll_to_bottom();
             let tx2 = tx.clone();
             tokio::spawn(async move {
@@ -1648,8 +1660,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
             app.scroll_to_bottom();
         }
-        CommandAction::RouterToggle => {
-            app.router.enabled = !app.router.enabled;
+        CommandAction::RouterSet(enabled) => {
+            app.router.enabled = enabled;
             let state = if app.router.enabled { "ON" } else { "OFF" };
             app.entries.push(ChatEntry::system(format!(
                 "Smart model router: {state}\n\

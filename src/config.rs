@@ -990,12 +990,7 @@ impl Config {
     /// Write bannerOrgDisplay to ~/.claude/config.json (preserves other fields)
     pub fn set_banner_label(value: &str) -> anyhow::Result<()> {
         let path = Self::claude_dir().join("config.json");
-        let mut json: serde_json::Value = if path.exists() {
-            let text = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&text).unwrap_or(serde_json::json!({}))
-        } else {
-            serde_json::json!({})
-        };
+        let mut json = read_json_object(&path)?;
         json["bannerOrgDisplay"] = serde_json::Value::String(value.to_string());
         write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
         Ok(())
@@ -1058,12 +1053,7 @@ impl Config {
     /// Preserves all other keys; creates the file if it doesn't exist.
     pub fn save_user_setting(key: &str, value: serde_json::Value) -> anyhow::Result<()> {
         let path = Self::claude_dir().join("settings.json");
-        let mut json: serde_json::Value = if path.exists() {
-            let text = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&text).unwrap_or(serde_json::json!({}))
-        } else {
-            serde_json::json!({})
-        };
+        let mut json = read_json_object(&path)?;
         json[key] = value;
         write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
         Ok(())
@@ -1399,6 +1389,31 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
         }
 
         base
+    }
+}
+
+/// Read a JSON settings file for a read-modify-write. Missing or empty is
+/// `{}`; anything that does not parse as an object is an error, because
+/// writing back `{}` plus one key would silently delete the user's config.
+pub fn read_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => anyhow::bail!(
+            "{} is not a JSON object; not overwriting it",
+            path.display()
+        ),
+        Err(e) => anyhow::bail!(
+            "{} is not valid JSON ({e}); fix it first, not overwriting it",
+            path.display()
+        ),
     }
 }
 

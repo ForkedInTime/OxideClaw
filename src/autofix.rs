@@ -173,17 +173,30 @@ pub fn should_trigger(config: &AutoFixConfig, autonomy_mode: &str) -> bool {
 /// pulling in a new dep for ~20 lines isn't worth it. We use a poll+kill loop
 /// via `try_wait`, which has the same behavior with no extra deps.
 pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
-    let mut parts = cmd.split_whitespace();
-    let Some(prog) = parts.next() else {
+    if cmd.trim().is_empty() {
         return CommandResult::Skipped {
             reason: "empty test command".to_string(),
         };
+    }
+    // Through the shell, so quoting, env assignments and `&&` work
+    // (`pytest -k "a b"` used to be split on the space).
+    #[cfg(unix)]
+    let mut command = {
+        use std::os::unix::process::CommandExt;
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd).process_group(0);
+        c
     };
-    let args: Vec<&str> = parts.collect();
-
-    let spawn = Command::new(prog)
-        .args(&args)
+    #[cfg(not(unix))]
+    let mut command = {
+        let mut parts = cmd.split_whitespace();
+        let mut c = Command::new(parts.next().unwrap_or_default());
+        c.args(parts);
+        c
+    };
+    let spawn = command
         .current_dir(cwd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -197,17 +210,40 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
         }
     };
 
+    // Drain both pipes while the command runs. Reading only after exit
+    // deadlocked any run printing more than a pipe buffer (64 KiB — a normal
+    // `cargo test`): the child blocked on write and was reported as timed out.
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
+
     // Poll until exit or timeout. `timeout_secs == 0` means "wait forever".
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let has_timeout = timeout_secs > 0;
     let start = std::time::Instant::now();
     let poll = std::time::Duration::from_millis(100);
 
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_status)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if has_timeout && start.elapsed() >= timeout {
+                    // The whole group: test binaries outlive a killed `cargo`
+                    // and would hold the pipes open.
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     return CommandResult::Timeout;
@@ -220,27 +256,24 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
                 };
             }
         }
-    }
-
-    // Collect output.
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            return CommandResult::Skipped {
-                reason: format!("failed to collect output: {e}"),
-            };
-        }
     };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
 
-    if output.status.success() {
+    if status.success() {
         CommandResult::Pass
     } else {
-        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        // Some runners (cargo test, go test) print failure details to stdout.
-        if stderr.trim().is_empty() {
-            stderr = String::from_utf8_lossy(&output.stdout).to_string();
-        }
-        CommandResult::Fail { stderr }
+        // Both streams: cargo test / go test put the failures on stdout while
+        // stderr has build noise. stdout goes last so the tail-trimmed
+        // feedback keeps the failure summary.
+        let stderr = String::from_utf8_lossy(&stderr);
+        let stdout = String::from_utf8_lossy(&stdout);
+        let combined = match (stderr.trim().is_empty(), stdout.trim().is_empty()) {
+            (_, true) => stderr.into_owned(),
+            (true, false) => stdout.into_owned(),
+            (false, false) => format!("{stderr}\n{stdout}"),
+        };
+        CommandResult::Fail { stderr: combined }
     }
 }
 
@@ -494,6 +527,37 @@ pub fn run_auto_fix_check(
 
 #[cfg(test)]
 mod tests {
+    /// More output than a pipe buffer used to deadlock until the timeout.
+    #[cfg(unix)]
+    #[test]
+    fn large_output_does_not_deadlock_and_keeps_stdout() {
+        let td = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+        let r = run_command(
+            td.path(),
+            "echo build-noise >&2; head -c 200000 /dev/zero | tr '\\0' x; echo; echo 'test result: FAILED'; exit 1",
+            30,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        match r {
+            CommandResult::Fail { stderr } => {
+                assert!(stderr.starts_with("build-noise"));
+                assert!(stderr.trim_end().ends_with("test result: FAILED"));
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commands_run_through_the_shell() {
+        let td = tempfile::TempDir::new().unwrap();
+        assert!(matches!(
+            run_command(td.path(), "test \"a b\" = 'a b' && X=1 true", 10),
+            CommandResult::Pass
+        ));
+    }
+
     use super::*;
     use std::fs;
     use tempfile::tempdir;

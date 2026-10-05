@@ -100,6 +100,17 @@ pub async fn run_pre_tool_hooks(
         if !r.should_continue {
             return r;
         }
+        // `{"decision":"block"}` with exit 0 is the documented JSON way to
+        // block a tool; it was parsed and then ignored.
+        if r.decision == Some(HookDecision::Block) {
+            return HookResult {
+                should_continue: false,
+                stop_reason: r
+                    .stop_reason
+                    .or_else(|| Some(format!("Blocked by PreToolUse hook '{}'", hook.command))),
+                ..r
+            };
+        }
         // Merge system messages / decisions
         if r.system_message.is_some() {
             result.system_message = r.system_message;
@@ -512,9 +523,15 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
             };
         }
 
+        // A block carries its `reason` so the model is told why.
+        let stop_reason = if decision == Some(HookDecision::Block) {
+            hook_out.reason
+        } else {
+            None
+        };
         return HookResult {
             should_continue: true,
-            stop_reason: None,
+            stop_reason,
             system_message: hook_out.system_message,
             decision,
             additional_context: hook_out.additional_context,
@@ -636,6 +653,21 @@ mod tests {
     }
 
     // ── Documented exit-code contract is preserved ───────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_block_decision_blocks_the_tool() {
+        let r = run_pre_tool_hooks(
+            &cfg_pre(r#"echo '{"decision":"block","reason":"no pushes"}'"#),
+            "Bash",
+            "{}",
+            "sess",
+            std::path::Path::new("."),
+        )
+        .await;
+        assert!(!r.should_continue, "documented: decision block blocks");
+        assert_eq!(r.stop_reason.as_deref(), Some("no pushes"));
+    }
 
     #[tokio::test]
     async fn exit_zero_allows() {

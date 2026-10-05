@@ -478,12 +478,18 @@ pub async fn ensure_xtts_server() -> Result<u16> {
     Err(anyhow!("XTTS v2 server failed to start within 60 seconds"))
 }
 
-/// Stop the XTTS v2 server if running.
+/// Stop the XTTS v2 server if running. Only a process *listening* on the
+/// port whose command line names xtts is killed: plain `lsof -ti:PORT` also
+/// lists clients and any unrelated server on that port.
 pub fn stop_xtts_server() {
     let _ = std::process::Command::new("sh")
         .args([
             "-c",
-            &format!("kill $(lsof -ti:{XTTS_SERVER_PORT}) 2>/dev/null"),
+            &format!(
+                "for p in $(lsof -ti tcp:{XTTS_SERVER_PORT} -sTCP:LISTEN 2>/dev/null); do \
+                   ps -p \"$p\" -o args= 2>/dev/null | grep -qi xtts && kill \"$p\"; \
+                 done"
+            ),
         ])
         .output();
 }

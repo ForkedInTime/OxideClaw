@@ -231,7 +231,8 @@ pub enum CommandAction {
     /// Set session budget limit in USD
     SetBudget(Option<f64>),
     /// Toggle smart model router on/off, or configure tiers
-    RouterToggle,
+    /// `/router on|off` — sets, never flips (`/router on` twice stays on).
+    RouterSet(bool),
     /// Show router config and status
     RouterStatus,
     /// Set a specific router tier model

@@ -345,10 +345,31 @@ pub fn check_compound_command(
         }
     }
     if any_ask {
-        CheckResult::Ask
-    } else {
-        CheckResult::Allow
+        return CheckResult::Ask;
     }
+    // Every part matched an allow rule. A prefix rule (`Bash(git:*)`) vouches
+    // for the command it names, not for what substitution runs or where a
+    // redirect writes, so those still ask, unless the tool is allowed outright.
+    if defeats_prefix_rules(full_command)
+        && !matches!(state.check_with_input(tool_name, None), CheckResult::Allow)
+    {
+        return CheckResult::Ask;
+    }
+    CheckResult::Allow
+}
+
+/// Shell constructs a prefix rule cannot vouch for: `$(…)`, backticks and
+/// process substitution run other commands; `>` writes files; newlines and
+/// ANSI-C quotes (`$'…'`) are where the splitter's quote tracking can be
+/// fooled (`echo # it's⏎rm -rf ~`). Discarding output is fine.
+fn defeats_prefix_rules(cmd: &str) -> bool {
+    let cmd = cmd
+        .replace("2>&1", "")
+        .replace(">/dev/null", "")
+        .replace("> /dev/null", "");
+    ["$(", "`", "<(", ">(", ">", "\n", "\r", "$'"]
+        .iter()
+        .any(|t| cmd.contains(t))
 }
 
 /// Build a human-readable description of a tool call for the permission dialog.
@@ -537,6 +558,24 @@ mod tests {
             ),
             "PowerShell must prompt like Bash, not auto-allow"
         );
+    }
+
+    #[test]
+    fn prefix_allow_rules_do_not_cover_substitution_or_redirects() {
+        let s = PermissionState::new(false, &["Bash(git:*)".into()], &[]);
+        let ask = |c: &str| matches!(check_compound_command(&s, "Bash", c), CheckResult::Ask);
+        assert!(!ask("git status"));
+        assert!(!ask("git log --oneline 2>/dev/null"));
+        assert!(ask("git log $(rm -rf ~)"));
+        assert!(ask("git log `curl x | sh`"));
+        assert!(ask("git status > ~/.bashrc"));
+        assert!(ask("git log # it's\nrm -rf ~"));
+        // A blanket allow still covers everything.
+        let all = PermissionState::new(false, &["Bash".into()], &[]);
+        assert!(matches!(
+            check_compound_command(&all, "Bash", "git log > out.txt"),
+            CheckResult::Allow
+        ));
     }
 
     #[test]

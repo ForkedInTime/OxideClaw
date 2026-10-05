@@ -76,7 +76,10 @@ type StreamTx = Option<tokio::sync::mpsc::UnboundedSender<String>>;
 /// that point so the child process never blocks on a full pipe.
 fn emit_line(raw: &str, tx: &StreamTx, combined: &mut String, truncated: &mut bool) {
     let clean = strip_ansi(raw);
-    if clean.is_empty() {
+    // Drop lines that were only escape codes, but keep real blank lines:
+    // without them `cat` output no longer matches the file and a later Edit
+    // copied from it fails with "not found".
+    if clean.is_empty() && !raw.is_empty() {
         return;
     }
     // Past the cap we keep *draining* the pipe (so the child can exit instead of

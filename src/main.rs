@@ -509,17 +509,6 @@ fn load_dotenv_auto() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Suppress broken-pipe errors — these happen when stdout is piped to `head`
-    // or any consumer that exits early. Without this, Rust panics with
-    // "failed to write ... Broken pipe" instead of exiting silently.
-    #[cfg(unix)]
-    {
-        // SAFETY: single-threaded before tokio runtime; no signal handlers yet.
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        }
-    }
-
     // Respect NO_COLOR (https://no-color.org/) and dumb terminals so piped
     // output / CI logs / `less` don't get ANSI escape codes.
     if std::env::var_os("NO_COLOR").is_some()
@@ -534,18 +523,51 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // One-shot commands exit quietly when stdout is piped to `head` instead of
+    // panicking on "Broken pipe". Long-lived modes keep Rust's SIG_IGN: they
+    // write to MCP/LSP child stdin, and SIG_DFL would kill the whole process
+    // (terminal left in raw mode) the moment one of those children died.
+    #[cfg(unix)]
+    {
+        let long_lived = cli.headless
+            || matches!(
+                cli.command,
+                Some(Commands::Acp) | Some(Commands::Browse { .. })
+            )
+            || (!cli.print && cli.command.is_none());
+        if !long_lived {
+            // SAFETY: plain disposition change; no handler is installed.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+        }
+    }
+
     // Initialize tracing — write to a log file in TUI mode so logs don't corrupt the screen
     let filter = if cli.verbose { "debug" } else { "warn" };
-    let log_path = std::env::temp_dir().join("oxideclaw.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .unwrap_or_else(|_| std::fs::File::create(&log_path).expect("Cannot create log file"));
+    let tmp = std::env::temp_dir();
+    // /tmp is shared: if another user owns oxideclaw.log, use a per-user
+    // file, and never refuse to start over a log.
+    let open = |p: std::path::PathBuf| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    };
+    #[cfg(unix)]
+    let per_user = format!("oxideclaw-{}.log", unsafe { libc::getuid() });
+    #[cfg(not(unix))]
+    let per_user = "oxideclaw-user.log".to_string();
+    let log_writer: Box<dyn std::io::Write + Send> =
+        match open(tmp.join("oxideclaw.log")).or_else(|| open(tmp.join(per_user))) {
+            Some(f) => Box::new(f),
+            None => Box::new(std::io::sink()),
+        };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::sync::Mutex::new(log_file))
+        .with_writer(std::sync::Mutex::new(log_writer))
         .init();
 
     // --register-protocol: install the deep link handler and exit
@@ -1325,9 +1347,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             // Reset approvedMcpjsonServers / rejectedMcpjsonServers in project settings
             let project_path = config.cwd.join(".claude").join("settings.json");
             if project_path.exists() {
-                let content = std::fs::read_to_string(&project_path)?;
-                let mut json: serde_json::Value =
-                    serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
+                let mut json = config::read_json_object(&project_path)?;
                 if let Some(m) = json.as_object_mut() {
                     m.remove("approvedMcpjsonServers");
                     m.remove("rejectedMcpjsonServers");
@@ -1350,13 +1370,7 @@ fn mcp_write_server(
     config: &Config,
 ) -> Result<()> {
     let path = mcp_scope_path(scope, config);
-    let content = if path.exists() {
-        std::fs::read_to_string(&path)?
-    } else {
-        "{}".to_string()
-    };
-    let mut json: serde_json::Value =
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
+    let mut json = config::read_json_object(&path)?;
     if json.get("mcpServers").is_none() {
         json["mcpServers"] = serde_json::json!({});
     }
@@ -1384,9 +1398,7 @@ fn mcp_remove_server(name: &str, scope: Option<&str>, config: &Config) -> Result
         if !path.exists() {
             continue;
         }
-        let content = std::fs::read_to_string(path)?;
-        let mut json: serde_json::Value =
-            serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
+        let mut json = config::read_json_object(path)?;
         if let Some(servers) = json.get_mut("mcpServers").and_then(|v| v.as_object_mut())
             && servers.remove(name).is_some()
         {

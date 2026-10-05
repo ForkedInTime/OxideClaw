@@ -116,8 +116,8 @@ pub(super) fn cmd_router(args: &str) -> CommandAction {
     let args = args.trim();
     match args {
         "" | "status" => CommandAction::RouterStatus,
-        "on" | "enable" => CommandAction::RouterToggle,
-        "off" | "disable" => CommandAction::RouterToggle,
+        "on" | "enable" => CommandAction::RouterSet(true),
+        "off" | "disable" => CommandAction::RouterSet(false),
         _ if args.starts_with("low ") => {
             let model = args["low ".len()..].trim().to_string();
             CommandAction::RouterSetTier {

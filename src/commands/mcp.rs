@@ -118,8 +118,10 @@ pub(super) fn mcp_add_server(args: &str) -> CommandAction {
     }
 
     let settings_path = Config::claude_dir().join("settings.json");
-    let raw = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
-    let mut val: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+    let mut val = match crate::config::read_json_object(&settings_path) {
+        Ok(v) => v,
+        Err(e) => return CommandAction::Message(e.to_string()),
+    };
 
     // Check if already exists
     if val.get("mcpServers").and_then(|m| m.get(name)).is_some() {
@@ -188,8 +190,10 @@ pub(super) fn mcp_remove_server(args: &str) -> CommandAction {
     }
 
     let settings_path = Config::claude_dir().join("settings.json");
-    let raw = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
-    let mut val: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+    let mut val = match crate::config::read_json_object(&settings_path) {
+        Ok(v) => v,
+        Err(e) => return CommandAction::Message(e.to_string()),
+    };
 
     let removed = val
         .get_mut("mcpServers")
@@ -224,8 +228,10 @@ pub(super) fn mcp_set_disabled(args: &str, disabled: bool) -> CommandAction {
     }
 
     let settings_path = Config::claude_dir().join("settings.json");
-    let raw = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
-    let mut val: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+    let mut val = match crate::config::read_json_object(&settings_path) {
+        Ok(v) => v,
+        Err(e) => return CommandAction::Message(e.to_string()),
+    };
 
     let server = val
         .get_mut("mcpServers")

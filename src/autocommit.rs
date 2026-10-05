@@ -229,7 +229,16 @@ pub fn snapshot_turn(
     // 3. Stage everything under cwd into the temp index.
     let add_status = git_cmd(cwd)
         .env("GIT_INDEX_FILE", &temp_index)
-        .args(["add", "-A"])
+        // Whole tree from any subdirectory, minus OxideClaw's own SQLite
+        // index/memory store: snapshotting it stored a binary blob per turn,
+        // and /undo overwrote the live database (rolling back memories).
+        .args([
+            "add",
+            "-A",
+            "--",
+            ":(top)",
+            ":(top,exclude,glob)**/.claude/rag.db*",
+        ])
         .status()?;
     if !add_status.success() {
         anyhow::bail!("git add -A failed");
@@ -998,6 +1007,30 @@ mod restore_tests {
         let _ = restore_to(td.path(), &commits, 2).unwrap();
         let contents = std::fs::read_to_string(td.path().join("app.txt")).unwrap();
         assert_eq!(contents, "v3\n");
+    }
+
+    #[test]
+    fn snapshots_leave_out_the_rag_database() {
+        let td = init_test_repo();
+        write_file(td.path(), "app.txt", "v1\n");
+        write_file(td.path(), ".claude/rag.db", "sqlite");
+        write_file(td.path(), ".claude/rag.db-wal", "wal");
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        snapshot_turn(
+            td.path(),
+            &AutoCommitConfig::default(),
+            "s",
+            "t",
+            1,
+            &mut commits,
+            &mut pos,
+        )
+        .unwrap();
+        let tree = tree_of_commit(td.path(), &commits[0]).unwrap();
+        let files = list_tree_files(td.path(), &tree);
+        assert!(files.iter().any(|f| f == "app.txt"), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("rag.db")), "{files:?}");
     }
 
     /// Launched from `repo/pkg`, /undo must restore `repo/pkg/x` in place,
