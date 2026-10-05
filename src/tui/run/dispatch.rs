@@ -35,6 +35,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         tokens_in: app.tokens_in,
         tokens_out: app.tokens_out,
         cache_read_tokens: app.cache_read_tokens,
+        cost_summary: app.cost_tracker.summary(),
         cache_write_tokens: app.cache_write_tokens,
         vim_mode: app.vim_enabled,
         skills,

@@ -322,6 +322,9 @@ pub struct CommandContext<'a> {
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Session cost from the per-call cost tracker (the same numbers
+    /// `/budget` and the status bar use).
+    pub cost_summary: String,
     pub vim_mode: bool,
     pub skills: &'a HashMap<String, Skill>,
     pub todo_state: &'a TodoState,

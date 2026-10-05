@@ -48,59 +48,21 @@ pub(super) fn cmd_status(ctx: &CommandContext) -> CommandAction {
 }
 
 pub(super) fn cmd_cost(ctx: &CommandContext) -> CommandAction {
-    if ctx.tokens_in == 0 && ctx.tokens_out == 0 {
+    if ctx.tokens_in == 0 && ctx.tokens_out == 0 && ctx.cache_read_tokens == 0 {
         return CommandAction::Message("No tokens used in this session yet.".into());
     }
-    let (price_in, price_out) = model_pricing(&ctx.config.model);
-    let cost_in = ctx.tokens_in as f64 * price_in / 1_000_000.0;
-    let cost_out = ctx.tokens_out as f64 * price_out / 1_000_000.0;
-    let total = cost_in + cost_out;
-
-    // Cache pricing: read = 10% of input price, write = 125% of input price (Anthropic prompt cache)
-    let cache_read_cost = ctx.cache_read_tokens as f64 * (price_in * 0.10) / 1_000_000.0;
-    let cache_write_cost = ctx.cache_write_tokens as f64 * (price_in * 1.25) / 1_000_000.0;
-    let cache_hit_pct = if ctx.tokens_in > 0 {
-        ctx.cache_read_tokens as f64 * 100.0 / ctx.tokens_in as f64
-    } else {
-        0.0
-    };
-
-    let cache_section = if ctx.cache_read_tokens > 0 || ctx.cache_write_tokens > 0 {
+    // Every API call of the session, priced by the shared table. This used
+    // its own stale table (Haiku at $0.25, every Opus 4.x at $15/$75) and
+    // only the last call's tokens, under the heading "Session cost".
+    let cache = if ctx.cache_read_tokens > 0 || ctx.cache_write_tokens > 0 {
         format!(
-            "\n\nPrompt cache\n\
-             Cache read:   {} tokens (${:.4}, {:.1}% hit rate)\n\
-             Cache write:  {} tokens (${:.4})\n\
-             Cache savings: ${:.4}",
-            ctx.cache_read_tokens,
-            cache_read_cost,
-            cache_hit_pct,
-            ctx.cache_write_tokens,
-            cache_write_cost,
-            // savings = what it would have cost at full price minus what was actually charged
-            ctx.cache_read_tokens as f64 * price_in / 1_000_000.0 - cache_read_cost,
+            "\n\nPrompt cache (last request): {} read, {} written",
+            ctx.cache_read_tokens, ctx.cache_write_tokens
         )
     } else {
         String::new()
     };
-
-    CommandAction::Message(format!(
-        "Session cost estimate\n\
-         \n\
-         Model:        {model}\n\
-         Input tokens: {tin} (${cin:.4})\n\
-         Output tokens:{tout} (${cout:.4})\n\
-         Total:        ${total:.4}\n\
-         \n\
-         Prices: ${pin}/1M input, ${pout}/1M output{cache}",
-        model = ctx.config.model,
-        tin = ctx.tokens_in,
-        cin = cost_in,
-        tout = ctx.tokens_out,
-        cout = cost_out,
-        pin = price_in,
-        pout = price_out,
-        cache = cache_section,
-    ))
+    CommandAction::Message(format!("{}{cache}", ctx.cost_summary))
 }
 
 pub(super) fn cmd_context(ctx: &CommandContext) -> CommandAction {

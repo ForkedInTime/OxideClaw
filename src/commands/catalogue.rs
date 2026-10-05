@@ -20,22 +20,6 @@ pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-4-6", "Previous Sonnet generation"),
 ];
 
-// Cost per million tokens (input, output) in USD
-
-pub(super) fn model_pricing(model: &str) -> (f64, f64) {
-    if crate::api::is_ollama_model(model) {
-        (0.0, 0.0) // Local — free
-    } else if model.contains("opus-4") {
-        (15.0, 75.0)
-    } else if model.contains("sonnet-4") {
-        (3.0, 15.0)
-    } else if model.contains("haiku") {
-        (0.25, 1.25)
-    } else {
-        (3.0, 15.0) // fallback to sonnet pricing
-    }
-}
-
 // ── Command action ────────────────────────────────────────────────────────────
 
 pub(super) fn cmd_model(args: &str, _ctx: &CommandContext) -> CommandAction {
