@@ -152,9 +152,10 @@ Simple edits go to Haiku or Ollama. Architecture questions go to Opus. Every tok
 
 ### 🎭 &nbsp; Parallel agents in git worktrees
 
-```bash
-oxideclaw spawn "refactor the auth middleware"
+```
+/spawn refactor the auth middleware
 # runs in an isolated git worktree while you keep working in the main tree
+# /spawn list · /spawn review <id> · /spawn merge <id> · /spawn discard <id>
 ```
 
 ### 🎤 &nbsp; Voice I/O with XTTS v2 cloning
@@ -183,7 +184,7 @@ Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July
 
 ### 🦀 &nbsp; Single 19 MB static binary
 
-No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw upgrade` verifies them.
+No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw update` verifies them.
 
 ### 🪝 &nbsp; Lifecycle hooks
 

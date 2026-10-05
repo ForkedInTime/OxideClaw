@@ -7,22 +7,13 @@ use tokio::process::Command;
 
 #[tokio::test]
 async fn test_health_check_via_headless() {
-    // Build first to ensure binary is up-to-date
-    let build = std::process::Command::new("cargo")
-        .args(["build"])
-        .output()
-        .expect("Failed to run cargo build");
-    assert!(
-        build.status.success(),
-        "cargo build failed: {}",
-        String::from_utf8_lossy(&build.stderr)
-    );
-
-    let mut child = Command::new("cargo")
-        .args(["run", "--", "--headless"])
+    // Cargo builds the binary for integration tests and exposes its path;
+    // shelling out to `cargo run` deadlocks on the build lock under `cargo test`.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxideclaw"))
+        .arg("--headless")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to spawn oxideclaw --headless");
 

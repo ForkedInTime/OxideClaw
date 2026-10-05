@@ -283,11 +283,7 @@ impl QueryEngine {
             }
 
             // Track cost and check budget
-            let turn_cost = estimate_cost_usd(
-                &self.config.model,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-            );
+            let turn_cost = estimate_cost_usd(&self.config.model, &response.usage);
             self.cumulative_cost_usd += turn_cost;
             if let Some(budget) = self.config.max_budget_usd
                 && self.cumulative_cost_usd >= budget
@@ -786,20 +782,14 @@ fn is_overloaded_error(e: &anyhow::Error) -> bool {
     msg.contains("529") || msg.contains("overloaded") || msg.contains("Overloaded")
 }
 
-/// Rough per-model cost estimate in USD.
-/// Uses publicly documented pricing as of mid-2025.
-fn estimate_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    // Prices per million tokens (input, output)
-    let (price_in, price_out): (f64, f64) = if model.contains("opus") {
-        (15.0, 75.0)
-    } else if model.contains("haiku") {
-        (0.25, 1.25)
-    } else {
-        // sonnet / default
-        (3.0, 15.0)
-    };
-    (input_tokens as f64 / 1_000_000.0) * price_in
-        + (output_tokens as f64 / 1_000_000.0) * price_out
+/// Per-call cost in USD, from the same price table as `/cost`.
+fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
+    crate::cost::model_price(model).cost(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    )
 }
 
 #[cfg(test)]

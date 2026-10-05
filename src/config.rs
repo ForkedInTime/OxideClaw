@@ -1311,8 +1311,8 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
      /compact                     — summarise conversation to free context space
      /exit                        — exit the program
      /model                       — show current model and available options
-     /model default               — switch back to claude-sonnet-4-6
-     /model claude-opus-4-6       — switch to an Anthropic model
+     /model default               — switch back to claude-sonnet-5
+     /model claude-opus-5         — switch to an Anthropic model
      /model ollama:<name>         — switch to a local Ollama model (e.g. /model ollama:dolphin-llama3:8b)
      /model groq:<name>           — use Groq (e.g. /model groq:llama-3.3-70b-versatile)
      /model openrouter:<name>     — use OpenRouter (e.g. /model openrouter:meta-llama/llama-3.3-70b-instruct)

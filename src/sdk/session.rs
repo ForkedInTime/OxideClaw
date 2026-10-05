@@ -254,8 +254,13 @@ impl SdkSession {
             let output_tok = response.usage.output_tokens;
             turn_input_tokens += input_tok;
             turn_output_tokens += output_tok;
-            self.cost_tracker
-                .record(&self.config.model, input_tok, output_tok);
+            self.cost_tracker.record_with_cache(
+                &self.config.model,
+                input_tok,
+                output_tok,
+                response.usage.cache_read_input_tokens,
+                response.usage.cache_creation_input_tokens,
+            );
 
             let turn_cost = self.cost_tracker.total_cost_usd - turn_cost_start;
             self.send_notif(SdkNotification::CostUpdated {

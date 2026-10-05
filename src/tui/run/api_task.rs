@@ -305,6 +305,14 @@ pub(super) async fn run_api_task(task: ApiTask) {
             }
         }
 
+        let _ = tx.send(AppEvent::Usage {
+            model: config.model.clone(),
+            input: response.usage.input_tokens,
+            output: response.usage.output_tokens,
+            cache_read: response.usage.cache_read_input_tokens,
+            cache_write: response.usage.cache_creation_input_tokens,
+        });
+
         // One-time notice when an Ollama model is detected as not supporting tools
         if client.take_tools_notice() {
             let _ = tx.send(AppEvent::SystemMessage(

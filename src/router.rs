@@ -40,11 +40,11 @@ impl std::fmt::Display for Complexity {
 pub struct RouterConfig {
     /// Model for low-complexity tasks (default: claude-haiku-4-5)
     pub low_model: String,
-    /// Model for medium-complexity tasks (default: claude-sonnet-4-6)
+    /// Model for medium-complexity tasks (default: claude-sonnet-5)
     pub medium_model: String,
     /// Model for high-complexity tasks (default: whatever the user configured)
     pub high_model: String,
-    /// Model for super-high tasks needing 1M context (default: claude-opus-4-6)
+    /// Model for super-high tasks needing 1M context (default: claude-opus-5)
     pub super_high_model: String,
     /// Whether the router is enabled
     pub enabled: bool,

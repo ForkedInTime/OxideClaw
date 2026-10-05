@@ -316,6 +316,8 @@ async fn run_loop(
     }
     let mut messages: Vec<Message> = Vec::new();
     let mut last_tokens_in: u64 = 0;
+    // Tokens across every API call of the running turn.
+    let mut turn_tokens: (u64, u64) = (0, 0);
     let mut consecutive_compact_count: u32 = 0;
     let mut saved_count: usize = 0;
     // Turn counter for file history snapshots (increments on each user prompt sent to API)
@@ -776,30 +778,47 @@ async fn run_loop(
                 let mut ev = event;
                 loop {
                     match ev {
+                        AppEvent::Usage { ref model, input, output, cache_read, cache_write } => {
+                            let was_warning = app.cost_tracker.budget_warning();
+                            app.cost_tracker.record_with_cache(model, input, output, cache_read, cache_write);
+                            turn_tokens.0 += input + cache_read + cache_write;
+                            turn_tokens.1 += output;
+                            if app.cost_tracker.over_budget() {
+                                // `/budget` is a cap, not a suggestion: stop the
+                                // tool loop rather than let it keep spending.
+                                if let Some(handle) = app.api_task.take() {
+                                    handle.abort();
+                                    app.is_loading = false;
+                                    app.turn_start = None;
+                                    app.flush_streaming();
+                                    app.entries.push(ChatEntry::system(format!(
+                                        "Budget exceeded (${:.4}) — turn stopped. Use /budget to raise or clear the limit.",
+                                        app.cost_tracker.total_cost_usd
+                                    )));
+                                    app.scroll_to_bottom();
+                                }
+                            } else if !was_warning
+                                && app.cost_tracker.budget_warning()
+                                && let Some(remaining) = app.cost_tracker.remaining()
+                            {
+                                app.entries.push(ChatEntry::system(
+                                    format!("Budget warning: ${:.4} remaining", remaining)
+                                ));
+                            }
+                        }
                         AppEvent::Done { tokens_in, tokens_out, cache_read, cache_write, messages: new_messages, model_used } => {
-                            last_tokens_in = tokens_in;
+                            // Context size includes prompt-cache hits, which
+                            // `input_tokens` excludes.
+                            last_tokens_in = tokens_in + cache_read + cache_write;
                             messages = new_messages.clone();
                             if !config.no_session_persistence && new_messages.len() > saved_count {
                                 let to_save = new_messages[saved_count..].to_vec();
                                 saved_count = new_messages.len();
                                 let _ = session.append(&to_save).await;
                             }
-                            // Per-turn cost tracking
-                            app.turn_costs.push((tokens_in, tokens_out));
-                            // Record in cost tracker (per-model breakdown)
-                            app.cost_tracker.record(&model_used, tokens_in, tokens_out);
-                            // Budget check
-                            if app.cost_tracker.budget_warning()
-                                && let Some(remaining) = app.cost_tracker.remaining() {
-                                    app.entries.push(ChatEntry::system(
-                                        format!("Budget warning: ${:.4} remaining", remaining)
-                                    ));
-                                }
-                            if app.cost_tracker.over_budget() {
-                                app.entries.push(ChatEntry::system(
-                                    "Budget exceeded! Use /budget to adjust or remove the limit.".to_string()
-                                ));
-                            }
+                            // Per-turn token totals (cost itself is recorded per API call
+                            // on `AppEvent::Usage`).
+                            app.turn_costs.push(std::mem::take(&mut turn_tokens));
 
                             // Notifications + terminal bell on task completion
                             if config.notifications_enabled {

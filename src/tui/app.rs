@@ -1359,6 +1359,8 @@ impl App {
                 }
                 self.scroll_to_bottom();
             }
+            // Cost is recorded by the event loop, which owns the budget check.
+            AppEvent::Usage { .. } => {}
             AppEvent::Done {
                 tokens_in,
                 tokens_out,

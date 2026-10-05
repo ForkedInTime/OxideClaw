@@ -14,6 +14,15 @@ pub enum AppEvent {
     ToolOutputStream(String),
     /// A tool call result
     ToolResult { is_error: bool, text: String },
+    /// One API call finished. A turn makes one call per tool round-trip, and
+    /// every call is billed, so cost is recorded here rather than on `Done`.
+    Usage {
+        model: String,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    },
     /// The full turn is complete — carries the updated full message history
     Done {
         tokens_in: u64,

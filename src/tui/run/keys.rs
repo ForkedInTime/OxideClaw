@@ -550,7 +550,17 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 .await;
             }
 
-            // Regular user message → send to Claude
+            // Regular user message → send to Claude, unless the budget is spent.
+            if app.cost_tracker.over_budget() {
+                app.input = raw.chars().collect();
+                app.cursor = app.input.len();
+                app.entries.push(ChatEntry::system(format!(
+                    "Budget of ${:.2} reached — not sending. Use /budget to raise or clear it.",
+                    app.cost_tracker.budget_usd.unwrap_or_default()
+                )));
+                app.scroll_to_bottom();
+                return Ok(());
+            }
             app.show_welcome = false;
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();

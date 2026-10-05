@@ -19,11 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BENCHMARKS.md** with `scripts/bench.py`: reproducible cold-start,
   executable-size, and peak-RSS numbers against whatever agents are on
   `PATH` (measured: Claude Code, Codex, Gemini CLI, Goose).
-- **Packaging.** Homebrew tap (`brew install ForkedInTime/rustyclaw/rustyclaw`)
-  and an AUR binary package (`rustyclaw-bin`, files in `contrib/aur/`), both
+- **Packaging.** Homebrew tap (`brew install ForkedInTime/oxideclaw/oxideclaw`)
+  and an AUR binary package (`oxideclaw-bin`, files in `contrib/aur/`), both
   pinned to the release assets' SHA-256. `scripts/update-packaging.sh vX.Y.Z`
   refreshes both for a new tag.
-- **`rustyclaw acp` — Agent Client Protocol.** RustyClaw can now be the
+- **`oxideclaw acp` — Agent Client Protocol.** OxideClaw can now be the
   agent behind Zed, JetBrains, and any ACP client: `initialize`,
   `session/new`, `session/prompt` with streamed `session/update`s, tool-call
   status, `session/request_permission` for tools the policy marks *ask*, and

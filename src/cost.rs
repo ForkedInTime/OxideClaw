@@ -6,25 +6,45 @@ use std::collections::HashMap;
 
 // ─── Per-model pricing (USD per million tokens) ─────────────────────────────
 
-struct ModelPrice {
-    input: f64,
-    output: f64,
+pub(crate) struct ModelPrice {
+    pub(crate) input: f64,
+    pub(crate) output: f64,
+    /// Cache-read price as a fraction of `input`. Writes (5-minute TTL) are
+    /// always 1.25× input.
+    cache_read_mult: f64,
     /// True when this is a guess for an unrecognised model rather than a known
     /// published rate. Surfaced in `/cost` so a wrong number is never presented
     /// as an authoritative one.
     estimated: bool,
 }
 
-/// Get pricing for a model.  Returns (input_price, output_price) per million tokens.
-fn model_price(model: &str) -> ModelPrice {
+/// Cache writes with the default 5-minute TTL bill at 1.25× the input rate.
+const CACHE_WRITE_MULT: f64 = 1.25;
+
+impl ModelPrice {
+    /// USD for one API call's usage. `input` excludes cached tokens, which the
+    /// API reports separately.
+    pub(crate) fn cost(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+        let per_m = |tokens: u64, rate: f64| tokens as f64 / 1_000_000.0 * rate;
+        per_m(input, self.input)
+            + per_m(output, self.output)
+            + per_m(cache_read, self.input * self.cache_read_mult)
+            + per_m(cache_write, self.input * CACHE_WRITE_MULT)
+    }
+}
+
+/// Get pricing for a model (USD per million tokens).
+pub(crate) fn model_price(model: &str) -> ModelPrice {
     let published = |input: f64, output: f64| ModelPrice {
         input,
         output,
+        cache_read_mult: 0.1,
         estimated: false,
     };
     let rough = |input: f64, output: f64| ModelPrice {
         input,
         output,
+        cache_read_mult: 0.1,
         estimated: true,
     };
     let m = model.to_ascii_lowercase();
@@ -33,10 +53,24 @@ fn model_price(model: &str) -> ModelPrice {
     // generations are cheaper than older ones, so match the generation, not
     // just the family — "opus" alone would charge Opus 5 at Opus 4.1 rates.
     if m.contains("fable") || m.contains("mythos") {
-        published(10.0, 50.0)
+        // The 5.1 generation reads cache at $0.25/MTok.
+        if m.contains("-5-1") {
+            ModelPrice {
+                cache_read_mult: 0.025,
+                ..published(10.0, 50.0)
+            }
+        } else {
+            published(10.0, 50.0)
+        }
     } else if m.contains("opus") {
-        // Opus 4.6 and later: $5/$25. Opus 4.5 and earlier: $15/$75.
-        if m.contains("opus-4-5")
+        // Opus 5.5: $4/$20, cache reads $0.20. Opus 4.6–5: $5/$25.
+        // Opus 4.5 and earlier: $15/$75.
+        if m.contains("opus-5-5") {
+            ModelPrice {
+                cache_read_mult: 0.05,
+                ..published(4.0, 20.0)
+            }
+        } else if m.contains("opus-4-5")
             || m.contains("opus-4-1")
             || m.contains("opus-4-0")
             || m.contains("3-opus")
@@ -133,11 +167,24 @@ impl CostTracker {
         self.budget_usd = None;
     }
 
-    /// Record token usage for a turn.
+    /// Record token usage for one API call with no prompt-cache traffic.
+    #[cfg(test)]
     pub fn record(&mut self, model: &str, input_tokens: u64, output_tokens: u64) {
+        self.record_with_cache(model, input_tokens, output_tokens, 0, 0);
+    }
+
+    /// Record token usage for one API call. `input_tokens` excludes the
+    /// cache reads and writes, which are priced at their own rates.
+    pub fn record_with_cache(
+        &mut self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) {
         let price = model_price(model);
-        let cost = (input_tokens as f64 / 1_000_000.0) * price.input
-            + (output_tokens as f64 / 1_000_000.0) * price.output;
+        let cost = price.cost(input_tokens, output_tokens, cache_read, cache_write);
 
         let entry = self.by_model.entry(model.to_string()).or_default();
         if price.estimated && !entry.estimated {
@@ -153,7 +200,8 @@ impl CostTracker {
         entry.cost_usd += cost;
 
         self.total_cost_usd += cost;
-        self.last_input_tokens = input_tokens;
+        // Context size is everything the model read, cached or not.
+        self.last_input_tokens = input_tokens + cache_read + cache_write;
     }
 
     /// Check if the budget is exceeded.
@@ -450,7 +498,9 @@ mod price_table_tests {
     fn current_claude_models_use_published_rates() {
         for (model, input, output) in [
             ("claude-fable-5-1", 10.0, 50.0),
+            ("claude-opus-5-5", 4.0, 20.0),
             ("claude-opus-5", 5.0, 25.0),
+            ("claude-sonnet-5-5", 2.0, 10.0),
             ("claude-opus-4-6", 5.0, 25.0),
             ("claude-sonnet-5", 2.0, 10.0),
             ("claude-sonnet-4-6", 3.0, 15.0),
@@ -474,5 +524,20 @@ mod price_table_tests {
             !model_price("ollama:llama3").estimated,
             "local is exactly free"
         );
+    }
+
+    /// Cache reads and writes are billed, so `/cost` must count them.
+    #[test]
+    fn cache_reads_and_writes_are_priced() {
+        let m = 1_000_000;
+        let p = model_price("claude-sonnet-5");
+        assert!((p.cost(0, 0, m, 0) - 0.2).abs() < 1e-9);
+        assert!((p.cost(0, 0, 0, m) - 2.5).abs() < 1e-9);
+        assert!((model_price("claude-opus-5-5").cost(0, 0, m, 0) - 0.2).abs() < 1e-9);
+        assert!((model_price("claude-fable-5-1").cost(0, 0, m, 0) - 0.25).abs() < 1e-9);
+
+        let mut t = super::CostTracker::new();
+        t.record_with_cache("claude-sonnet-5", 100, 0, 9_000, 900);
+        assert_eq!(t.last_input_tokens, 10_000, "context counts cached tokens");
     }
 }

@@ -124,6 +124,20 @@ pub fn supports_adaptive_thinking(model: &str) -> bool {
     }
 }
 
+/// Models that reject an explicit `{"type":"disabled"}` with a 400: thinking
+/// is always on for Fable/Mythos, and cannot be switched off on Opus 5.5+ or
+/// Sonnet 5.5+. For these, "off" means omitting the field.
+pub fn rejects_disabled_thinking(model: &str) -> bool {
+    let model = canonical(model);
+    let Some((_, family)) = family_of(&model) else {
+        return false;
+    };
+    if family == "fable" || family == "mythos" {
+        return true;
+    }
+    (family == "opus" || family == "sonnet") && model_version(&model).is_some_and(|v| v >= (5, 5))
+}
+
 /// `output_config.effort` support tracks adaptive thinking exactly.
 pub fn supports_effort(model: &str) -> bool {
     supports_adaptive_thinking(model)
@@ -137,7 +151,8 @@ pub fn thinking_for(model: &str, budget: Option<u32>, max_tokens: u32) -> Option
     family_of(&model)?;
     let adaptive = supports_adaptive_thinking(&model);
     if budget == 0 {
-        return adaptive.then_some(ThinkingConfig::Disabled);
+        return (adaptive && !rejects_disabled_thinking(&model))
+            .then_some(ThinkingConfig::Disabled);
     }
     if adaptive {
         return Some(ThinkingConfig::Adaptive);
@@ -333,6 +348,29 @@ mod tests {
             Some(ThinkingConfig::Disabled)
         );
         assert_eq!(thinking_for("claude-haiku-4-5", Some(0), 64_000), None);
+    }
+
+    #[test]
+    fn zero_budget_omits_thinking_where_disabled_is_a_400() {
+        for m in [
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "fable",
+        ] {
+            assert_eq!(thinking_for(m, Some(0), 64_000), None, "{m}");
+            assert_eq!(
+                thinking_for(m, Some(4_096), 64_000),
+                Some(ThinkingConfig::Adaptive),
+                "{m}"
+            );
+        }
+        assert_eq!(
+            thinking_for("claude-opus-5", Some(0), 64_000),
+            Some(ThinkingConfig::Disabled)
+        );
     }
 
     #[test]

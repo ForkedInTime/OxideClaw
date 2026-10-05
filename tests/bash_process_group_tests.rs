@@ -21,7 +21,20 @@ use tempfile::TempDir;
 fn pid_alive(pid: i32) -> bool {
     // SAFETY: kill(pid, 0) with sig=0 only performs permission/existence
     // checking and does not deliver a signal.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    // A killed orphan is reparented to init; under a container init that never
+    // reaps, it lingers as a zombie, which kill(pid, 0) still reports. It is dead.
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                != Some("Z")
+        }
+        Err(_) => true, // no procfs (macOS): trust kill()
+    }
 }
 
 /// Wait up to `total` for the pid to die; polls every 50ms.

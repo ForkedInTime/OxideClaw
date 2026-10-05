@@ -117,7 +117,7 @@ struct Cli {
     #[arg(long)]
     dangerously_skip_permissions: bool,
 
-    /// Model to use (default: claude-sonnet-4-6)
+    /// Model to use (default: claude-sonnet-5)
     #[arg(long)]
     model: Option<String>,
 
