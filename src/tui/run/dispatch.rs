@@ -2016,9 +2016,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         }
                         labels.push("session base (pre-OxideClaw)".to_string());
                         positions.push(0);
+                        // The body is what is drawn; the picker highlights
+                        // lines starting "N." (an empty body was a blank popup).
+                        let body = std::iter::once("Undo to (↑/↓ then Enter):\n".to_string())
+                            .chain(
+                                labels
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, l)| format!("  {}. {l}", i + 1)),
+                            )
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         app.overlay = Some(crate::tui::app::Overlay::with_items(
                             "undo".to_string(),
-                            String::new(),
+                            body,
                             labels,
                         ));
                         app.pending_undo_positions = Some(positions);
@@ -2096,9 +2107,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             ));
                             positions.push(i + 1);
                         }
+                        // The body is what is drawn; the picker highlights
+                        // lines starting "N." (an empty body was a blank popup).
+                        let body = std::iter::once("Redo to (↑/↓ then Enter):\n".to_string())
+                            .chain(
+                                labels
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, l)| format!("  {}. {l}", i + 1)),
+                            )
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         app.overlay = Some(crate::tui::app::Overlay::with_items(
                             "redo".to_string(),
-                            String::new(),
+                            body,
                             labels,
                         ));
                         app.pending_redo_positions = Some(positions);
