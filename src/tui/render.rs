@@ -978,8 +978,15 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     };
 
     let popup_w = (area.width * 7 / 10).max(50).min(area.width);
-    let desc_lines = perm.description.lines().count() as u16 + 5;
-    let popup_h = desc_lines.max(8).min(area.height);
+    // Height counts *wrapped* rows: sizing by `lines()` clipped a long
+    // one-line Bash command, hiding its tail and the [y]/[a]/[n] legend.
+    let text_w = popup_w.saturating_sub(2).max(1) as usize;
+    let desc_rows: usize = perm
+        .description
+        .lines()
+        .map(|l| (l.chars().count() + 2).div_ceil(text_w).max(1))
+        .sum();
+    let popup_h = (desc_rows as u16).saturating_add(5).max(8).min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect {
@@ -1008,8 +1015,9 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
             Style::default().fg(Color::White),
         )));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
+    // The legend is drawn pinned to the bottom row, so it stays visible even
+    // when the command is taller than the screen.
+    let legend = Line::from(vec![
         Span::styled("  [", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "y",
@@ -1030,12 +1038,24 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         Span::styled("] deny", Style::default().fg(Color::DarkGray)),
-    ]));
+    ]);
 
+    let legend_h = 1.min(inner.height);
+    let body = Rect {
+        height: inner.height.saturating_sub(legend_h + 1),
+        ..inner
+    };
+    let legend_area = Rect {
+        y: inner.y + inner.height.saturating_sub(legend_h),
+        height: legend_h,
+        ..inner
+    };
+    // trim: false keeps the command's own indentation when it wraps.
     f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
-        inner,
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        body,
     );
+    f.render_widget(Paragraph::new(legend), legend_area);
 }
 
 // ── Overlay panel ─────────────────────────────────────────────────────────────
@@ -1216,4 +1236,44 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
         inner,
     );
+}
+
+#[cfg(test)]
+mod permission_popup_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// The user must see the whole command they approve, and the legend.
+    #[test]
+    fn long_command_and_legend_are_fully_visible() {
+        let cmd = format!("echo {} && rm -rf ./build-artifacts-TAIL", "x".repeat(300));
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.pending_permission = Some(crate::tui::app::PendingPermission {
+            tool_name: "Bash".into(),
+            description: format!("Run shell command:\n  {cmd}"),
+            reply,
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            draw_permission(f, area, &app, theme_colors("dark"));
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = screen
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect();
+        assert!(flat.contains("build-artifacts-TAIL"), "{screen}");
+        assert!(screen.contains("] deny"), "{screen}");
+    }
 }
