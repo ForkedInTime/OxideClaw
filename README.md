@@ -103,7 +103,7 @@ oxideclaw
 
 OxideClaw is a coding agent, not a port. It talks to Claude, Ollama, and 9 OpenAI-compatible providers, and it builds the things only a native binary makes practical: an on-disk index of your codebase, a router that sends each task to the cheapest model that can handle it, agents that run in parallel git worktrees, a lint-and-test loop that fixes its own mistakes, and spoken answers in your own voice.
 
-How it compares with the agents people actually run. Every cell was checked against the project's public README and source on 2026-09-11.
+How it compares with the agents people actually run. Every cell was checked against the project's public README and source on 2026-09-11; Claude Code's browser and AGENTS.md cells were re-checked against its docs on 2026-10-05.
 ✅ documented · ❌ not offered · — not documented by the project.
 
 | | Claude Code | Codewhale | jcode | claurst | **OxideClaw** |
@@ -114,21 +114,21 @@ How it compares with the agents people actually run. Every cell was checked agai
 | Auto model routing | ❌ | ✅ DeepSeek tiers | — | — | **✅ any provider, by task complexity, `/budget` cap** |
 | Auto-fix loop (lint + tests + retry after every edit) | ❌ | — | — | — | **✅** |
 | Spoken replies in a cloned voice | ❌ | ✅ cloud TTS tool (MiMo), on request | — | ❌ | **✅ local XTTS v2, every reply** |
-| Autonomous browser agent (`/browse <goal>`) | ❌ | — | — | — | **✅ 50-step cap, approval gate** |
 | `/redo` after `/undo` | — | — | — | — | **✅** |
 | `/undo` | ✅ `/rewind` | ✅ `/undo`, `/restore` | — | — | **✅ hidden git refs, clean `git log`** |
+| Autonomous browser agent (`/browse <goal>`) | ✅ Chrome extension, claude.ai plan required | — | — | — | **✅ any provider, 50-step cap, approval gate** |
 | Parallel agents in git worktrees | ✅ | ✅ | ✅ swarm, no worktrees | ✅ | **✅ `spawn`, up to 8** |
 | Voice input (Whisper) | ✅ | — | ✅ | ✅ | **✅** |
-| Browser automation in the binary | via MCP | ✅ | ✅ | — | **✅ 9 CDP tools** |
+| Browser automation in the binary | via Chrome extension | ✅ | ✅ | — | **✅ 9 CDP tools** |
 | Ollama with native tool calling | ❌ | ✅ | ✅ | ✅ | **✅** |
 | OpenAI-compatible providers | ❌ | ✅ | ✅ | ✅ | **✅ 9 providers** |
 | Lifecycle hooks | ✅ | ✅ | — | ✅ | **✅ 8 events** |
 | MCP servers | ✅ | ✅ | ✅ | ✅ | **✅** |
 | Editor integration (Agent Client Protocol) | via adapter | — | — | ✅ | **✅ `oxideclaw acp`** |
 | Sandboxed shell (bwrap / firejail) | ✅ | ✅ | — | — | **✅** |
-| CLAUDE.md + AGENTS.md | CLAUDE.md | — | — | ✅ | **✅ both, `/reload`** |
+| CLAUDE.md + AGENTS.md | ✅ both | — | — | ✅ | **✅ both, `/reload`** |
 
-The first seven rows are where OxideClaw stands apart. The rest is table stakes, and OxideClaw has it too.
+The first five rows are where OxideClaw stands apart. The rest is table stakes, and OxideClaw has it too.
 
 ---
 
