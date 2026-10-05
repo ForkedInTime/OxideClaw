@@ -7,14 +7,22 @@ use super::*;
 /// Prevents runaway loops where Claude repeatedly calls tools without finishing.
 pub(super) const MAX_TOOL_ITERATIONS: u32 = 50;
 
-/// Destructive tools blocked when plan mode is active.
+/// Destructive tools blocked when plan mode is active. PowerShell runs
+/// commands like Bash; Agent spawns a sub-agent with its own (unblocked)
+/// tools; the browser actions click and type on live sites.
 pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "Bash",
+    "PowerShell",
     "Write",
     "Edit",
     "MultiEdit",
     "NotebookEdit",
+    "MemoryWrite",
     "EnterWorktree",
+    "Agent",
+    "browser_click",
+    "browser_fill",
+    "browser_press_key",
 ];
 
 /// Owned bundle handed to `run_api_task` when a user turn kicks off a new

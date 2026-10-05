@@ -32,6 +32,9 @@ pub enum PermissionDecision {
 ///
 /// `MultiEdit` was absent too, so it edited any file with no prompt and
 /// ignored `deny: ["Edit"]`.
+///
+/// `ExitPlanMode` is here so leaving plan mode is the user's call: the model
+/// asking is the plan being proposed, and the prompt is its approval.
 pub const SENSITIVE_TOOLS: &[&str] = &[
     "Bash",
     "PowerShell",
@@ -39,6 +42,7 @@ pub const SENSITIVE_TOOLS: &[&str] = &[
     "Edit",
     "MultiEdit",
     "NotebookEdit",
+    "ExitPlanMode",
 ];
 
 /// Session-scoped permission state — shared between tool executor and TUI.
@@ -159,17 +163,58 @@ fn rule_matches(rule: &str, tool_name: &str, input: Option<&serde_json::Value>) 
 
         // Check the input's "command" field for Bash, or "file_path" for file tools
         if let Some(inp) = input {
-            let value = match tool_name {
-                "Bash" | "PowerShell" => inp["command"].as_str().unwrap_or(""),
-                "Write" | "Edit" | "Read" => inp["file_path"].as_str().unwrap_or(""),
-                _ => return false,
+            return match tool_name {
+                "Bash" | "PowerShell" => inp["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with(prefix.as_str()),
+                // Paths are compared after resolving `.` and `..`, so
+                // `Edit(prefix:/proj/src/)` does not cover
+                // `/proj/src/../../.bashrc`, and a deny on `~/.ssh/` is not
+                // dodged by `~/./.ssh/id_rsa`.
+                "Write" | "Edit" | "Read" => {
+                    normalize_lexically(inp["file_path"].as_str().unwrap_or(""))
+                        .starts_with(prefix.as_str())
+                }
+                _ => false,
             };
-            return value.starts_with(prefix.as_str());
         }
         false
     } else {
         // Simple name match
         rule.eq_ignore_ascii_case(tool_name)
+    }
+}
+
+/// Resolve `.` and `..` without touching the filesystem. A relative path
+/// that climbs above its start keeps its leading `..`, so it never matches
+/// a prefix rule written for a directory below.
+fn normalize_lexically(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|p| *p != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            p => parts.push(p),
+        }
+    }
+    let joined = parts.join("/");
+    let trailing = if path.ends_with('/') && !joined.is_empty() {
+        "/"
+    } else {
+        ""
+    };
+    if absolute {
+        format!("/{joined}{trailing}")
+    } else {
+        format!("{joined}{trailing}")
     }
 }
 
@@ -392,6 +437,7 @@ pub fn describe_tool_call(tool_name: &str, input: &serde_json::Value) -> String 
             let old = input["old_string"].as_str().unwrap_or("");
             format!("Edit file:\n  {path}\n  Replace: {}", truncate(old, 60))
         }
+        "ExitPlanMode" => "Leave plan mode and start making changes (approve the plan)".to_string(),
         _ => format!("{tool_name}({})", truncate(&input.to_string(), 80)),
     }
 }
@@ -558,6 +604,31 @@ mod tests {
             ),
             "PowerShell must prompt like Bash, not auto-allow"
         );
+    }
+
+    #[test]
+    fn file_rules_compare_normalized_paths() {
+        let s = PermissionState::new(
+            false,
+            &["Edit(prefix:/proj/src/)".into()],
+            &["Read(prefix:/home/u/.ssh/)".into()],
+        );
+        let edit =
+            |p: &str| s.check_with_input("Edit", Some(&serde_json::json!({ "file_path": p })));
+        assert!(matches!(edit("/proj/src/lib.rs"), CheckResult::Allow));
+        assert!(matches!(
+            edit("/proj/src/../../home/u/.bashrc"),
+            CheckResult::Ask
+        ));
+        assert!(matches!(edit("/proj/./src/a/../b.rs"), CheckResult::Allow));
+        let read =
+            |p: &str| s.check_with_input("Read", Some(&serde_json::json!({ "file_path": p })));
+        assert!(matches!(read("/home/u/./.ssh/id_rsa"), CheckResult::Deny));
+        assert!(matches!(
+            read("/home/u/x/../.ssh/id_rsa"),
+            CheckResult::Deny
+        ));
+        assert_eq!(super::normalize_lexically("src/../../etc"), "../etc");
     }
 
     #[test]
