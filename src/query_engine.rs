@@ -21,6 +21,10 @@ pub struct QueryEngine {
     messages: Vec<Message>,
     json_output: bool,
     stream_json_output: bool,
+    /// Print nothing to stdout. Embedded runs (browse under the SDK, the
+    /// TUI, or `oxideclaw browse`'s NDJSON) own stdout; human-readable
+    /// "Claude:" text there corrupted the stream.
+    quiet: bool,
     include_partial_messages: bool,
     include_hook_events: bool,
     cumulative_cost_usd: f64,
@@ -83,6 +87,7 @@ impl QueryEngine {
             messages: Vec::new(),
             json_output: false,
             stream_json_output: false,
+            quiet: false,
             include_partial_messages: false,
             include_hook_events: false,
             cumulative_cost_usd: 0.0,
@@ -190,7 +195,8 @@ impl QueryEngine {
 
             // Call the API with streaming, printing text as it arrives
             let mut full_text = String::new();
-            if !self.json_output && !self.stream_json_output {
+            let human = !self.json_output && !self.stream_json_output && !self.quiet;
+            if human {
                 print!("\n{} ", "Claude:".cyan().bold());
             }
             let include_partial = self.include_partial_messages && self.stream_json_output;
@@ -207,10 +213,10 @@ impl QueryEngine {
                                 println!("{}", event);
                             }
                             full_text.push_str(chunk);
-                        } else if self.json_output {
-                            full_text.push_str(chunk);
-                        } else {
+                        } else if human {
                             print!("{chunk}");
+                        } else {
+                            full_text.push_str(chunk);
                         }
                     })
                     .await;
@@ -232,10 +238,10 @@ impl QueryEngine {
                                             println!("{}", event);
                                         }
                                         full_text.push_str(chunk);
-                                    } else if self.json_output {
-                                        full_text.push_str(chunk);
-                                    } else {
+                                    } else if human {
                                         print!("{chunk}");
+                                    } else {
+                                        full_text.push_str(chunk);
                                     }
                                 }).await?
                             } else {
@@ -249,7 +255,7 @@ impl QueryEngine {
                     Ok(r) => r,
                 }
             };
-            if !self.json_output && !self.stream_json_output {
+            if human {
                 println!(); // newline after streamed text
             }
             // JSON / stream-json mode: emit result object at end of turn
@@ -431,7 +437,7 @@ impl QueryEngine {
                         "input": input,
                     });
                     println!("{}", event);
-                } else if !self.json_output && !self.stream_json_output {
+                } else if !self.json_output && !self.stream_json_output && !self.quiet {
                     println!(
                         "\n{} {}({})",
                         "Tool:".yellow().bold(),
@@ -705,6 +711,7 @@ impl QueryEngine {
         let mut engine = Self::new(config, tools)?;
         engine.system_prompt = system_prompt;
         engine.middlewares = middlewares;
+        engine.quiet = true;
         Ok(engine)
     }
 
