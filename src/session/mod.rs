@@ -306,8 +306,9 @@ pub fn entries_from_messages(messages: &[Message]) -> Vec<ChatEntry> {
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            let preview = if text.len() > 300 {
-                                format!("{}…", &text[..300])
+                            // chars, not bytes: a byte cut can split a code point and panic.
+                            let preview = if text.chars().count() > 300 {
+                                format!("{}…", text.chars().take(300).collect::<String>())
                             } else {
                                 text
                             };

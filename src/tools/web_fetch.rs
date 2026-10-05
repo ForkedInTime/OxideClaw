@@ -93,7 +93,12 @@ impl Tool for WebFetchTool {
 
         let mut text = text;
         if text.len() > MAX_CONTENT_BYTES {
-            text.truncate(MAX_CONTENT_BYTES);
+            // `truncate` panics off a char boundary (any non-ASCII page).
+            let mut cut = MAX_CONTENT_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
             text.push_str("\n... (content truncated)");
         }
 

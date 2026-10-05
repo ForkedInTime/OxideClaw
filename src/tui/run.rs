@@ -81,6 +81,20 @@ pub async fn run_tui(
     resume_id: Option<String>,
     initial_input: Option<String>,
 ) -> Result<()> {
+    // The release profile aborts on panic, so no destructor will restore the
+    // terminal: do it in the hook, before the message prints, or the user is
+    // left in raw mode with mouse capture on and no visible error.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+        default_hook(info);
+    }));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Clear the visible screen and anchor cursor at top-left so the compact
@@ -1012,7 +1026,7 @@ async fn run_loop(
             // Terminal keyboard / mouse / paste events
             Some(Ok(term_ev)) = term_events.next() => {
                 match term_ev {
-                    Event::Key(key) => {
+                    Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
                         handle_key(KeyCtx {
                             key,
                             app: &mut app,

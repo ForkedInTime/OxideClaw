@@ -99,6 +99,12 @@ impl Tool for MultiEditTool {
             std::collections::BTreeSet::new();
 
         for (i, edit) in input.edits.iter().enumerate() {
+            if edit.old_string.is_empty() {
+                let label = format!("[{}/{}] {}", i + 1, input.edits.len(), edit.file_path);
+                results.push(format!("{label} ✗ old_string must not be empty"));
+                had_error = true;
+                continue;
+            }
             let path = match resolve_path(&edit.file_path, &ctx.cwd) {
                 Ok(p) => p,
                 Err(e) => {

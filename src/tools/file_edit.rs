@@ -70,6 +70,14 @@ impl Tool for FileEditTool {
             return Ok(err);
         }
 
+        // An empty old_string matches between every character: replace_all
+        // would interleave new_string through the whole file.
+        if input.old_string.is_empty() {
+            return Ok(ToolOutput::error(
+                "old_string must not be empty — use Write to create or replace a whole file",
+            ));
+        }
+
         // Snapshot the original before editing
         snapshot_file(ctx, &path).await;
 

@@ -1,18 +1,19 @@
 #!/bin/bash
-# OxideClaw installer — single-binary Claude Code alternative written in Rust
+# OxideClaw installer — single-binary, provider-neutral coding agent
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash -s v0.4.0
 #
-# Installs to ~/.local/bin/oxideclaw (or /usr/local/bin with --global)
+# Installs to ~/.local/bin/oxideclaw (or /usr/local/bin with --global:
+#   curl -fsSL .../install.sh | bash -s -- --global)
 # Supports Linux (x64, arm64, musl) and macOS (Intel, Apple Silicon)
-# For Windows: download .exe from GitHub Releases or use `cargo install --path .`
+# For Windows: download .exe from GitHub Releases or use `cargo install oxideclaw`
 
 set -e
 
 REPO="ForkedInTime/OxideClaw"
-VERSION="${1:-latest}"
+VERSION="latest"
 INSTALL_DIR="${OXIDECLAW_INSTALL_DIR:-${RUSTYCLAW_INSTALL_DIR:-$HOME/.local/bin}}"
 GLOBAL=false
 
@@ -32,7 +33,7 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     echo "On Windows, download the .exe directly from:"
     echo "  https://github.com/${REPO}/releases/latest"
-    echo "Or build from source: cargo install --path ."
+    echo "Or build from source: cargo install oxideclaw"
     exit 1
     ;;
   *) echo "Unsupported OS: $(uname -s)" >&2; exit 1 ;;
@@ -46,7 +47,11 @@ esac
 
 # Detect musl vs glibc (Linux only)
 if [ "$os" = "linux" ]; then
-  if ldd --version 2>&1 | grep -qi musl || [ -f /lib/libc.musl-*.so.1 ] 2>/dev/null; then
+  if ldd --version 2>&1 | grep -qi musl || ls /lib/libc.musl-*.so.1 >/dev/null 2>&1; then
+    if [ "$arch" != "x64" ]; then
+      echo "No prebuilt musl binary for ${arch}. Build from source: cargo install oxideclaw" >&2
+      exit 1
+    fi
     platform="linux-${arch}-musl"
   else
     platform="linux-${arch}"

@@ -264,12 +264,15 @@ impl QueryEngine {
                 full_text.clear();
             }
 
-            // Collect assistant content into message history
-            let assistant_message = Message {
-                role: Role::Assistant,
-                content: response.content.clone(),
-            };
-            self.messages.push(assistant_message);
+            // Collect assistant content into message history. An empty
+            // assistant message (whitespace-only reply, refusal, a dropped
+            // truncated tool call) is a 400 on the next request.
+            if !response.content.is_empty() {
+                self.messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content.clone(),
+                });
+            }
 
             // Log token usage in verbose mode
             if self.config.verbose {
@@ -328,6 +331,14 @@ impl QueryEngine {
                         );
                     }
                 }
+                // Summarising now would replace the assistant tool_use that the
+                // results appended below answer, orphaning them (a 400). Snip
+                // this round; summarise once the model stops calling tools.
+                CompactNeeded::Summarise if response.stop_reason == Some(StopReason::ToolUse) => {
+                    if self.config.auto_compact_enabled {
+                        snip_compact(&mut self.messages);
+                    }
+                }
                 CompactNeeded::Summarise => {
                     if self.config.auto_compact_enabled {
                         eprintln!(
@@ -360,9 +371,13 @@ impl QueryEngine {
 
             // Check stop reason
             match &response.stop_reason {
-                Some(StopReason::EndTurn) | None => break,
-                Some(StopReason::MaxTokens) => {
+                Some(StopReason::EndTurn) | Some(StopReason::Other) | None => break,
+                Some(StopReason::MaxTokens) | Some(StopReason::ModelContextWindowExceeded) => {
                     eprintln!("{}", "Warning: max tokens reached".yellow());
+                    break;
+                }
+                Some(StopReason::Refusal) => {
+                    eprintln!("{}", "The model declined this request.".yellow());
                     break;
                 }
                 Some(StopReason::ToolUse) => {
@@ -570,9 +585,24 @@ impl QueryEngine {
             }],
         });
 
+        // Sub-agents (Agent tool, /spawn) run unattended with a bypass gate,
+        // so they need the same turn cap and budget as the headless loop.
+        const DEFAULT_MAX_TURNS: u32 = 50;
+        let max_turns = if self.config.max_turns > 0 {
+            self.config.max_turns
+        } else {
+            DEFAULT_MAX_TURNS
+        };
+        // The agent's answer is its last message, not all its narration.
         let mut final_text = String::new();
+        let mut turns = 0u32;
 
         loop {
+            turns += 1;
+            if turns > max_turns {
+                final_text.push_str(&format!("\n\n[Stopped after {max_turns} turns.]"));
+                break;
+            }
             let tool_defs: Vec<ToolDefinition> =
                 self.tools.iter().map(|t| t.definition()).collect();
 
@@ -589,21 +619,38 @@ impl QueryEngine {
                 session_id: self.session_id.clone(),
             };
 
+            let mut turn_text = String::new();
             let response = self
                 .client
                 .messages_stream(request, |chunk| {
-                    final_text.push_str(chunk);
+                    turn_text.push_str(chunk);
                 })
                 .await?;
+            if !turn_text.trim().is_empty() {
+                final_text = turn_text;
+            }
 
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: response.content.clone(),
-            });
+            self.cumulative_cost_usd += estimate_cost_usd(&self.config.model, &response.usage);
+            if let Some(budget) = self.config.max_budget_usd
+                && self.cumulative_cost_usd >= budget
+            {
+                final_text.push_str(&format!("\n\n[Stopped: budget of ${budget:.2} reached.]"));
+                break;
+            }
+
+            if !response.content.is_empty() {
+                self.messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content.clone(),
+                });
+            }
 
             match &response.stop_reason {
-                Some(StopReason::EndTurn) | None => break,
-                Some(StopReason::MaxTokens) => break,
+                Some(StopReason::EndTurn)
+                | Some(StopReason::Other)
+                | Some(StopReason::Refusal)
+                | None => break,
+                Some(StopReason::MaxTokens) | Some(StopReason::ModelContextWindowExceeded) => break,
                 Some(StopReason::ToolUse) => {
                     let tool_results = self.execute_tools(&response.content).await?;
                     self.messages.push(Message {

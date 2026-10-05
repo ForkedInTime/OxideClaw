@@ -243,11 +243,14 @@ impl SdkSession {
                 final_text = turn_text;
             }
 
-            // Push assistant message to history
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: response.content.clone(),
-            });
+            // Push assistant message to history (never empty: that is a 400
+            // on the next request).
+            if !response.content.is_empty() {
+                self.messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content.clone(),
+                });
+            }
 
             // Record cost
             let input_tok = response.usage.input_tokens;
@@ -322,8 +325,16 @@ impl SdkSession {
 
                     // Continue loop for next API call
                 }
-                Some(StopReason::EndTurn) | None => break,
-                Some(StopReason::MaxTokens) => {
+                Some(StopReason::EndTurn) | Some(StopReason::Other) | None => break,
+                Some(StopReason::Refusal) => {
+                    self.send_notif(SdkNotification::Error {
+                        session_id: self.session_id.clone(),
+                        code: "refusal".into(),
+                        message: "The model declined this request.".into(),
+                    });
+                    break;
+                }
+                Some(StopReason::MaxTokens) | Some(StopReason::ModelContextWindowExceeded) => {
                     self.send_notif(SdkNotification::Error {
                         session_id: self.session_id.clone(),
                         code: "max_tokens".into(),

@@ -522,7 +522,7 @@ impl Config {
             cfg.verbose = v;
         }
         if let Some(host) = settings.ollama_host {
-            cfg.ollama_host = host;
+            cfg.ollama_host = normalize_ollama_host(&host);
         }
         if let Some(tbt) = settings.thinking_budget_tokens {
             cfg.thinking_budget_tokens = Some(tbt);
@@ -787,7 +787,7 @@ impl Config {
             cfg.model = model;
         }
         if let Ok(host) = std::env::var("OLLAMA_HOST") {
-            cfg.ollama_host = host;
+            cfg.ollama_host = normalize_ollama_host(&host);
         }
         if let Some(v) = app_env("VERBOSE") {
             cfg.verbose = v == "1" || v.eq_ignore_ascii_case("true");
@@ -1399,6 +1399,41 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
         }
 
         base
+    }
+}
+
+/// `OLLAMA_HOST` in the form Ollama itself documents (`0.0.0.0:11434`,
+/// `127.0.0.1`, trailing slash) → a base URL requests can be built on.
+pub fn normalize_ollama_host(host: &str) -> String {
+    let host = host.trim().trim_end_matches('/');
+    let has_scheme = host.starts_with("http://") || host.starts_with("https://");
+    let url = if has_scheme {
+        host.to_string()
+    } else if host.contains(':') || host.starts_with('[') {
+        format!("http://{host}")
+    } else {
+        // A bare host (Ollama's own form) means its default port.
+        format!("http://{host}:11434")
+    };
+    // 0.0.0.0 is a bind address for the server, not a destination.
+    url.replacen("://0.0.0.0", "://127.0.0.1", 1)
+}
+
+#[cfg(test)]
+mod ollama_host_tests {
+    use super::normalize_ollama_host as n;
+
+    #[test]
+    fn accepts_the_forms_ollama_documents() {
+        assert_eq!(n("http://localhost:11434"), "http://localhost:11434");
+        assert_eq!(n("http://localhost:11434/"), "http://localhost:11434");
+        assert_eq!(n("127.0.0.1:11434"), "http://127.0.0.1:11434");
+        assert_eq!(n("0.0.0.0:11434"), "http://127.0.0.1:11434");
+        assert_eq!(n("gpu-box"), "http://gpu-box:11434");
+        assert_eq!(
+            n("https://ollama.example.com"),
+            "https://ollama.example.com"
+        );
     }
 }
 

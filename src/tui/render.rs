@@ -179,11 +179,15 @@ fn draw_banner(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
 
 fn draw_banner_left(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     let max_cwd = area.width.saturating_sub(3) as usize;
-    let cwd_display = if app.cached_cwd.len() > max_cwd {
-        format!(
-            "…{}",
-            &app.cached_cwd[app.cached_cwd.len().saturating_sub(max_cwd - 1)..]
-        )
+    let cwd_chars = app.cached_cwd.chars().count();
+    let cwd_display = if cwd_chars > max_cwd {
+        // chars, not bytes: a byte cut can land inside `ó` and panic.
+        let tail: String = app
+            .cached_cwd
+            .chars()
+            .skip(cwd_chars - max_cwd.saturating_sub(1))
+            .collect();
+        format!("…{tail}")
     } else {
         app.cached_cwd.clone()
     };

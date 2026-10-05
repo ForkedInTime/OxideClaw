@@ -167,10 +167,9 @@ fn render_history(messages: &[Message]) -> String {
                     out.push_str(&format!("[Tool {label}: {text}]\n"));
                 }
                 ContentBlock::Thinking { thinking, .. } => {
-                    out.push_str(&format!(
-                        "[Thinking: {}]\n",
-                        &thinking[..thinking.len().min(200)]
-                    ));
+                    // chars, not bytes: a byte cut can split a code point and panic.
+                    let head: String = thinking.chars().take(200).collect();
+                    out.push_str(&format!("[Thinking: {head}]\n"));
                 }
                 ContentBlock::Image { .. } => {
                     out.push_str("[Image attachment]\n");

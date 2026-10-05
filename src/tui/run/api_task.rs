@@ -331,13 +331,25 @@ pub(super) async fn run_api_task(task: ApiTask) {
             }
         }
 
-        messages.push(Message {
-            role: Role::Assistant,
-            content: response.content.clone(),
-        });
+        // Never store an empty assistant message: the next request would 400.
+        if !response.content.is_empty() {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: response.content.clone(),
+            });
+        }
 
+        if response.stop_reason == Some(StopReason::Refusal) {
+            let _ = tx.send(AppEvent::SystemMessage(
+                "The model declined this request (stop_reason: refusal).".into(),
+            ));
+        }
         match &response.stop_reason {
-            Some(StopReason::EndTurn) | None | Some(StopReason::StopSequence) => {
+            Some(StopReason::EndTurn)
+            | None
+            | Some(StopReason::StopSequence)
+            | Some(StopReason::Refusal)
+            | Some(StopReason::Other) => {
                 let _ = tx.send(AppEvent::Done {
                     tokens_in: response.usage.input_tokens,
                     tokens_out: response.usage.output_tokens,
@@ -348,7 +360,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 });
                 return;
             }
-            Some(StopReason::MaxTokens) => {
+            Some(StopReason::MaxTokens) | Some(StopReason::ModelContextWindowExceeded) => {
                 // Response hit the model's max_tokens cap. Preserve the partial
                 // assistant content (already pushed to `messages` above) and
                 // surface a warning instead of dropping the turn with an error.
@@ -626,11 +638,14 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         }
                         crate::autofix::AutoFixAction::Retry { feedback, status } => {
                             let _ = tx.send(AppEvent::SystemMessage(status));
-                            // Append the synthetic user turn so the model sees
-                            // the lint/test failure on the next API round.
+                            // Every tool_use needs its tool_result in the very
+                            // next user message, so the lint/test failure rides
+                            // along after the results rather than replacing them.
+                            let mut content = std::mem::take(&mut results);
+                            content.push(ContentBlock::Text { text: feedback });
                             messages.push(Message {
                                 role: Role::User,
-                                content: vec![ContentBlock::Text { text: feedback }],
+                                content,
                             });
                             auto_fix_retries += 1;
                             // Re-enter the outer loop to call the model again
@@ -639,6 +654,10 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         }
                         crate::autofix::AutoFixAction::GiveUp { status } => {
                             let _ = tx.send(AppEvent::SystemMessage(status));
+                            messages.push(Message {
+                                role: Role::User,
+                                content: std::mem::take(&mut results),
+                            });
                             let _ = tx.send(AppEvent::Done {
                                 tokens_in: response.usage.input_tokens,
                                 tokens_out: response.usage.output_tokens,

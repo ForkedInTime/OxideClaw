@@ -237,6 +237,14 @@ impl ClaudeClient {
 
         let mut stream = resp.bytes_stream().eventsource();
 
+        // Tool schemas by name, so string arguments are only re-parsed where
+        // the schema asks for an array or object.
+        let schemas: HashMap<&str, &serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|t| (t.name.as_str(), &t.input_schema))
+            .collect();
+
         // Accumulator state
         let mut result = StreamedResponse::default();
         // Per-block accumulators: index → (type, text/json buffer)
@@ -258,7 +266,7 @@ impl ClaudeClient {
 
             match parsed {
                 StreamEvent::MessageStart { message } => {
-                    result.usage.input_tokens = message.usage.input_tokens;
+                    result.usage = message.usage;
                 }
                 StreamEvent::ContentBlockStart {
                     index,
@@ -306,9 +314,10 @@ impl ClaudeClient {
                         let mut input: serde_json::Value = serde_json::from_str(&json)
                             .unwrap_or(serde_json::Value::Object(Default::default()));
                         // Normalize: the API sometimes emits array/object fields as
-                        // JSON-encoded strings. Re-parse any string values that look
-                        // like JSON arrays or objects (v2.1.89/92 fix).
-                        normalize_tool_input(&mut input);
+                        // JSON-encoded strings (v2.1.89/92 fix).
+                        if let Some(schema) = schemas.get(name.as_str()) {
+                            normalize_tool_input(&mut input, schema);
+                        }
                         result
                             .content
                             .push(ContentBlock::ToolUse { id, name, input });
@@ -321,8 +330,17 @@ impl ClaudeClient {
                 }
                 StreamEvent::MessageDelta { delta, usage } => {
                     result.stop_reason = delta.stop_reason;
+                    // Counts here are cumulative; keep start's values where
+                    // the delta omits a field.
                     if let Some(u) = usage {
-                        result.usage.output_tokens = u.output_tokens;
+                        let r = &mut result.usage;
+                        r.output_tokens = u.output_tokens;
+                        r.input_tokens = r.input_tokens.max(u.input_tokens);
+                        r.cache_read_input_tokens =
+                            r.cache_read_input_tokens.max(u.cache_read_input_tokens);
+                        r.cache_creation_input_tokens = r
+                            .cache_creation_input_tokens
+                            .max(u.cache_creation_input_tokens);
                     }
                 }
                 StreamEvent::MessageStop | StreamEvent::Ping => {}
@@ -336,36 +354,68 @@ impl ClaudeClient {
     }
 }
 
-/// Normalize streamed tool input: when the API emits array/object fields as
-/// JSON-encoded strings (e.g. `"[\"a\",\"b\"]"` instead of `["a","b"]`),
-/// re-parse them so downstream tools see the intended shape.
-/// Fixes double-encoded JSON from the API.
-fn normalize_tool_input(val: &mut serde_json::Value) {
-    match val {
-        serde_json::Value::Object(map) => {
-            for (_, v) in map.iter_mut() {
-                normalize_tool_input(v);
+/// Normalize streamed tool input: when the API emits an array/object field as
+/// a JSON-encoded string (e.g. `"[\"a\",\"b\"]"` instead of `["a","b"]`),
+/// re-parse it. Only properties the schema types as array or object are
+/// touched: a string argument that happens to be JSON (Write's `content` for
+/// `package.json`) must stay a string.
+fn normalize_tool_input(val: &mut serde_json::Value, schema: &serde_json::Value) {
+    let (Some(map), Some(props)) = (
+        val.as_object_mut(),
+        schema.get("properties").and_then(|p| p.as_object()),
+    ) else {
+        return;
+    };
+    for (key, v) in map.iter_mut() {
+        let Some(prop) = props.get(key) else {
+            continue;
+        };
+        let wants = |t: &str| match prop.get("type") {
+            Some(serde_json::Value::String(s)) => s == t,
+            Some(serde_json::Value::Array(a)) => {
+                a.iter().any(|x| x == t) && !a.iter().any(|x| x == "string")
             }
+            _ => false,
+        };
+        if let serde_json::Value::String(s) = v
+            && (wants("array") || wants("object"))
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+            && ((parsed.is_array() && wants("array")) || (parsed.is_object() && wants("object")))
+        {
+            *v = parsed;
         }
-        serde_json::Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                normalize_tool_input(v);
-            }
+        if v.is_object() && wants("object") {
+            normalize_tool_input(v, prop);
         }
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim_start();
-            if (trimmed.starts_with('[') || trimmed.starts_with('{'))
-                && let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(s)
-                && matches!(
-                    parsed,
-                    serde_json::Value::Array(_) | serde_json::Value::Object(_)
-                )
-            {
-                normalize_tool_input(&mut parsed);
-                *val = parsed;
-            }
-        }
-        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_tool_input;
+    use serde_json::json;
+
+    #[test]
+    fn json_text_in_a_string_property_stays_a_string() {
+        let schema = json!({"properties": {
+            "file_path": {"type": "string"},
+            "content": {"type": "string"}
+        }});
+        let mut input = json!({"file_path": "package.json", "content": "{\"name\": \"x\"}"});
+        normalize_tool_input(&mut input, &schema);
+        assert_eq!(input["content"], "{\"name\": \"x\"}");
+    }
+
+    #[test]
+    fn double_encoded_array_and_object_properties_are_reparsed() {
+        let schema = json!({"properties": {
+            "todos": {"type": "array"},
+            "opts": {"type": "object", "properties": {"tags": {"type": "array"}}}
+        }});
+        let mut input = json!({"todos": "[1,2]", "opts": "{\"tags\": \"[\\\"a\\\"]\"}"});
+        normalize_tool_input(&mut input, &schema);
+        assert_eq!(input["todos"], json!([1, 2]));
+        assert_eq!(input["opts"]["tags"], json!(["a"]));
     }
 }
 
@@ -425,11 +475,13 @@ impl ApiBackend {
         request: MessagesRequest,
         on_text: impl FnMut(&str),
     ) -> Result<StreamedResponse> {
-        match self {
+        let mut response = match self {
             Self::Anthropic(c) => c.messages_stream(request, on_text).await,
             Self::Ollama(c) => c.messages_stream(request, on_text).await,
             Self::OpenAiCompat(c) => c.messages_stream(request, on_text).await,
-        }
+        }?;
+        response.drop_unanswerable_tool_calls();
+        Ok(response)
     }
 
     /// Non-streaming call (falls through to streaming + collect for non-Anthropic backends).

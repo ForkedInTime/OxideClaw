@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// NDJSON protocol version. See `SdkResponse::HealthCheck::protocol_version`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
     /// Tools that execute silently (no notification).
     #[serde(default)]
@@ -35,6 +35,21 @@ pub struct Policy {
 
 fn default_approval_timeout() -> u64 {
     60
+}
+
+// Not derived: a derived Default ignores the serde default above and gives a
+// 0 s approval timeout, so every ask-policy tool (all tools under ACP) was
+// denied before the host could answer.
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            auto_approve: Vec::new(),
+            deny: Vec::new(),
+            ask: Vec::new(),
+            approval_timeout_seconds: default_approval_timeout(),
+        }
+    }
 }
 
 /// Host capabilities — tells the agent what the environment supports.
@@ -414,6 +429,15 @@ pub enum SdkNotification {
 #[cfg(test)]
 mod version_tests {
     use super::*;
+
+    /// ACP and policy-less `session/start` use `Policy::default()`; a 0 s
+    /// timeout there denied every tool before the host could answer.
+    #[test]
+    fn default_policy_waits_for_approval() {
+        assert_eq!(Policy::default().approval_timeout_seconds, 60);
+        let parsed: Policy = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, Policy::default());
+    }
 
     /// Editors embedding the sidecar need a number to gate on; the crate
     /// version says nothing about wire compatibility.

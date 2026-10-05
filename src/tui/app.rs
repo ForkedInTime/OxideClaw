@@ -1177,45 +1177,45 @@ impl App {
         self.cursor += 1;
     }
 
+    /// Start index of the line containing char index `at`.
+    fn line_start(&self, at: usize) -> usize {
+        self.input[..at]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |p| p + 1)
+    }
+
+    /// End index (exclusive, at the `\n` or input end) of the line containing `at`.
+    fn line_end(&self, at: usize) -> usize {
+        self.input[at..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(self.input.len(), |p| at + p)
+    }
+
     /// Move cursor up one visual line (within multi-line input), preserving column.
+    /// Works on char indices: `input` is a `Vec<char>` and `cursor` indexes it.
     pub fn move_cursor_up_one_line(&mut self) {
-        let before: String = self.input[..self.cursor].iter().collect();
-        let col = before
-            .rfind('\n')
-            .map(|p| before.len() - p - 1)
-            .unwrap_or(before.len());
-        // Find end of the previous line
-        let prev_newline = before.rfind('\n');
-        if let Some(pnl) = prev_newline {
-            // pnl is the index of '\n' ending the previous line
-            let prev_line_end = pnl; // exclusive
-            let prev_line_start = before[..pnl].rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let prev_line_len = prev_line_end - prev_line_start;
-            let target_col = col.min(prev_line_len);
-            self.cursor = prev_line_start + target_col;
+        let start = self.line_start(self.cursor);
+        if start == 0 {
+            return;
         }
+        let col = self.cursor - start;
+        let prev_start = self.line_start(start - 1);
+        let prev_len = start - 1 - prev_start;
+        self.cursor = prev_start + col.min(prev_len);
     }
 
     /// Move cursor down one visual line (within multi-line input), preserving column.
     pub fn move_cursor_down_one_line(&mut self) {
-        let before: String = self.input[..self.cursor].iter().collect();
-        let col = before
-            .rfind('\n')
-            .map(|p| before.len() - p - 1)
-            .unwrap_or(before.len());
-        // Find start of the next line
-        let full: String = self.input.iter().collect();
-        if let Some(next_nl_rel) = full[self.cursor..].find('\n') {
-            let next_line_start = self.cursor + next_nl_rel + 1;
-            // Find end of next line
-            let next_line_end = full[next_line_start..]
-                .find('\n')
-                .map(|p| next_line_start + p)
-                .unwrap_or(full.len());
-            let next_line_len = next_line_end - next_line_start;
-            let target_col = col.min(next_line_len);
-            self.cursor = next_line_start + target_col;
+        let col = self.cursor - self.line_start(self.cursor);
+        let end = self.line_end(self.cursor);
+        if end >= self.input.len() {
+            return;
         }
+        let next_start = end + 1;
+        let next_len = self.line_end(next_start) - next_start;
+        self.cursor = next_start + col.min(next_len);
     }
 
     // ── Scroll helpers ────────────────────────────────────────────────────────
@@ -1331,10 +1331,11 @@ impl App {
                 }
                 // Update or create the live output entry (last entry if it's a tool_stream kind)
                 let display = if self.tool_stream_buf.len() > 500 {
-                    format!(
-                        "…{}",
-                        &self.tool_stream_buf[self.tool_stream_buf.len() - 500..]
-                    )
+                    let mut cut = self.tool_stream_buf.len() - 500;
+                    while !self.tool_stream_buf.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    format!("…{}", &self.tool_stream_buf[cut..])
                 } else {
                     self.tool_stream_buf.clone()
                 };
@@ -1557,6 +1558,22 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod trim_entries_tests {
+    /// Up/Down used byte offsets into a char-indexed buffer: "é⏎x", Up,
+    /// Down panicked on a non-char boundary.
+    #[test]
+    fn line_moves_index_chars_not_bytes() {
+        let mut app = App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.input = "é\nxyz".chars().collect();
+        app.cursor = app.input.len(); // after "xyz"
+        app.move_cursor_up_one_line();
+        assert_eq!(app.cursor, 1, "clamped to end of the 1-char line");
+        app.move_cursor_down_one_line();
+        assert_eq!(app.cursor, 3, "column 1 of the second line");
+        app.move_cursor_up_one_line();
+        app.move_cursor_up_one_line(); // already on the first line
+        assert_eq!(app.cursor, 1);
+    }
+
     use super::*;
 
     fn app_with(n: usize) -> App {

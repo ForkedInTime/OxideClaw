@@ -298,9 +298,9 @@ impl McpClient {
 
     /// Call a paginated MCP `*/list` endpoint and accumulate every page.
     ///
-    /// MCP servers return `{ "<field>": [...], "next[redacted]": "..." }`. If
-    /// `next[redacted]` is present, the client MUST repeat the request with
-    /// `params = { "cursor": "<next[redacted]>" }` until `next[redacted]` is absent
+    /// MCP servers return `{ "<field>": [...], "nextCursor": "..." }`. If
+    /// `nextCursor` is present, the client MUST repeat the request with
+    /// `params = { "cursor": "<nextCursor>" }` until `nextCursor` is absent
     /// or empty. Previously we only fetched the first page, silently
     /// truncating tool/resource lists for any server with more than one
     /// page's worth of items (spec §Pagination).
@@ -308,7 +308,7 @@ impl McpClient {
         let mut out: Vec<Value> = Vec::new();
         let mut cursor: Option<String> = None;
         // Hard cap on pages as a safety rail — a buggy server that always
-        // returns the same next[redacted] would otherwise loop forever.
+        // returns the same nextCursor would otherwise loop forever.
         const MAX_PAGES: usize = 256;
 
         for _ in 0..MAX_PAGES {
@@ -323,7 +323,7 @@ impl McpClient {
             }
 
             cursor = result
-                .get("next[redacted]")
+                .get("nextCursor")
                 .and_then(|c| c.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
@@ -555,26 +555,26 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_follows_next_cursor_across_pages() {
-        // Three pages of tools. Pages 1 and 2 return `next[redacted]`; page 3
+        // Three pages of tools. Pages 1 and 2 return `nextCursor`; page 3
         // omits it (end of list).
         let page1 = json!({
             "tools": [
                 { "name": "alpha", "description": "a", "inputSchema": { "type": "object" } },
                 { "name": "beta",  "description": "b", "inputSchema": { "type": "object" } }
             ],
-            "next[redacted]": "cur-2"
+            "nextCursor": "cur-2"
         });
         let page2 = json!({
             "tools": [
                 { "name": "gamma", "description": "c", "inputSchema": { "type": "object" } }
             ],
-            "next[redacted]": "cur-3"
+            "nextCursor": "cur-3"
         });
         let page3 = json!({
             "tools": [
                 { "name": "delta", "description": "d", "inputSchema": { "type": "object" } }
             ]
-            // no next[redacted] → end
+            // no nextCursor → end
         });
 
         let mut responses = HashMap::new();
@@ -601,9 +601,9 @@ mod tests {
     #[tokio::test]
     async fn list_paginated_sends_cursor_param_on_each_follow_up() {
         // Explicit check: second and third requests must carry
-        // `{ "cursor": "<prev-next[redacted]>" }`, first carries `{}`.
-        let page1 = json!({ "tools": [], "next[redacted]": "cur-2" });
-        let page2 = json!({ "tools": [], "next[redacted]": "cur-3" });
+        // `{ "cursor": "<prev-nextCursor>" }`, first carries `{}`.
+        let page1 = json!({ "tools": [], "nextCursor": "cur-2" });
+        let page2 = json!({ "tools": [], "nextCursor": "cur-3" });
         let page3 = json!({ "tools": [] });
 
         let mut responses = HashMap::new();
@@ -644,11 +644,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_paginated_stops_on_empty_next_cursor_string() {
-        // Edge case: server returns `"next[redacted]": ""`. Spec-compliant clients
+        // Edge case: server returns `"nextCursor": ""`. Spec-compliant clients
         // treat empty string as "no more pages" — we must not loop.
         let page1 = json!({
             "resources": [ { "uri": "file://a", "name": "a" } ],
-            "next[redacted]": ""
+            "nextCursor": ""
         });
         let mut responses = HashMap::new();
         responses.insert("resources/list".to_string(), vec![page1]);
@@ -664,11 +664,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_paginated_caps_runaway_page_loop() {
-        // A buggy server that ALWAYS returns the same next[redacted] would loop
+        // A buggy server that ALWAYS returns the same nextCursor would loop
         // forever without the MAX_PAGES safety rail. Feed 300 identical pages
         // and verify we stop gracefully instead of hanging (or exhausting the
         // mock queue with an Err).
-        let page = json!({ "tools": [], "next[redacted]": "stuck" });
+        let page = json!({ "tools": [], "nextCursor": "stuck" });
         let responses = {
             let mut m = HashMap::new();
             m.insert("tools/list".to_string(), vec![page; 300]);

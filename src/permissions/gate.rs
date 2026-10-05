@@ -81,8 +81,15 @@ impl PermissionGate {
 
     /// Allow everything. Only for executors the user has explicitly asked
     /// to run autonomously (`/spawn`).
+    #[cfg(test)]
     pub fn bypass() -> Self {
-        Self::new(PermissionState::new(true, &[], &[]), false, None)
+        Self::bypass_with_deny(&[])
+    }
+
+    /// No prompts, but `permissions.deny` still holds: the user's written
+    /// rules are not something "autonomous" waives.
+    pub fn bypass_with_deny(deny: &[String]) -> Self {
+        Self::new(PermissionState::new(true, &[], deny), false, None)
     }
 
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
@@ -91,7 +98,7 @@ impl PermissionGate {
                 "{tool_name} is blocked in plan mode. Use ExitPlanMode when the plan is approved."
             ));
         }
-        let check = if self.suggest_mode && matches!(tool_name, "Write" | "Edit") {
+        let check = if self.suggest_mode && matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
             CheckResult::Ask
         } else if is_command_tool(tool_name) {
             // Compound commands are split so a prefix rule cannot authorise
@@ -318,6 +325,20 @@ mod tests {
         );
         assert_eq!(
             g.decide("Read", &json!({"file_path": "a"})).await,
+            GateOutcome::Allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_gate_still_honours_deny_rules() {
+        let g = PermissionGate::bypass_with_deny(&["Bash(git push:*)".into()]);
+        assert!(matches!(
+            g.decide("Bash", &json!({"command": "git push origin main"}))
+                .await,
+            GateOutcome::Denied(_)
+        ));
+        assert_eq!(
+            g.decide("Bash", &json!({"command": "git status"})).await,
             GateOutcome::Allowed
         );
     }

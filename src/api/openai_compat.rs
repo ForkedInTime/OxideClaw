@@ -273,26 +273,8 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                     .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
                     .collect();
 
-                if !text_blocks.is_empty() {
-                    let text = text_blocks
-                        .iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::Text { text } = b {
-                                Some(text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    out.push(OaiMessage {
-                        role: "user".into(),
-                        content: Some(serde_json::Value::String(text)),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-
+                // `tool` messages must directly follow the assistant's
+                // tool_calls, so any user text (auto-fix feedback) goes after.
                 for block in result_blocks {
                     if let ContentBlock::ToolResult {
                         tool_use_id,
@@ -315,6 +297,26 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                             tool_call_id: Some(tool_use_id.clone()),
                         });
                     }
+                }
+
+                if !text_blocks.is_empty() {
+                    let text = text_blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push(OaiMessage {
+                        role: "user".into(),
+                        content: Some(serde_json::Value::String(text)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
                 }
             }
 
@@ -495,6 +497,11 @@ pub(crate) async fn parse_oai_stream(
 
     let mut tool_entries: Vec<(usize, (String, String, String))> = tool_bufs.into_iter().collect();
     tool_entries.sort_by_key(|(idx, _)| *idx);
+    // Some servers (older Ollama, llama.cpp, vLLM) finish with "stop" even
+    // when the turn is tool calls. The calls are the turn either way.
+    let has_tool_calls = tool_entries
+        .iter()
+        .any(|(_, (_, name, _))| !name.is_empty());
 
     for (_, (id, name, args)) in tool_entries {
         let input =
@@ -507,9 +514,10 @@ pub(crate) async fn parse_oai_stream(
     // ── Map finish_reason → StopReason ───────────────────────────────────────
 
     result.stop_reason = match finish_reason.as_deref() {
-        Some("stop") | Some("eos") => Some(StopReason::EndTurn),
-        Some("tool_calls") | Some("function_call") => Some(StopReason::ToolUse),
         Some("length") => Some(StopReason::MaxTokens),
+        Some("content_filter") => Some(StopReason::Refusal),
+        _ if has_tool_calls => Some(StopReason::ToolUse),
+        Some("tool_calls") | Some("function_call") => Some(StopReason::ToolUse),
         Some("stop_sequence") => Some(StopReason::StopSequence),
         _ => Some(StopReason::EndTurn),
     };

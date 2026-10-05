@@ -336,9 +336,14 @@ fn tokenize_line(line: &str, lang: &str) -> Vec<Span<'static>> {
             buf.push(chars[i]);
             i += 1;
         }
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, SYN_DEFAULT));
+        if buf.is_empty() {
+            // A quote/backtick no branch above consumed (a Rust lifetime
+            // `'a`, a backtick outside JS): take it as plain text. Without
+            // this the loop made no progress and froze the UI.
+            buf.push(chars[i]);
+            i += 1;
         }
+        spans.push(Span::styled(buf, SYN_DEFAULT));
     }
 
     if spans.is_empty() {
@@ -1024,6 +1029,23 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod robustness_tests {
+    /// Lifetimes and stray backticks used to stall `tokenize_line` forever.
+    #[test]
+    fn quotes_no_branch_consumes_do_not_hang() {
+        for (line, lang) in [
+            ("fn f<'a>(x: &'a str) -> &'static str", "rust"),
+            ("echo `date`", "bash"),
+            ("x := `raw`", "go"),
+            ("it's", ""),
+        ] {
+            let text: String = super::tokenize_line(line, lang)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(text, line);
+        }
+    }
+
     use super::{render, render_dim};
 
     /// Model output is adversarial by accident: unclosed fences, lone

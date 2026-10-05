@@ -180,6 +180,12 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
         }
         None => ctx.cwd.clone(),
     };
+    // rg applies `--glob` exclusions only while walking: a denied file named
+    // directly (`path: "~/.ssh/id_rsa"`) is searched and printed regardless.
+    if let Some(err) = super::check_sensitive_path_resolved(&search_path, super::SensitiveOp::Read)
+    {
+        return Ok(err);
+    }
     args.push(search_path.to_string_lossy().into_owned());
 
     let output = Command::new("rg")

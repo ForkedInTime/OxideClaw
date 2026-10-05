@@ -429,8 +429,19 @@ pub fn restore_to(
         anyhow::bail!("git read-tree {tree_sha} failed");
     }
 
-    let prefix = format!("{}/", cwd.display());
-    let checkout_status = git_cmd(cwd)
+    // Index paths are repo-relative, and checkout-index run from a
+    // subdirectory skips files outside it, so restore from the top level:
+    // `--prefix <cwd>/` from `repo/pkg` wrote `repo/pkg/pkg/x` and left the
+    // real files untouched.
+    let toplevel = git_cmd(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
+    let prefix = format!("{}/", toplevel.display());
+    let checkout_status = git_cmd(&toplevel)
         .env("GIT_INDEX_FILE", &temp_index)
         .args(["checkout-index", "-a", "-f", "--prefix", &prefix])
         .status()?;
@@ -987,6 +998,37 @@ mod restore_tests {
         let _ = restore_to(td.path(), &commits, 2).unwrap();
         let contents = std::fs::read_to_string(td.path().join("app.txt")).unwrap();
         assert_eq!(contents, "v3\n");
+    }
+
+    /// Launched from `repo/pkg`, /undo must restore `repo/pkg/x` in place,
+    /// not write `repo/pkg/pkg/x`, and must reach files outside `pkg/`.
+    #[test]
+    fn restore_from_a_subdirectory_restores_in_place() {
+        let td = init_test_repo();
+        write_file(td.path(), "pkg/x.txt", "v1\n");
+        write_file(td.path(), "top.txt", "v1\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "v1"])
+            .status()
+            .unwrap();
+        let sub = td.path().join("pkg");
+
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        write_file(td.path(), "pkg/x.txt", "v2\n");
+        write_file(td.path(), "top.txt", "v2\n");
+        snapshot_turn(&sub, &cfg, "s", "v2", 1, &mut commits, &mut pos).unwrap();
+        write_file(td.path(), "pkg/x.txt", "v3\n");
+        write_file(td.path(), "top.txt", "v3\n");
+        snapshot_turn(&sub, &cfg, "s", "v3", 2, &mut commits, &mut pos).unwrap();
+
+        restore_to(&sub, &commits, 1).unwrap();
+        let read = |p: &str| std::fs::read_to_string(td.path().join(p)).unwrap();
+        assert_eq!(read("pkg/x.txt"), "v2\n");
+        assert_eq!(read("top.txt"), "v2\n");
+        assert!(!td.path().join("pkg/pkg").exists(), "no nested copy");
     }
 
     #[test]

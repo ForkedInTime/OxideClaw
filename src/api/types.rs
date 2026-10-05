@@ -165,11 +165,22 @@ pub enum StopReason {
     ToolUse,
     MaxTokens,
     StopSequence,
+    /// Safety classifiers declined the request.
+    Refusal,
+    /// The context window filled mid-response.
+    ModelContextWindowExceeded,
+    /// A reason this build does not know. Without this, the whole
+    /// `message_delta` event fails to parse and its usage is lost.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Usage {
+    // `message_delta` may carry only `output_tokens`.
+    #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
@@ -249,4 +260,16 @@ pub struct StreamedResponse {
     pub content: Vec<ContentBlock>,
     pub stop_reason: Option<StopReason>,
     pub usage: Usage,
+}
+
+impl StreamedResponse {
+    /// Tool calls only run when the model stopped *for* them. Otherwise
+    /// (max_tokens mid-call, refusal, context exhausted) a `tool_use` would sit
+    /// in history with no `tool_result`, and every later request is a 400.
+    pub fn drop_unanswerable_tool_calls(&mut self) {
+        if self.stop_reason != Some(StopReason::ToolUse) {
+            self.content
+                .retain(|b| !matches!(b, ContentBlock::ToolUse { .. }));
+        }
+    }
 }

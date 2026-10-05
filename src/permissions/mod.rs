@@ -29,7 +29,17 @@ pub enum PermissionDecision {
 /// `PowerShell` executes arbitrary commands exactly like `Bash` and must be
 /// gated the same way. It was previously absent, so on any machine with `pwsh`
 /// installed the model could run shell commands with no approval prompt at all.
-pub const SENSITIVE_TOOLS: &[&str] = &["Bash", "PowerShell", "Write", "Edit", "NotebookEdit"];
+///
+/// `MultiEdit` was absent too, so it edited any file with no prompt and
+/// ignored `deny: ["Edit"]`.
+pub const SENSITIVE_TOOLS: &[&str] = &[
+    "Bash",
+    "PowerShell",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+];
 
 /// Session-scoped permission state — shared between tool executor and TUI.
 #[derive(Clone, Default)]
@@ -79,8 +89,17 @@ impl PermissionState {
         // Deny list first — an explicit `permissions.deny` holds even under
         // `--dangerously-skip-permissions`; bypass skips *prompts*, it does
         // not override a rule the user wrote down.
+        // A MultiEdit is N Edits: a deny rule hits if it covers any file,
+        // an allow rule only if it covers every file.
+        let hits = |rule: &str, any: bool| {
+            if tool_name == "MultiEdit" {
+                multi_edit_matches(rule, input, any)
+            } else {
+                rule_matches(rule, tool_name, input)
+            }
+        };
         for rule in &inner.deny_list {
-            if rule_matches(rule, tool_name, input) {
+            if hits(rule, true) {
                 return CheckResult::Deny;
             }
         }
@@ -95,7 +114,7 @@ impl PermissionState {
 
         // Check always-allowed — also supports prefix rules
         for rule in &inner.always_allowed {
-            if rule_matches(rule, tool_name, input) {
+            if hits(rule, false) {
                 return CheckResult::Allow;
             }
         }
@@ -151,6 +170,33 @@ fn rule_matches(rule: &str, tool_name: &str, input: Option<&serde_json::Value>) 
     } else {
         // Simple name match
         rule.eq_ignore_ascii_case(tool_name)
+    }
+}
+
+/// `rule` against a MultiEdit call: a rule naming MultiEdit, or an Edit rule
+/// applied to each edit's `file_path` (`any` for deny, all for allow).
+fn multi_edit_matches(rule: &str, input: Option<&serde_json::Value>, any: bool) -> bool {
+    if rule_matches(rule, "MultiEdit", input) {
+        return true;
+    }
+    let files: Vec<serde_json::Value> = input
+        .and_then(|i| i.get("edits"))
+        .and_then(|e| e.as_array())
+        .map(|edits| {
+            edits
+                .iter()
+                .map(|e| serde_json::json!({ "file_path": e.get("file_path").cloned().unwrap_or_default() }))
+                .collect()
+        })
+        .unwrap_or_default();
+    if files.is_empty() {
+        return rule_matches(rule, "Edit", None);
+    }
+    let hit = |f: &serde_json::Value| rule_matches(rule, "Edit", Some(f));
+    if any {
+        files.iter().any(hit)
+    } else {
+        files.iter().all(hit)
     }
 }
 
@@ -490,6 +536,31 @@ mod tests {
                 CheckResult::Ask
             ),
             "PowerShell must prompt like Bash, not auto-allow"
+        );
+    }
+
+    #[test]
+    fn multi_edit_prompts_and_honours_edit_rules() {
+        let input = serde_json::json!({ "edits": [
+            { "file_path": "/proj/src/a.rs", "old_string": "a", "new_string": "b" },
+            { "file_path": "/home/u/.bashrc", "old_string": "a", "new_string": "b" }
+        ]});
+        assert!(matches!(
+            state().check_with_input("MultiEdit", Some(&input)),
+            CheckResult::Ask
+        ));
+        let deny = PermissionState::new(false, &[], &["Edit(prefix:/home/u/)".into()]);
+        assert!(matches!(
+            deny.check_with_input("MultiEdit", Some(&input)),
+            CheckResult::Deny
+        ));
+        let allow_src = PermissionState::new(false, &["Edit(prefix:/proj/src/)".into()], &[]);
+        assert!(
+            matches!(
+                allow_src.check_with_input("MultiEdit", Some(&input)),
+                CheckResult::Ask
+            ),
+            "an allow rule must cover every file"
         );
     }
 
