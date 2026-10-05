@@ -894,11 +894,51 @@ pub async fn await_voice_approval(timeout_secs: u64) -> bool {
         Ok(Ok(text)) => text,
         _ => return false, // timeout or transcription error = deny
     };
-    let lower = transcript.trim().to_lowercase();
-    lower.contains("confirm")
-        || lower.contains("yes")
-        || lower.contains("approve")
-        || lower.contains("ok")
+    is_spoken_approval(&transcript)
+}
+
+/// A spoken "yes" for a destructive action: an affirmative *word* and no
+/// negation. Substring matching approved "not okay", "don't book it"
+/// ("bo-ok") and "no, I don't approve".
+pub fn is_spoken_approval(transcript: &str) -> bool {
+    let lower = transcript.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .collect();
+    const NEGATIONS: &[&str] = &[
+        "no", "not", "don't", "dont", "never", "stop", "cancel", "deny", "wait", "nope",
+    ];
+    const YES: &[&str] = &[
+        "yes",
+        "yeah",
+        "yep",
+        "confirm",
+        "confirmed",
+        "approve",
+        "approved",
+        "ok",
+        "okay",
+    ];
+    !words.iter().any(|w| NEGATIONS.contains(w)) && words.iter().any(|w| YES.contains(w))
+}
+
+#[cfg(test)]
+mod spoken_approval_tests {
+    use super::is_spoken_approval as yes;
+
+    #[test]
+    fn only_unnegated_affirmatives_approve() {
+        assert!(yes("Yes."));
+        assert!(yes("okay, confirm"));
+        assert!(yes("yes, do it"));
+        assert!(!yes("do not confirm"));
+        assert!(!yes("not okay"));
+        assert!(!yes("don't book it"));
+        assert!(!yes("no, I don't approve"));
+        assert!(!yes("cookie"));
+        assert!(!yes(""));
+    }
 }
 
 // ── Status display ────────────────────────────────────────────────────────────

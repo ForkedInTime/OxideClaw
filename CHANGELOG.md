@@ -52,6 +52,13 @@ Full QA pass (2026-10-05). Each item below was reproduced or traced end to end.
 - **Auto-fix loop** deadlocked on more than 64 KiB of lint/test output and
   dropped `cargo test` failures printed to stdout; commands now run through
   the shell.
+- **`/rewind`** cut n×2 messages (leaving a `tool_use` without its result
+  after any tool-using turn), restored files with `_` in their path to the
+  wrong place and then deleted the only snapshot, and restored the newest
+  rather than the oldest version across turns.
+- **Voice approval** of destructive browser actions matched substrings, so
+  "not okay" and "don't book it" approved; it now needs an affirmative word
+  and no negation.
 - Also: `/browse` and `oxideclaw browse` can be cancelled (Esc / Ctrl-C);
   `/index` no longer leaves a stuck spinner; `/router on` no longer
   toggles; the strict sandbox stopped blocking every `rm -rf /<path>`;

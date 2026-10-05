@@ -260,68 +260,94 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.api_task = Some(handle.abort_handle());
         }
         CommandAction::Rewind(n) => {
-            // Remove last n user+assistant pairs from messages and entries
-            let pairs_to_remove = n * 2; // each exchange = user + assistant message
-            let len = messages.len();
-            if len == 0 {
+            // An exchange is everything from one user prompt on: with tools
+            // that is many messages, so cut at the n-th last prompt rather
+            // than n*2 messages (which left a tool_use without its result).
+            let is_prompt = |m: &Message| {
+                m.role == Role::User
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { .. }))
+                    && !m
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            };
+            let prompts: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| is_prompt(m))
+                .map(|(i, _)| i)
+                .collect();
+            if prompts.is_empty() || n == 0 {
                 app.entries.push(ChatEntry::system("Nothing to rewind."));
             } else {
-                let remove = pairs_to_remove.min(len);
-                messages.truncate(len - remove);
+                let n = n.min(prompts.len());
+                messages.truncate(prompts[prompts.len() - n]);
                 messages.shrink_to_fit();
-                // Also trim display entries — remove last n*2 non-system entries
-                let mut removed = 0;
-                while removed < pairs_to_remove {
-                    if let Some(pos) = app.entries.iter().rposition(|e| {
-                        matches!(
-                            e.kind,
-                            crate::tui::app::EntryKind::User
-                                | crate::tui::app::EntryKind::Assistant
-                        )
-                    }) {
-                        app.entries.remove(pos);
-                        removed += 1;
-                    } else {
-                        break;
-                    }
+                // Display: drop everything from the n-th last user entry on.
+                let user_entries: Vec<usize> = app
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches!(e.kind, crate::tui::app::EntryKind::User))
+                    .map(|(i, _)| i)
+                    .collect();
+                if user_entries.len() >= n {
+                    app.entries.truncate(user_entries[user_entries.len() - n]);
                 }
 
-                // Restore file snapshots for rewound turns
+                // Restore file snapshots. Oldest rewound turn first, first
+                // snapshot per file wins: that is the state before the
+                // earliest rewound edit. A turn's snapshots are deleted only
+                // once all of them were restored.
                 let restore_start = (*turn_counter).saturating_sub(n) + 1;
                 let snap_base = crate::config::Config::sessions_dir()
                     .join(&session.id)
                     .join("snapshots");
                 let mut restored_files: Vec<String> = Vec::new();
-                for turn in (restore_start..=*turn_counter).rev() {
+                let mut failed: Vec<String> = Vec::new();
+                for turn in restore_start..=*turn_counter {
                     let snap_dir = snap_base.join(format!("turn-{}", turn));
+                    let mut turn_ok = true;
                     if let Ok(entries) = std::fs::read_dir(&snap_dir) {
                         for entry in entries.flatten() {
                             let src = entry.path();
-                            // Convert flat snapshot name back to absolute path
-                            // e.g. "home_user_project_src_main.rs" → "/home/user/project/src/main.rs"
                             let flat = src
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let real_path =
-                                std::path::PathBuf::from(format!("/{}", flat.replace('_', "/")));
-                            if !restored_files.contains(&flat)
-                                && std::fs::copy(&src, &real_path).is_ok()
-                            {
-                                restored_files.push(flat);
+                            if restored_files.contains(&flat) {
+                                continue;
+                            }
+                            let real_path = crate::tools::snapshot_path(&flat);
+                            match std::fs::copy(&src, &real_path) {
+                                Ok(_) => restored_files.push(flat),
+                                Err(e) => {
+                                    turn_ok = false;
+                                    failed.push(format!("{}: {e}", real_path.display()));
+                                }
                             }
                         }
                     }
-                    let _ = std::fs::remove_dir_all(&snap_dir);
+                    if turn_ok {
+                        let _ = std::fs::remove_dir_all(&snap_dir);
+                    }
                 }
                 *turn_counter = (*turn_counter).saturating_sub(n);
 
-                let file_note = if restored_files.is_empty() {
+                let mut file_note = if restored_files.is_empty() {
                     String::new()
                 } else {
                     format!(" {} file(s) restored.", restored_files.len())
                 };
+                if !failed.is_empty() {
+                    file_note.push_str(&format!(
+                        "\nCould not restore (snapshots kept): {}",
+                        failed.join(", ")
+                    ));
+                }
                 app.entries.push(ChatEntry::system(format!(
                     "Rewound {} exchange{}.{}",
                     n,

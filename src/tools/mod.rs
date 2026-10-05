@@ -161,20 +161,52 @@ pub async fn snapshot_file(ctx: &ToolContext, path: &std::path::Path) {
         return;
     } // new file — nothing to snapshot
 
-    // Compute a relative-ish path for the snapshot filename
-    // e.g. /home/user/project/src/main.rs → "home_user_project_src_main.rs"
-    let flat_name = path
-        .display()
-        .to_string()
-        .replace('/', "_")
-        .trim_start_matches('_')
-        .to_string();
+    let flat_name = snapshot_name(path);
 
     if tokio::fs::create_dir_all(snap_dir).await.is_err() {
         return;
     }
     let dest = snap_dir.join(&flat_name);
+    // The first snapshot of a turn is the state /rewind must return to; a
+    // second edit in the same turn would otherwise overwrite it.
+    if dest.exists() {
+        return;
+    }
     let _ = tokio::fs::copy(path, &dest).await;
+}
+
+/// Reversible flat file name for a snapshot of `path`: `/` → `_`, with
+/// literal `%` and `_` escaped. (Mapping only `/` → `_` restored
+/// `src/query_engine.rs` to `src/query/engine.rs`.)
+pub fn snapshot_name(path: &std::path::Path) -> String {
+    path.display()
+        .to_string()
+        .replace('%', "%25")
+        .replace('_', "%5F")
+        .replace('/', "_")
+        .trim_start_matches('_')
+        .to_string()
+}
+
+/// Inverse of [`snapshot_name`].
+pub fn snapshot_path(flat: &str) -> std::path::PathBuf {
+    let path = flat
+        .split('_')
+        .map(|part| part.replace("%5F", "_").replace("%25", "%"))
+        .collect::<Vec<_>>()
+        .join("/");
+    std::path::PathBuf::from(format!("/{path}"))
+}
+
+#[cfg(test)]
+mod snapshot_name_tests {
+    #[test]
+    fn names_round_trip_paths_with_underscores() {
+        for p in ["/home/u/src/query_engine.rs", "/a/100%_done/b_c", "/x/y.rs"] {
+            let path = std::path::Path::new(p);
+            assert_eq!(super::snapshot_path(&super::snapshot_name(path)), path);
+        }
+    }
 }
 
 /// Result of a tool execution
