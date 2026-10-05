@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+Full QA pass (2026-10-05). Each item below was reproduced or traced end to end.
+
+- **Cost and `/budget`.** The TUI billed only the last API call of a turn,
+  so a turn with N tool round-trips cost about 1/N of what was shown.
+  Every call is now recorded, prompt-cache reads/writes are priced, Opus
+  5.5 is $4/$20, and the headless price table (Opus at 3×, Haiku at ¼) is
+  gone. `/budget` now stops the running turn and refuses new prompts
+  instead of only printing a warning.
+- **Requests that 400'd for the rest of the session.** Auto-fix retries
+  dropped the tool results; a reply truncated mid-tool-call or refused kept
+  an unanswerable `tool_use`; empty assistant messages were stored;
+  headless auto-compaction could summarise away a pending `tool_use`;
+  `--thinking disabled` sent `{"type":"disabled"}` to Fable, Opus 5.5 and
+  Sonnet 5.5, which reject it.
+- **Write could not create JSON files.** String arguments that looked like
+  JSON were turned into objects; only schema-typed array/object fields
+  are re-parsed now.
+- **Crashes and freezes.** A Rust lifetime (`'a`) or a stray backtick in a
+  code block froze the TUI; seven UTF-8 byte-slice panics (resume,
+  compaction, live tool output, banner cwd, Up/Down in multi-line input,
+  WebFetch); a startup panic when another user owns `/tmp/oxideclaw.log`;
+  SIGPIPE killing the TUI when an MCP server died. A panic now restores
+  the terminal. Windows no longer handles every key twice.
+- **Security.** `MultiEdit` was never permission-checked; `/spawn` agents
+  ignored `permissions.deny`; Grep printed a denied file named directly;
+  `Bash(git:*)`-style allow rules auto-approved `$(…)`, backticks and
+  redirects; an untrusted project's settings could set auto-fix commands,
+  allow rules, the shell, the voice upload URL or the Ollama host, or
+  loosen the sandbox; PreToolUse guard hooks did not run in `-p`, sub-agents
+  or `/spawn`; `{"decision":"block"}` was ignored; `/quit` could kill
+  unrelated processes on port 5002.
+- **Data loss.** `/undo`/`/redo` from a subdirectory restored nothing and
+  wrote nested copies; snapshots captured (and `/undo` overwrote) the
+  live `.claude/rag.db`; `/clear` left new turns unsaved and then skipped
+  some; `--fork-session` wrote into the original; an unparseable
+  `settings.json` was replaced by `/model`, `/mcp add` and friends.
+- **ACP / SDK / MCP.** Sessions without a policy had a 0 s approval
+  timeout, so every tool was denied before the editor could ask; MCP
+  pagination read a mangled key and never got past page 1; MCP tool names
+  over 64 characters or non-ASCII broke every request.
+- **Auto-fix loop** deadlocked on more than 64 KiB of lint/test output and
+  dropped `cargo test` failures printed to stdout; commands now run through
+  the shell.
+- Also: `/browse` and `oxideclaw browse` can be cancelled (Esc / Ctrl-C);
+  `/index` no longer leaves a stuck spinner; `/router on` no longer
+  toggles; the strict sandbox stopped blocking every `rm -rf /<path>`;
+  Bash output keeps blank lines; `OLLAMA_HOST` accepts Ollama's own forms;
+  README no longer documents `oxideclaw spawn`, `oxideclaw upgrade` or
+  `browse --json`; installer `--global` and Alpine arm64 handling.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

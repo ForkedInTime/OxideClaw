@@ -362,8 +362,21 @@ pub async fn run_browse(
         return Ok(result);
     }
 
-    // 12. Run the agentic loop.
-    let query_result = engine.query(&req.goal).await;
+    // 12. Run the agentic loop, racing the cancel flag: it used to be read
+    // only before and after the loop, so Ctrl-C / Esc could not stop a
+    // running agent. Dropping the query future aborts the in-flight call.
+    let cancel_watch = {
+        let cancel = cancel.clone();
+        async move {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    let query_result = tokio::select! {
+        r = engine.query(&req.goal) => r,
+        _ = cancel_watch => Err(anyhow::anyhow!("cancelled by user")),
+    };
 
     // 13. Determine the result.
     let steps_used = engine.turns_used();

@@ -1006,6 +1006,7 @@ async fn run_loop(
                                 voice: true,
                             };
                             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            app.browse_cancel = Some(cancel.clone());
                             tokio::spawn(async move {
                                 let channels = crate::browser::browse_loop::BrowseChannels { progress_tx, approval_tx, cancel };
                                 let result = crate::browser::browse_loop::run_browse(

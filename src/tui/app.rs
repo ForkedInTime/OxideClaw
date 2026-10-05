@@ -690,6 +690,8 @@ pub struct App {
     /// Active browse approval prompt awaiting user input (A=approve, D=deny).
     pub browse_approval: Option<crate::browser::approval_gate::ApprovalPrompt>,
     /// Receiver for browse progress events (active during a /browse run).
+    /// Cancel flag of the running /browse agent; Esc sets it.
+    pub browse_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub browse_progress_rx:
         Option<tokio::sync::mpsc::Receiver<crate::browser::browse_loop::BrowseProgress>>,
     /// Receiver for browse approval prompts.
@@ -826,6 +828,7 @@ impl App {
             browser_session: None,
             watcher: None,
             browse_approval: None,
+            browse_cancel: None,
             browse_progress_rx: None,
             browse_approval_rx: None,
         }

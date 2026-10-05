@@ -69,13 +69,17 @@ impl Tool for McpDynamicTool {
 /// Convert all connected MCP servers' tools into `Arc<dyn Tool>` entries.
 pub fn mcp_dyn_tools(manager: &McpManager) -> Vec<DynTool> {
     let mut tools: Vec<DynTool> = Vec::new();
+    let mut used = std::collections::HashSet::new();
 
     for client in &manager.clients {
         let server = sanitize_name(&client.server_name);
 
         for tool_def in &client.tools {
             let original = tool_def.name.clone();
-            let composed = format!("mcp__{}__{}", server, sanitize_name(&original));
+            let composed = fit_tool_name(
+                format!("mcp__{}__{}", server, sanitize_name(&original)),
+                &mut used,
+            );
 
             let description = describe(&client.server_name, &original, &tool_def.description);
 
@@ -114,10 +118,11 @@ fn describe(server: &str, original: &str, description: &str) -> String {
     d
 }
 
+/// ASCII only: the API's tool-name pattern is `^[a-zA-Z0-9_-]{1,64}$`.
 fn sanitize_name(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
             } else {
                 '_'
@@ -126,8 +131,39 @@ fn sanitize_name(s: &str) -> String {
         .collect()
 }
 
+/// The API rejects the *whole request* over one tool name longer than 64
+/// characters or a duplicate name, so every MCP tool must fit and be unique.
+/// Long or colliding names keep a readable prefix plus a hash of the original.
+fn fit_tool_name(name: String, used: &mut std::collections::HashSet<String>) -> String {
+    const MAX: usize = 64;
+    let fitted = if name.len() <= MAX && !used.contains(&name) {
+        name
+    } else {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(name.as_bytes());
+        let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        let keep = name.len().min(MAX - hash.len() - 1);
+        format!("{}_{hash}", &name[..keep])
+    };
+    used.insert(fitted.clone());
+    fitted
+}
+
 #[cfg(test)]
 mod description_tests {
+    #[test]
+    fn tool_names_fit_the_api_pattern_and_stay_unique() {
+        let mut used = std::collections::HashSet::new();
+        let long = format!("mcp__srv__{}", "x".repeat(80));
+        let a = super::fit_tool_name(long.clone(), &mut used);
+        assert!(a.len() <= 64, "{a}");
+        let b = super::fit_tool_name("mcp__s__t".into(), &mut used);
+        let c = super::fit_tool_name("mcp__s__t".into(), &mut used);
+        assert_eq!(b, "mcp__s__t");
+        assert_ne!(b, c, "duplicates get a distinct name");
+        assert_eq!(super::sanitize_name("café.list"), "caf__list");
+    }
+
     use super::*;
 
     #[test]

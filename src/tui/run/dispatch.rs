@@ -2189,6 +2189,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 voice: false,
             };
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.browse_cancel = Some(cancel.clone());
             tokio::spawn(async move {
                 let channels = crate::browser::browse_loop::BrowseChannels {
                     progress_tx,

@@ -499,6 +499,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             if let Some(handle) = app.api_task.take() {
                 handle.abort();
             }
+            if let Some(cancel) = app.browse_cancel.take() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             app.is_loading = false;
             app.turn_start = None; // cancelled — no completion message
             app.flush_streaming();
