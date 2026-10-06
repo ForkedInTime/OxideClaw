@@ -19,11 +19,12 @@ impl ToolMiddleware for RecordingMiddleware {
         MiddlewareVerdict::Allow
     }
 
-    async fn after_tool(&self, tool_name: &str, output: &str) {
+    async fn after_tool(&self, tool_name: &str, output: &str) -> Option<String> {
         self.log
             .lock()
             .unwrap()
             .push(format!("after:{tool_name}:{output}"));
+        None
     }
 }
 
@@ -60,8 +61,9 @@ impl ToolMiddleware for Denier {
         }
     }
 
-    async fn after_tool(&self, _tool_name: &str, _output: &str) {
+    async fn after_tool(&self, _tool_name: &str, _output: &str) -> Option<String> {
         // Never called when denied.
+        None
     }
 }
 

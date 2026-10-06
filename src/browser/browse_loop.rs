@@ -179,9 +179,10 @@ impl ToolMiddleware for UrlSyncMiddleware {
         MiddlewareVerdict::Allow
     }
 
-    async fn after_tool(&self, _tool_name: &str, _output: &str) {
+    async fn after_tool(&self, _tool_name: &str, _output: &str) -> Option<String> {
         let url = self.session.lock().await.current_url.clone();
         *self.shared_url.lock().await = url;
+        None
     }
 }
 
@@ -208,7 +209,9 @@ impl ToolMiddleware for StepEmitterMiddleware {
         MiddlewareVerdict::Allow
     }
 
-    async fn after_tool(&self, _tool_name: &str, _output: &str) {}
+    async fn after_tool(&self, _tool_name: &str, _output: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Orchestrate an autonomous browser agent run.

@@ -440,7 +440,10 @@ impl QueryEngine {
                     self.absorb_child_usage();
                     // Stop only after the results are in, so every tool_use
                     // in the history keeps its tool_result.
-                    if stop {
+                    // A middleware that ended the run (stagnation, a second
+                    // denial) denies every later call, browse_done included,
+                    // so the model could never finish the turn by itself.
+                    if stop || self.middlewares.iter().any(|m| m.should_stop()) {
                         break;
                     }
                     if let Some(budget) = self.config.max_budget_usd
@@ -630,8 +633,9 @@ impl QueryEngine {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                let mut notes = Vec::new();
                 for mw in &ctx.middlewares {
-                    mw.after_tool(name, &output_text).await;
+                    notes.extend(mw.after_tool(name, &output_text).await);
                 }
                 if let Some(hook_cfg) = &self.config.hooks
                     && !self.config.disable_all_hooks
@@ -679,6 +683,8 @@ impl QueryEngine {
                     let ToolResultContent::Text { text } = c;
                     crate::compact::budget_tool_result(text);
                 }
+                // After the cut, so a long page cannot push the note out.
+                content.extend(notes.into_iter().map(ToolResultContent::text));
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content,
@@ -1748,6 +1754,98 @@ mod tests {
             engine.messages.last().unwrap().content[0],
             ContentBlock::ToolResult { .. }
         ));
+    }
+
+    /// Denies every call and reports the run as over, like the loop
+    /// detector after its last nudge or the gate after a second denial.
+    struct Ended;
+    #[async_trait::async_trait]
+    impl crate::browser::middleware::ToolMiddleware for Ended {
+        async fn before_tool(&self, _: &str, _: &serde_json::Value) -> MiddlewareVerdict {
+            MiddlewareVerdict::Deny {
+                reason: "stopped".into(),
+            }
+        }
+        async fn after_tool(&self, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn should_stop(&self) -> bool {
+            true
+        }
+    }
+
+    /// Once a middleware stopped the run, every call was denied, browse_done
+    /// included, and the engine kept asking the model until max_turns.
+    #[tokio::test]
+    async fn a_browse_engine_stops_when_a_middleware_ends_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, hits) = browse_done_model().await;
+        let config = Config {
+            model: "ollama:test-model".into(),
+            ollama_host: host,
+            cwd: dir.path().to_path_buf(),
+            max_turns: 5,
+            ..Config::default()
+        };
+        let tools: Vec<DynTool> = vec![std::sync::Arc::new(
+            crate::tools::browser_tools::BrowseDoneTool::new(),
+        )];
+        let mut engine = QueryEngine::new_for_browse(
+            config,
+            tools,
+            "browse".into(),
+            vec![std::sync::Arc::new(Ended)],
+        )
+        .unwrap();
+        engine.query("goal").await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            engine.messages.last().unwrap().content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+    }
+
+    /// Loop-detector nudges went only to the UI; the model never read the
+    /// "try a different approach" it was meant to act on.
+    #[tokio::test]
+    async fn a_loop_detector_nudge_is_appended_to_the_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "ollama:test-model".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let tools: Vec<DynTool> = vec![std::sync::Arc::new(
+            crate::tools::browser_tools::BrowseDoneTool::new(),
+        )];
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let loop_mw = std::sync::Arc::new(
+            crate::browser::loop_detector::LoopDetectorMiddleware::new(tx),
+        );
+        let mut engine =
+            QueryEngine::new_for_browse(config, tools, "browse".into(), vec![loop_mw]).unwrap();
+        let call = vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "browse_done".into(),
+            input: serde_json::json!({"achieved": false, "summary": "stuck"}),
+        }];
+        let text = |blocks: &[ContentBlock]| match &blocks[0] {
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .map(|c| {
+                    let ToolResultContent::Text { text } = c;
+                    text.clone()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("expected a tool result, got {other:?}"),
+        };
+        for _ in 0..2 {
+            let out = engine.execute_tools(&call).await.unwrap();
+            assert!(!text(&out).contains("different approach"));
+        }
+        let out = engine.execute_tools(&call).await.unwrap();
+        assert!(text(&out).contains("different approach"), "{}", text(&out));
     }
 
     /// The verdict comes from the model's own call, not from whatever text a

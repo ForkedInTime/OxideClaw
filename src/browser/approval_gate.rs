@@ -640,12 +640,17 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         }
     }
 
-    async fn after_tool(&self, tool_name: &str, _output: &str) {
+    async fn after_tool(&self, tool_name: &str, _output: &str) -> Option<String> {
         // Step counting is owned by StepEmitterMiddleware (runs after this middleware).
         // A navigation leaves the form behind.
         if tool_name == "browser_navigate" {
             self.sensitive_fill_pending.store(false, Ordering::SeqCst);
         }
+        None
+    }
+
+    fn should_stop(&self) -> bool {
+        self.is_user_denied()
     }
 }
 
@@ -1070,13 +1075,14 @@ mod price_signal_tests {
                 .await,
             MiddlewareVerdict::Deny { .. }
         ));
-        assert!(!mw.is_user_denied());
+        assert!(!mw.is_user_denied() && !mw.should_stop());
         assert!(matches!(
             mw.before_tool("browser_press_key", &json!({"key": "Enter"}))
                 .await,
             MiddlewareVerdict::Deny { .. }
         ));
         assert!(mw.is_user_denied(), "second denial must end the session");
+        assert!(mw.should_stop(), "the engine must stop with it");
         drop(mw);
         assert_eq!(host.await.unwrap().len(), 2);
     }

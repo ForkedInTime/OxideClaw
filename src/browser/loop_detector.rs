@@ -15,7 +15,7 @@ const NUDGES: [&str; 3] = [
     "This action has failed multiple times on the same page state. Consider: \
      (1) the element may be disabled or overlaid, (2) you may need to scroll first, \
      (3) try using JavaScript evaluation as a fallback, (4) the page may require authentication.",
-    "Stopping — the browser agent has repeated the same action 3 times with no progress. \
+    "Stopping — the browser agent kept repeating the same action with no progress. \
      The page may be stuck, require a CAPTCHA, or the target element may not be interactable.",
 ];
 
@@ -141,11 +141,11 @@ impl ToolMiddleware for LoopDetectorMiddleware {
         MiddlewareVerdict::Allow
     }
 
-    async fn after_tool(&self, tool_name: &str, output: &str) {
+    async fn after_tool(&self, tool_name: &str, output: &str) -> Option<String> {
         // browser_navigate resets the detector (new page = fresh state).
         if tool_name == "browser_navigate" {
             self.inner.lock().unwrap_or_else(|e| e.into_inner()).reset();
-            return;
+            return None;
         }
         let nudge = {
             let target = self
@@ -157,14 +157,20 @@ impl ToolMiddleware for LoopDetectorMiddleware {
             ld.record_action(tool_name, &target, output);
             ld.check_stagnation()
         };
-        if let Some(nudge) = nudge {
-            // If this is the terminal nudge (level 3 — contains "Stopping"),
-            // set the stopped flag so before_tool denies subsequent calls.
-            if nudge.contains("Stopping") {
-                self.stopped.store(true, Ordering::SeqCst);
-            }
-            let _ = self.nudge_tx.send(nudge).await;
+        let nudge = nudge?;
+        // If this is the terminal nudge (level 3 — contains "Stopping"),
+        // set the stopped flag so before_tool denies subsequent calls.
+        if nudge.contains("Stopping") {
+            self.stopped.store(true, Ordering::SeqCst);
         }
+        // The channel only feeds the UI; the returned copy is what the
+        // model reads, appended to this tool's result.
+        let _ = self.nudge_tx.send(nudge.clone()).await;
+        Some(nudge)
+    }
+
+    fn should_stop(&self) -> bool {
+        self.is_stopped()
     }
 }
 
@@ -191,12 +197,17 @@ mod fingerprint_tests {
     async fn the_same_target_repeated_still_stops() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mw = LoopDetectorMiddleware::new(tx);
+        let mut notes = Vec::new();
         for _ in 0..5 {
             mw.before_tool("browser_click", &json!({"ref": "@e1"}))
                 .await;
-            mw.after_tool("browser_click", "Clicked. Title: Home").await;
+            notes.push(mw.after_tool("browser_click", "Clicked. Title: Home").await);
         }
-        assert!(mw.is_stopped());
+        assert!(mw.is_stopped() && mw.should_stop());
+        // The model reads each nudge in the result of the call that tripped it.
+        assert!(notes[..2].iter().all(Option::is_none));
+        assert!(notes[2].as_deref().unwrap().contains("different approach"));
+        assert!(notes[4].as_deref().unwrap().starts_with("Stopping"));
     }
 
     #[tokio::test]
