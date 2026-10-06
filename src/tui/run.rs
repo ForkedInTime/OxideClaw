@@ -71,6 +71,30 @@ fn session_snapshot_base(session_id: &str) -> std::path::PathBuf {
     Config::sessions_dir().join(session_id).join("snapshots")
 }
 
+/// Record the session base before an agent turn can touch files. Needed
+/// whenever the next snapshot would be the first after the base (position
+/// 0): without it turn 1 parents on HEAD and `/undo` to the session base
+/// wipes whatever was uncommitted, including edits made since startup or
+/// since an earlier `/undo` to the base.
+async fn begin_agent_turn(session: &mut Session, config: &Config) {
+    if !config.auto_commit.enabled || session.meta.undo_position != 0 {
+        return;
+    }
+    let base = match oxideclaw::autocommit::snapshot_base(&config.cwd) {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::warn!("autoCommit: could not snapshot the session base: {e}");
+            return;
+        }
+    };
+    if base != session.meta.base_commit {
+        session.meta.base_commit = base;
+        if let Err(e) = session.save_meta().await {
+            tracing::warn!("autoCommit: failed to save meta after base snapshot: {e}");
+        }
+    }
+}
+
 /// Puts a permission prompt in front of the user through the TUI event
 /// loop. A dropped reply (TUI shutdown, panic, SIGHUP) is `None`, which the
 /// gate treats as Deny — the "close terminal = auto-approve" class.
@@ -959,6 +983,7 @@ async fn run_loop(
                                     turn_index,
                                     &mut session.meta.auto_commits,
                                     &mut session.meta.undo_position,
+                                    session.meta.base_commit.as_deref(),
                                 ) {
                                     Ok(oxideclaw::autocommit::SnapshotOutcome::Committed { sha, files }) => {
                                         tracing::info!(
@@ -1014,6 +1039,7 @@ async fn run_loop(
                             )));
                             app.scroll_to_bottom();
                             app.start_loading();
+                            begin_agent_turn(&mut session, &config).await;
                             let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
                             let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
                             app.browse_progress_rx = Some(progress_rx);

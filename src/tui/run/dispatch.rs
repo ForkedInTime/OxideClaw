@@ -248,6 +248,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
+            begin_agent_turn(session, config).await;
             // Snapshot: existing history + ephemeral prompt, but don't mutate messages
             let mut snapshot = messages.clone();
             snapshot.push(Message {
@@ -1308,6 +1309,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::user(input.clone()));
                 app.scroll_to_bottom();
                 app.start_loading();
+                begin_agent_turn(session, config).await;
                 let mut snapshot = messages.clone();
                 snapshot.push(Message {
                     role: Role::User,
@@ -1999,8 +2001,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                     format!("turn {new_pos}")
                                 };
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[undo] rewound to {label} ({} files restored)",
-                                    report.files_restored
+                                    "[undo] rewound to {label} ({} files restored){}",
+                                    report.files_restored,
+                                    report.saved_edits_note()
                                 )));
                             }
                             Err(e) => {
@@ -2084,8 +2087,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                     tracing::warn!("[redo] failed to save meta: {e}");
                                 }
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[redo] advanced to turn {new_pos} ({} files restored)",
-                                    report.files_restored
+                                    "[redo] advanced to turn {new_pos} ({} files restored){}",
+                                    report.files_restored,
+                                    report.saved_edits_note()
                                 )));
                             }
                             Err(e) => {
@@ -2240,6 +2244,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             )));
             app.scroll_to_bottom();
             app.start_loading();
+            begin_agent_turn(session, config).await;
 
             // Create channels for progress events and approval prompts
             let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
@@ -2296,6 +2301,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
+            begin_agent_turn(session, config).await;
             let mut snapshot = messages.clone();
             snapshot.push(Message {
                 role: Role::User,
@@ -2330,6 +2336,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
+            begin_agent_turn(session, config).await;
             let mut snapshot = messages.clone();
             snapshot.push(Message {
                 role: Role::User,
@@ -2546,6 +2553,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::user(input));
                 app.scroll_to_bottom();
                 app.start_loading();
+                begin_agent_turn(session, config).await;
                 // Skills are also ephemeral — don't contaminate history
                 let mut snapshot = messages.clone();
                 snapshot.push(Message {

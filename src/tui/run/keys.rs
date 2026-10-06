@@ -111,8 +111,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     format!("turn {target_pos}")
                                 };
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[undo] rewound to {label} ({} files restored)",
-                                    report.files_restored
+                                    "[undo] rewound to {label} ({} files restored){}",
+                                    report.files_restored,
+                                    report.saved_edits_note()
                                 )));
                             }
                             Err(e) => {
@@ -141,8 +142,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     tracing::warn!("[redo] failed to save meta: {e}");
                                 }
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[redo] advanced to turn {target_pos} ({} files restored)",
-                                    report.files_restored
+                                    "[redo] advanced to turn {target_pos} ({} files restored){}",
+                                    report.files_restored,
+                                    report.saved_edits_note()
                                 )));
                             }
                             Err(e) => {
@@ -568,6 +570,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
+            begin_agent_turn(session, config).await;
 
             // Build message content — text + optional image attachment
             let mut user_content: Vec<ContentBlock> = Vec::new();

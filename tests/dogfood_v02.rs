@@ -19,8 +19,8 @@
 #![cfg(unix)]
 
 use oxideclaw::autocommit::{
-    AutoCommitConfig, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo, prune_old_refs, restore_to,
-    snapshot_turn,
+    AutoCommitConfig, RECOVERY_REF, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo,
+    prune_old_refs, restore_to, snapshot_base, snapshot_turn,
 };
 use std::fs;
 use std::path::Path;
@@ -107,6 +107,7 @@ fn dogfood_end_to_end_undo_redo_against_real_tree() {
         1,
         &mut commits,
         &mut pos,
+        None,
     )
     .unwrap();
     assert!(matches!(out, SnapshotOutcome::Committed { .. }));
@@ -122,6 +123,7 @@ fn dogfood_end_to_end_undo_redo_against_real_tree() {
         2,
         &mut commits,
         &mut pos,
+        None,
     )
     .unwrap();
 
@@ -136,6 +138,7 @@ fn dogfood_end_to_end_undo_redo_against_real_tree() {
         3,
         &mut commits,
         &mut pos,
+        None,
     )
     .unwrap();
 
@@ -205,6 +208,7 @@ fn dogfood_shadow_refs_invisible_to_normal_git() {
             i,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
         let status_after = git(td.path(), &["status", "--porcelain=v1"]);
@@ -318,6 +322,7 @@ fn dogfood_snapshot_preserves_user_index_and_worktree() {
         1,
         &mut commits,
         &mut pos,
+        None,
     )
     .unwrap();
 
@@ -354,6 +359,97 @@ fn dogfood_snapshot_preserves_user_index_and_worktree() {
     assert!(files.contains("untracked.tmp"));
 }
 
+/// /undo to "session base (pre-OxideClaw)" must land on the tree the user
+/// had when the session started, uncommitted edits included, not on HEAD.
+#[test]
+fn dogfood_undo_to_session_base_keeps_pre_session_uncommitted_work() {
+    let td = TempDir::new().unwrap();
+    git_init(td.path());
+    commit_initial(td.path());
+    write(td.path(), "README.md", "base\nuser edit\n"); // dirty before the session
+
+    let base = snapshot_base(td.path()).unwrap();
+    assert!(base.is_some(), "a dirty tree needs its own base commit");
+
+    write(td.path(), "README.md", "base\nuser edit\nagent edit\n");
+    write(td.path(), "agent.rs", "fn agent() {}\n");
+    let cfg = AutoCommitConfig::default();
+    let mut commits: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    let out = snapshot_turn(
+        td.path(),
+        &cfg,
+        "base",
+        "agent turn",
+        1,
+        &mut commits,
+        &mut pos,
+        base.as_deref(),
+    )
+    .unwrap();
+    assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
+
+    let report = restore_to(td.path(), &commits, 0).unwrap();
+    assert_eq!(read(td.path(), "README.md"), "base\nuser edit\n");
+    assert_eq!(report.saved_edits, None, "the live tree was turn 1's");
+
+    // A clean tree needs no base commit: HEAD already is the base.
+    git(td.path(), &["checkout", "-q", "--", "README.md"]);
+    fs::remove_file(td.path().join("agent.rs")).unwrap();
+    assert_eq!(snapshot_base(td.path()).unwrap(), None);
+}
+
+/// Edits made after the last snapshot are not in any commit; /undo used to
+/// overwrite them silently. They must be saved under RECOVERY_REF first.
+#[test]
+fn dogfood_undo_saves_edits_made_after_the_last_snapshot() {
+    let td = TempDir::new().unwrap();
+    git_init(td.path());
+    commit_initial(td.path());
+    let cfg = AutoCommitConfig::default();
+    let mut commits: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    for (i, body) in ["v1\n", "v2\n"].iter().enumerate() {
+        write(td.path(), "README.md", body);
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "late",
+            "turn",
+            i as u32 + 1,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
+    }
+    write(td.path(), "README.md", "v2\nhand edit after the turn\n");
+
+    let report = restore_to(td.path(), &commits, 1).unwrap();
+    assert_eq!(read(td.path(), "README.md"), "v1\n");
+    let saved = report.saved_edits.clone().expect("edits must be saved");
+    assert_eq!(git(td.path(), &["rev-parse", RECOVERY_REF]).trim(), saved);
+    assert_eq!(
+        git(td.path(), &["show", &format!("{saved}:README.md")]),
+        "v2\nhand edit after the turn\n"
+    );
+    assert!(report.saved_edits_note().contains(&saved[..7]));
+
+    // A second save keeps the first reachable.
+    write(td.path(), "README.md", "v1\nanother edit\n");
+    let second = restore_to(td.path(), &commits, 2)
+        .unwrap()
+        .saved_edits
+        .unwrap();
+    git(td.path(), &["merge-base", "--is-ancestor", &saved, &second]);
+
+    // Nothing unsaved: /redo back and forth records nothing new.
+    assert_eq!(
+        restore_to(td.path(), &commits, 1).unwrap().saved_edits,
+        None
+    );
+}
+
 /// Dogfood #4: Prune 15 sessions down to 10 AND verify the user's real
 /// refs (main branch + HEAD) are not touched by the prune.
 #[test]
@@ -379,6 +475,7 @@ fn dogfood_prune_touches_only_shadow_refs() {
             1,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
     }
@@ -443,6 +540,7 @@ fn dogfood_noop_turn_creates_no_commit() {
         1,
         &mut commits,
         &mut pos,
+        None,
     )
     .unwrap();
     assert!(
@@ -488,6 +586,7 @@ fn dogfood_non_git_dir_returns_disabled_outcome() {
         1,
         &mut commits,
         &mut pos,
+        None,
     )
     .unwrap();
     assert!(matches!(out, SnapshotOutcome::Disabled { .. }));

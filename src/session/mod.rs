@@ -31,6 +31,12 @@ pub struct SessionMeta {
     /// "at session base"; `auto_commits.len()` means "at latest turn".
     #[serde(default)]
     pub undo_position: usize,
+    /// Snapshot of the uncommitted work present before the first recorded
+    /// turn: the parent of turn 1, i.e. what `/undo` to the session base
+    /// restores. `None` when the tree matched HEAD (or in legacy metas), in
+    /// which case HEAD is the base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
 }
 
 impl SessionMeta {
@@ -76,6 +82,7 @@ impl Session {
             tags: Vec::new(),
             auto_commits: Vec::new(),
             undo_position: 0,
+            base_commit: None,
         };
         meta.save().await?;
         Ok(Self {
@@ -112,6 +119,7 @@ impl Session {
         // Undo history lives on the original's shadow ref.
         self.meta.auto_commits.clear();
         self.meta.undo_position = 0;
+        self.meta.base_commit = None;
         self.path = Self::jsonl_path(&id);
         self.id = id;
         self.meta.save().await?;

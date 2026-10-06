@@ -68,11 +68,41 @@ fn full_3_turn_sequence_with_undo_redo() {
     let mut pos = 0usize;
 
     write(td.path(), "app.txt", "v1\n");
-    snapshot_turn(td.path(), &cfg, "s", "turn 1", 1, &mut commits, &mut pos).unwrap();
+    snapshot_turn(
+        td.path(),
+        &cfg,
+        "s",
+        "turn 1",
+        1,
+        &mut commits,
+        &mut pos,
+        None,
+    )
+    .unwrap();
     write(td.path(), "app.txt", "v2\n");
-    snapshot_turn(td.path(), &cfg, "s", "turn 2", 2, &mut commits, &mut pos).unwrap();
+    snapshot_turn(
+        td.path(),
+        &cfg,
+        "s",
+        "turn 2",
+        2,
+        &mut commits,
+        &mut pos,
+        None,
+    )
+    .unwrap();
     write(td.path(), "app.txt", "v3\n");
-    snapshot_turn(td.path(), &cfg, "s", "turn 3", 3, &mut commits, &mut pos).unwrap();
+    snapshot_turn(
+        td.path(),
+        &cfg,
+        "s",
+        "turn 3",
+        3,
+        &mut commits,
+        &mut pos,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(commits.len(), 3);
     assert_eq!(pos, 3);
@@ -102,9 +132,9 @@ fn undo_past_session_start_is_clamped() {
     let mut pos = 0usize;
 
     write(td.path(), "a.txt", "1\n");
-    snapshot_turn(td.path(), &cfg, "s", "a", 1, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "a", 1, &mut commits, &mut pos, None).unwrap();
     write(td.path(), "a.txt", "2\n");
-    snapshot_turn(td.path(), &cfg, "s", "b", 2, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "b", 2, &mut commits, &mut pos, None).unwrap();
 
     // Simulate `/undo 5` via saturating_sub → target_position = 0 (session base)
     let new_pos = pos.saturating_sub(5);
@@ -132,17 +162,17 @@ fn redo_stack_discarded_on_new_turn() {
     let mut pos = 0usize;
 
     write(td.path(), "a.txt", "1\n");
-    snapshot_turn(td.path(), &cfg, "s", "a", 1, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "a", 1, &mut commits, &mut pos, None).unwrap();
     write(td.path(), "a.txt", "2\n");
-    snapshot_turn(td.path(), &cfg, "s", "b", 2, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "b", 2, &mut commits, &mut pos, None).unwrap();
     write(td.path(), "a.txt", "3\n");
-    snapshot_turn(td.path(), &cfg, "s", "c", 3, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "c", 3, &mut commits, &mut pos, None).unwrap();
     assert_eq!(commits.len(), 3);
 
     // Simulate /undo 2 → pos = 1
     pos = 1;
     write(td.path(), "a.txt", "new2\n");
-    snapshot_turn(td.path(), &cfg, "s", "new", 2, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "new", 2, &mut commits, &mut pos, None).unwrap();
     assert_eq!(commits.len(), 2, "old turns 2 + 3 should be discarded");
     assert_eq!(pos, 2);
 }
@@ -161,7 +191,7 @@ fn disabled_config_emits_no_commits() {
     let mut pos = 0usize;
 
     write(td.path(), "x.txt", "1\n");
-    let out = snapshot_turn(td.path(), &cfg, "s", "x", 1, &mut commits, &mut pos).unwrap();
+    let out = snapshot_turn(td.path(), &cfg, "s", "x", 1, &mut commits, &mut pos, None).unwrap();
     assert!(matches!(out, SnapshotOutcome::Disabled { .. }));
     assert!(commits.is_empty());
     assert_eq!(pos, 0);
@@ -174,7 +204,7 @@ fn non_git_dir_is_disabled() {
     let cfg = AutoCommitConfig::default();
     let mut commits: Vec<String> = Vec::new();
     let mut pos = 0usize;
-    let out = snapshot_turn(td.path(), &cfg, "s", "x", 1, &mut commits, &mut pos).unwrap();
+    let out = snapshot_turn(td.path(), &cfg, "s", "x", 1, &mut commits, &mut pos, None).unwrap();
     assert!(matches!(out, SnapshotOutcome::Disabled { .. }));
 }
 
@@ -198,6 +228,7 @@ fn prune_integration_15_refs_keeps_10() {
             1,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
     }
@@ -233,7 +264,17 @@ fn concurrent_ref_write_is_detected_not_clobbered() {
 
     // Our instance records one turn.
     write(td.path(), "a.txt", "one\n");
-    snapshot_turn(td.path(), &cfg, "shared", "t1", 1, &mut commits, &mut pos).unwrap();
+    snapshot_turn(
+        td.path(),
+        &cfg,
+        "shared",
+        "t1",
+        1,
+        &mut commits,
+        &mut pos,
+        None,
+    )
+    .unwrap();
     let ours = commits.last().cloned().expect("first turn committed");
 
     // Another instance writes the same ref behind our back.
@@ -255,8 +296,17 @@ fn concurrent_ref_write_is_detected_not_clobbered() {
 
     // Our next turn must refuse rather than overwrite the other writer.
     write(td.path(), "a.txt", "two\n");
-    let outcome =
-        snapshot_turn(td.path(), &cfg, "shared", "t2", 2, &mut commits, &mut pos).unwrap();
+    let outcome = snapshot_turn(
+        td.path(),
+        &cfg,
+        "shared",
+        "t2",
+        2,
+        &mut commits,
+        &mut pos,
+        None,
+    )
+    .unwrap();
     assert!(
         matches!(outcome, SnapshotOutcome::Conflict { .. }),
         "expected Conflict, got {outcome:?}"
@@ -286,7 +336,7 @@ fn conflict_leaves_the_working_tree_untouched() {
     let mut pos = 0usize;
 
     write(td.path(), "w.txt", "v1\n");
-    snapshot_turn(td.path(), &cfg, "s", "t1", 1, &mut commits, &mut pos).unwrap();
+    snapshot_turn(td.path(), &cfg, "s", "t1", 1, &mut commits, &mut pos, None).unwrap();
 
     let refname = format!("{SHADOW_REF_PREFIX}s");
     let head = Command::new("git")
@@ -302,7 +352,7 @@ fn conflict_leaves_the_working_tree_untouched() {
         .unwrap();
 
     write(td.path(), "w.txt", "v2-user-edit\n");
-    let _ = snapshot_turn(td.path(), &cfg, "s", "t2", 2, &mut commits, &mut pos).unwrap();
+    let _ = snapshot_turn(td.path(), &cfg, "s", "t2", 2, &mut commits, &mut pos, None).unwrap();
 
     let on_disk = std::fs::read_to_string(td.path().join("w.txt")).unwrap();
     assert_eq!(on_disk, "v2-user-edit\n", "working tree must be untouched");

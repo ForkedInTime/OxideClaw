@@ -18,6 +18,12 @@ pub use crate::settings::{AutoCommitConfig, DEFAULT_KEEP_SESSIONS, DEFAULT_MESSA
 pub const SHADOW_REF_PREFIX: &str = "refs/oxideclaw/sessions/";
 /// Prefix used before the rename; refs found there are moved on startup.
 pub const LEGACY_SHADOW_REF_PREFIX: &str = "refs/rustyclaw/sessions/";
+/// Working-tree states `restore_to` was about to overwrite without any
+/// snapshot holding them. Each recovery commit keeps the previous one as a
+/// second parent, so all of them stay reachable.
+pub const RECOVERY_REF: &str = "refs/oxideclaw/recovery";
+/// Canonical empty tree: the session base of a repo with no commits.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Outcome of a single `snapshot_turn` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +51,24 @@ pub struct RestoreReport {
     /// Files in the working tree that do NOT exist in the target tree. They
     /// are left untouched; the caller may mention them in a system message.
     pub orphaned_files: Vec<PathBuf>,
+    /// Commit holding the working tree as it was before the restore, when no
+    /// snapshot had it (edits made after the last turn). Reachable from
+    /// [`RECOVERY_REF`].
+    pub saved_edits: Option<String>,
+}
+
+impl RestoreReport {
+    /// What to tell the user about `saved_edits`, or "" when nothing was saved.
+    pub fn saved_edits_note(&self) -> String {
+        match &self.saved_edits {
+            Some(sha) => format!(
+                "\nYour edits since the last snapshot were saved as {} \
+                 ({RECOVERY_REF}); `git checkout {sha} -- .` brings them back.",
+                &sha[..7.min(sha.len())]
+            ),
+            None => String::new(),
+        }
+    }
 }
 
 // ── Git subprocess helpers ────────────────────────────────────────────────────
@@ -138,6 +162,93 @@ fn count_tree_files(cwd: &Path, tree: &str) -> u32 {
     }
 }
 
+/// Stage the whole working tree into the temp index at `temp_index`, seeded
+/// from `seed_tree`, and return the resulting tree SHA. The user's real index
+/// is never touched.
+fn stage_worktree(
+    cwd: &Path,
+    seed_tree: Option<&str>,
+    temp_index: &Path,
+) -> anyhow::Result<String> {
+    // Seed from the parent's tree so `add -A` only records diffs relative to
+    // it, which makes empty-turn detection accurate even when the user's real
+    // index has other staging.
+    if let Some(tree) = seed_tree {
+        let s = git_cmd(cwd)
+            .env("GIT_INDEX_FILE", temp_index)
+            .args(["read-tree", tree])
+            .status()?;
+        if !s.success() {
+            anyhow::bail!("git read-tree {tree} failed");
+        }
+    }
+    let add_status = git_cmd(cwd)
+        .env("GIT_INDEX_FILE", temp_index)
+        // Whole tree from any subdirectory, minus OxideClaw's own SQLite
+        // index/memory store: snapshotting it stored a binary blob per turn,
+        // and /undo overwrote the live database (rolling back memories).
+        .args([
+            "add",
+            "-A",
+            "--",
+            ":(top)",
+            ":(top,exclude,glob)**/.claude/rag.db*",
+        ])
+        .status()?;
+    if !add_status.success() {
+        anyhow::bail!("git add -A failed");
+    }
+    git_output(
+        git_cmd(cwd)
+            .env("GIT_INDEX_FILE", temp_index)
+            .args(["write-tree"]),
+    )
+}
+
+/// `git commit-tree` with OxideClaw as author, so shadow commits never carry
+/// the user's identity or depend on it being configured.
+fn commit_tree(cwd: &Path, tree: &str, parents: &[&str], msg: &str) -> anyhow::Result<String> {
+    let mut cmd = git_cmd(cwd);
+    cmd.env("GIT_AUTHOR_NAME", "oxideclaw")
+        .env("GIT_AUTHOR_EMAIL", "noreply@oxideclaw.local")
+        .env("GIT_COMMITTER_NAME", "oxideclaw")
+        .env("GIT_COMMITTER_EMAIL", "noreply@oxideclaw.local")
+        .args(["commit-tree", tree, "-m", msg]);
+    for p in parents {
+        cmd.args(["-p", p]);
+    }
+    git_output(&mut cmd)
+}
+
+/// Snapshot the working tree as it is before the session's first recorded
+/// turn, so `/undo` to the session base returns the user's uncommitted work
+/// instead of HEAD. Returns `None` when the tree equals HEAD's (HEAD already
+/// is the base) or `cwd` is not in a git repo. The commit is not put on any
+/// ref: the first turn's snapshot takes it as parent, which keeps it alive.
+pub fn snapshot_base(cwd: &Path) -> anyhow::Result<Option<String>> {
+    if !is_git_repo(cwd) {
+        return Ok(None);
+    }
+    let head = resolve_head(cwd);
+    let head_tree = match &head {
+        Some(h) => tree_of_commit(cwd, h),
+        None => Some(EMPTY_TREE.to_string()),
+    };
+    let td = tempfile::TempDir::new()?;
+    let tree = stage_worktree(cwd, head_tree.as_deref(), &td.path().join("base.index"))?;
+    if head_tree.as_deref() == Some(tree.as_str()) {
+        return Ok(None);
+    }
+    let parents: Vec<&str> = head.as_deref().into_iter().collect();
+    commit_tree(
+        cwd,
+        &tree,
+        &parents,
+        "oxideclaw: session base (uncommitted work before the first turn)",
+    )
+    .map(Some)
+}
+
 /// Trim a user prompt to a 60-char single-line subject fragment.
 fn subject_from_prompt(prompt: &str) -> String {
     let first_line = prompt.lines().next().unwrap_or("").trim();
@@ -162,6 +273,11 @@ fn subject_from_prompt(prompt: &str) -> String {
 /// Git enforces it atomically under its own ref lock, across processes and
 /// without a lockfile of ours to leak. A concurrent write now fails loudly
 /// ([`SnapshotOutcome::Conflict`]) instead of destroying data quietly.
+///
+/// `base_commit` (from [`snapshot_base`]) is the parent at position 0; without
+/// it HEAD is, and `/undo` to the session base would drop whatever was
+/// uncommitted when the session started.
+#[allow(clippy::too_many_arguments)]
 pub fn snapshot_turn(
     cwd: &Path,
     config: &AutoCommitConfig,
@@ -170,6 +286,7 @@ pub fn snapshot_turn(
     turn_index: u32,
     auto_commits: &mut Vec<String>,
     undo_position: &mut usize,
+    base_commit: Option<&str>,
 ) -> anyhow::Result<SnapshotOutcome> {
     if !config.enabled {
         return Ok(SnapshotOutcome::Disabled {
@@ -202,64 +319,25 @@ pub fn snapshot_turn(
     let ref_name = shadow_ref(session_id);
     let expected_ref = auto_commits.last().cloned();
 
-    // 1. Temp index file, isolated via GIT_INDEX_FILE.
-    let td = tempfile::TempDir::new()?;
-    let temp_index = td.path().join("turn.index");
-
-    // 2. Seed the temp index from the parent's tree (if we have one) so `add -A`
-    //    only records diffs relative to the parent, which makes empty-turn
-    //    detection accurate even when the user's real index has other staging.
+    // 1. Stage the whole tree into a temp index (GIT_INDEX_FILE) seeded from
+    //    the parent's tree, and write it.
     let parent = if *undo_position > 0 {
         auto_commits.get(*undo_position - 1).cloned()
     } else {
-        resolve_head(cwd)
+        base_commit
+            .map(str::to_string)
+            .or_else(|| resolve_head(cwd))
     };
-    if let Some(p) = &parent
-        && let Some(tree) = tree_of_commit(cwd, p)
-    {
-        let s = git_cmd(cwd)
-            .env("GIT_INDEX_FILE", &temp_index)
-            .args(["read-tree", &tree])
-            .status()?;
-        if !s.success() {
-            anyhow::bail!("git read-tree {tree} failed");
-        }
-    }
+    let parent_tree = parent.as_deref().and_then(|p| tree_of_commit(cwd, p));
+    let td = tempfile::TempDir::new()?;
+    let tree_sha = stage_worktree(cwd, parent_tree.as_deref(), &td.path().join("turn.index"))?;
 
-    // 3. Stage everything under cwd into the temp index.
-    let add_status = git_cmd(cwd)
-        .env("GIT_INDEX_FILE", &temp_index)
-        // Whole tree from any subdirectory, minus OxideClaw's own SQLite
-        // index/memory store: snapshotting it stored a binary blob per turn,
-        // and /undo overwrote the live database (rolling back memories).
-        .args([
-            "add",
-            "-A",
-            "--",
-            ":(top)",
-            ":(top,exclude,glob)**/.claude/rag.db*",
-        ])
-        .status()?;
-    if !add_status.success() {
-        anyhow::bail!("git add -A failed");
-    }
-
-    // 4. Write the tree.
-    let tree_sha = git_output(
-        git_cmd(cwd)
-            .env("GIT_INDEX_FILE", &temp_index)
-            .args(["write-tree"]),
-    )?;
-
-    // 5. Empty-turn optimization: compare against parent tree.
-    if let Some(p) = &parent
-        && let Some(parent_tree) = tree_of_commit(cwd, p)
-        && parent_tree == tree_sha
-    {
+    // 2. Empty-turn optimization: compare against parent tree.
+    if parent_tree.as_deref() == Some(tree_sha.as_str()) {
         return Ok(SnapshotOutcome::NoChanges);
     }
 
-    // 6. Build the commit.
+    // 3. Build the commit.
     let subject = format!(
         "{} turn {}: {}",
         config.message_prefix,
@@ -272,19 +350,10 @@ pub fn snapshot_turn(
     );
     let full_msg = format!("{subject}\n{body}");
 
-    let mut commit_cmd = git_cmd(cwd);
-    commit_cmd
-        .env("GIT_AUTHOR_NAME", "oxideclaw")
-        .env("GIT_AUTHOR_EMAIL", "noreply@oxideclaw.local")
-        .env("GIT_COMMITTER_NAME", "oxideclaw")
-        .env("GIT_COMMITTER_EMAIL", "noreply@oxideclaw.local")
-        .args(["commit-tree", &tree_sha, "-m", &full_msg]);
-    if let Some(p) = &parent {
-        commit_cmd.args(["-p", p]);
-    }
-    let commit_sha = git_output(&mut commit_cmd)?;
+    let parents: Vec<&str> = parent.as_deref().into_iter().collect();
+    let commit_sha = commit_tree(cwd, &tree_sha, &parents, &full_msg)?;
 
-    // 7. Update the shadow ref, compare-and-swap against the value we started
+    // 4. Update the shadow ref, compare-and-swap against the value we started
     //    from. An empty expected-old tells git the ref must not exist yet.
     let expected_old = expected_ref.as_deref().unwrap_or("");
     let update_status = git_cmd(cwd)
@@ -304,7 +373,7 @@ pub fn snapshot_turn(
         });
     }
 
-    // 8. Discard redo tail if user was in an undone state, then append.
+    // 5. Discard redo tail if user was in an undone state, then append.
     if *undo_position < auto_commits.len() {
         auto_commits.truncate(*undo_position);
     }
@@ -393,12 +462,12 @@ pub fn restore_to(
             } else if let Some(head) = resolve_head(cwd) {
                 tree_of_commit(cwd, &head).unwrap_or_default()
             } else {
-                "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+                EMPTY_TREE.to_string()
             }
         } else if let Some(head) = resolve_head(cwd) {
             tree_of_commit(cwd, &head).unwrap_or_default()
         } else {
-            "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+            EMPTY_TREE.to_string()
         }
     } else {
         let commit = &auto_commits[target_position - 1];
@@ -427,6 +496,8 @@ pub fn restore_to(
         .filter(|f| !target_files.contains(*f))
         .map(PathBuf::from)
         .collect();
+
+    let saved_edits = save_unrecorded_worktree(cwd, auto_commits)?;
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
@@ -461,7 +532,70 @@ pub fn restore_to(
     Ok(RestoreReport {
         files_restored: target_files.len() as u32,
         orphaned_files,
+        saved_edits,
     })
+}
+
+/// Before `restore_to` overwrites the working tree, commit it under
+/// [`RECOVERY_REF`] unless some snapshot already holds exactly this tree.
+/// Edits made after the last turn (or uncommitted work a legacy session base
+/// never captured) were otherwise overwritten with no way back. Errors abort
+/// the restore: better no undo than an undo that destroys work.
+fn save_unrecorded_worktree(cwd: &Path, auto_commits: &[String]) -> anyhow::Result<Option<String>> {
+    let head = resolve_head(cwd);
+    let latest = auto_commits.last().cloned().or_else(|| head.clone());
+    let latest_tree = latest.as_deref().and_then(|c| tree_of_commit(cwd, c));
+    let td = tempfile::TempDir::new()?;
+    let live_tree = stage_worktree(cwd, latest_tree.as_deref(), &td.path().join("live.index"))?;
+
+    // Every state /undo and /redo can reach: each turn and the session base.
+    let mut revs: Vec<String> = auto_commits
+        .iter()
+        .map(|c| format!("{c}^{{tree}}"))
+        .collect();
+    if let Some(first) = auto_commits.first() {
+        revs.push(format!("{first}^^{{tree}}"));
+    }
+    if let Some(h) = &head {
+        revs.push(format!("{h}^{{tree}}"));
+    }
+    let mut known: Vec<String> = revs
+        .iter()
+        .filter_map(|r| git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", r])).ok())
+        .collect();
+    if head.is_none() {
+        known.push(EMPTY_TREE.to_string());
+    }
+    if known.contains(&live_tree) {
+        return Ok(None);
+    }
+
+    let previous =
+        git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", RECOVERY_REF])).ok();
+    let mut parents: Vec<&str> = latest.as_deref().into_iter().collect();
+    if let Some(prev) = &previous {
+        parents.push(prev);
+    }
+    let sha = commit_tree(
+        cwd,
+        &live_tree,
+        &parents,
+        "oxideclaw: working tree saved before /undo or /redo",
+    )?;
+    let status = git_cmd(cwd)
+        .args([
+            "update-ref",
+            RECOVERY_REF,
+            &sha,
+            previous.as_deref().unwrap_or(""),
+        ])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!(
+            "could not save un-snapshotted edits to {RECOVERY_REF}; nothing was restored"
+        );
+    }
+    Ok(Some(sha))
 }
 
 // ── Prune pipeline ────────────────────────────────────────────────────────────
@@ -583,6 +717,7 @@ pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
 /// instead of `&AutoCommitConfig`, avoiding cross-crate type-identity issues
 /// when the bin crate's TUI event loop calls into the lib.  The caller is
 /// responsible for checking `enabled` and `keep_sessions` before dispatching.
+#[allow(clippy::too_many_arguments)]
 pub fn snapshot_turn_raw(
     cwd: &Path,
     message_prefix: &str,
@@ -591,6 +726,7 @@ pub fn snapshot_turn_raw(
     turn_index: u32,
     auto_commits: &mut Vec<String>,
     undo_position: &mut usize,
+    base_commit: Option<&str>,
 ) -> anyhow::Result<SnapshotOutcome> {
     let config = AutoCommitConfig {
         enabled: true,
@@ -605,6 +741,7 @@ pub fn snapshot_turn_raw(
         turn_index,
         auto_commits,
         undo_position,
+        base_commit,
     )
 }
 
@@ -762,6 +899,7 @@ mod snapshot_tests {
             1,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
 
@@ -798,13 +936,43 @@ mod snapshot_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "a.txt", "1\n");
-        snapshot_turn(td.path(), &cfg, "s1", "add a", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s1",
+            "add a",
+            1,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
 
         write_file(td.path(), "b.txt", "2\n");
-        snapshot_turn(td.path(), &cfg, "s1", "add b", 2, &mut commits, &mut pos).unwrap();
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s1",
+            "add b",
+            2,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
 
         write_file(td.path(), "c.txt", "3\n");
-        snapshot_turn(td.path(), &cfg, "s1", "add c", 3, &mut commits, &mut pos).unwrap();
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s1",
+            "add c",
+            3,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(commits.len(), 3);
         assert_eq!(pos, 3);
@@ -835,6 +1003,7 @@ mod snapshot_tests {
             1,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
         assert_eq!(outcome, SnapshotOutcome::NoChanges);
@@ -853,7 +1022,7 @@ mod snapshot_tests {
         let mut commits = Vec::new();
         let mut pos = 0usize;
         let outcome =
-            snapshot_turn(td.path(), &cfg, "s", "msg", 1, &mut commits, &mut pos).unwrap();
+            snapshot_turn(td.path(), &cfg, "s", "msg", 1, &mut commits, &mut pos, None).unwrap();
         match outcome {
             SnapshotOutcome::Disabled { reason } => {
                 assert!(reason.contains("disabled"), "reason: {reason}");
@@ -870,7 +1039,7 @@ mod snapshot_tests {
         let mut commits = Vec::new();
         let mut pos = 0usize;
         let outcome =
-            snapshot_turn(td.path(), &cfg, "s", "msg", 1, &mut commits, &mut pos).unwrap();
+            snapshot_turn(td.path(), &cfg, "s", "msg", 1, &mut commits, &mut pos, None).unwrap();
         assert!(matches!(outcome, SnapshotOutcome::Disabled { .. }));
     }
 
@@ -885,7 +1054,17 @@ mod snapshot_tests {
         let cfg = AutoCommitConfig::default();
         let mut commits = Vec::new();
         let mut pos = 0usize;
-        snapshot_turn(td.path(), &cfg, "s", "ignored", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s",
+            "ignored",
+            1,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
         assert_eq!(commits.len(), 1);
 
         // ls-tree the commit and confirm secret.txt is NOT present.
@@ -918,6 +1097,7 @@ mod snapshot_tests {
             1,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
 
@@ -950,18 +1130,18 @@ mod snapshot_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "a.txt", "1\n");
-        snapshot_turn(td.path(), &cfg, "s", "a", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "a", 1, &mut commits, &mut pos, None).unwrap();
         write_file(td.path(), "b.txt", "2\n");
-        snapshot_turn(td.path(), &cfg, "s", "b", 2, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "b", 2, &mut commits, &mut pos, None).unwrap();
         write_file(td.path(), "c.txt", "3\n");
-        snapshot_turn(td.path(), &cfg, "s", "c", 3, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "c", 3, &mut commits, &mut pos, None).unwrap();
         assert_eq!(commits.len(), 3);
         assert_eq!(pos, 3);
 
         // Simulate /undo 2 → pos = 1, then new work — expect redo tail discarded.
         pos = 1;
         write_file(td.path(), "d.txt", "4\n");
-        snapshot_turn(td.path(), &cfg, "s", "d", 2, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "d", 2, &mut commits, &mut pos, None).unwrap();
         assert_eq!(
             commits.len(),
             2,
@@ -995,9 +1175,9 @@ mod restore_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "app.txt", "v2\n");
-        snapshot_turn(td.path(), &cfg, "s", "v2", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "v2", 1, &mut commits, &mut pos, None).unwrap();
         write_file(td.path(), "app.txt", "v3\n");
-        snapshot_turn(td.path(), &cfg, "s", "v3", 2, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "v3", 2, &mut commits, &mut pos, None).unwrap();
 
         let report = restore_to(td.path(), &commits, 1).unwrap();
         assert!(report.files_restored >= 1);
@@ -1025,6 +1205,7 @@ mod restore_tests {
             1,
             &mut commits,
             &mut pos,
+            None,
         )
         .unwrap();
         let tree = tree_of_commit(td.path(), &commits[0]).unwrap();
@@ -1052,10 +1233,10 @@ mod restore_tests {
         let mut pos = 0usize;
         write_file(td.path(), "pkg/x.txt", "v2\n");
         write_file(td.path(), "top.txt", "v2\n");
-        snapshot_turn(&sub, &cfg, "s", "v2", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(&sub, &cfg, "s", "v2", 1, &mut commits, &mut pos, None).unwrap();
         write_file(td.path(), "pkg/x.txt", "v3\n");
         write_file(td.path(), "top.txt", "v3\n");
-        snapshot_turn(&sub, &cfg, "s", "v3", 2, &mut commits, &mut pos).unwrap();
+        snapshot_turn(&sub, &cfg, "s", "v3", 2, &mut commits, &mut pos, None).unwrap();
 
         restore_to(&sub, &commits, 1).unwrap();
         let read = |p: &str| std::fs::read_to_string(td.path().join(p)).unwrap();
@@ -1082,7 +1263,7 @@ mod restore_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "tracked.txt", "y\n");
-        snapshot_turn(td.path(), &cfg, "s", "mod", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "mod", 1, &mut commits, &mut pos, None).unwrap();
 
         write_file(td.path(), "untracked.log", "scratch\n");
 
@@ -1115,7 +1296,7 @@ mod restore_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "app.txt", "modified\n");
-        snapshot_turn(td.path(), &cfg, "s", "m", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "m", 1, &mut commits, &mut pos, None).unwrap();
 
         restore_to(td.path(), &commits, 0).unwrap();
         assert_eq!(
@@ -1142,7 +1323,17 @@ mod restore_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "new.txt", "added\n");
-        snapshot_turn(td.path(), &cfg, "s", "add new", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s",
+            "add new",
+            1,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
 
         let report = restore_to(td.path(), &commits, 0).unwrap();
         assert!(
@@ -1163,7 +1354,17 @@ mod restore_tests {
         let mut pos = 0usize;
 
         write_file(td.path(), "only.txt", "solo\n");
-        snapshot_turn(td.path(), &cfg, "s", "first", 1, &mut commits, &mut pos).unwrap();
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s",
+            "first",
+            1,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
         assert_eq!(commits.len(), 1);
 
         // Verify commits[0] has no parent (root commit).
