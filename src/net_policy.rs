@@ -223,6 +223,164 @@ pub async fn fetch(
     bail!("too many redirects (more than {MAX_REDIRECTS} hops)")
 }
 
+/// A loopback forward proxy that applies a [`NetPolicy`] to every connection
+/// a child process makes. Headless Chromium follows redirects, meta refresh
+/// and JS navigation and resolves DNS itself, so checking only the URL it is
+/// launched with lets a public page bounce it to `169.254.169.254`. Routed
+/// through this proxy, every hop and subresource is resolved and checked here
+/// and the connection is pinned to the addresses that passed.
+///
+/// Dropping it stops the listener and every open tunnel.
+pub struct PolicyProxy {
+    pub addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PolicyProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Request heads larger than this are refused; no legitimate request needs it.
+const MAX_PROXY_HEAD: usize = 64 * 1024;
+
+pub async fn spawn_policy_proxy(policy: NetPolicy) -> Result<PolicyProxy> {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        // Owned by this task, so aborting it on drop tears down every tunnel.
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((sock, _)) => {
+                        conns.spawn(proxy_one(sock, policy));
+                    }
+                    Err(_) => break,
+                },
+                Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            }
+        }
+    });
+    Ok(PolicyProxy { addr, task })
+}
+
+async fn proxy_one(mut client: tokio::net::TcpStream, policy: NetPolicy) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = Vec::with_capacity(4096);
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if buf.len() > MAX_PROXY_HEAD {
+            return;
+        }
+        let mut chunk = [0u8; 4096];
+        match client.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let rest = buf[head_end..].to_vec();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        let _ = client
+            .write_all(&refusal("400 Bad Request", "malformed request"))
+            .await;
+        return;
+    };
+    let connect = method.eq_ignore_ascii_case("CONNECT");
+    // CONNECT carries authority-form `host:port`; everything else must be
+    // absolute-form, which is what a browser sends to an HTTP proxy.
+    let url = if connect {
+        Url::parse(&format!("https://{target}/"))
+    } else {
+        Url::parse(target)
+    };
+    let url = match url {
+        Ok(u) if connect || u.scheme() == "http" => u,
+        _ => {
+            let _ = client
+                .write_all(&refusal("400 Bad Request", "unsupported request target"))
+                .await;
+            return;
+        }
+    };
+    let addrs = match policy.resolve(&url).await {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = client
+                .write_all(&refusal(
+                    "403 Forbidden",
+                    &format!("WebBrowser refused: {e}"),
+                ))
+                .await;
+            return;
+        }
+    };
+    let Ok(mut upstream) = tokio::net::TcpStream::connect(&addrs[..]).await else {
+        let _ = client
+            .write_all(&refusal("502 Bad Gateway", "could not connect"))
+            .await;
+        return;
+    };
+
+    if connect {
+        if client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+    } else {
+        // Origin-form for the server, and `Connection: close` so a reused
+        // proxy connection can never carry a request for another host to
+        // this already-checked upstream.
+        let mut path = url.path().to_string();
+        if let Some(q) = url.query() {
+            path.push('?');
+            path.push_str(q);
+        }
+        let mut out = format!("{method} {path} {version}\r\n");
+        for line in lines.filter(|l| !l.is_empty()) {
+            let name = line.split(':').next().unwrap_or("").trim();
+            if name.eq_ignore_ascii_case("connection")
+                || name.eq_ignore_ascii_case("proxy-connection")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+                || name.eq_ignore_ascii_case("keep-alive")
+            {
+                continue;
+            }
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out.push_str("Connection: close\r\n\r\n");
+        if upstream.write_all(out.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+    if !rest.is_empty() && upstream.write_all(&rest).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+fn refusal(status: &str, msg: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{msg}",
+        msg.len()
+    )
+    .into_bytes()
+}
+
 /// A scripted loopback HTTP server for the fetch tools' tests.
 #[cfg(test)]
 pub mod test_support {
@@ -464,5 +622,76 @@ mod tests {
             .unwrap();
         assert_eq!(got.body, b"hello");
         assert_eq!(got.content_type, "text/plain");
+    }
+
+    // ── policy proxy (WebBrowser's Chromium path) ────────────────────────
+
+    /// Send one raw request through the proxy and return everything it
+    /// answers until the connection closes.
+    async fn via_proxy(proxy: &PolicyProxy, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sock = tokio::net::TcpStream::connect(proxy.addr).await.unwrap();
+        sock.write_all(request.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(SECS, sock.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Chromium followed a public page's redirect to the metadata service or
+    /// loopback unchecked. Through the proxy, each hop is refused before any
+    /// connection is made, for plain HTTP and CONNECT tunnels alike.
+    #[tokio::test]
+    async fn proxy_refuses_hops_the_policy_denies() {
+        let (base, hits) = scripted_server(vec![ok("secret")]).await;
+        let authority = base.trim_start_matches("http://");
+        let strict = spawn_policy_proxy(NetPolicy::STRICT).await.unwrap();
+        for req in [
+            format!("GET {base}/ HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
+            format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
+            "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\n\r\n".to_string(),
+            "CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n".to_string(),
+        ] {
+            let got = via_proxy(&strict, &req).await;
+            assert!(got.starts_with("HTTP/1.1 403"), "{req:?} -> {got}");
+            assert!(!got.contains("secret"));
+        }
+        let local = spawn_policy_proxy(NetPolicy::LOCAL_OK).await.unwrap();
+        let got = via_proxy(
+            &local,
+            "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may connect");
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_allowed_requests_and_tunnels() {
+        let (base, hits) = scripted_server(vec![ok("hello")]).await;
+        let authority = base.trim_start_matches("http://");
+        let proxy = spawn_policy_proxy(NetPolicy::LOCAL_OK).await.unwrap();
+
+        let got = via_proxy(
+            &proxy,
+            &format!("GET {base}/x?y=1 HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"),
+        )
+        .await;
+        assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+        assert!(got.ends_with("hello"), "{got}");
+
+        let got = via_proxy(
+            &proxy,
+            &format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n\
+                 GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            got.starts_with("HTTP/1.1 200 Connection Established"),
+            "{got}"
+        );
+        assert!(got.ends_with("hello"), "{got}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

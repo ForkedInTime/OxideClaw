@@ -75,9 +75,10 @@ impl Tool for WebBrowserTool {
             return Ok(ToolOutput::error(format!("WebBrowser refused: {e}")));
         }
 
-        // Try headless Chromium first. Residual: chromium follows redirects
-        // itself, so only the initial URL is policy-checked on this path.
-        if let Some(text) = try_chromium(url.as_str(), max_chars).await {
+        // Try headless Chromium first. It follows redirects, meta refresh and
+        // JS navigation on its own, so every connection it makes goes through
+        // a proxy that re-applies the policy.
+        if let Some(text) = try_chromium(url.as_str(), &self.policy, max_chars).await {
             return Ok(ToolOutput::success(text));
         }
 
@@ -89,10 +90,18 @@ impl Tool for WebBrowserTool {
     }
 }
 
-/// Try to fetch via `chromium --headless --dump-dom`.
-async fn try_chromium(url: &str, max_chars: usize) -> Option<String> {
+/// Try to fetch via `chromium --headless --dump-dom`, with all of its
+/// traffic forced through a policy-enforcing proxy.
+async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option<String> {
     use tokio::process::Command;
     use tokio::time::{Duration, timeout};
+
+    // Without the proxy Chromium would reach whatever a redirect names, so
+    // no proxy means no Chromium; the guarded plain fetch takes over.
+    // Both live until this returns, timeout included.
+    let proxy = crate::net_policy::spawn_policy_proxy(*policy).await.ok()?;
+    let profile = tempfile::tempdir().ok()?;
+    let args = chromium_args(proxy.addr, profile.path(), url);
 
     // Try several common chromium executable names
     for exe in &[
@@ -104,7 +113,7 @@ async fn try_chromium(url: &str, max_chars: usize) -> Option<String> {
         let result = timeout(
             Duration::from_secs(20),
             Command::new(exe)
-                .args(["--headless", "--disable-gpu", "--dump-dom", url])
+                .args(&args)
                 // A timeout drops this future; without this the browser
                 // would outlive the tool call as an orphan.
                 .kill_on_drop(true)
@@ -124,6 +133,26 @@ async fn try_chromium(url: &str, max_chars: usize) -> Option<String> {
         }
     }
     None
+}
+
+fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &str) -> Vec<String> {
+    vec![
+        "--headless".into(),
+        "--disable-gpu".into(),
+        "--no-first-run".into(),
+        "--disable-background-networking".into(),
+        "--disable-component-update".into(),
+        "--disable-sync".into(),
+        format!("--user-data-dir={}", profile.display()),
+        format!("--proxy-server=http://{proxy}"),
+        // Chromium implicitly bypasses proxies for localhost; `<-loopback>`
+        // removes that, so loopback goes through the policy too.
+        "--proxy-bypass-list=<-loopback>".into(),
+        // WebRTC would otherwise send UDP straight past the proxy.
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
+        "--dump-dom".into(),
+        url.into(),
+    ]
 }
 
 /// Plain HTTP fetch as fallback.
@@ -227,6 +256,19 @@ mod tests {
                 ToolResultContent::Text { text } => text.as_str(),
             })
             .collect()
+    }
+
+    /// Chromium used to run with no proxy, so a redirect it followed was
+    /// never policy-checked. Every connection must go through the proxy,
+    /// loopback included (Chromium bypasses proxies for localhost by default).
+    #[test]
+    fn chromium_is_pinned_to_the_policy_proxy() {
+        let proxy: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let args = chromium_args(proxy, std::path::Path::new("/p"), "https://e.example/");
+        assert!(args.contains(&"--proxy-server=http://127.0.0.1:4242".to_string()));
+        assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
+        assert!(args.contains(&"--user-data-dir=/p".to_string()));
+        assert_eq!(args.last().unwrap(), "https://e.example/");
     }
 
     /// `chromium --dump-dom file:///etc/passwd` would happily print the
