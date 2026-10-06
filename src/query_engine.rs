@@ -41,6 +41,9 @@ pub struct QueryEngine {
     /// Every tool call goes through this. Defaults to the headless gate
     /// (settings/CLI rules apply; anything needing a prompt is refused).
     gate: crate::permissions::PermissionGate,
+    /// A `Skill` call succeeded this turn with `disableSkillShellExecution`
+    /// set: shell tools are refused until the next `query`.
+    skill_shell_blocked: bool,
     /// Nesting level for `Agent` launches; published to tools via ToolContext.
     agent_depth: u8,
     /// Tool whose successful call ends `query()` once that turn's results
@@ -109,6 +112,7 @@ impl QueryEngine {
             middlewares: Vec::new(),
             turns: 0,
             gate,
+            skill_shell_blocked: false,
             agent_depth: 0,
             stop_after_tool: None,
             usage_sink: None,
@@ -172,6 +176,7 @@ impl QueryEngine {
     pub async fn query(&mut self, user_input: impl Into<String>) -> Result<()> {
         let user_input = user_input.into();
         self.turns = 0;
+        self.skill_shell_blocked = false;
 
         // --replay-user-messages: echo user message in stream-json output
         if self.replay_user_messages() && self.stream_json_output {
@@ -463,9 +468,13 @@ impl QueryEngine {
     /// Execute all tool_use blocks in the response content.
     /// Returns a vec of tool_result ContentBlocks to send back.
     pub(crate) async fn execute_tools(
-        &self,
+        &mut self,
         content: &[ContentBlock],
     ) -> Result<Vec<ContentBlock>> {
+        let mut gate = self.gate.clone();
+        if self.skill_shell_blocked {
+            gate = gate.with_skill_shell_blocked();
+        }
         let mut ctx = ToolContext::new(self.config.cwd.clone());
         ctx.default_shell = self.config.default_shell.clone();
         ctx.snapshot_dir = self.config.file_snapshot_dir.clone();
@@ -479,7 +488,7 @@ impl QueryEngine {
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
         ctx.middlewares = self.middlewares.clone();
-        ctx.permission_gate = Some(self.gate.clone());
+        ctx.permission_gate = Some(gate.clone());
         ctx.agent_depth = self.agent_depth;
         ctx.usage_sink = Some(self.child_usage_tx.clone());
         ctx.budget_remaining_usd = self
@@ -569,7 +578,7 @@ impl QueryEngine {
                 // ── Permission gate ───────────────────────────────────
                 // Same decision the TUI makes; headless engines fail closed.
                 if let crate::permissions::GateOutcome::Denied(reason) =
-                    self.gate.decide(name, input).await
+                    gate.decide(name, input).await
                 {
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -589,6 +598,19 @@ impl QueryEngine {
                     },
                     None => crate::tools::ToolOutput::error(format!("Unknown tool: {name}")),
                 };
+
+                // Same rule as the TUI: once a skill is loaded with
+                // disableSkillShellExecution set, no shell for this turn,
+                // including the rest of this response and any Agent child.
+                if name == "Skill"
+                    && !output.is_error
+                    && self.config.disable_skill_shell_execution
+                    && !self.skill_shell_blocked
+                {
+                    self.skill_shell_blocked = true;
+                    gate = gate.with_skill_shell_blocked();
+                    ctx.permission_gate = Some(gate.clone());
+                }
 
                 // ── Middleware after_tool ─────────────────────────────
                 let output_text: String = output
@@ -1195,7 +1217,7 @@ mod scripted_api_tests {
             cwd: dir.path().to_path_buf(),
             ..Config::default()
         };
-        let e = QueryEngine::new(config, vec![Arc::new(Huge)]).unwrap();
+        let mut e = QueryEngine::new(config, vec![Arc::new(Huge)]).unwrap();
         let r = e
             .execute_tools(&[ContentBlock::ToolUse {
                 id: "t1".into(),
@@ -1310,7 +1332,7 @@ mod permission_wiring_tests {
     async fn default_engine_refuses_a_sensitive_tool_with_no_human_attached() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("marker.txt");
-        let e = engine(
+        let mut e = engine(
             dir.path(),
             vec![Arc::new(crate::tools::file_write::FileWriteTool)],
         );
@@ -1330,7 +1352,7 @@ mod permission_wiring_tests {
             false,
             Some(Arc::new(AlwaysDeny)),
         );
-        let e = engine(
+        let mut e = engine(
             dir.path(),
             vec![Arc::new(crate::tools::file_write::FileWriteTool)],
         )
@@ -1345,7 +1367,7 @@ mod permission_wiring_tests {
     async fn a_bypass_gate_lets_the_tool_run() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("marker.txt");
-        let e = engine(
+        let mut e = engine(
             dir.path(),
             vec![Arc::new(crate::tools::file_write::FileWriteTool)],
         )
@@ -1382,7 +1404,7 @@ mod permission_wiring_tests {
     async fn tools_see_the_gate_and_depth_of_their_executor() {
         let dir = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe(Mutex::new(None)));
-        let e = engine(dir.path(), vec![probe.clone()]).with_agent_depth(2);
+        let mut e = engine(dir.path(), vec![probe.clone()]).with_agent_depth(2);
         let call = vec![ContentBlock::ToolUse {
             id: "t1".into(),
             name: "Probe".into(),
@@ -1425,7 +1447,7 @@ mod permission_wiring_tests {
             assert!(ok);
         }
         let state = crate::tools::worktree::new_worktree_state();
-        let e = engine(
+        let mut e = engine(
             &root,
             vec![
                 Arc::new(crate::tools::worktree::EnterWorktreeTool {
@@ -1459,6 +1481,60 @@ mod permission_wiring_tests {
             !root.join("new.txt").exists(),
             "main tree must be untouched"
         );
+    }
+
+    /// disableSkillShellExecution only added a sentence to the prompt, and
+    /// the Skill tool ignored it entirely. Shell before the skill loads runs;
+    /// after it, even later in the same response and under a bypass gate,
+    /// it is refused.
+    #[tokio::test]
+    async fn a_loaded_skill_blocks_shell_for_the_rest_of_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("oxc-test-skill.md"), "Run touch after.txt").unwrap();
+        let c = Config {
+            model: "ollama:test-model".into(),
+            cwd: dir.path().to_path_buf(),
+            disable_skill_shell_execution: true,
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(
+            c,
+            vec![
+                Arc::new(crate::tools::bash::BashTool),
+                Arc::new(crate::tools::skill_tool::SkillTool),
+            ],
+        )
+        .unwrap()
+        .with_permission_gate(PermissionGate::bypass());
+        let bash = |id: &str, file: &str| ContentBlock::ToolUse {
+            id: id.into(),
+            name: "Bash".into(),
+            input: json!({"command": format!("touch {file}")}),
+        };
+        let calls = vec![
+            bash("t1", "before.txt"),
+            ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "Skill".into(),
+                input: json!({"skill": "oxc-test-skill"}),
+            },
+            bash("t3", "after.txt"),
+        ];
+        let out = e.execute_tools(&calls).await.unwrap();
+        assert!(dir.path().join("before.txt").exists(), "{out:?}");
+        let (is_error, text) = result(&out[2..]);
+        assert!(
+            is_error && text.contains("disableSkillShellExecution"),
+            "{text}"
+        );
+        assert!(!dir.path().join("after.txt").exists());
+
+        // Next response in the same turn: still blocked.
+        let out = e.execute_tools(&[bash("t4", "later.txt")]).await.unwrap();
+        assert!(result(&out).0);
+        assert!(!dir.path().join("later.txt").exists());
     }
 }
 

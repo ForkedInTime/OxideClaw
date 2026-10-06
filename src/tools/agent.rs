@@ -442,7 +442,7 @@ mod tests {
         ctx.agent_depth = 1;
         ctx.permission_gate = Some(PermissionGate::bypass());
         let probe = Arc::new(Probe(Mutex::new(None)));
-        let engine = tool
+        let mut engine = tool
             .build_sub_engine(config(), vec![probe.clone()], &ctx)
             .unwrap();
         let call = vec![ContentBlock::ToolUse {
@@ -473,13 +473,13 @@ mod tests {
         let mut ctx = ToolContext::new(dir.path().to_path_buf());
         ctx.permission_gate = Some(PermissionGate::bypass());
         let allowed = dir.path().join("allowed.txt");
-        let e = tool.build_sub_engine(config(), write(), &ctx).unwrap();
+        let mut e = tool.build_sub_engine(config(), write(), &ctx).unwrap();
         e.execute_tools(&call(&allowed)).await.unwrap();
         assert!(allowed.exists(), "bypass gate inherited → Write runs");
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let refused = dir.path().join("refused.txt");
-        let e = tool.build_sub_engine(config(), write(), &ctx).unwrap();
+        let mut e = tool.build_sub_engine(config(), write(), &ctx).unwrap();
         e.execute_tools(&call(&refused)).await.unwrap();
         assert!(
             !refused.exists(),
@@ -506,7 +506,7 @@ mod tests {
 
         // `echo mkfs` is harmless unsandboxed but matches strict's blocklist.
         let bash: Vec<DynTool> = vec![Arc::new(crate::tools::bash::BashTool)];
-        let e = tool.build_sub_engine(sub, bash, &ctx).unwrap();
+        let mut e = tool.build_sub_engine(sub, bash, &ctx).unwrap();
         let call = vec![ContentBlock::ToolUse {
             id: "t1".into(),
             name: "Bash".into(),

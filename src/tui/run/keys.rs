@@ -742,6 +742,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    skill_no_shell: false,
                     budget_remaining_usd: budget_left,
                     session_id: sid2,
                     history: turn_history,

@@ -286,6 +286,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    skill_no_shell: false,
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
                     history: turn_history,
@@ -1396,6 +1397,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         system_prompt: sp,
                         tx: tx2,
                         plan_mode: pm,
+                        skill_no_shell: false,
                         budget_remaining_usd: budget_left,
                         session_id: sid3,
                         history: turn_history,
@@ -2423,6 +2425,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    skill_no_shell: false,
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
                     history: turn_history,
@@ -2466,6 +2469,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    skill_no_shell: false,
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
                     history: turn_history,
@@ -2677,6 +2681,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let sp = system_prompt.clone();
                 let ps = perm_state.clone();
                 let pm = app.plan_mode;
+                let no_shell = config.disable_skill_shell_execution;
                 let budget_left = app.cost_tracker.remaining();
                 let sid4 = session.id.clone();
                 let turn_history = TurnHistory::default();
@@ -2691,6 +2696,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         system_prompt: sp,
                         tx: tx2,
                         plan_mode: pm,
+                        skill_no_shell: no_shell,
                         budget_remaining_usd: budget_left,
                         session_id: sid4,
                         history: turn_history,

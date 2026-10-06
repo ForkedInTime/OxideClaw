@@ -379,7 +379,8 @@ pub struct Config {
     /// Whether bwrap sandbox allows outbound network access.
     pub sandbox_allow_network: bool,
 
-    /// When true, the Bash tool is blocked while a skill turn is running.
+    /// When true, Bash and PowerShell are refused for the rest of any turn that
+    /// runs a skill (`/<skill>` or the Skill tool), sub-agents included.
     pub disable_skill_shell_execution: bool,
 
     /// Smart model router enabled on startup.

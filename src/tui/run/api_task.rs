@@ -41,6 +41,10 @@ pub(super) struct ApiTask {
     pub(super) system_prompt: String,
     pub(super) tx: mpsc::UnboundedSender<AppEvent>,
     pub(super) plan_mode: bool,
+    /// A `/skill` turn with `disableSkillShellExecution` set: shell tools are
+    /// refused from the first call. A `Skill` tool call sets the same block
+    /// mid-turn.
+    pub(super) skill_no_shell: bool,
     pub(super) session_id: String,
     /// What is left of the `/budget` cap when the turn starts.
     pub(super) budget_remaining_usd: Option<f64>,
@@ -195,6 +199,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
         system_prompt,
         tx,
         plan_mode,
+        skill_no_shell,
         session_id,
         budget_remaining_usd,
         history,
@@ -233,6 +238,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
 
     // Runtime plan mode state (may be toggled mid-turn by EnterPlanMode/ExitPlanMode tools)
     let mut effective_plan_mode = plan_mode;
+    // Sticky for the whole turn: the gate is rebuilt every iteration.
+    let mut skill_shell_blocked = skill_no_shell;
 
     // max_turns from CLI overrides the built-in safety cap (0 = use default cap)
     let turn_limit = if config.max_turns > 0 {
@@ -569,7 +576,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 // One gate per turn (autonomy can change between turns via
                 // /autonomy). Published on the context so `Agent` children
                 // prompt through the same user.
-                let gate = PermissionGate::new(
+                let mut gate = PermissionGate::new(
                     perm_state.clone(),
                     config.autonomy == "suggest",
                     Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
@@ -579,6 +586,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 } else {
                     &[]
                 });
+                if skill_shell_blocked {
+                    gate = gate.with_skill_shell_blocked();
+                }
                 ctx.permission_gate = Some(gate.clone());
                 let mut results: Vec<ContentBlock> = Vec::new();
 
@@ -672,21 +682,15 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         // override, compound-command splitting, the prompt,
                         // and always-allow recording. Same code path as
                         // sub-agents and headless engines.
-                        let decision = match gate.decide(name, input).await {
-                            GateOutcome::Allowed => PermissionDecision::Allow,
-                            GateOutcome::Denied(_) => PermissionDecision::Deny,
-                        };
-
-                        if decision == PermissionDecision::Deny {
+                        // The gate's text, so a blocked tool says why.
+                        if let GateOutcome::Denied(reason) = gate.decide(name, input).await {
                             let _ = tx.send(AppEvent::ToolResult {
                                 is_error: true,
-                                text: format!("Permission denied: {name}"),
+                                text: reason.clone(),
                             });
                             results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
-                                content: vec![ToolResultContent::text(format!(
-                                    "Permission denied: {name}"
-                                ))],
+                                content: vec![ToolResultContent::text(reason)],
                                 is_error: Some(true),
                             });
                             continue;
@@ -721,6 +725,19 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             });
                         }
                         ctx.budget_remaining_usd = task_cost.remaining();
+
+                        // A skill the model loads itself is as untrusted as a
+                        // /skill one; later calls in this response are covered
+                        // too, since they go through the updated gate.
+                        if name == "Skill"
+                            && !output.is_error
+                            && config.disable_skill_shell_execution
+                            && !skill_shell_blocked
+                        {
+                            skill_shell_blocked = true;
+                            gate = gate.with_skill_shell_blocked();
+                            ctx.permission_gate = Some(gate.clone());
+                        }
 
                         let result_text = output
                             .content

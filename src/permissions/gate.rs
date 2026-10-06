@@ -29,6 +29,15 @@ pub trait PermissionAsker: Send + Sync {
     ) -> Option<PermissionDecision>;
 }
 
+/// Shell tools refused for the rest of a turn that invoked a skill while
+/// `disableSkillShellExecution` is set. `Agent` needs no entry: children
+/// inherit this gate, block list included.
+pub const SKILL_SHELL_BLOCKED_TOOLS: &[&str] = &["Bash", "PowerShell"];
+
+const PLAN_MODE_REASON: &str = "in plan mode. Use ExitPlanMode when the plan is approved.";
+const SKILL_SHELL_REASON: &str =
+    "during skill invocations (disableSkillShellExecution is set). Do not retry it this turn.";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum GateOutcome {
     Allowed,
@@ -43,10 +52,10 @@ pub struct PermissionGate {
     /// would allow them.
     suggest_mode: bool,
     asker: Option<Arc<dyn PermissionAsker>>,
-    /// Tools refused outright for this turn (plan mode). Inherited by
-    /// sub-agents through the gate, so a child launched in plan mode
-    /// cannot write either.
-    blocked: Vec<String>,
+    /// Tools refused outright for this turn (plan mode, skill turns), each
+    /// with the reason the model is told. Inherited by sub-agents through
+    /// the gate, so a child launched in plan mode cannot write either.
+    blocked: Vec<(String, &'static str)>,
     /// Consult the asker for every tool that passes the deny list, not only
     /// the sensitive ones: an SDK/ACP host policy covers Read and WebFetch
     /// too, and an `Agent` child must not get around it.
@@ -75,8 +84,24 @@ impl PermissionGate {
     }
 
     /// Refuse these tools for the life of this gate (plan mode).
-    pub fn with_blocked_tools(mut self, tools: &[&str]) -> Self {
-        self.blocked = tools.iter().map(|t| t.to_string()).collect();
+    pub fn with_blocked_tools(self, tools: &[&str]) -> Self {
+        self.block(tools, PLAN_MODE_REASON)
+    }
+
+    /// Refuse shell tools for the life of this gate: a skill ran while
+    /// `disableSkillShellExecution` is set.
+    pub fn with_skill_shell_blocked(self) -> Self {
+        self.block(SKILL_SHELL_BLOCKED_TOOLS, SKILL_SHELL_REASON)
+    }
+
+    /// Adds to the block list rather than replacing it, so plan mode and a
+    /// skill turn can both be in force.
+    fn block(mut self, tools: &[&str], reason: &'static str) -> Self {
+        for t in tools {
+            if !self.blocked.iter().any(|(b, _)| b == t) {
+                self.blocked.push((t.to_string(), reason));
+            }
+        }
         self
     }
 
@@ -114,14 +139,12 @@ impl PermissionGate {
     }
 
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
-        if self
+        if let Some((_, reason)) = self
             .blocked
             .iter()
-            .any(|b| blocked_entry_matches(b, tool_name))
+            .find(|(b, _)| blocked_entry_matches(b, tool_name))
         {
-            return GateOutcome::Denied(format!(
-                "{tool_name} is blocked in plan mode. Use ExitPlanMode when the plan is approved."
-            ));
+            return GateOutcome::Denied(format!("{tool_name} is blocked {reason}"));
         }
         let check = if self.suggest_mode && matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
             CheckResult::Ask
@@ -361,6 +384,38 @@ mod tests {
             g.decide("Read", &json!({"file_path": "a"})).await,
             GateOutcome::Allowed
         );
+    }
+
+    /// disableSkillShellExecution only added a sentence to the prompt; Bash
+    /// still ran under an allow rule or skip-permissions. The block must
+    /// hold on a bypass gate, stack with plan mode, and say why.
+    #[tokio::test]
+    async fn skill_shell_block_holds_under_bypass_and_stacks_with_plan_mode() {
+        let g = PermissionGate::bypass().with_skill_shell_blocked();
+        for tool in ["Bash", "PowerShell"] {
+            let out = g.decide(tool, &json!({"command": "id"})).await;
+            assert!(
+                matches!(out, GateOutcome::Denied(ref m) if m.contains("disableSkillShellExecution")),
+                "{out:?}"
+            );
+        }
+        assert_eq!(
+            g.decide("Read", &json!({"file_path": "a"})).await,
+            GateOutcome::Allowed
+        );
+
+        let both = PermissionGate::bypass()
+            .with_blocked_tools(&["Write"])
+            .with_skill_shell_blocked();
+        let out = both.decide("Write", &json!({"file_path": "a"})).await;
+        assert!(
+            matches!(out, GateOutcome::Denied(ref m) if m.contains("plan mode")),
+            "{out:?}"
+        );
+        assert!(matches!(
+            both.decide("Bash", &json!({"command": "id"})).await,
+            GateOutcome::Denied(_)
+        ));
     }
 
     /// MCP tools fell through as "not sensitive", so a server's write_file
