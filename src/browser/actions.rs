@@ -360,34 +360,94 @@ pub async fn screenshot(client: &CdpClient, full_page: bool) -> Result<String> {
     Ok(data)
 }
 
-/// Press a key (e.g. "Enter", "Tab", "Escape", "a").
-pub async fn press_key(client: &CdpClient, key: &str) -> Result<String> {
-    let key_lower = key.to_lowercase();
-    let (key_code, text) = match key_lower.as_str() {
-        "enter" | "return" => ("Enter", "\r"),
-        "tab" => ("Tab", "\t"),
-        "escape" | "esc" => ("Escape", ""),
-        "backspace" => ("Backspace", ""),
-        "space" => (" ", " "),
-        _ => (key, key),
-    };
+/// Named keys `press_key` accepts: (name, key, code, Windows virtual key
+/// code, text). Chrome's editing commands (Backspace deletes, arrows move
+/// the caret) and page handlers reading `e.keyCode` go by the virtual key
+/// code; without it Backspace did nothing. The approval gate treats
+/// "enter"/"return" as submit and "space"/" " as activating, so no other
+/// spelling may map to those keys.
+const NAMED_KEYS: &[(&str, &str, &str, i64, &str)] = &[
+    ("enter", "Enter", "Enter", 13, "\r"),
+    ("return", "Enter", "Enter", 13, "\r"),
+    ("tab", "Tab", "Tab", 9, ""),
+    ("escape", "Escape", "Escape", 27, ""),
+    ("esc", "Escape", "Escape", 27, ""),
+    ("backspace", "Backspace", "Backspace", 8, ""),
+    ("delete", "Delete", "Delete", 46, ""),
+    ("space", " ", "Space", 32, " "),
+    (" ", " ", "Space", 32, " "),
+    ("arrowleft", "ArrowLeft", "ArrowLeft", 37, ""),
+    ("arrowup", "ArrowUp", "ArrowUp", 38, ""),
+    ("arrowright", "ArrowRight", "ArrowRight", 39, ""),
+    ("arrowdown", "ArrowDown", "ArrowDown", 40, ""),
+    ("home", "Home", "Home", 36, ""),
+    ("end", "End", "End", 35, ""),
+    ("pageup", "PageUp", "PageUp", 33, ""),
+    ("pagedown", "PageDown", "PageDown", 34, ""),
+];
 
-    client
-        .send(
-            "Input.dispatchKeyEvent",
-            json!({
-                "type": "keyDown",
-                "key": key_code,
-                "text": text,
-            }),
-        )
-        .await?;
+/// The `Input.dispatchKeyEvent` fields for `key`: (key, code, virtual key
+/// code, text). Unknown names are refused: sent as text, Chrome rejected
+/// names over 4 characters and typed shorter ones ("Home") literally.
+fn key_event(key: &str) -> Result<(String, String, i64, String)> {
+    // ASCII folding, exactly as the approval gate folds the key it checks.
+    let lower = key.to_ascii_lowercase();
+    if let Some(&(_, k, code, vk, text)) = NAMED_KEYS.iter().find(|e| e.0 == lower) {
+        return Ok((k.into(), code.into(), vk, text.into()));
+    }
+    let mut chars = key.chars();
+    // Control characters are refused too: "\r" as text submits a form
+    // without the approval gate seeing an Enter.
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && !c.is_control()
+    {
+        let upper = c.to_ascii_uppercase();
+        let (code, vk) = if upper.is_ascii_uppercase() {
+            (format!("Key{upper}"), upper as i64)
+        } else if c.is_ascii_digit() {
+            (format!("Digit{c}"), c as i64)
+        } else {
+            (String::new(), 0)
+        };
+        return Ok((c.to_string(), code, vk, c.to_string()));
+    }
+    bail!(
+        "unsupported key '{key}': use a single character or one of Enter, Tab, Escape, \
+         Backspace, Delete, Space, ArrowLeft, ArrowUp, ArrowRight, ArrowDown, Home, End, \
+         PageUp, PageDown"
+    )
+}
+
+/// Press a key (e.g. "Enter", "Tab", "Backspace", "ArrowDown", "a").
+pub async fn press_key(client: &CdpClient, key: &str) -> Result<String> {
+    let (key_name, code, vk, text) = key_event(key)?;
+    // Chrome only inserts text for "keyDown"; keys without text are "rawKeyDown".
+    let down_type = if text.is_empty() {
+        "rawKeyDown"
+    } else {
+        "keyDown"
+    };
+    let mut down = json!({
+        "type": down_type,
+        "key": key_name,
+        "code": code,
+        "windowsVirtualKeyCode": vk,
+        "nativeVirtualKeyCode": vk,
+    });
+    if !text.is_empty() {
+        down["text"] = json!(text);
+        down["unmodifiedText"] = json!(text);
+    }
+    client.send("Input.dispatchKeyEvent", down).await?;
     client
         .send(
             "Input.dispatchKeyEvent",
             json!({
                 "type": "keyUp",
-                "key": key_code,
+                "key": key_name,
+                "code": code,
+                "windowsVirtualKeyCode": vk,
+                "nativeVirtualKeyCode": vk,
             }),
         )
         .await?;
@@ -726,5 +786,53 @@ mod cdp_request_tests {
         screenshot(&client, false).await.unwrap();
         let shot = sent(&log, "Page.captureScreenshot").remove(1);
         assert!(shot.get("clip").is_none() && shot.get("captureBeyondViewport").is_none());
+    }
+
+    #[test]
+    fn named_keys_carry_virtual_key_codes() {
+        let k = |s: &str| key_event(s).unwrap();
+        assert_eq!(
+            k("Backspace"),
+            ("Backspace".into(), "Backspace".into(), 8, "".into())
+        );
+        assert_eq!(
+            k("enter"),
+            ("Enter".into(), "Enter".into(), 13, "\r".into())
+        );
+        assert_eq!(k("ArrowDown").2, 40);
+        assert_eq!(k("Home"), ("Home".into(), "Home".into(), 36, "".into()));
+        assert_eq!(k("Space"), (" ".into(), "Space".into(), 32, " ".into()));
+        assert_eq!(k("a"), ("a".into(), "KeyA".into(), 65, "a".into()));
+        assert_eq!(k("7"), ("7".into(), "Digit7".into(), 55, "7".into()));
+        assert_eq!(k("é").3, "é");
+    }
+
+    /// Unknown names were sent as text: Chrome rejected long ones and typed
+    /// short ones; a raw "\r" submitted a form past the gate's Enter check.
+    #[test]
+    fn unknown_names_and_control_characters_are_refused() {
+        for key in ["Foo", "F5", "\r", "\n", "\t", ""] {
+            assert!(key_event(key).is_err(), "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backspace_is_sent_as_a_raw_key_down_with_its_key_code() {
+        let (ws, log) = scripted_cdp(|_, _| json!({})).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        press_key(&client, "Backspace").await.unwrap();
+        let events = sent(&log, "Input.dispatchKeyEvent");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "rawKeyDown");
+        assert_eq!(events[0]["windowsVirtualKeyCode"], 8);
+        assert!(events[0].get("text").is_none());
+        assert_eq!(events[1]["type"], "keyUp");
+        assert_eq!(events[1]["windowsVirtualKeyCode"], 8);
+
+        press_key(&client, "x").await.unwrap();
+        let events = sent(&log, "Input.dispatchKeyEvent");
+        assert_eq!(events[2]["type"], "keyDown");
+        assert_eq!(events[2]["text"], "x");
+        assert_eq!(events[2]["windowsVirtualKeyCode"], 88);
     }
 }

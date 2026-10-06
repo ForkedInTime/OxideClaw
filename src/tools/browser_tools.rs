@@ -429,7 +429,7 @@ impl Tool for BrowserPressKeyTool {
         "browser_press_key"
     }
     fn description(&self) -> &str {
-        "Send a single key press to the page (e.g. \"Enter\", \"Tab\", \"Escape\", or a single character)."
+        "Send a single key press to the focused element (a named key or a single character)."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
@@ -437,7 +437,7 @@ impl Tool for BrowserPressKeyTool {
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Key name — \"Enter\", \"Tab\", \"Escape\", \"Backspace\", \"Space\", or a single character"
+                    "description": "A single character, or one of \"Enter\", \"Tab\", \"Escape\", \"Backspace\", \"Delete\", \"Space\", \"ArrowLeft\", \"ArrowUp\", \"ArrowRight\", \"ArrowDown\", \"Home\", \"End\", \"PageUp\", \"PageDown\""
                 }
             },
             "required": ["key"]
