@@ -81,6 +81,11 @@ pub struct SdkSession {
     approval_rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
     /// Set by `session/cancel`; checked between model calls and tools.
     cancel: Arc<CancelSignal>,
+    /// Sub-agents (`Agent`) report each API response they pay for here.
+    child_usage_tx: crate::tools::UsageSink,
+    child_usage_rx: mpsc::UnboundedReceiver<(String, Usage)>,
+    /// Sub-agent (input, output) tokens recorded since the last CostUpdated.
+    child_tokens: (u64, u64),
 }
 
 impl SdkSession {
@@ -109,6 +114,7 @@ impl SdkSession {
         }
 
         let interactive = capabilities.interactive_approval;
+        let (child_usage_tx, child_usage_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             session_id,
@@ -127,6 +133,9 @@ impl SdkSession {
             approval_rx,
             approval_tx,
             cancel: Arc::new(CancelSignal::default()),
+            child_usage_tx,
+            child_usage_rx,
+            child_tokens: (0, 0),
         })
     }
 
@@ -348,6 +357,33 @@ impl SdkSession {
                         content: tool_results,
                     });
 
+                    let (child_in, child_out) = std::mem::take(&mut self.child_tokens);
+                    if child_in + child_out > 0 {
+                        turn_input_tokens += child_in;
+                        turn_output_tokens += child_out;
+                        self.send_notif(SdkNotification::CostUpdated {
+                            session_id: self.session_id.clone(),
+                            turn_cost_usd: self.cost_tracker.total_cost_usd - turn_cost_start,
+                            session_total_usd: self.cost_tracker.total_cost_usd,
+                            budget_remaining_usd: self.cost_tracker.remaining(),
+                            input_tokens: child_in,
+                            output_tokens: child_out,
+                            model: self.config.model.clone(),
+                        });
+                    }
+                    if self.cost_tracker.over_budget() {
+                        self.send_notif(SdkNotification::Error {
+                            session_id: self.session_id.clone(),
+                            code: "budget_exceeded".into(),
+                            message: format!(
+                                "Budget limit reached: ${:.4} spent.",
+                                self.cost_tracker.total_cost_usd
+                            ),
+                        });
+                        end = TurnEnd::BudgetExceeded;
+                        break;
+                    }
+
                     // Progress notification
                     self.send_notif(SdkNotification::ProgressUpdated {
                         session_id: self.session_id.clone(),
@@ -421,6 +457,8 @@ impl SdkSession {
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
+        ctx.usage_sink = Some(self.child_usage_tx.clone());
+        ctx.budget_remaining_usd = self.cost_tracker.remaining();
         // The host's policy and approval see only tool names, so the user's
         // `permissions.deny` rules are checked here as well. This gate is for
         // top-level calls only: ctx.permission_gate stays None so Agent
@@ -584,6 +622,21 @@ impl SdkSession {
                 },
                 None => ToolOutput::error(format!("Unknown tool: {name}")),
             };
+
+            // A sub-agent's spend is the session's: it counts toward
+            // CostUpdated, TurnCompleted and the budget.
+            while let Ok((model, u)) = self.child_usage_rx.try_recv() {
+                self.cost_tracker.record_with_cache(
+                    &model,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_input_tokens,
+                    u.cache_creation_input_tokens,
+                );
+                self.child_tokens.0 += u.input_tokens;
+                self.child_tokens.1 += u.output_tokens;
+            }
+            ctx.budget_remaining_usd = self.cost_tracker.remaining();
 
             let duration_ms = tool_start.elapsed().as_millis() as u64;
             let success = !output.is_error;
@@ -1021,8 +1074,22 @@ mod guard_tests {
         fn input_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(&self, input: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+        async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
+            if input["command"] == "spend" {
+                // What an Agent child reports for one response.
+                let usage = Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                };
+                let sink = ctx
+                    .usage_sink
+                    .as_ref()
+                    .expect("no usage sink on the context");
+                sink.send(("claude-sonnet-5".into(), usage)).unwrap();
+                return Ok(ToolOutput::success("spent"));
+            }
             if input["command"] == "huge" {
                 return Ok(ToolOutput::success("x".repeat(3_000_000)));
             }
@@ -1184,5 +1251,19 @@ mod guard_tests {
 
         assert!(s.execute_turn("hi".into()).await.is_err());
         assert!(s.messages.is_empty(), "the rejected turn stayed in history");
+    }
+
+    /// Sub-agent spend never reached the SDK's tracker, so CostUpdated,
+    /// TurnCompleted and the budget all left it out.
+    #[tokio::test]
+    async fn sub_agent_spend_counts_toward_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.max_budget_usd = Some(1.0);
+        let (mut s, _) = session(c);
+        s.execute_tools_with_approval(&call("spend")).await.unwrap();
+        assert!(s.cost_tracker.total_cost_usd > 1.0);
+        assert!(s.cost_tracker.over_budget());
+        assert_eq!(s.child_tokens, (1_000, 1_000_000));
     }
 }

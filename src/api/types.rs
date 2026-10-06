@@ -175,7 +175,7 @@ pub enum StopReason {
     Other,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Usage {
     // `message_delta` may carry only `output_tokens`.
     #[serde(default)]

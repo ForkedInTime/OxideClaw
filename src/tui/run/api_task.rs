@@ -42,6 +42,8 @@ pub(super) struct ApiTask {
     pub(super) tx: mpsc::UnboundedSender<AppEvent>,
     pub(super) plan_mode: bool,
     pub(super) session_id: String,
+    /// What is left of the `/budget` cap when the turn starts.
+    pub(super) budget_remaining_usd: Option<f64>,
 }
 
 pub(super) async fn run_api_task(task: ApiTask) {
@@ -55,6 +57,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
         tx,
         plan_mode,
         session_id,
+        budget_remaining_usd,
     } = task;
     let session_id = session_id.as_str();
     // Surface the client's retry backoff in the transcript. Without this a
@@ -68,6 +71,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
             },
         ));
     }
+    // This task's own spend, so a sub-agent is capped at what is left of
+    // the budget rather than given all of it again.
+    let mut task_cost = crate::cost::CostTracker::new();
+    if let Some(left) = budget_remaining_usd {
+        task_cost.set_budget(left);
+    }
+    let (child_usage_tx, mut child_usage_rx) = tokio::sync::mpsc::unbounded_channel();
     // Set up AskUserQuestion channel: tool → TUI dialog
     let (ask_tx, mut ask_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, oneshot::Sender<String>)>();
@@ -310,6 +320,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
             }
         }
 
+        task_cost.record_with_cache(
+            &config.model,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+            response.usage.cache_read_input_tokens,
+            response.usage.cache_creation_input_tokens,
+        );
         let _ = tx.send(AppEvent::Usage {
             model: config.model.clone(),
             input: response.usage.input_tokens,
@@ -409,6 +426,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 ctx.live_model = Some(config.model.clone());
                 ctx.live_api_key = Some(config.api_key.clone());
                 ctx.live_ollama_host = Some(config.ollama_host.clone());
+                ctx.usage_sink = Some(child_usage_tx.clone());
+                ctx.budget_remaining_usd = task_cost.remaining();
                 // One gate per turn (autonomy can change between turns via
                 // /autonomy). Published on the context so `Agent` children
                 // prompt through the same user.
@@ -563,6 +582,26 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
                             None => ToolOutput::error(format!("Unknown tool: {name}")),
                         };
+
+                        // Sub-agent spend goes to /cost and /budget like the
+                        // session's own; over budget, the main loop stops the turn.
+                        while let Ok((model, u)) = child_usage_rx.try_recv() {
+                            task_cost.record_with_cache(
+                                &model,
+                                u.input_tokens,
+                                u.output_tokens,
+                                u.cache_read_input_tokens,
+                                u.cache_creation_input_tokens,
+                            );
+                            let _ = tx.send(AppEvent::Usage {
+                                model,
+                                input: u.input_tokens,
+                                output: u.output_tokens,
+                                cache_read: u.cache_read_input_tokens,
+                                cache_write: u.cache_creation_input_tokens,
+                            });
+                        }
+                        ctx.budget_remaining_usd = task_cost.remaining();
 
                         let result_text = output
                             .content

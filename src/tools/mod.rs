@@ -103,11 +103,21 @@ pub struct ToolContext {
     pub permission_gate: Option<crate::permissions::PermissionGate>,
     /// How many `Agent` launches deep this executor is (0 = the session).
     pub agent_depth: u8,
+    /// Where a tool that runs its own engine (`Agent`) reports each API
+    /// response it pays for, so the executor's cost tracking and budget
+    /// include it.
+    pub usage_sink: Option<UsageSink>,
+    /// What is left of the executor's budget when this tool starts. A
+    /// sub-agent caps itself at this rather than at the full budget.
+    pub budget_remaining_usd: Option<f64>,
 
     /// Middleware chain: pre/post hooks around every tool call.
     /// Default empty = no-op (existing behavior unchanged).
     pub middlewares: crate::browser::middleware::MiddlewareChain,
 }
+
+/// One sub-agent API response: the model it ran on and what it used.
+pub type UsageSink = tokio::sync::mpsc::UnboundedSender<(String, crate::api::types::Usage)>;
 
 impl std::fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,6 +148,8 @@ impl ToolContext {
             live_ollama_host: None,
             permission_gate: None,
             agent_depth: 0,
+            usage_sink: None,
+            budget_remaining_usd: None,
             middlewares: Vec::new(),
         }
     }

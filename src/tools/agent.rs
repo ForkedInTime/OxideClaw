@@ -29,7 +29,9 @@ impl AgentTool {
         tools: Vec<DynTool>,
         ctx: &ToolContext,
     ) -> Result<QueryEngine> {
-        let mut engine = QueryEngine::new(sub_config, tools)?.with_agent_depth(ctx.agent_depth + 1);
+        let mut engine = QueryEngine::new(sub_config, tools)?
+            .with_agent_depth(ctx.agent_depth + 1)
+            .with_usage_sink(ctx.usage_sink.clone());
         if let Some(gate) = &ctx.permission_gate {
             engine = engine.with_permission_gate(gate.clone());
         }
@@ -139,6 +141,17 @@ impl Tool for AgentTool {
         }
 
         let mut sub_config = self.live_config(ctx);
+        // A child given the whole budget again could spend it on top of
+        // what the session already has.
+        if let Some(left) = ctx.budget_remaining_usd {
+            if left <= 0.0 {
+                return Ok(ToolOutput::error(
+                    "The session's budget is spent; no sub-agent can be launched.",
+                ));
+            }
+            sub_config.max_budget_usd =
+                Some(sub_config.max_budget_usd.map_or(left, |b| b.min(left)));
+        }
         // Grandchild Agent tools get these live values too, but not the
         // specialised prompt chosen for this child below.
         let tool_config = sub_config.clone();
@@ -384,6 +397,21 @@ mod tests {
             .expect("a refusal is a tool error, not Err");
         assert!(out.is_error);
         assert!(tool_text(&out).contains("nest"), "{}", tool_text(&out));
+    }
+
+    /// Children were given the whole budget again; with none left, no
+    /// child may start at all.
+    #[tokio::test]
+    async fn no_sub_agent_starts_once_the_budget_is_spent() {
+        let tool = AgentTool { config: config() };
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.budget_remaining_usd = Some(0.0);
+        let out = tool
+            .execute(json!({"prompt": "do it"}), &ctx)
+            .await
+            .expect("a refusal is a tool error, not Err");
+        assert!(out.is_error);
+        assert!(tool_text(&out).contains("budget"), "{}", tool_text(&out));
     }
 
     struct Probe(Mutex<Option<(u8, bool)>>);

@@ -46,6 +46,13 @@ pub struct QueryEngine {
     /// Tool whose successful call ends `query()` once that turn's results
     /// are recorded (`browse_done` for browse runs). None everywhere else.
     stop_after_tool: Option<&'static str>,
+    /// The parent executor's sink when this engine is a sub-agent: every
+    /// response it pays for, and its own children's, is reported there.
+    usage_sink: Option<crate::tools::UsageSink>,
+    /// Handed to this engine's tools; drained after each tool round so
+    /// children's spend counts toward this engine's budget.
+    child_usage_tx: crate::tools::UsageSink,
+    child_usage_rx: tokio::sync::mpsc::UnboundedReceiver<(String, crate::api::types::Usage)>,
 }
 
 impl QueryEngine {
@@ -84,6 +91,7 @@ impl QueryEngine {
         }));
         let system_prompt = config.build_system_prompt();
         let gate = crate::permissions::PermissionGate::headless(&config);
+        let (child_usage_tx, child_usage_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             client,
             system_prompt,
@@ -103,7 +111,27 @@ impl QueryEngine {
             gate,
             agent_depth: 0,
             stop_after_tool: None,
+            usage_sink: None,
+            child_usage_tx,
+            child_usage_rx,
         })
+    }
+
+    /// Report this engine's spend to the executor that launched it.
+    pub fn with_usage_sink(mut self, sink: Option<crate::tools::UsageSink>) -> Self {
+        self.usage_sink = sink;
+        self
+    }
+
+    /// Count what sub-agents spent during the last tool round, and pass it
+    /// up to this engine's own parent.
+    fn absorb_child_usage(&mut self) {
+        while let Ok((model, usage)) = self.child_usage_rx.try_recv() {
+            self.cumulative_cost_usd += estimate_cost_usd(&model, &usage);
+            if let Some(sink) = &self.usage_sink {
+                let _ = sink.send((model, usage));
+            }
+        }
     }
 
     /// Replace the headless default with the parent executor's gate, so a
@@ -404,9 +432,23 @@ impl QueryEngine {
                         role: Role::User,
                         content: tool_results,
                     });
+                    self.absorb_child_usage();
                     // Stop only after the results are in, so every tool_use
                     // in the history keeps its tool_result.
                     if stop {
+                        break;
+                    }
+                    if let Some(budget) = self.config.max_budget_usd
+                        && self.cumulative_cost_usd >= budget
+                    {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "Budget limit reached: ${:.4} / ${:.4} — stopping.",
+                                self.cumulative_cost_usd, budget
+                            )
+                            .yellow()
+                        );
                         break;
                     }
                     // Continue the loop to get Claude's next response
@@ -439,6 +481,11 @@ impl QueryEngine {
         ctx.middlewares = self.middlewares.clone();
         ctx.permission_gate = Some(self.gate.clone());
         ctx.agent_depth = self.agent_depth;
+        ctx.usage_sink = Some(self.child_usage_tx.clone());
+        ctx.budget_remaining_usd = self
+            .config
+            .max_budget_usd
+            .map(|b| (b - self.cumulative_cost_usd).max(0.0));
         let mut results = Vec::new();
 
         for block in content {
@@ -680,6 +727,9 @@ impl QueryEngine {
             }
 
             self.cumulative_cost_usd += estimate_cost_usd(&self.config.model, &response.usage);
+            if let Some(sink) = &self.usage_sink {
+                let _ = sink.send((self.config.model.clone(), response.usage.clone()));
+            }
             if let Some(budget) = self.config.max_budget_usd
                 && self.cumulative_cost_usd >= budget
             {
@@ -706,6 +756,14 @@ impl QueryEngine {
                         role: Role::User,
                         content: tool_results,
                     });
+                    self.absorb_child_usage();
+                    if let Some(budget) = self.config.max_budget_usd
+                        && self.cumulative_cost_usd >= budget
+                    {
+                        final_text
+                            .push_str(&format!("\n\n[Stopped: budget of ${budget:.2} reached.]"));
+                        break;
+                    }
                 }
                 Some(StopReason::StopSequence) => break,
             }
@@ -1030,6 +1088,79 @@ mod scripted_api_tests {
                 .contains("validate_session_token"),
             "{user}"
         );
+    }
+
+    fn usage(output_tokens: u64) -> crate::api::types::Usage {
+        crate::api::types::Usage {
+            output_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// A sub-agent's spend vanished with its engine: nothing reached the
+    /// parent's tracker and the parent's budget never saw it. A child must
+    /// report each response it pays for and pass its own children's up, and
+    /// count them toward its budget.
+    #[tokio::test]
+    async fn sub_agent_spend_reaches_the_parent_and_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, seen) = serve(vec![
+            sse(
+                &[serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})],
+                "tool_use",
+            ),
+            sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            max_budget_usd: Some(1.0),
+            ..Config::default()
+        };
+        let (parent_tx, mut parent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut e = QueryEngine::new(config, Vec::new())
+            .unwrap()
+            .with_usage_sink(Some(parent_tx));
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        // What a grandchild launched in the first tool round spent: $15.
+        e.child_usage_tx
+            .send(("claude-sonnet-5".into(), usage(1_000_000)))
+            .unwrap();
+
+        let out = e.query_and_collect("go").await.unwrap();
+
+        assert!(tool_text(&out).contains("budget"), "{}", tool_text(&out));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "over budget after the tool round"
+        );
+        let mut reported = Vec::new();
+        while let Ok((_, u)) = parent_rx.try_recv() {
+            reported.push(u.output_tokens);
+        }
+        assert_eq!(
+            reported,
+            [5, 1_000_000],
+            "own response, then the grandchild's"
+        );
+    }
+
+    fn tool_text(out: &crate::tools::ToolOutput) -> String {
+        out.content
+            .iter()
+            .map(|c| {
+                let ToolResultContent::Text { text } = c;
+                text.as_str()
+            })
+            .collect()
     }
 
     struct Huge;

@@ -717,6 +717,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             };
             let ps = perm_state.clone();
             let pm = app.plan_mode;
+            let budget_left = app.cost_tracker.remaining();
 
             let sid2 = session.id.clone();
             let handle = tokio::spawn(async move {
@@ -729,6 +730,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    budget_remaining_usd: budget_left,
                     session_id: sid2,
                 })
                 .await;

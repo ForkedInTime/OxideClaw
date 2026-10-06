@@ -263,6 +263,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let sp = system_prompt.clone();
             let ps = perm_state.clone();
             let pm = app.plan_mode;
+            let budget_left = app.cost_tracker.remaining();
             let sid3 = session.id.clone();
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
@@ -274,6 +275,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    budget_remaining_usd: budget_left,
                     session_id: sid3,
                 })
                 .await;
@@ -1323,6 +1325,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let sp = system_prompt.clone();
                 let ps = perm_state.clone();
                 let pm = app.plan_mode;
+                let budget_left = app.cost_tracker.remaining();
                 let sid3 = session.id.clone();
                 let handle = tokio::spawn(async move {
                     run_api_task(ApiTask {
@@ -1334,6 +1337,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         system_prompt: sp,
                         tx: tx2,
                         plan_mode: pm,
+                        budget_remaining_usd: budget_left,
                         session_id: sid3,
                     })
                     .await;
@@ -2315,6 +2319,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let sp = system_prompt.clone();
             let ps = perm_state.clone();
             let pm = app.plan_mode;
+            let budget_left = app.cost_tracker.remaining();
             let sid3 = session.id.clone();
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
@@ -2326,6 +2331,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    budget_remaining_usd: budget_left,
                     session_id: sid3,
                 })
                 .await;
@@ -2350,6 +2356,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let sp = system_prompt.clone();
             let ps = perm_state.clone();
             let pm = app.plan_mode;
+            let budget_left = app.cost_tracker.remaining();
             let sid3 = session.id.clone();
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
@@ -2361,6 +2368,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     system_prompt: sp,
                     tx: tx2,
                     plan_mode: pm,
+                    budget_remaining_usd: budget_left,
                     session_id: sid3,
                 })
                 .await;
@@ -2568,6 +2576,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let sp = system_prompt.clone();
                 let ps = perm_state.clone();
                 let pm = app.plan_mode;
+                let budget_left = app.cost_tracker.remaining();
                 let sid4 = session.id.clone();
                 let handle = tokio::spawn(async move {
                     run_api_task(ApiTask {
@@ -2579,6 +2588,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         system_prompt: sp,
                         tx: tx2,
                         plan_mode: pm,
+                        budget_remaining_usd: budget_left,
                         session_id: sid4,
                     })
                     .await;
