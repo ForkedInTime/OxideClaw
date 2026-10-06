@@ -19,9 +19,18 @@ pub const SHADOW_REF_PREFIX: &str = "refs/oxideclaw/sessions/";
 /// Prefix used before the rename; refs found there are moved on startup.
 pub const LEGACY_SHADOW_REF_PREFIX: &str = "refs/rustyclaw/sessions/";
 /// Working-tree states `restore_to` was about to overwrite without any
-/// snapshot holding them. Each recovery commit keeps the previous one as a
-/// second parent, so all of them stay reachable.
-pub const RECOVERY_REF: &str = "refs/oxideclaw/recovery";
+/// snapshot holding them, per session: `refs/oxideclaw/recovery/<session>`
+/// (see [`recovery_ref`]). Each recovery commit keeps the previous one as a
+/// second parent, so all of them stay reachable until `prune_old_refs`
+/// deletes the session, and its recovery ref with it.
+pub const RECOVERY_REF_PREFIX: &str = "refs/oxideclaw/recovery/";
+/// The single, unbounded recovery ref used before it became per-session.
+const LEGACY_RECOVERY_REF: &str = "refs/oxideclaw/recovery";
+
+/// The recovery ref of one session.
+pub fn recovery_ref(session_id: &str) -> String {
+    format!("{RECOVERY_REF_PREFIX}{session_id}")
+}
 /// Canonical empty tree: the session base of a repo with no commits.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -53,8 +62,10 @@ pub struct RestoreReport {
     pub orphaned_files: Vec<PathBuf>,
     /// Commit holding the working tree as it was before the restore, when no
     /// snapshot had it (edits made after the last turn). Reachable from
-    /// [`RECOVERY_REF`].
+    /// `recovery_ref`.
     pub saved_edits: Option<String>,
+    /// The session's [`recovery_ref`].
+    pub recovery_ref: String,
 }
 
 impl RestoreReport {
@@ -63,8 +74,9 @@ impl RestoreReport {
         match &self.saved_edits {
             Some(sha) => format!(
                 "\nYour edits since the last snapshot were saved as {} \
-                 ({RECOVERY_REF}); `git checkout {sha} -- .` brings them back.",
-                &sha[..7.min(sha.len())]
+                 ({}); `git checkout {sha} -- .` brings them back.",
+                &sha[..7.min(sha.len())],
+                self.recovery_ref
             ),
             None => String::new(),
         }
@@ -97,48 +109,115 @@ pub(crate) fn git_cmd(cwd: &Path) -> std::process::Command {
     cmd
 }
 
-/// Repo-local `filter.*` drivers as first seen by this process, per git dir.
-static TRUSTED_FILTERS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, String>>> =
+/// What snapshots and /undo trust about a repository, recorded at startup
+/// by [`pin_filters`]: where its git dir and work tree are, and the
+/// repo-local config that runs commands or moves the work tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPin {
+    git_dir: Option<String>,
+    toplevel: Option<String>,
+    config: String,
+}
+
+/// Pins per (canonical) session directory. Never filled lazily: a repository
+/// first seen mid-session may have been made by a sandboxed command.
+static PINS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, RepoPin>>> =
     std::sync::Mutex::new(None);
 
-/// Refuse to run the repo's clean/smudge filters if a repo-local filter
-/// driver appeared or changed since this process first looked (the first
-/// call pins what is trusted, so call it at startup). `add -A` and
-/// `checkout-index` run those commands on the host, so a sandboxed command
-/// that rewrote `.git/config` would otherwise escape on the next snapshot or
-/// /undo. Filters are not simply disabled: that would store LFS/git-crypt
-/// files raw and /undo would write pointers or ciphertext over them.
-/// Global and system config are outside any sandbox's reach and not checked.
-pub fn check_filters_unchanged(cwd: &Path) -> anyhow::Result<()> {
-    let git_dir = git_output(git_cmd(cwd).args(["rev-parse", "--absolute-git-dir"]))?;
-    let out = git_cmd(cwd)
-        .args(["config", "--show-scope", "--get-regexp", r"^filter\."])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()?;
-    // Exit 1 is "no such keys"; anything else means git could not tell us.
-    if !out.status.success() && out.status.code() != Some(1) {
-        anyhow::bail!("git config --show-scope failed; not running repo filters");
+fn pin_key(cwd: &Path) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// Repo-local config a sandboxed command could write that would act on the
+/// host: `filter.*` drivers (run by `add -A` and `checkout-index`) and
+/// `core.worktree`/`core.bare` (which move what is staged and restored, e.g.
+/// to `$HOME`). Read per scope rather than with `--show-scope` (git 2.26+):
+/// `--local`, `--includes` and `--worktree` work on every supported git.
+fn local_sensitive_config(cwd: &Path, git_dir: &str) -> anyhow::Result<String> {
+    let read = |scope: &str| -> anyhow::Result<String> {
+        let out = git_cmd(cwd)
+            .args([
+                "config",
+                scope,
+                "--includes",
+                "--get-regexp",
+                r"^(filter\.|core\.worktree$|core\.bare$)",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()?;
+        match out.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+            Some(1) => Ok(String::new()), // no such keys
+            _ => anyhow::bail!("git config {scope} failed; not running repo filters"),
+        }
+    };
+    let mut local = read("--local")?;
+    if Path::new(git_dir).join("config.worktree").exists() {
+        local.push_str(&read("--worktree")?);
     }
-    let local: String = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.starts_with("global\t") && !l.starts_with("system\t"))
-        .map(|l| format!("{l}\n"))
-        .collect();
-    let mut guard = TRUSTED_FILTERS.lock().unwrap_or_else(|e| e.into_inner());
-    let trusted = guard
+    Ok(local)
+}
+
+fn repo_state(cwd: &Path) -> anyhow::Result<RepoPin> {
+    let Ok(git_dir) = git_output(git_cmd(cwd).args(["rev-parse", "--absolute-git-dir"])) else {
+        return Ok(RepoPin {
+            git_dir: None,
+            toplevel: None,
+            config: String::new(),
+        });
+    };
+    let toplevel = git_output(git_cmd(cwd).args(["rev-parse", "--show-toplevel"])).ok();
+    let config = local_sensitive_config(cwd, &git_dir)?;
+    Ok(RepoPin {
+        git_dir: Some(git_dir),
+        toplevel,
+        config,
+    })
+}
+
+/// Record the repository at `cwd` as trusted: call at startup, before any
+/// (possibly sandboxed) tool runs. Snapshots and /undo then refuse to run if
+/// its git dir, work tree or filter/work-tree config differ from this.
+/// Filters are not simply disabled: that would store LFS/git-crypt files raw
+/// and /undo would write pointers or ciphertext over them.
+pub fn pin_filters(cwd: &Path) -> anyhow::Result<()> {
+    let pin = repo_state(cwd)?;
+    PINS.lock()
+        .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .entry(PathBuf::from(git_dir))
-        .or_insert_with(|| local.clone());
-    if *trusted != local {
+        .insert(pin_key(cwd), pin);
+    Ok(())
+}
+
+/// Refuse to run the repo's clean/smudge filters, or to stage and restore
+/// files, unless the repository is the one [`pin_filters`] recorded. `add -A`
+/// and `checkout-index` run filter commands on the host, and `core.worktree`
+/// points them at any directory, so a sandboxed command that rewrote
+/// `.git/config`, or replaced `.git` with a `gitdir:` file pointing at a git
+/// dir of its own, would otherwise escape on the next snapshot or /undo.
+/// Global and system config are outside any sandbox's reach and not checked.
+/// Returns the pin, so callers use its work tree rather than re-reading it.
+pub fn check_filters_unchanged(cwd: &Path) -> anyhow::Result<RepoPin> {
+    let now = repo_state(cwd)?;
+    let guard = PINS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pinned) = guard.as_ref().and_then(|m| m.get(&pin_key(cwd))) else {
         anyhow::bail!(
-            "the repository's git filter configuration changed during this session, \
-             so OxideClaw will not run it (it could have been written from inside \
-             the sandbox). Review the filter.* entries in .git/config, then restart \
-             OxideClaw to resume auto-commit and /undo."
+            "this repository was not pinned when OxideClaw started, so its git \
+             filters and work tree are not trusted. Restart OxideClaw in this folder \
+             to enable auto-commit and /undo."
+        );
+    };
+    if *pinned != now {
+        anyhow::bail!(
+            "the repository's git filter/core.worktree configuration (or its git \
+             directory) changed during this session, so OxideClaw will not run it (it \
+             could have been written from inside the sandbox). Review .git and the \
+             filter.* and core.worktree entries in .git/config, then restart OxideClaw \
+             to resume auto-commit and /undo."
         );
     }
-    Ok(())
+    Ok(now)
 }
 
 /// Return true if `cwd` is inside a git work tree. Uses
@@ -484,6 +563,7 @@ fn list_tracked_files(cwd: &Path) -> Vec<String> {
 
 pub fn restore_to(
     cwd: &Path,
+    session_id: &str,
     auto_commits: &[String],
     target_position: usize,
 ) -> anyhow::Result<RestoreReport> {
@@ -552,7 +632,8 @@ pub fn restore_to(
         .map(PathBuf::from)
         .collect();
 
-    let saved_edits = save_unrecorded_worktree(cwd, auto_commits)?;
+    let recovery = recovery_ref(session_id);
+    let saved_edits = save_unrecorded_worktree(cwd, &recovery, auto_commits)?;
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
@@ -568,15 +649,13 @@ pub fn restore_to(
     // subdirectory skips files outside it, so restore from the top level:
     // `--prefix <cwd>/` from `repo/pkg` wrote `repo/pkg/pkg/x` and left the
     // real files untouched.
-    let toplevel = git_cmd(cwd)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+    // The pinned work tree, not a fresh query: repo config cannot move it.
+    let pin = check_filters_unchanged(cwd)?;
+    let toplevel = pin
+        .toplevel
+        .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
     let prefix = format!("{}/", toplevel.display());
-    check_filters_unchanged(cwd)?;
     let checkout_status = git_cmd(&toplevel)
         .env("GIT_INDEX_FILE", &temp_index)
         .args(["checkout-index", "-a", "-f", "--prefix", &prefix])
@@ -589,15 +668,20 @@ pub fn restore_to(
         files_restored: target_files.len() as u32,
         orphaned_files,
         saved_edits,
+        recovery_ref: recovery,
     })
 }
 
-/// Before `restore_to` overwrites the working tree, commit it under
-/// [`RECOVERY_REF`] unless some snapshot already holds exactly this tree.
+/// Before `restore_to` overwrites the working tree, commit it under the
+/// session's `recovery` ref unless some snapshot already holds exactly this tree.
 /// Edits made after the last turn (or uncommitted work a legacy session base
 /// never captured) were otherwise overwritten with no way back. Errors abort
 /// the restore: better no undo than an undo that destroys work.
-fn save_unrecorded_worktree(cwd: &Path, auto_commits: &[String]) -> anyhow::Result<Option<String>> {
+fn save_unrecorded_worktree(
+    cwd: &Path,
+    recovery: &str,
+    auto_commits: &[String],
+) -> anyhow::Result<Option<String>> {
     let head = resolve_head(cwd);
     let latest = auto_commits.last().cloned().or_else(|| head.clone());
     let latest_tree = latest.as_deref().and_then(|c| tree_of_commit(cwd, c));
@@ -626,8 +710,7 @@ fn save_unrecorded_worktree(cwd: &Path, auto_commits: &[String]) -> anyhow::Resu
         return Ok(None);
     }
 
-    let previous =
-        git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", RECOVERY_REF])).ok();
+    let previous = git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", recovery])).ok();
     let mut parents: Vec<&str> = latest.as_deref().into_iter().collect();
     if let Some(prev) = &previous {
         parents.push(prev);
@@ -641,15 +724,13 @@ fn save_unrecorded_worktree(cwd: &Path, auto_commits: &[String]) -> anyhow::Resu
     let status = git_cmd(cwd)
         .args([
             "update-ref",
-            RECOVERY_REF,
+            recovery,
             &sha,
             previous.as_deref().unwrap_or(""),
         ])
         .status()?;
     if !status.success() {
-        anyhow::bail!(
-            "could not save un-snapshotted edits to {RECOVERY_REF}; nothing was restored"
-        );
+        anyhow::bail!("could not save un-snapshotted edits to {recovery}; nothing was restored");
     }
     Ok(Some(sha))
 }
@@ -700,6 +781,20 @@ pub fn migrate_legacy_refs(cwd: &Path) -> anyhow::Result<u32> {
         .output()?;
     if !out.status.success() {
         return Ok(0);
+    }
+    // The old single recovery ref would block every per-session one
+    // (`recovery` cannot be both a ref and a directory of refs).
+    if let Ok(sha) =
+        git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", LEGACY_RECOVERY_REF]))
+    {
+        let deleted = git_cmd(cwd)
+            .args(["update-ref", "-d", LEGACY_RECOVERY_REF, &sha])
+            .status();
+        if matches!(deleted, Ok(s) if s.success()) {
+            let _ = git_cmd(cwd)
+                .args(["update-ref", &recovery_ref("legacy"), &sha])
+                .status();
+        }
     }
     let mut moved = 0u32;
     for line in String::from_utf8(out.stdout)?.lines() {
@@ -761,7 +856,19 @@ pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
     for r in &to_delete {
         let status = git_cmd(cwd).args(["update-ref", "-d", r]).status();
         match status {
-            Ok(s) if s.success() => deleted += 1,
+            Ok(s) if s.success() => {
+                deleted += 1;
+                // The session's saved edits go with it, or they would keep
+                // every pruned snapshot alive through their parents.
+                if let Some(id) = r.strip_prefix(SHADOW_REF_PREFIX) {
+                    let rec = recovery_ref(id);
+                    if let Ok(sha) =
+                        git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", &rec]))
+                    {
+                        let _ = git_cmd(cwd).args(["update-ref", "-d", &rec, &sha]).status();
+                    }
+                }
+            }
             Ok(_) => tracing::warn!("autoCommit prune: failed to delete {r}"),
             Err(e) => tracing::warn!("autoCommit prune: error deleting {r}: {e}"),
         }
@@ -889,6 +996,8 @@ mod git_detection_tests {
                 .expect("git config");
             assert!(s.success());
         }
+        // What OxideClaw does at startup: trust the repo as it is now.
+        pin_filters(td.path()).unwrap();
         td
     }
 
@@ -1235,12 +1344,12 @@ mod restore_tests {
         write_file(td.path(), "app.txt", "v3\n");
         snapshot_turn(td.path(), &cfg, "s", "v3", 2, &mut commits, &mut pos, None).unwrap();
 
-        let report = restore_to(td.path(), &commits, 1).unwrap();
+        let report = restore_to(td.path(), "test", &commits, 1).unwrap();
         assert!(report.files_restored >= 1);
         let contents = std::fs::read_to_string(td.path().join("app.txt")).unwrap();
         assert_eq!(contents, "v2\n");
 
-        let _ = restore_to(td.path(), &commits, 2).unwrap();
+        let _ = restore_to(td.path(), "test", &commits, 2).unwrap();
         let contents = std::fs::read_to_string(td.path().join("app.txt")).unwrap();
         assert_eq!(contents, "v3\n");
     }
@@ -1283,6 +1392,8 @@ mod restore_tests {
             .status()
             .unwrap();
         let sub = td.path().join("pkg");
+        // OxideClaw launched from the subdirectory pins it at startup.
+        pin_filters(&sub).unwrap();
 
         let cfg = AutoCommitConfig::default();
         let mut commits = Vec::new();
@@ -1294,7 +1405,7 @@ mod restore_tests {
         write_file(td.path(), "top.txt", "v3\n");
         snapshot_turn(&sub, &cfg, "s", "v3", 2, &mut commits, &mut pos, None).unwrap();
 
-        restore_to(&sub, &commits, 1).unwrap();
+        restore_to(&sub, "test", &commits, 1).unwrap();
         let read = |p: &str| std::fs::read_to_string(td.path().join(p)).unwrap();
         assert_eq!(read("pkg/x.txt"), "v2\n");
         assert_eq!(read("top.txt"), "v2\n");
@@ -1323,7 +1434,7 @@ mod restore_tests {
 
         write_file(td.path(), "untracked.log", "scratch\n");
 
-        restore_to(td.path(), &commits, 0).unwrap();
+        restore_to(td.path(), "test", &commits, 0).unwrap();
         assert_eq!(
             std::fs::read_to_string(td.path().join("tracked.txt")).unwrap(),
             "x\n"
@@ -1354,7 +1465,7 @@ mod restore_tests {
         write_file(td.path(), "app.txt", "modified\n");
         snapshot_turn(td.path(), &cfg, "s", "m", 1, &mut commits, &mut pos, None).unwrap();
 
-        restore_to(td.path(), &commits, 0).unwrap();
+        restore_to(td.path(), "test", &commits, 0).unwrap();
         assert_eq!(
             std::fs::read_to_string(td.path().join("app.txt")).unwrap(),
             "base\n"
@@ -1391,7 +1502,7 @@ mod restore_tests {
         )
         .unwrap();
 
-        let report = restore_to(td.path(), &commits, 0).unwrap();
+        let report = restore_to(td.path(), "test", &commits, 0).unwrap();
         assert!(
             report.orphaned_files.iter().any(|p| p.ends_with("new.txt")),
             "expected new.txt to be flagged as orphaned: {:?}",
@@ -1435,7 +1546,7 @@ mod restore_tests {
         );
 
         // Restore to session base → empty tree.
-        let report = restore_to(td.path(), &commits, 0).unwrap();
+        let report = restore_to(td.path(), "test", &commits, 0).unwrap();
         // only.txt was in turn 1 but not in empty target tree → orphaned.
         assert!(
             report
@@ -1516,7 +1627,7 @@ mod sandbox_escape_tests {
         let (mut commits, mut pos) = (Vec::new(), 0);
         let out = turn(td.path(), &mut commits, &mut pos, 1).unwrap();
         assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
-        restore_to(td.path(), &commits, 0).unwrap();
+        restore_to(td.path(), "test", &commits, 0).unwrap();
         assert!(
             !marker.exists(),
             "a planted hook or fsmonitor ran on the host"
@@ -1541,6 +1652,8 @@ mod sandbox_escape_tests {
             ".gitattributes",
             "*.txt filter=ok\n*.bin filter=evil\n",
         );
+        // The session starts with the `ok` filter already configured.
+        pin_filters(td.path()).unwrap();
 
         let (mut commits, mut pos) = (Vec::new(), 0);
         let out = turn(td.path(), &mut commits, &mut pos, 1).unwrap();
@@ -1559,11 +1672,94 @@ mod sandbox_escape_tests {
 
         let err = turn(td.path(), &mut commits, &mut pos, 2).unwrap_err();
         assert!(
-            err.to_string().contains("filter configuration changed"),
+            err.to_string().contains("changed during this session"),
             "{err}"
         );
-        assert!(restore_to(td.path(), &commits, 0).is_err());
+        assert!(restore_to(td.path(), "test", &commits, 0).is_err());
         assert!(!marker.exists(), "a planted filter ran on the host");
+    }
+
+    /// `mv .git evil; echo 'gitdir: evil' > .git` gave a git dir never seen
+    /// before, so its filters were pinned as trusted on first sight.
+    #[test]
+    fn a_swapped_in_git_dir_is_not_trusted() {
+        let td = init_test_repo();
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        turn(td.path(), &mut commits, &mut pos, 1).unwrap();
+
+        std::fs::rename(td.path().join(".git"), td.path().join("evil")).unwrap();
+        std::fs::write(td.path().join(".git"), "gitdir: evil\n").unwrap();
+        let marker = td.path().join("pwned");
+        let evil = td.path().join("evil/evil.sh");
+        script(&evil, &marker, true);
+        git_config(td.path(), "filter.x.clean", &evil.display().to_string());
+        git_config(td.path(), "filter.x.smudge", &evil.display().to_string());
+        write_file(td.path(), ".gitattributes", "* filter=x\n");
+
+        let err = turn(td.path(), &mut commits, &mut pos, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("changed during this session"),
+            "{err}"
+        );
+        assert!(restore_to(td.path(), "test", &commits, 0).is_err());
+        assert!(!marker.exists(), "the swapped-in filter ran on the host");
+    }
+
+    /// A repository that appears after startup (`git init` from a sandboxed
+    /// command) was pinned lazily, with whatever filters it was made with.
+    #[test]
+    fn a_repo_that_was_not_pinned_at_startup_is_refused() {
+        let td = tempfile::TempDir::new().unwrap();
+        pin_filters(td.path()).unwrap(); // not a repo yet
+        let s = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(td.path())
+            .status()
+            .unwrap();
+        assert!(s.success());
+        assert!(check_filters_unchanged(td.path()).is_err());
+
+        let other = tempfile::TempDir::new().unwrap();
+        let s = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(other.path())
+            .status()
+            .unwrap();
+        assert!(s.success());
+        let err = check_filters_unchanged(other.path()).unwrap_err();
+        assert!(err.to_string().contains("not pinned"), "{err}");
+    }
+
+    /// `git config core.worktree $HOME` made `add -A` stage files from
+    /// outside the project into `.git/objects`, readable from the sandbox.
+    #[test]
+    fn a_moved_work_tree_is_refused() {
+        // `home/` stands in for $HOME, `home/proj` for the project in it.
+        let home = tempfile::TempDir::new().unwrap();
+        let proj = home.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let s = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&proj)
+            .status()
+            .unwrap();
+        assert!(s.success());
+        pin_filters(&proj).unwrap();
+        write_file(home.path(), "secret/id_rsa", "KEY\n");
+        git_config(&proj, "core.worktree", &home.path().display().to_string());
+
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        let err = turn(&proj, &mut commits, &mut pos, 1).unwrap_err();
+        assert!(err.to_string().contains("core.worktree"), "{err}");
+        let objects = Command::new("git")
+            .args(["count-objects"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&objects.stdout).starts_with("0 objects"),
+            "files from outside the project were staged"
+        );
     }
 }
 
@@ -1624,7 +1820,10 @@ mod prune_tests {
         .to_string();
         make_ref(td.path(), &format!("{LEGACY_SHADOW_REF_PREFIX}s1/1"), &sha);
         make_ref(td.path(), &format!("{LEGACY_SHADOW_REF_PREFIX}s2/1"), &sha);
+        make_ref(td.path(), LEGACY_RECOVERY_REF, &sha);
         assert_eq!(migrate_legacy_refs(td.path()).unwrap(), 2);
+        // The single recovery ref moves aside, so per-session ones can exist.
+        make_ref(td.path(), &recovery_ref("s1"), &sha);
         let refs = String::from_utf8(
             git_cmd(td.path())
                 .args(["for-each-ref", "--format=%(refname)"])
@@ -1654,9 +1853,25 @@ mod prune_tests {
             let sha = make_empty_commit(td.path(), &format!("session-{i}"));
             make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
         }
+        // Saved edits of a pruned session (s0) and a kept one (s4).
+        let rec = make_empty_commit(td.path(), "recovery");
+        make_ref(td.path(), &recovery_ref("s0"), &rec);
+        make_ref(td.path(), &recovery_ref("s4"), &rec);
 
         let deleted = prune_old_refs(td.path(), 3).unwrap();
         assert_eq!(deleted, 2, "should delete the 2 oldest of 5 refs");
+        // The recovery ref of a pruned session would keep all of its
+        // snapshots alive through their parents.
+        let has = |r: &str| {
+            git_cmd(td.path())
+                .args(["rev-parse", "--verify", "-q", r])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(!has(&recovery_ref("s0")));
+        assert!(has(&recovery_ref("s4")));
 
         let out = git_cmd(td.path())
             .args([

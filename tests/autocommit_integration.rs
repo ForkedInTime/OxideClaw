@@ -3,8 +3,8 @@
 #![cfg(unix)]
 
 use oxideclaw::autocommit::{
-    AutoCommitConfig, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo, prune_old_refs, restore_to,
-    snapshot_turn,
+    AutoCommitConfig, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo, pin_filters, prune_old_refs,
+    restore_to, snapshot_turn,
 };
 use std::fs;
 use std::path::Path;
@@ -29,6 +29,8 @@ fn git_init(path: &Path) {
             .status()
             .unwrap();
     }
+    // What OxideClaw does at startup: trust the repo as it is now.
+    pin_filters(path).unwrap();
 }
 
 fn write(path: &Path, rel: &str, body: &str) {
@@ -109,13 +111,13 @@ fn full_3_turn_sequence_with_undo_redo() {
     assert_eq!(read(td.path(), "app.txt"), "v3\n");
 
     // /undo 1 → turn 2 state
-    restore_to(td.path(), &commits, 2).unwrap();
+    restore_to(td.path(), "test", &commits, 2).unwrap();
     pos -= 1;
     assert_eq!(pos, 2);
     assert_eq!(read(td.path(), "app.txt"), "v2\n");
 
     // /redo 1 → turn 3 state
-    restore_to(td.path(), &commits, 3).unwrap();
+    restore_to(td.path(), "test", &commits, 3).unwrap();
     pos += 1;
     assert_eq!(pos, 3);
     assert_eq!(read(td.path(), "app.txt"), "v3\n");
@@ -139,7 +141,7 @@ fn undo_past_session_start_is_clamped() {
     // Simulate `/undo 5` via saturating_sub → target_position = 0 (session base)
     let new_pos = pos.saturating_sub(5);
     assert_eq!(new_pos, 0);
-    let report = restore_to(td.path(), &commits, new_pos).unwrap();
+    let report = restore_to(td.path(), "test", &commits, new_pos).unwrap();
     // Session base had the initial "base\n" README. a.txt exists only in the
     // shadow commits, so restoring to position 0 reports it as orphaned (Task 5
     // reports orphans rather than deleting them; the caller decides the policy).

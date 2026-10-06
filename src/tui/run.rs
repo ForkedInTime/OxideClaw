@@ -579,9 +579,12 @@ async fn run_loop(
         hooks::run_session_start_hooks(hook_cfg, &session.id, &config.cwd).await;
     }
 
-    // Pin the repo's filter drivers before any (possibly sandboxed) tool runs;
-    // snapshots and /undo refuse to run drivers that change after this.
-    let _ = oxideclaw::autocommit::check_filters_unchanged(&config.cwd);
+    // Pin the repo (git dir, work tree, filter drivers) before any (possibly
+    // sandboxed) tool runs; snapshots and /undo refuse to run if any of it
+    // changes after this.
+    if let Err(e) = oxideclaw::autocommit::pin_filters(&config.cwd) {
+        tracing::warn!("autoCommit: could not pin the repository: {e}");
+    }
 
     // Move pre-rename shadow refs first so /undo history survives, then prune
     // (keeps the configured number of newest sessions).

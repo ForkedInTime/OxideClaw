@@ -19,8 +19,8 @@
 #![cfg(unix)]
 
 use oxideclaw::autocommit::{
-    AutoCommitConfig, RECOVERY_REF, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo,
-    prune_old_refs, restore_to, snapshot_base, snapshot_turn,
+    AutoCommitConfig, SHADOW_REF_PREFIX, SnapshotOutcome, is_git_repo, pin_filters, prune_old_refs,
+    recovery_ref, restore_to, snapshot_base, snapshot_turn,
 };
 use std::fs;
 use std::path::Path;
@@ -47,6 +47,8 @@ fn git_init(path: &Path) {
             .status()
             .unwrap();
     }
+    // What OxideClaw does at startup: trust the repo as it is now.
+    pin_filters(path).unwrap();
 }
 
 fn git(path: &Path, args: &[&str]) -> String {
@@ -148,7 +150,7 @@ fn dogfood_end_to_end_undo_redo_against_real_tree() {
     assert!(!td.path().join("src/notes.md").exists());
 
     // /undo 2 → back to turn 1 state (pos=1)
-    restore_to(td.path(), &commits, 1).unwrap();
+    restore_to(td.path(), "test", &commits, 1).unwrap();
     pos -= 2;
     assert_eq!(pos, 1);
     assert_eq!(
@@ -161,7 +163,7 @@ fn dogfood_end_to_end_undo_redo_against_real_tree() {
     // The key guarantee: files THAT EXISTED in turn 1 are restored.
 
     // /redo 2 → back to turn 3 state
-    let report = restore_to(td.path(), &commits, 3).unwrap();
+    let report = restore_to(td.path(), "test", &commits, 3).unwrap();
     pos += 2;
     assert_eq!(pos, 3);
     assert_eq!(read(td.path(), "src/app.txt"), "v3\n");
@@ -389,7 +391,7 @@ fn dogfood_undo_to_session_base_keeps_pre_session_uncommitted_work() {
     .unwrap();
     assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
 
-    let report = restore_to(td.path(), &commits, 0).unwrap();
+    let report = restore_to(td.path(), "test", &commits, 0).unwrap();
     assert_eq!(read(td.path(), "README.md"), "base\nuser edit\n");
     assert_eq!(report.saved_edits, None, "the live tree was turn 1's");
 
@@ -400,7 +402,7 @@ fn dogfood_undo_to_session_base_keeps_pre_session_uncommitted_work() {
 }
 
 /// Edits made after the last snapshot are not in any commit; /undo used to
-/// overwrite them silently. They must be saved under RECOVERY_REF first.
+/// overwrite them silently. They must be saved under the session recovery ref first.
 #[test]
 fn dogfood_undo_saves_edits_made_after_the_last_snapshot() {
     let td = TempDir::new().unwrap();
@@ -425,10 +427,13 @@ fn dogfood_undo_saves_edits_made_after_the_last_snapshot() {
     }
     write(td.path(), "README.md", "v2\nhand edit after the turn\n");
 
-    let report = restore_to(td.path(), &commits, 1).unwrap();
+    let report = restore_to(td.path(), "test", &commits, 1).unwrap();
     assert_eq!(read(td.path(), "README.md"), "v1\n");
     let saved = report.saved_edits.clone().expect("edits must be saved");
-    assert_eq!(git(td.path(), &["rev-parse", RECOVERY_REF]).trim(), saved);
+    assert_eq!(
+        git(td.path(), &["rev-parse", &recovery_ref("test")]).trim(),
+        saved
+    );
     assert_eq!(
         git(td.path(), &["show", &format!("{saved}:README.md")]),
         "v2\nhand edit after the turn\n"
@@ -437,7 +442,7 @@ fn dogfood_undo_saves_edits_made_after_the_last_snapshot() {
 
     // A second save keeps the first reachable.
     write(td.path(), "README.md", "v1\nanother edit\n");
-    let second = restore_to(td.path(), &commits, 2)
+    let second = restore_to(td.path(), "test", &commits, 2)
         .unwrap()
         .saved_edits
         .unwrap();
@@ -445,7 +450,9 @@ fn dogfood_undo_saves_edits_made_after_the_last_snapshot() {
 
     // Nothing unsaved: /redo back and forth records nothing new.
     assert_eq!(
-        restore_to(td.path(), &commits, 1).unwrap().saved_edits,
+        restore_to(td.path(), "test", &commits, 1)
+            .unwrap()
+            .saved_edits,
         None
     );
 }

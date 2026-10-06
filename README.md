@@ -168,7 +168,7 @@ Every `Write`/`Edit` kicks off a lint + test cycle, using the project's own runn
 
 ### ↩️ &nbsp; `/undo` and `/redo` on shadow refs
 
-Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`. Invisible to `git log`, `git branch`, `git status`. Never pushed. Use the `/undo` picker or skip straight to a turn with `/undo 3`. The session base keeps the uncommitted work you started with, and edits you make between turns are saved to `refs/oxideclaw/recovery` before an `/undo` or `/redo` overwrites them. **Other tools with undo pollute your history. OxideClaw doesn't.**
+Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`. Invisible to `git log`, `git branch`, `git status`. Never pushed. Use the `/undo` picker or skip straight to a turn with `/undo 3`. The session base keeps the uncommitted work you started with, and edits you make between turns are saved to `refs/oxideclaw/recovery/<session>` before an `/undo` or `/redo` overwrites them. **Other tools with undo pollute your history. OxideClaw doesn't.**
 
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 

@@ -97,6 +97,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     {
                         match oxideclaw::autocommit::restore_to(
                             &config.cwd,
+                            &session.id,
                             &session.meta.auto_commits,
                             target_pos,
                         ) {
@@ -133,6 +134,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     {
                         match oxideclaw::autocommit::restore_to(
                             &config.cwd,
+                            &session.id,
                             &session.meta.auto_commits,
                             target_pos,
                         ) {

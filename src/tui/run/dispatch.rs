@@ -2062,6 +2062,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let new_pos = session.meta.undo_position.saturating_sub(k as usize);
                         match oxideclaw::autocommit::restore_to(
                             &config.cwd,
+                            &session.id,
                             &session.meta.auto_commits,
                             new_pos,
                         ) {
@@ -2153,6 +2154,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             .min(session.meta.auto_commits.len());
                         match oxideclaw::autocommit::restore_to(
                             &config.cwd,
+                            &session.id,
                             &session.meta.auto_commits,
                             new_pos,
                         ) {
