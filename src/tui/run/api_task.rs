@@ -903,8 +903,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 // failure output and re-enter the agentic loop. On cap reached,
                 // emit a SystemMessage and end the turn preserving partial work.
                 if !auto_fix_touched.is_empty() {
+                    // After EnterWorktree the edits are in the worktree,
+                    // not the main checkout.
+                    let work_cwd = crate::tools::session_cwd(&tools, &config.cwd);
                     let action = crate::autofix::run_auto_fix_check(
-                        &config.cwd,
+                        &work_cwd,
                         &config.auto_fix,
                         &config.autonomy,
                         auto_fix_retries,

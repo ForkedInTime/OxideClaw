@@ -410,6 +410,8 @@ async fn run_loop(
     // drive the SAME Chrome instance as the `browser_*` tools. `None` if browser disabled.
     let browser_session_for_app = shared_state.browser_session.clone();
     let spawn_registry = crate::spawn::new_registry();
+    // Shown once: auto-commit skips turns that ran in a worktree.
+    let mut worktree_undo_notice_shown = false;
 
     crate::tools::apply_tool_filters(&mut tools, &config);
     let perm_state = PermissionState::new(
@@ -1092,7 +1094,21 @@ async fn run_loop(
                             app.apply(AppEvent::Done { tokens_in, tokens_out, cache_read, cache_write, messages: new_messages, model_used });
 
                             // Auto-commit: snapshot the working tree for this turn.
-                            if config.auto_commit.enabled {
+                            // After EnterWorktree the turn's edits are in the
+                            // worktree; snapshotting the main tree would record
+                            // nothing of them, and mixing trees in one undo
+                            // stack would make /undo restore the wrong one.
+                            let in_worktree = config.auto_commit.enabled
+                                && crate::tools::session_cwd(&tools, &config.cwd) != config.cwd;
+                            if in_worktree {
+                                if !worktree_undo_notice_shown {
+                                    worktree_undo_notice_shown = true;
+                                    app.entries.push(crate::tui::app::ChatEntry::system(
+                                        "Auto-commit paused: this session is in a worktree. /undo does not cover \
+                                         worktree edits; commit them on the worktree branch.",
+                                    ));
+                                }
+                            } else if config.auto_commit.enabled {
                                 // snapshot_turn truncates the redo stack to undo_position before
                                 // appending, so after /undo + new work, auto_commits is about to
                                 // shrink. Use the post-truncation index so the tracing log line
