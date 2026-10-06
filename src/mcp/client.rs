@@ -171,6 +171,10 @@ impl McpTransport for StdioTransport {
 pub(crate) struct HttpTransport {
     url: String,
     client: reqwest::Client,
+    /// `Mcp-Session-Id` a stateful Streamable-HTTP server assigns on
+    /// `initialize`; every later request must echo it or the server
+    /// answers 400.
+    session_id: std::sync::Mutex<Option<String>>,
 }
 
 impl HttpTransport {
@@ -197,6 +201,7 @@ impl HttpTransport {
         Ok(Self {
             url: url.to_string(),
             client: builder.build()?,
+            session_id: std::sync::Mutex::new(None),
         })
     }
 }
@@ -207,18 +212,27 @@ impl HttpTransport {
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 impl HttpTransport {
+    fn session(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     async fn post(&self, req: &JsonRpcRequest, method: &str) -> Result<reqwest::Response> {
-        let resp = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            self.client
-                .post(&self.url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .json(req)
-                .send(),
-        )
-        .await
-        .map_err(|_| anyhow!("HTTP MCP request timed out ({})", method))??;
+        // Streamable-HTTP servers reject (406) a POST that does not accept
+        // both; they may answer with plain JSON or an SSE stream.
+        let mut builder = self
+            .client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(sid) = self.session() {
+            builder = builder.header("Mcp-Session-Id", sid);
+        }
+        let resp = tokio::time::timeout(REQUEST_TIMEOUT, builder.json(req).send())
+            .await
+            .map_err(|_| anyhow!("HTTP MCP request timed out ({})", method))??;
         Ok(resp)
     }
 
@@ -245,6 +259,88 @@ impl HttpTransport {
         }
         Ok(body)
     }
+
+    /// Read an SSE response stream until the JSON-RPC response for `id`
+    /// arrives. Servers may interleave notifications and their own requests
+    /// before it, and need not close the stream afterwards.
+    async fn sse_response(
+        resp: reqwest::Response,
+        id: u64,
+        method: &str,
+    ) -> Result<JsonRpcResponse> {
+        use tokio_stream::StreamExt;
+        let read = async {
+            let mut stream = resp.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut total = 0usize;
+            // Bytes of `buf` already searched for an event end, so a large
+            // event arriving in small chunks is not rescanned each time.
+            let mut scanned = 0usize;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                total += chunk.len();
+                if total > MAX_HTTP_BODY_BYTES {
+                    return Err(anyhow!(
+                        "HTTP MCP {method} response too large (limit {MAX_HTTP_BODY_BYTES} bytes)"
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+                while let Some((end, sep)) = sse_event_end(&buf, scanned) {
+                    let event: Vec<u8> = buf.drain(..end + sep).collect();
+                    scanned = 0;
+                    if let Some(r) = sse_event_response(&event[..end], id) {
+                        return Ok(r);
+                    }
+                }
+                // A terminator may straddle the next chunk boundary.
+                scanned = buf.len().saturating_sub(3);
+            }
+            // A final event may lack the trailing blank line.
+            sse_event_response(&buf, id)
+                .ok_or_else(|| anyhow!("HTTP MCP {method}: event stream ended without a response"))
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, read)
+            .await
+            .map_err(|_| anyhow!("HTTP MCP request timed out ({})", method))?
+    }
+}
+
+/// End of the first complete SSE event in `buf` (searching from `from`)
+/// and the length of its blank-line terminator.
+fn sse_event_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let find = |pat: &[u8]| {
+        buf[from..]
+            .windows(pat.len())
+            .position(|w| w == pat)
+            .map(|i| i + from)
+    };
+    match (find(b"\n\n"), find(b"\r\n\r\n")) {
+        (Some(a), Some(b)) if b < a => Some((b, 4)),
+        (Some(a), _) => Some((a, 2)),
+        (None, Some(b)) => Some((b, 4)),
+        (None, None) => None,
+    }
+}
+
+/// The JSON-RPC response for `id` carried by one SSE event, if that is
+/// what the event holds (not a notification or a server-to-client request).
+fn sse_event_response(event: &[u8], id: u64) -> Option<JsonRpcResponse> {
+    let text = String::from_utf8_lossy(event);
+    let data: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(|d| d.strip_prefix(' ').unwrap_or(d))
+        .collect();
+    if data.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&data.join("\n")).ok()?;
+    let is_response = v.get("result").is_some() || v.get("error").is_some();
+    if !is_response || v.get("id").and_then(Value::as_u64) != Some(id) {
+        return None;
+    }
+    serde_json::from_value(v).ok()
 }
 
 #[async_trait]
@@ -255,13 +351,42 @@ impl McpTransport for HttpTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND && self.session().is_some() {
+                return Err(anyhow!(
+                    "HTTP MCP {method} failed: session expired — restart oxideclaw to reconnect"
+                ));
+            }
             let body = Self::bounded_body(resp, method).await.unwrap_or_default();
             let body = String::from_utf8_lossy(&body);
             return Err(anyhow!("HTTP MCP {} failed: {} — {}", method, status, body));
         }
 
-        let body = Self::bounded_body(resp, method).await?;
-        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body)?;
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            let mut stored = self.session_id.lock().unwrap_or_else(|e| e.into_inner());
+            if stored.is_none() {
+                *stored = Some(sid.to_string());
+            }
+        }
+
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.trim()
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            });
+        let rpc_resp: JsonRpcResponse = if is_sse {
+            Self::sse_response(resp, id, method).await?
+        } else {
+            let body = Self::bounded_body(resp, method).await?;
+            serde_json::from_slice(&body)?
+        };
 
         if let Some(err) = rpc_resp.error {
             return Err(anyhow!("MCP error {}: {}", err.code, err.message));
@@ -351,7 +476,8 @@ impl McpClient {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        self.request("initialize", params)
+        let init = self
+            .request("initialize", params)
             .await
             .map_err(|e| anyhow!("MCP initialize failed for '{}': {}", self.server_name, e))?;
 
@@ -360,10 +486,20 @@ impl McpClient {
 
         // 3. Fetch tool list — with cursor pagination so servers that return
         //    more than one page worth of tools aren't silently truncated.
-        let pages = self
-            .list_paginated("tools/list", "tools")
-            .await
-            .unwrap_or_default();
+        //    A failure leaves the server connected (resource- or prompt-only
+        //    servers answer -32601), but say so when it claims tools: a
+        //    silent "connected (0 tools)" hid real transport errors.
+        let pages = match self.list_paginated("tools/list", "tools").await {
+            Ok(pages) => pages,
+            Err(e) => {
+                if init.pointer("/capabilities/tools").is_some() {
+                    tracing::warn!("MCP '{}': tools/list failed: {}", self.server_name, e);
+                } else {
+                    tracing::debug!("MCP '{}': tools/list failed: {}", self.server_name, e);
+                }
+                Vec::new()
+            }
+        };
         self.tools = pages
             .into_iter()
             .filter_map(|v| serde_json::from_value(v).ok())
@@ -749,6 +885,98 @@ mod hardening_tests {
         let t = HttpTransport::new(&base, &HashMap::new()).unwrap();
         t.notify("notifications/initialized").await;
         assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "no request was sent");
+    }
+
+    /// Serves `script` one connection at a time and records each raw request.
+    async fn recording_server(script: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for reply in script {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).to_ascii_lowercase());
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Stateful Streamable-HTTP servers (the SDK default) need both media
+    /// types accepted, the session id from `initialize` echoed on every later
+    /// request, and may answer in SSE with notifications before the response.
+    #[tokio::test]
+    async fn http_transport_speaks_streamable_http() {
+        let init = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}}}}"#;
+        let sse = "event: message\r\n\
+                   data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\r\n\r\n\
+                   data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n\
+                   event: message\n\
+                   data: {\"jsonrpc\":\"2.0\",\"id\":2,\n\
+                   data: \"result\":{\"tools\":[{\"name\":\"echo\"}]}}\n\n";
+        let (base, seen) = recording_server(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: sess-42\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{init}",
+                init.len()
+            ),
+            "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 connection: close\r\n\r\n{sse}"
+            ),
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
+        ])
+        .await;
+
+        let client = McpClient::connect_http("remote".into(), &base, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(client.tools.len(), 1, "SSE tools/list response was lost");
+        assert_eq!(client.tools[0].name, "echo");
+
+        let err = client.call_tool("echo", json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("session expired"), "{err}");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        for req in seen.iter() {
+            assert!(
+                req.contains("accept: application/json, text/event-stream"),
+                "{req}"
+            );
+        }
+        assert!(!seen[0].contains("mcp-session-id"), "{}", seen[0]);
+        for req in &seen[1..] {
+            assert!(req.contains("mcp-session-id: sess-42"), "{req}");
+        }
     }
 
     /// A server answering with a multi-gigabyte body must be refused, not
