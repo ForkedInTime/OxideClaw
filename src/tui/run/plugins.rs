@@ -109,6 +109,106 @@ fn marketplace_clone_cmd(url: &str, dir: &std::path::Path) -> tokio::process::Co
     cmd
 }
 
+/// The registry name of a `/plugin install` spec, without its version:
+/// `@scope/pkg@1.2` is `@scope/pkg`, `pkg@latest` is `pkg`. Scoped names
+/// start with '@', so splitting the whole spec on '@' gave "" for every
+/// official MCP server and registered them all under an empty name.
+fn registry_package_name(spec: &str) -> anyhow::Result<String> {
+    let spec = spec.trim();
+    let (scoped, body) = match spec.strip_prefix('@') {
+        Some(b) => (true, b),
+        None => (false, spec),
+    };
+    let base = body.split('@').next().unwrap_or(body);
+    let valid = if scoped {
+        base.split_once('/')
+            .is_some_and(|(scope, name)| !scope.is_empty() && !name.is_empty())
+    } else {
+        !base.is_empty()
+    };
+    if !valid {
+        anyhow::bail!("'{spec}' is not a package name (expected <pkg> or @<scope>/<pkg>)");
+    }
+    Ok(if scoped {
+        format!("@{base}")
+    } else {
+        base.to_string()
+    })
+}
+
+/// `@scope/pkg` -> `pkg`: the command name npm uses for a string `bin`.
+fn package_leaf_name(pkg_name: &str) -> &str {
+    pkg_name.rsplit('/').next().unwrap_or(pkg_name)
+}
+
+/// The command a package links into `node_modules/.bin`, per its package.json
+/// `bin`. The package name alone is wrong for scoped packages and for any
+/// package whose command differs from its name (server-github ships
+/// `mcp-server-github`).
+fn package_bin_name(manifest: &serde_json::Value, pkg_name: &str) -> Option<String> {
+    let leaf = package_leaf_name(pkg_name);
+    let name = match &manifest["bin"] {
+        serde_json::Value::String(_) => leaf.to_string(),
+        serde_json::Value::Object(map) if map.len() == 1 => map.keys().next()?.clone(),
+        serde_json::Value::Object(map) if map.contains_key(leaf) => leaf.to_string(),
+        _ => return None,
+    };
+    // The key becomes a path component; a manifest must not point it elsewhere.
+    if name.is_empty() || name.contains(['/', '\\']) || name == ".." {
+        return None;
+    }
+    Some(name)
+}
+
+/// The installed executable for `pkg_name` under an install prefix, if the
+/// package declares one and the package manager linked it.
+fn installed_bin(prefix: &std::path::Path, pkg_name: &str) -> Option<std::path::PathBuf> {
+    let manifest_path = prefix
+        .join("node_modules")
+        .join(pkg_name)
+        .join("package.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest_path).ok()?).ok()?;
+    let bin = prefix
+        .join("node_modules")
+        .join(".bin")
+        .join(package_bin_name(&manifest, pkg_name)?);
+    bin.is_file().then_some(bin)
+}
+
+/// Give the plugins dir its own package.json. bun (and npm/pnpm without
+/// --prefix) install into the nearest ancestor that has one, which would be
+/// ~/.claude, ~ or wherever else a stray manifest lives.
+async fn ensure_plugins_manifest(plugins_dir: &std::path::Path) -> anyhow::Result<()> {
+    let manifest = plugins_dir.join("package.json");
+    if !manifest.exists() {
+        tokio::fs::write(&manifest, "{\"private\": true}\n").await?;
+    }
+    Ok(())
+}
+
+/// The registry install for a plugin, pinned to `plugins_dir`. bun has no
+/// --prefix: `bun install --prefix <dir> <pkg>` is `bun add <dir> <pkg>` in
+/// the inherited cwd, so it either failed or added both to the user's
+/// project. bun installs into its cwd's manifest instead.
+fn registry_install_cmd(
+    pm: &str,
+    plugins_dir: &std::path::Path,
+    spec: &str,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(pm);
+    if pm == "bun" {
+        cmd.args(["add", spec]);
+    } else {
+        cmd.arg("install")
+            .arg("--prefix")
+            .arg(plugins_dir)
+            .arg(spec);
+    }
+    cmd.current_dir(plugins_dir);
+    cmd
+}
+
 pub(super) async fn plugin_install_task(
     spec: String,
     tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
@@ -203,7 +303,14 @@ pub(super) async fn plugin_install_task(
             }
 
             // Find entry point for MCP server registration
-            let bin_path = clone_dir.join("node_modules").join(".bin").join(&npm_name);
+            let manifest: serde_json::Value = tokio::fs::read_to_string(&pkg_path)
+                .await
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let bin_name = package_bin_name(&manifest, &npm_name)
+                .unwrap_or_else(|| package_leaf_name(&npm_name).to_string());
+            let bin_path = clone_dir.join("node_modules").join(".bin").join(bin_name);
             let main_path = clone_dir.join("index.js");
             let server_cfg = if bin_path.exists() {
                 serde_json::json!({ "command": bin_path.to_string_lossy().as_ref(), "args": [] })
@@ -234,10 +341,10 @@ pub(super) async fn plugin_install_task(
                 .join("plugins");
             std::fs::create_dir_all(&plugins_dir)?;
 
-            let npm_name = raw_spec.split('@').next().unwrap_or(&raw_spec).to_string();
+            let npm_name = registry_package_name(&raw_spec)?;
+            ensure_plugins_manifest(&plugins_dir).await?;
 
-            let output = tokio::process::Command::new(pm)
-                .args(["install", "--prefix", &plugins_dir.to_string_lossy(), &raw_spec])
+            let output = registry_install_cmd(pm, &plugins_dir, &raw_spec)
                 .output()
                 .await
                 .map_err(|e| anyhow::anyhow!("{pm} not found — is a JS runtime installed?\n{e}"))?;
@@ -247,11 +354,11 @@ pub(super) async fn plugin_install_task(
                 anyhow::bail!("{pm} install failed:\n{}", stderr.trim());
             }
 
-            let bin_path = plugins_dir.join("node_modules").join(".bin").join(&npm_name);
-            let server_cfg = if bin_path.exists() {
-                serde_json::json!({ "command": bin_path.to_string_lossy().as_ref(), "args": [] })
-            } else {
-                serde_json::json!({ "command": pm_runner, "args": ["-y", &npm_name] })
+            let server_cfg = match installed_bin(&plugins_dir, &npm_name) {
+                Some(bin_path) => {
+                    serde_json::json!({ "command": bin_path.to_string_lossy().as_ref(), "args": [] })
+                }
+                None => serde_json::json!({ "command": pm_runner, "args": ["-y", &raw_spec] }),
             };
 
             register_mcp_server(&npm_name, server_cfg).await?;
@@ -374,6 +481,103 @@ mod marketplace_clone_tests {
         assert_eq!(
             args[..4],
             ["clone", "--depth", "1", "https://github.com/x/y.git"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod registry_install_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_specs_keep_their_scope_and_drop_the_version() {
+        let name = |s: &str| registry_package_name(s).unwrap();
+        assert_eq!(
+            name("@modelcontextprotocol/server-github"),
+            "@modelcontextprotocol/server-github"
+        );
+        assert_eq!(name("@scope/pkg@1.2.3"), "@scope/pkg");
+        assert_eq!(name("context-mode@latest"), "context-mode");
+        assert_eq!(name("plain"), "plain");
+        for bad in ["@", "@scope", "@scope/", "@/pkg", "@1.0"] {
+            assert!(registry_package_name(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn bin_name_comes_from_the_manifest_not_the_package_name() {
+        let pkg = "@modelcontextprotocol/server-github";
+        let obj = serde_json::json!({ "bin": { "mcp-server-github": "dist/index.js" } });
+        assert_eq!(
+            package_bin_name(&obj, pkg).as_deref(),
+            Some("mcp-server-github")
+        );
+        let s = serde_json::json!({ "bin": "dist/index.js" });
+        assert_eq!(package_bin_name(&s, pkg).as_deref(), Some("server-github"));
+        let multi = serde_json::json!({ "bin": { "a": "a.js", "server-github": "s.js" } });
+        assert_eq!(
+            package_bin_name(&multi, pkg).as_deref(),
+            Some("server-github")
+        );
+        let ambiguous = serde_json::json!({ "bin": { "a": "a.js", "b": "b.js" } });
+        assert_eq!(package_bin_name(&ambiguous, pkg), None);
+        let escape = serde_json::json!({ "bin": { "../../evil": "x.js" } });
+        assert_eq!(package_bin_name(&escape, pkg), None);
+        assert_eq!(package_bin_name(&serde_json::json!({}), pkg), None);
+    }
+
+    #[test]
+    fn installed_bin_resolves_a_scoped_package_and_never_the_bin_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        let pkg_dir = nm.join("@modelcontextprotocol").join("server-github");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::create_dir_all(nm.join(".bin")).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"bin":{"mcp-server-github":"dist/index.js"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_bin(dir.path(), "@modelcontextprotocol/server-github"),
+            None,
+            "a bin that was not linked must fall back to the runner"
+        );
+        std::fs::write(nm.join(".bin").join("mcp-server-github"), "").unwrap();
+        assert_eq!(
+            installed_bin(dir.path(), "@modelcontextprotocol/server-github"),
+            Some(nm.join(".bin").join("mcp-server-github"))
+        );
+    }
+
+    #[test]
+    fn bun_installs_into_the_plugins_dir_not_the_inherited_cwd() {
+        let dir = std::path::Path::new("/tmp/plugins");
+        let bun = registry_install_cmd("bun", dir, "@x/y@1");
+        let args: Vec<_> = bun.as_std().get_args().collect();
+        assert_eq!(args, ["add", "@x/y@1"]);
+        assert_eq!(bun.as_std().get_current_dir(), Some(dir));
+
+        let npm = registry_install_cmd("npm", dir, "@x/y@1");
+        let args: Vec<_> = npm.as_std().get_args().collect();
+        assert_eq!(args, ["install", "--prefix", "/tmp/plugins", "@x/y@1"]);
+        assert_eq!(npm.as_std().get_current_dir(), Some(dir));
+    }
+
+    #[tokio::test]
+    async fn plugins_manifest_is_created_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_plugins_manifest(dir.path()).await.unwrap();
+        let manifest = dir.path().join("package.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(v["private"], true);
+        std::fs::write(&manifest, r#"{"dependencies":{"a":"1"}}"#).unwrap();
+        ensure_plugins_manifest(dir.path()).await.unwrap();
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("dependencies")
         );
     }
 }
