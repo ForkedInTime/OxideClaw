@@ -57,6 +57,7 @@ impl StdioTransport {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        cwd: &std::path::Path,
     ) -> Result<Self> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::process::Command;
@@ -64,6 +65,7 @@ impl StdioTransport {
         let mut child = Command::new(command)
             .args(args)
             .envs(env)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -516,8 +518,9 @@ impl McpClient {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        cwd: &std::path::Path,
     ) -> Result<Self> {
-        let transport = StdioTransport::connect(command, args, env).await?;
+        let transport = StdioTransport::connect(command, args, env, cwd).await?;
         let mut client = Self {
             server_name,
             tools: Vec::new(),

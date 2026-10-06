@@ -26,16 +26,19 @@ impl McpManager {
         } else {
             Settings::load(&cfg.cwd)
         };
-        Self::start_with_extra(&settings, &cfg.extra_mcp_servers).await
+        Self::start_with_extra(&settings, &cfg.extra_mcp_servers, &cfg.cwd).await
     }
 
     /// Start all MCP servers listed in settings + any injected via CLI --mcp-config.
-    /// Errors per-server are logged; the manager is always returned.
+    /// Errors per-server are logged; the manager is always returned. Stdio
+    /// servers start in `cwd`, the session's project directory: SDK and ACP
+    /// sessions name their own, which need not be the process directory.
     pub async fn start_with_extra(
         settings: &Settings,
         extra: &std::collections::HashMap<String, McpServerConfig>,
+        cwd: &std::path::Path,
     ) -> Self {
-        Self::start_with_extra_timeout(settings, extra, PER_SERVER_STARTUP_TIMEOUT).await
+        Self::start_with_extra_timeout(settings, extra, PER_SERVER_STARTUP_TIMEOUT, cwd).await
     }
 
     /// Servers are connected **concurrently**, each under `per_server`. One
@@ -45,6 +48,7 @@ impl McpManager {
         settings: &Settings,
         extra: &std::collections::HashMap<String, McpServerConfig>,
         per_server: std::time::Duration,
+        cwd: &std::path::Path,
     ) -> Self {
         let mut all: std::collections::HashMap<String, McpServerConfig> =
             settings.mcp_servers.clone();
@@ -65,10 +69,13 @@ impl McpManager {
         let handles: Vec<_> = entries
             .into_iter()
             .map(|(name, cfg)| {
+                let cwd = cwd.to_path_buf();
                 tokio::spawn(async move {
-                    let result =
-                        tokio::time::timeout(per_server, Self::connect_one(name.clone(), &cfg))
-                            .await;
+                    let result = tokio::time::timeout(
+                        per_server,
+                        Self::connect_one(name.clone(), &cfg, &cwd),
+                    )
+                    .await;
                     (name, result)
                 })
             })
@@ -107,10 +114,14 @@ impl McpManager {
         Self { clients, failed }
     }
 
-    async fn connect_one(name: String, cfg: &McpServerConfig) -> anyhow::Result<McpClient> {
+    async fn connect_one(
+        name: String,
+        cfg: &McpServerConfig,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<McpClient> {
         match cfg {
             McpServerConfig::Stdio(s) => {
-                McpClient::connect_stdio(name, &s.command, &s.args, &s.env).await
+                McpClient::connect_stdio(name, &s.command, &s.args, &s.env, cwd).await
             }
             McpServerConfig::Http(h) => McpClient::connect_http(name, &h.url, &h.headers).await,
         }
@@ -182,6 +193,35 @@ cat >/dev/null"#;
         assert!(names.contains(&"Read"), "built-ins must still be there");
     }
 
+    /// SDK and ACP sessions name their own cwd, usually not the directory the
+    /// editor launched the process in: a project server like
+    /// `./tools/mcp.sh` failed to start, or worked on the wrong tree.
+    #[tokio::test]
+    async fn stdio_servers_start_in_the_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, server) = fake_server("rel");
+        let McpServerConfig::Stdio(s) = &server else {
+            unreachable!()
+        };
+        let script = s.args[1].clone();
+        std::fs::write(dir.path().join("server.sh"), script).unwrap();
+        let rel = McpServerConfig::Stdio(StdioServerConfig {
+            command: "sh".into(),
+            args: vec!["./server.sh".into()],
+            env: Default::default(),
+            disabled: false,
+        });
+        let cfg = crate::config::Config {
+            cwd: dir.path().to_path_buf(),
+            strict_mcp_config: true,
+            extra_mcp_servers: [("rel".to_string(), rel)].into_iter().collect(),
+            ..Default::default()
+        };
+        let tools = crate::mcp::tools_for_config(&cfg).await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"mcp__rel__ping"), "{names:?}");
+    }
+
     /// ACP and `--headless` sessions take their tools from here; the CLI
     /// filters used to apply only in -p and the TUI.
     #[tokio::test]
@@ -241,6 +281,7 @@ cat >/dev/null"#;
             &Settings::default(),
             &extra,
             std::time::Duration::from_secs(10),
+            std::path::Path::new("."),
         )
         .await;
         let started: Vec<&str> = m.clients.iter().map(|c| c.server_name.as_str()).collect();
@@ -261,6 +302,7 @@ cat >/dev/null"#;
             &Settings::default(),
             &extra,
             std::time::Duration::from_millis(500),
+            std::path::Path::new("."),
         )
         .await;
         assert!(m.clients.is_empty());
