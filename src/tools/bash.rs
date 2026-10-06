@@ -327,6 +327,7 @@ impl Tool for BashTool {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let stream_tx = ctx.stream_tx.clone();
         let cwd = ctx.cwd.clone();
+        let extra_env = ctx.env.clone();
         // Resolve shell: ctx.default_shell → $SHELL env var → "bash"
         let shell = ctx
             .default_shell
@@ -348,7 +349,8 @@ impl Tool for BashTool {
                 .stderr(Stdio::piped())
                 // Defense in depth: if our Drop guard somehow doesn't fire,
                 // tokio's kill_on_drop still SIGKILLs the direct shell.
-                .kill_on_drop(true);
+                .kill_on_drop(true)
+                .envs(&extra_env);
 
             // Put the shell in its own process group so we can SIGKILL the
             // entire subtree on cancellation. Without this, grandchildren
@@ -480,5 +482,36 @@ impl Tool for BashTool {
         };
 
         fut.await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// settings.json `env` was documented as reaching Bash but was never set
+    /// on the child process.
+    #[tokio::test]
+    async fn settings_env_reaches_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.default_shell = Some("sh".into());
+        ctx.env
+            .insert("OXIDECLAW_TEST_SETTING".into(), "from-settings".into());
+        let out = BashTool
+            .execute(
+                serde_json::json!({ "command": "echo \"v=$OXIDECLAW_TEST_SETTING\"" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text: String = out
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::api::types::ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect();
+        assert!(text.contains("v=from-settings"), "{text}");
     }
 }

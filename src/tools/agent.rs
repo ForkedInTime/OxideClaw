@@ -68,6 +68,7 @@ impl AgentTool {
         if ctx.default_shell.is_some() {
             sub_config.default_shell = ctx.default_shell.clone();
         }
+        sub_config.env = ctx.env.clone();
         sub_config
     }
 }

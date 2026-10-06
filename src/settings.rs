@@ -137,8 +137,9 @@ pub struct Settings {
     /// Effort level: low/medium/high/max (influences thinking budget and compactness).
     pub effort: Option<String>,
 
-    /// Environment variables to inject into tool calls (e.g. for Bash tool).
-    /// Example: { "MY_VAR": "value" }
+    /// Environment variables set on every Bash and PowerShell tool command.
+    /// Example: { "MY_VAR": "value" }. An untrusted project's `env` is
+    /// dropped, since `PATH` or `LD_PRELOAD` would run code of its choosing.
     #[serde(default)]
     pub env: HashMap<String, String>,
 
@@ -465,8 +466,8 @@ impl Settings {
     /// Merge with the trust rule applied: an untrusted project contributes
     /// nothing that runs code, widens permissions, loosens the sandbox, or
     /// sends data somewhere new — no hooks, `apiKeyHelper`, MCP servers,
-    /// auto-fix commands, allow rules, shell, voice URL, Ollama host, Chrome
-    /// binary or CDP endpoint — and
+    /// auto-fix commands, allow rules, shell, tool `env`, voice URL, Ollama
+    /// host, Chrome binary or CDP endpoint — and
     /// cannot switch off the user's own hooks with `disableAllHooks`, re-enable
     /// the browser tools with `browserEnabled`, delete
     /// the user's sessions with `cleanupPeriodDays`, loosen `autonomy` or
@@ -488,6 +489,11 @@ impl Settings {
             }
             if project.api_key_helper.take().is_some() {
                 dropped.push("apiKeyHelper".into());
+            }
+            // `PATH` or `LD_PRELOAD` here picks what every Bash call runs.
+            if !project.env.is_empty() {
+                project.env.clear();
+                dropped.push("env".into());
             }
             // lint/test commands run automatically after the first edit.
             if project.auto_fix.take().is_some() {
@@ -1222,6 +1228,27 @@ mod project_trust_tests {
             trusted.browser_cdp_endpoint.as_deref(),
             Some("ws://attacker.example:9222")
         );
+    }
+
+    /// `env` is set on every Bash command, so `PATH` or `LD_PRELOAD` from a
+    /// cloned repo would choose what runs.
+    #[test]
+    fn an_untrusted_project_cannot_set_tool_env() {
+        let project = || Settings {
+            env: HashMap::from([("PATH".into(), "./bin".into())]),
+            ..Settings::default()
+        };
+        let global = Settings {
+            env: HashMap::from([("MY_VAR".into(), "mine".into())]),
+            ..Settings::default()
+        };
+        let merged = Settings::merge_with_trust(global.clone(), project(), None, false);
+        assert_eq!(merged.env, global.env);
+        assert!(merged.untrusted_project_config.contains(&"env".to_string()));
+
+        let trusted = Settings::merge_with_trust(global, project(), None, true);
+        assert_eq!(trusted.env.get("PATH").map(String::as_str), Some("./bin"));
+        assert_eq!(trusted.env.get("MY_VAR").map(String::as_str), Some("mine"));
     }
 
     #[test]

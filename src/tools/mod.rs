@@ -72,6 +72,8 @@ pub struct ToolContext {
     /// Default shell for the Bash tool ("bash", "powershell", etc.).
     /// None = use $SHELL env var or "bash" as fallback.
     pub default_shell: Option<String>,
+    /// `env` from settings.json, set on every Bash / PowerShell command.
+    pub env: std::collections::HashMap<String, String>,
 
     /// If set, Write/Edit tools snapshot the original file here before modifying it.
     /// Set to `~/.claude/sessions/<sid>/snapshots/turn-<n>/` by the run loop.
@@ -139,6 +141,7 @@ impl ToolContext {
             ask_user_tx: None,
             plan_mode_tx: None,
             default_shell: None,
+            env: std::collections::HashMap::new(),
             snapshot_dir: None,
             sandbox_mode: None,
             sandbox_allow_network: true,

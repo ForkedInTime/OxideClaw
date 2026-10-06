@@ -289,9 +289,6 @@ pub struct Config {
     /// Custom agent definitions JSON (--agents flag).
     pub custom_agents: Option<serde_json::Value>,
 
-    /// Which settings sources to load (user, project, local).
-    pub setting_sources: Option<Vec<String>>,
-
     /// Active output style name (e.g. "Explanatory", "Learning", or a custom .md name).
     /// "default" or None = no style active.
     pub output_style: Option<String>,
@@ -470,7 +467,6 @@ impl Default for Config {
             replay_user_messages: false,
             fork_session: false,
             custom_agents: None,
-            setting_sources: None,
             output_style: None,
             output_style_prompt: None,
             theme: None,
@@ -738,7 +734,6 @@ impl Config {
             replay_user_messages: old.replay_user_messages,
             fork_session: old.fork_session,
             custom_agents: old.custom_agents,
-            setting_sources: old.setting_sources,
             file_snapshot_dir: old.file_snapshot_dir,
             watch_debounce_ms: old.watch_debounce_ms,
             watch_rate_limit_ms: old.watch_rate_limit_ms,

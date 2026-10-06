@@ -252,12 +252,13 @@ struct Cli {
     #[arg(long)]
     fallback_model: Option<String>,
 
-    /// Create a git worktree at startup (optional name)
-    #[arg(long)]
+    // Accepted for Claude Code command-line compatibility but not
+    // implemented; `ignored_flag_warnings` says so instead of silently running
+    // in the main tree. `oxideclaw spawn` is the worktree path.
+    #[arg(long, hide = true)]
     worktree: Option<Option<String>>,
 
-    /// Create a tmux pane for the worktree (requires --worktree)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     tmux: bool,
 
     /// Handle a deep link URI (called by the OS when a registered URL scheme is activated)
@@ -276,8 +277,8 @@ struct Cli {
     #[arg(long)]
     disable_slash_commands: bool,
 
-    /// Comma-separated list of setting sources to load (user, project, local)
-    #[arg(long, value_delimiter = ',')]
+    // Accepted but not implemented; see `ignored_flag_warnings`.
+    #[arg(long, value_delimiter = ',', hide = true)]
     setting_sources: Vec<String>,
 
     /// Tools to make available: "" = none, "default" = all, or specific names
@@ -863,6 +864,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    for w in ignored_flag_warnings(&cli) {
+        eprintln!("warning: {w}");
+    }
+
     // Load config
     let mut config = Config::load()?;
 
@@ -1005,9 +1010,6 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-    }
-    if !cli.setting_sources.is_empty() {
-        config.setting_sources = Some(cli.setting_sources.clone());
     }
     // --settings: load extra settings from a file path or JSON string
     if let Some(ref settings_arg) = cli.settings {
@@ -1622,6 +1624,27 @@ mod self_update_tests {
     }
 }
 
+/// Flags kept so Claude Code command lines still parse, but which OxideClaw
+/// does not implement. Running anyway is right; doing it silently is not, since
+/// the user believes they are in a worktree or that project settings are off.
+fn ignored_flag_warnings(cli: &Cli) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cli.worktree.is_some() || cli.tmux {
+        out.push(
+            "--worktree and --tmux are not implemented and were ignored; this session runs \
+             in the current directory. Use `oxideclaw spawn \"<task>\"` for an agent in its \
+             own git worktree.",
+        );
+    }
+    if !cli.setting_sources.is_empty() {
+        out.push(
+            "--setting-sources is not implemented and was ignored; user and project \
+             settings both load. Use --settings <file> to add settings for one run.",
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod cli_parse_tests {
     use super::Cli;
@@ -1657,6 +1680,22 @@ mod cli_parse_tests {
 
         let cli = Cli::try_parse_from(["oxideclaw", "-p", "--", "fix", "-x", "flag"]).unwrap();
         assert_eq!(cli.prompt, vec!["fix", "-x", "flag"]);
+    }
+
+    /// These flags parsed and then did nothing, so `--worktree foo` edited the
+    /// main tree with no hint that it had.
+    #[test]
+    fn unimplemented_flags_warn_instead_of_vanishing() {
+        let warns = |args: &[&str]| {
+            let mut argv = vec!["oxideclaw"];
+            argv.extend_from_slice(args);
+            super::ignored_flag_warnings(&Cli::try_parse_from(argv).unwrap())
+        };
+        assert!(warns(&[]).is_empty());
+        assert!(warns(&["--worktree"])[0].contains("--worktree"));
+        assert!(warns(&["--worktree", "feat"])[0].contains("--worktree"));
+        assert!(warns(&["--tmux"])[0].contains("--tmux"));
+        assert!(warns(&["--setting-sources", "user,project"])[0].contains("--setting-sources"));
     }
 }
 

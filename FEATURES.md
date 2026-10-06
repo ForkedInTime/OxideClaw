@@ -55,30 +55,26 @@ Models that don't support tool use get automatic text-only fallback. Ollama mode
 
 OxideClaw supports any OpenAI-compatible API endpoint:
 
-| Provider | Config key |
-|----------|-----------|
-| Groq | `groq` |
-| OpenRouter | `openrouter` |
-| DeepSeek | `deepseek` |
-| LM Studio | `lmstudio` |
-| Together | `together` |
-| Mistral | `mistral` |
-| Venice.ai | `venice` |
-| OpenAI | `openai` |
-| Generic | `openai-compat` |
+| Provider | Model prefix | API key variable |
+|----------|--------------|------------------|
+| Groq | `groq:` | `GROQ_API_KEY` |
+| OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` |
+| DeepSeek | `deepseek:` | `DEEPSEEK_API_KEY` |
+| LM Studio | `lmstudio:` | none (`LM_STUDIO_HOST` overrides `http://localhost:1234/v1`) |
+| Together | `together:` | `TOGETHER_API_KEY` |
+| Mistral | `mistral:` | `MISTRAL_API_KEY` |
+| Venice.ai | `venice:` | `VENICE_API_KEY` |
+| OpenAI | `oai:` | `OPENAI_API_KEY` |
+| Generic | `openai-compat:` | `OPENAI_API_KEY`, plus `OPENAI_BASE_URL` (required) |
 
-Configure in `~/.config/oxideclaw/settings.json`:
+Keys come from the environment, never from `settings.json`. Export the variable or put it in `~/.env` or `~/.config/oxideclaw/.env`, then pick the model:
 
-```json
-{
-  "providers": {
-    "groq": {
-      "api_key": "gsk_...",
-      "model": "llama-3.3-70b-versatile"
-    }
-  }
-}
+```bash
+echo 'GROQ_API_KEY=gsk_...' >> ~/.config/oxideclaw/.env
+oxideclaw --model groq:llama-3.3-70b-versatile
 ```
+
+Each provider reads only its own variable, so your OpenAI key is never sent to Groq or OpenRouter.
 
 ---
 
@@ -415,8 +411,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 {
   "model": "claude-sonnet-5",
   "showThinkingSummaries": true,
-  "spinnerStyle": "themed",
-  "providers": {}
+  "spinnerStyle": "themed"
 }
 ```
 
@@ -427,6 +422,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 | `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables (ignored on Fable, Opus 5.5 and Sonnet 5.5, where the API does not allow thinking to be turned off). CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
 | `effort` | `low` / `medium` / `high` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5; older and non-Claude models get a prompt nudge. Set with `/effort` |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
+| `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |
 
 ### CLAUDE.md / AGENTS.md
 

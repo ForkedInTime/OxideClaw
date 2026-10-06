@@ -92,7 +92,8 @@ impl Tool for PowerShellTool {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
+                .kill_on_drop(true)
+                .envs(&ctx.env);
             #[cfg(unix)]
             cmd.process_group(0);
 
