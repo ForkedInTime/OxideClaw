@@ -49,6 +49,36 @@ pub(super) struct ApiTask {
     pub(super) history: TurnHistory,
 }
 
+/// Loop detection: the same call getting the same result several times in
+/// a row is a model stuck, not progress. Repeating a call alone is normal
+/// (edit, `cargo test`, edit, `cargo test`), so the result counts too.
+#[derive(Default)]
+struct LoopGuard {
+    last: Option<(String, u64, bool)>,
+    streak: usize,
+}
+
+const LOOP_THRESHOLD: usize = 3;
+
+impl LoopGuard {
+    /// Record a finished call; returns how many times in a row it has now
+    /// run with these arguments and this result.
+    fn record(&mut self, name: &str, args: &str, result: &str, is_error: bool) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        args.hash(&mut hasher);
+        result.hash(&mut hasher);
+        let sig = (name.to_string(), hasher.finish(), is_error);
+        if self.last.as_ref() == Some(&sig) {
+            self.streak += 1;
+        } else {
+            self.last = Some(sig);
+            self.streak = 1;
+        }
+        self.streak
+    }
+}
+
 /// Publish the turn's history so far: `messages` plus the results of the
 /// tool round in progress.
 fn publish_history(history: &TurnHistory, messages: &[Message], results: &[ContentBlock]) {
@@ -212,12 +242,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
     // compact notice instead of the full body (v2.1.86).
     let read_cache = crate::tools::new_read_cache();
 
-    // Loop detection: track recent (tool_name, args_hash) to catch repeated failures.
-    // If the same call appears 3+ times in the last 6 entries, pause and ask.
-    let mut recent_calls: std::collections::VecDeque<(String, u64)> =
-        std::collections::VecDeque::new();
-    const LOOP_WINDOW: usize = 6;
-    const LOOP_THRESHOLD: usize = 3;
+    let mut loop_guard = LoopGuard::default();
 
     let mut iterations: u32 = 0;
     // Retries consumed by the auto-fix loop within the current user turn.
@@ -582,27 +607,6 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             args: args.clone(),
                         });
 
-                        // ── Loop detection ──────────────────────────────────
-                        {
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            args.hash(&mut hasher);
-                            let sig = (name.clone(), hasher.finish());
-                            recent_calls.push_back(sig.clone());
-                            while recent_calls.len() > LOOP_WINDOW {
-                                recent_calls.pop_front();
-                            }
-                            let repeats = recent_calls.iter().filter(|c| **c == sig).count();
-                            if repeats >= LOOP_THRESHOLD {
-                                let _ = tx.send(AppEvent::TurnFailed(format!(
-                                    "Loop detected: tool '{name}' called {} times with identical arguments in the last {} calls. \
-                                     Pausing to prevent infinite loop. Send a new message to continue.",
-                                    repeats, LOOP_WINDOW,
-                                )));
-                                return;
-                            }
-                        }
-
                         // Plan mode: block destructive tools
                         if effective_plan_mode
                             && PLAN_MODE_BLOCKED_TOOLS
@@ -750,10 +754,47 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             let _ = tx.send(AppEvent::SetPlanMode(enabled));
                         }
 
+                        let same_call_streak =
+                            loop_guard.record(name, &args, &result_text, output.is_error);
+
                         let _ = tx.send(AppEvent::ToolResult {
                             is_error: output.is_error,
                             text: result_text,
                         });
+
+                        if same_call_streak >= LOOP_THRESHOLD {
+                            // End the turn like any other: keep its history
+                            // and answer every tool_use, so the user can
+                            // steer and the next request is valid.
+                            results.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: vec![ToolResultContent::text(format!(
+                                    "Loop detected: identical '{name}' call returned identical \
+                                     output {same_call_streak} times in a row. Change approach \
+                                     or ask the user."
+                                ))],
+                                is_error: Some(true),
+                            });
+                            messages.push(Message {
+                                role: Role::User,
+                                content: std::mem::take(&mut results),
+                            });
+                            close_dangling_tool_uses(&mut messages);
+                            let _ = tx.send(AppEvent::SystemMessage(format!(
+                                "Loop detected: '{name}' returned the same output \
+                                 {same_call_streak} times in a row — paused. Send a message to \
+                                 continue."
+                            )));
+                            let _ = tx.send(AppEvent::Done {
+                                tokens_in: response.usage.input_tokens,
+                                tokens_out: response.usage.output_tokens,
+                                cache_read: response.usage.cache_read_input_tokens,
+                                cache_write: response.usage.cache_creation_input_tokens,
+                                messages: messages.clone(),
+                                model_used: config.model.clone(),
+                            });
+                            return;
+                        }
 
                         // Track files touched by successful Write/Edit/MultiEdit
                         // calls for the auto-fix post-loop check.
@@ -1093,5 +1134,41 @@ mod turn_history_tests {
         let (got, rewrite) = recover_turn_history(&history, &current, 2).unwrap();
         assert!(rewrite);
         assert_eq!(got, vec![text(Role::User, "SUMMARY")]);
+    }
+}
+
+#[cfg(test)]
+mod loop_guard_tests {
+    use super::*;
+
+    /// edit, test, edit, test, edit, test: each test run is the same call,
+    /// which the old detector counted as a loop and aborted the turn on.
+    #[test]
+    fn an_edit_test_cycle_is_not_a_loop() {
+        let mut g = LoopGuard::default();
+        for i in 0..5 {
+            let edit = format!(r#"{{"file_path":"a.rs","new_string":"v{i}"}}"#);
+            assert_eq!(g.record("Edit", &edit, "ok", false), 1);
+            let out = format!("{} passed; 1 failed", i);
+            assert_eq!(
+                g.record("Bash", r#"{"command":"cargo test"}"#, &out, false),
+                1
+            );
+        }
+    }
+
+    /// The same call answered the same way, back to back, is a model stuck.
+    #[test]
+    fn identical_call_and_result_in_a_row_trips_the_threshold() {
+        let mut g = LoopGuard::default();
+        let args = r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#;
+        assert_eq!(g.record("Edit", args, "old_string not found", true), 1);
+        assert_eq!(g.record("Edit", args, "old_string not found", true), 2);
+        assert_eq!(
+            g.record("Edit", args, "old_string not found", true),
+            LOOP_THRESHOLD
+        );
+        // A different result resets the streak.
+        assert_eq!(g.record("Edit", args, "ok", false), 1);
     }
 }
