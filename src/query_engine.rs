@@ -151,13 +151,18 @@ impl QueryEngine {
             println!("{}", event);
         }
 
-        // RAG context injection: search the local index for relevant code
+        // RAG context rides in the user turn, after the prompt. Putting it in
+        // `system` for the first request only changed `system` mid-
+        // conversation, which invalidates the signed thinking blocks replayed
+        // on the next request (a 400 on Opus 5.5 / Fable 5.1 / Sonnet 5.5).
         let rag_context = self.retrieve_rag_context(&user_input);
-
-        // Append user message
+        let mut content = vec![ContentBlock::Text { text: user_input }];
+        if !rag_context.is_empty() {
+            content.push(ContentBlock::Text { text: rag_context });
+        }
         self.messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: user_input }],
+            content,
         });
 
         const DEFAULT_MAX_TURNS: u32 = 50;
@@ -179,17 +184,10 @@ impl QueryEngine {
             let tool_defs: Vec<ToolDefinition> =
                 self.tools.iter().map(|t| t.definition()).collect();
 
-            // Augment system prompt with RAG context on the first turn
-            let effective_system = if turn == 1 && !rag_context.is_empty() {
-                format!("{}\n\n{}", self.system_prompt, rag_context)
-            } else {
-                self.system_prompt.clone()
-            };
-
             let request = MessagesRequest {
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens_for(&self.config.model),
-                system: crate::api::types::SystemContent::Plain(effective_system),
+                system: crate::api::types::SystemContent::Plain(self.system_prompt.clone()),
                 messages: self.messages.clone(),
                 tools: tool_defs,
                 stream: None,
@@ -895,6 +893,138 @@ fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
         usage.cache_read_input_tokens,
         usage.cache_creation_input_tokens,
     )
+}
+
+#[cfg(test)]
+mod rag_placement_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn sse(blocks: &[serde_json::Value], stop_reason: &str) -> String {
+        let mut events = vec![
+            r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#.to_string(),
+        ];
+        for (i, b) in blocks.iter().enumerate() {
+            events.push(
+                serde_json::json!({"type":"content_block_start","index":i,"content_block":b})
+                    .to_string(),
+            );
+            if b["type"] == "tool_use" {
+                events.push(serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":"{}"}}).to_string());
+            }
+            events.push(serde_json::json!({"type":"content_block_stop","index":i}).to_string());
+        }
+        events.push(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":5}}).to_string());
+        events.push(r#"{"type":"message_stop"}"#.to_string());
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Anthropic stand-in: answers each connection with the next scripted
+    /// response and records every request body.
+    async fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let len = text[..split]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= split + 4 + len || n == 0 {
+                            sink.lock().unwrap().push(text[split + 4..].to_string());
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// RAG text went into `system` on the first request of a prompt only,
+    /// so the request after a tool call carried a different `system` and
+    /// the replayed thinking signatures were rejected. `system` must be
+    /// identical on every request, with the context in the user turn.
+    #[tokio::test]
+    async fn rag_context_keeps_the_system_prompt_stable_across_tool_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("auth.rs"),
+            "/// Validate the session token expiry.\nfn validate_session_token() -> bool { true }\n",
+        )
+        .unwrap();
+        let db = rag::RagDb::open(dir.path()).unwrap();
+        rag::indexer::index_project(&db, dir.path(), true).unwrap();
+        drop(db);
+
+        let (url, seen) = serve(vec![
+            sse(
+                &[serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})],
+                "tool_use",
+            ),
+            sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+
+        e.query("validate session token").await.unwrap();
+
+        let bodies: Vec<serde_json::Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["system"], bodies[1]["system"]);
+        assert!(!bodies[0]["system"].to_string().contains("codebase_context"));
+        let user = &bodies[1]["messages"][0]["content"];
+        assert_eq!(user[0]["text"], "validate session token");
+        assert!(
+            user[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("validate_session_token"),
+            "{user}"
+        );
+    }
 }
 
 #[cfg(test)]

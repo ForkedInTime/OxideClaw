@@ -150,7 +150,9 @@ impl SdkSession {
         // 1. Reset per-turn state
         self.tools_used_this_turn.clear();
 
-        // 2. Retrieve RAG context (silently ignore errors)
+        // 2. Retrieve RAG context (silently ignore errors). It goes in the
+        // user turn: `system` must stay byte-identical for the whole
+        // conversation or replayed thinking-block signatures are rejected.
         let rag_context = self.retrieve_rag_context(&prompt);
 
         // UserPromptSubmit hooks may add context or stop the prompt, as in the TUI.
@@ -180,10 +182,16 @@ impl SdkSession {
         };
 
         // 3. Push user message
+        let mut content = vec![ContentBlock::Text { text: prompt }];
+        if !rag_context.is_empty() {
+            content.push(ContentBlock::Text { text: rag_context });
+        }
         self.messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: prompt }],
+            content,
         });
+        let mut system = self.system_prompt.clone();
+        self.inject_capabilities(&mut system);
 
         // 4. Agentic loop
         const DEFAULT_MAX_TURNS: u32 = 50;
@@ -217,18 +225,10 @@ impl SdkSession {
             let tool_defs: Vec<ToolDefinition> =
                 self.tools.iter().map(|t| t.definition()).collect();
 
-            // Augment system prompt with RAG context on the first turn + capabilities
-            let mut effective_system = if loop_turn == 1 && !rag_context.is_empty() {
-                format!("{}\n\n{}", self.system_prompt, rag_context)
-            } else {
-                self.system_prompt.clone()
-            };
-            self.inject_capabilities(&mut effective_system);
-
             let request = MessagesRequest {
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens_for(&self.config.model),
-                system: SystemContent::Plain(effective_system),
+                system: SystemContent::Plain(system.clone()),
                 messages: self.messages.clone(),
                 tools: tool_defs,
                 stream: None,
