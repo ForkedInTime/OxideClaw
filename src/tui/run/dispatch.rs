@@ -1148,7 +1148,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             };
             // Otherwise a typo reads as "no changes detected".
             if !settings.load_errors.is_empty() {
-                msg.push_str("\n");
+                msg.push('\n');
                 msg.push_str(&crate::settings::load_errors_notice(&settings.load_errors));
             }
             config.settings_load_errors = settings.load_errors;
