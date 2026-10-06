@@ -261,8 +261,9 @@ pub async fn run_browse(
     );
 
     // Bridge: internal approvals → progress event + external approval channel.
+    // The gate-trip announcement is spoken by the gate itself, before it
+    // starts listening: spoken here, it played into the open mic.
     let approval_bridge_progress_tx = progress_tx.clone();
-    let voice_on_gate = req.voice;
     let approval_bridge_handle = tokio::spawn(async move {
         while let Some(prompt) = internal_approval_rx.recv().await {
             let _ = approval_bridge_progress_tx
@@ -274,19 +275,6 @@ pub async fn run_browse(
                     reason: prompt.reason.clone(),
                 })
                 .await;
-            if voice_on_gate {
-                let phrase = format!(
-                    "Approval needed for {} — {}",
-                    prompt.tool_name, prompt.reason
-                );
-                tokio::spawn(async move {
-                    crate::voice::speak_browse_milestone(
-                        crate::voice::BrowseMilestone::GateTrip,
-                        &phrase,
-                    )
-                    .await;
-                });
-            }
             if approval_tx.send(prompt).await.is_err() {
                 // Caller dropped the approval channel — stop bridging.
                 break;

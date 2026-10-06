@@ -238,6 +238,20 @@ pub fn form_signals_for(tool_name: &str, target_text: &str) -> Vec<String> {
 
 // ── Middleware bridge ─────────────────────────────────────────────────────────
 
+/// What the voice gate says before it listens. Fixed wording on purpose: it
+/// carries no page text (a button labelled "Confirm purchase" read aloud is a
+/// "confirm" the mic may hear) and no yes/no words of its own.
+fn gate_trip_phrase(tool_name: &str) -> String {
+    let action = match tool_name {
+        "browser_click" => "click",
+        "browser_fill" => "fill in a field",
+        "browser_press_key" => "press a key",
+        "browser_navigate" => "open a page",
+        _ => "take a browser action",
+    };
+    format!("Approval needed to {action}. Please answer.")
+}
+
 /// Approval prompt sent to the host (TUI/SDK/voice).
 pub struct ApprovalPrompt {
     pub step: u32,
@@ -484,19 +498,38 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                     };
                 }
                 use tokio::time::{Duration, timeout};
-                // If voice is on, race the keyboard reply against a voice-approval
-                // listener. Whichever resolves first wins. Voice only contributes
-                // an Approve vote (false/timeout is ignored unless no keyboard reply
-                // arrives either).
+                // If voice is on, announce the gate, then race the keyboard reply
+                // against a voice-approval listener. Whichever resolves first wins.
+                // Voice only contributes an Approve vote (false/timeout is ignored
+                // unless no keyboard reply arrives either).
                 let approved_opt: Option<bool> = if self.voice {
-                    tokio::select! {
-                        kb = timeout(Duration::from_secs(60), rx) => match kb {
-                            Ok(Ok(b)) => Some(b),
-                            _ => None,
+                    let mut rx = rx;
+                    // The announcement must finish before the mic opens, or the
+                    // speaker's own words are transcribed as the reply. A key
+                    // pressed meanwhile still answers.
+                    let phrase = gate_trip_phrase(tool_name);
+                    let early = tokio::select! {
+                        kb = &mut rx => Some(kb.ok()),
+                        _ = crate::voice::speak_browse_milestone(
+                            crate::voice::BrowseMilestone::GateTrip,
+                            &phrase,
+                        ) => None,
+                    };
+                    match early {
+                        Some(kb) => kb,
+                        None => tokio::select! {
+                            kb = timeout(Duration::from_secs(60), rx) => match kb {
+                                Ok(Ok(b)) => Some(b),
+                                _ => None,
+                            },
+                            voice_yes = crate::voice::await_voice_approval(
+                                60,
+                                self.voice_api_url.as_deref(),
+                                &phrase,
+                            ) => {
+                                if voice_yes { Some(true) } else { None }
+                            }
                         },
-                        voice_yes = crate::voice::await_voice_approval(60, self.voice_api_url.as_deref()) => {
-                            if voice_yes { Some(true) } else { None }
-                        }
                     }
                 } else {
                     match timeout(Duration::from_secs(60), rx).await {
@@ -587,6 +620,30 @@ mod wiring_tests {
             visible_prices: vec![],
         };
         assert_eq!(gate.check(&ctx), GateVerdict::Allow);
+    }
+
+    /// The gate announcement is spoken right before the mic opens; any of
+    /// its words that reached the recording must neither approve nor veto a
+    /// real "yes", whatever the tool.
+    #[test]
+    fn the_gate_announcement_is_neutral_to_the_voice_matcher() {
+        for tool in [
+            "browser_click",
+            "browser_fill",
+            "browser_press_key",
+            "browser_navigate",
+            "browser_unknown",
+        ] {
+            let phrase = gate_trip_phrase(tool);
+            assert!(
+                !crate::voice::is_spoken_approval(&phrase, ""),
+                "{phrase:?} approves by itself"
+            );
+            assert!(
+                crate::voice::is_spoken_approval(&format!("{phrase} yes"), ""),
+                "{phrase:?} vetoes a spoken yes"
+            );
+        }
     }
 
     /// Build a middleware with an auto-approving host.

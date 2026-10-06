@@ -971,8 +971,9 @@ pub async fn speak_browse_milestone(milestone: BrowseMilestone, text: &str) {
 /// Returns true if the user said "confirm"/"yes"/"approve"/"ok", false otherwise.
 /// Times out after `timeout_secs`, returning false on timeout. `api_url` is
 /// the user's `voiceApiUrl`: without it the reply always went to OpenAI, with
-/// whatever key was meant for the custom endpoint.
-pub async fn await_voice_approval(timeout_secs: u64, api_url: Option<&str>) -> bool {
+/// whatever key was meant for the custom endpoint. `prompt` is what was just
+/// spoken to the user, so its echo in the recording is not taken as the reply.
+pub async fn await_voice_approval(timeout_secs: u64, api_url: Option<&str>, prompt: &str) -> bool {
     // Requires a recorder to be available; return deny if none found.
     let backend = match find_recorder() {
         Some(b) => b,
@@ -1014,18 +1015,23 @@ pub async fn await_voice_approval(timeout_secs: u64, api_url: Option<&str>) -> b
         Ok(Ok(text)) => text,
         _ => return false, // timeout or transcription error = deny
     };
-    is_spoken_approval(&transcript)
+    is_spoken_approval(&transcript, prompt)
 }
 
 /// A spoken "yes" for a destructive action: an affirmative *word* and no
 /// negation. Substring matching approved "not okay", "don't book it"
-/// ("bo-ok") and "no, I don't approve".
-pub fn is_spoken_approval(transcript: &str) -> bool {
-    let lower = transcript.to_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_alphanumeric() && c != '\'')
-        .filter(|w| !w.is_empty())
-        .collect();
+/// ("bo-ok") and "no, I don't approve". An affirmative that also appears in
+/// `prompt` does not count: the mic can pick up the speaker reading the prompt,
+/// and an echoed "confirm" is not the user's answer. Echoed negations still
+/// deny, which fails safe.
+pub fn is_spoken_approval(transcript: &str, prompt: &str) -> bool {
+    fn words(s: &str) -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
     const NEGATIONS: &[&str] = &[
         "no", "not", "don't", "dont", "never", "stop", "cancel", "deny", "wait", "nope",
     ];
@@ -1040,12 +1046,32 @@ pub fn is_spoken_approval(transcript: &str) -> bool {
         "ok",
         "okay",
     ];
-    !words.iter().any(|w| NEGATIONS.contains(w)) && words.iter().any(|w| YES.contains(w))
+    let heard = words(transcript);
+    let echoed = words(prompt);
+    !heard.iter().any(|w| NEGATIONS.contains(&w.as_str()))
+        && heard
+            .iter()
+            .any(|w| YES.contains(&w.as_str()) && !echoed.contains(w))
 }
 
 #[cfg(test)]
 mod spoken_approval_tests {
-    use super::is_spoken_approval as yes;
+    use super::is_spoken_approval;
+
+    fn yes(transcript: &str) -> bool {
+        is_spoken_approval(transcript, "")
+    }
+
+    /// Played while the mic was open, the old gate announcement read the
+    /// page's button label aloud and approved a purchase by itself.
+    #[test]
+    fn the_prompt_echoed_back_is_not_an_approval() {
+        let prompt = "Approval needed for browser_click — button_text: Confirm purchase";
+        assert!(yes(prompt), "echo without the prompt filter approves");
+        assert!(!is_spoken_approval(prompt, prompt));
+        assert!(!is_spoken_approval(&format!("{prompt} okay, no"), prompt));
+        assert!(is_spoken_approval(&format!("{prompt} yes"), prompt));
+    }
 
     #[test]
     fn only_unnegated_affirmatives_approve() {
