@@ -158,6 +158,11 @@ fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &s
         format!("--user-data-dir={}", profile.display()),
     ];
     args.extend(crate::net_policy::chromium_proxy_args(proxy));
+    // As root Chromium refuses to start with its sandbox on, and every
+    // fetch silently fell back to the plain one.
+    if crate::browser::runs_as_root() {
+        args.push("--no-sandbox".into());
+    }
     args.extend(["--dump-dom".into(), url.into()]);
     args
 }

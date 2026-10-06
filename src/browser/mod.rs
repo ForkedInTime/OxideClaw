@@ -95,22 +95,39 @@ impl BrowserSession {
         let proxy =
             crate::net_policy::spawn_policy_proxy(crate::net_policy::NetPolicy::LOCAL_OK).await?;
 
-        let args = launch_args(port, user_data.path(), proxy.addr, headless);
+        let args = launch_args(port, user_data.path(), proxy.addr, headless, runs_as_root());
 
         let mut child = tokio::process::Command::new(&chrome)
             .args(&args)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to launch Chrome at {}: {e}", chrome.display()))?;
+        // Chrome explains a failed start only on stderr. Drained for the
+        // whole session so a chatty Chrome never blocks on a full pipe.
+        let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain = child
+            .stderr
+            .take()
+            .map(|pipe| tokio::spawn(keep_tail(pipe, stderr_tail.clone())));
 
         // Cleanup guard: if poll or connect fail, kill the child before returning.
-        let ws_url = match poll_cdp_endpoint(port).await {
+        let ws_url = match poll_cdp_endpoint(port, &mut child).await {
             Ok(u) => u,
             Err(e) => {
                 let _ = child.kill().await;
-                return Err(e);
+                // Chrome's helpers can hold the pipe open after it exits.
+                if let Some(d) = drain {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), d).await;
+                }
+                let tail = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+                let tail = String::from_utf8_lossy(&tail);
+                let tail = tail.trim();
+                if tail.is_empty() {
+                    return Err(e);
+                }
+                return Err(anyhow::anyhow!("{e}\nChrome stderr:\n{tail}"));
             }
         };
         let client = match CdpClient::connect(&ws_url).await {
@@ -232,6 +249,39 @@ pub fn normalize_ref(r: &str) -> String {
     }
 }
 
+/// Bytes of Chrome's stderr kept for a launch error.
+const STDERR_TAIL: usize = 2048;
+
+/// Read `pipe` to EOF, keeping only its last `STDERR_TAIL` bytes in `tail`.
+async fn keep_tail(mut pipe: tokio::process::ChildStderr, tail: Arc<std::sync::Mutex<Vec<u8>>>) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = pipe.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+        t.extend_from_slice(&buf[..n]);
+        let excess = t.len().saturating_sub(STDERR_TAIL);
+        t.drain(..excess);
+    }
+}
+
+/// Chrome on Linux refuses to start as root unless its sandbox is off
+/// ("Running as root without --no-sandbox is not supported"), and root is
+/// the default user in Docker and most CI runners.
+pub(crate) fn runs_as_root() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Chrome's command line for a launched session. Every connection goes
 /// through the policy proxy at `proxy`.
 fn launch_args(
@@ -239,6 +289,7 @@ fn launch_args(
     user_data: &std::path::Path,
     proxy: std::net::SocketAddr,
     headless: bool,
+    no_sandbox: bool,
 ) -> Vec<String> {
     let mut args = vec![
         format!("--remote-debugging-port={port}"),
@@ -251,6 +302,9 @@ fn launch_args(
         "--disable-dev-shm-usage".to_string(),
     ];
     args.extend(crate::net_policy::chromium_proxy_args(proxy));
+    if no_sandbox {
+        args.push("--no-sandbox".to_string());
+    }
     if headless {
         args.push("--headless=new".to_string());
         args.push("--disable-gpu".to_string());
@@ -448,12 +502,17 @@ async fn find_free_port() -> Result<u16> {
 /// page target; the browser-level WebSocket from /json/version returns
 /// `'Page.enable' wasn't found`. If no page target exists yet, fall back to
 /// creating one via PUT /json/new.
-async fn poll_cdp_endpoint(port: u16) -> Result<String> {
+async fn poll_cdp_endpoint(port: u16, child: &mut Child) -> Result<String> {
     let list_url = format!("http://127.0.0.1:{port}/json/list");
     let new_url = format!("http://127.0.0.1:{port}/json/new?about:blank");
     let client = reqwest::Client::new();
 
     for attempt in 0..30 {
+        // A Chrome that refused to start used to cost the full 6 s and
+        // surface only as "no page target".
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("Chrome exited during startup ({status})");
+        }
         if let Ok(resp) = client.get(&list_url).send().await
             && let Ok(targets) = resp.json::<serde_json::Value>().await
             && let Some(arr) = targets.as_array()
@@ -492,7 +551,7 @@ mod tests {
     fn launched_chrome_is_pinned_to_the_policy_proxy() {
         let proxy: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
         for headless in [true, false] {
-            let args = launch_args(9222, std::path::Path::new("/p"), proxy, headless);
+            let args = launch_args(9222, std::path::Path::new("/p"), proxy, headless, false);
             assert!(args.contains(&"--proxy-server=http://127.0.0.1:4242".to_string()));
             assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
             assert!(
@@ -500,6 +559,47 @@ mod tests {
             );
             assert_eq!(args.last().unwrap(), "about:blank");
         }
+    }
+
+    #[test]
+    fn the_sandbox_is_off_only_when_asked() {
+        let proxy: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let p = std::path::Path::new("/p");
+        assert!(launch_args(9222, p, proxy, true, true).contains(&"--no-sandbox".to_string()));
+        assert!(!launch_args(9222, p, proxy, true, false).contains(&"--no-sandbox".to_string()));
+    }
+
+    /// Chrome refusing to start (as root without --no-sandbox, a missing
+    /// library) was reported after 6 s as "did not expose a page target",
+    /// with its stderr thrown away.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chrome_that_exits_at_startup_reports_its_stderr_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("chrome");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'Running as root without --no-sandbox is not supported.' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = BrowserSession::default()
+            .launch(true, Some(fake.to_str().unwrap()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exited during startup"), "{err}");
+        assert!(
+            err.contains("without --no-sandbox is not supported"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "{err}"
+        );
     }
 
     #[test]
