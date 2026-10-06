@@ -517,6 +517,22 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Take the API key from `api_key_helper`, if one is set and prints a
+    /// key. The key is registered so a 401 on it re-runs the helper.
+    pub fn apply_api_key_helper(&mut self) {
+        let Some(cmd) = self.api_key_helper.clone() else {
+            return;
+        };
+        match crate::auth::run_api_key_helper(&cmd) {
+            Ok(key) if !key.is_empty() => {
+                crate::auth::register_helper_key(&cmd, &key);
+                self.api_key = key;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("Warning: {e}"),
+        }
+    }
+
     pub fn load() -> Result<Self> {
         let mut cfg = Config::default();
 
@@ -563,28 +579,8 @@ impl Config {
         }
 
         // ── apiKeyHelper: run a shell command to get the API key
-        if cfg.api_key.is_empty()
-            && let Some(ref helper_cmd) = cfg.api_key_helper.clone()
-        {
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(helper_cmd)
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !key.is_empty() {
-                        cfg.api_key = key;
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    eprintln!("Warning: apiKeyHelper failed: {stderr}");
-                }
-                Err(e) => {
-                    eprintln!("Warning: apiKeyHelper could not run: {e}");
-                }
-            }
+        if cfg.api_key.is_empty() {
+            cfg.apply_api_key_helper();
         }
 
         // ── Last resort: the active `ant auth login` profile.

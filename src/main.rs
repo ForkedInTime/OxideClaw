@@ -1032,8 +1032,13 @@ async fn main() -> Result<()> {
             if let Some(mt) = extra.max_tokens {
                 config.max_tokens = Some(mt);
             }
+            // Config::load already ran the helpers it knew of; this one
+            // would otherwise never run.
             if let Some(ah) = extra.api_key_helper {
                 config.api_key_helper = Some(ah);
+                if config.api_key.is_empty() {
+                    config.apply_api_key_helper();
+                }
             }
             for (k, v) in extra.mcp_servers {
                 config.extra_mcp_servers.insert(k, v);

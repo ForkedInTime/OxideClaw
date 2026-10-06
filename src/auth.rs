@@ -291,6 +291,60 @@ impl ProfileTokens {
     }
 }
 
+/// Every key `apiKeyHelper` has printed for this process, newest last.
+///
+/// Helpers exist to mint short-lived keys (vault, gateway, STS), and the
+/// key fetched at startup was sent until restart, so a long session failed
+/// every request with 401 once it expired. A 401 on a helper key re-runs
+/// the helper, exactly as an `ant` profile token is refreshed.
+pub static HELPER_KEYS: ProfileTokens = ProfileTokens::new(fetch_helper_key);
+
+/// The helper command `HELPER_KEYS` re-runs; the latest one configured.
+static HELPER_CMD: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+fn fetch_helper_key() -> Option<String> {
+    let cmd = HELPER_CMD
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    run_api_key_helper(&cmd)
+        .ok()
+        .and_then(|k| non_empty(Some(k)))
+}
+
+/// Run an `apiKeyHelper` command: the key is its trimmed stdout. `Err`
+/// carries the message to warn with.
+pub fn run_api_key_helper(cmd: &str) -> Result<String, String> {
+    match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Err(format!(
+            "apiKeyHelper failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("apiKeyHelper could not run: {e}")),
+    }
+}
+
+/// Record that `key` came from the helper `cmd`, so a 401 on it (or on any
+/// copy of it) re-runs `cmd`.
+pub fn register_helper_key(cmd: &str, key: &str) {
+    *HELPER_CMD.write().unwrap_or_else(|e| e.into_inner()) = Some(cmd.to_string());
+    HELPER_KEYS.register(key);
+}
+
+/// Where a credential of this kind is refreshed from: the `ant` profile for
+/// OAuth tokens, the apiKeyHelper for keys. A secret neither issued passes
+/// through unchanged and is never retried.
+pub fn refreshable(is_oauth: bool) -> &'static ProfileTokens {
+    if is_oauth {
+        &PROFILE_TOKENS
+    } else {
+        &HELPER_KEYS
+    }
+}
+
 /// The real environment: process env vars plus the `ant` CLI.
 pub struct ProcessAuthEnv;
 
@@ -443,6 +497,36 @@ mod profile_token_tests {
         let p = ProfileTokens::new(unchanged);
         p.register("t1");
         assert_eq!(p.refresh("t1"), None);
+    }
+
+    /// The helper ran once at startup, so a rotated key never reached a
+    /// running session. A 401 on its key must re-run it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_helper_key_reruns_the_helper() {
+        use super::{HELPER_KEYS, register_helper_key, run_api_key_helper};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key");
+        let cmd = format!("cat '{}'", file.display());
+        std::fs::write(&file, "  helper-key-1\n").unwrap();
+        let first = run_api_key_helper(&cmd).unwrap();
+        assert_eq!(first, "helper-key-1");
+        register_helper_key(&cmd, &first);
+
+        std::fs::write(&file, "helper-key-2\n").unwrap();
+        assert_eq!(
+            HELPER_KEYS.refresh("helper-key-1").as_deref(),
+            Some("helper-key-2")
+        );
+        assert_eq!(HELPER_KEYS.live("helper-key-1"), "helper-key-2");
+        // A key the helper never printed is not its to refresh.
+        assert_eq!(HELPER_KEYS.refresh("sk-ant-static"), None);
+
+        assert!(
+            run_api_key_helper("echo nope >&2; exit 3")
+                .unwrap_err()
+                .contains("nope")
+        );
     }
 }
 

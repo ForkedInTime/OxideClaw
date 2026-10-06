@@ -120,7 +120,8 @@ pub struct ClaudeClient {
     /// `api_key` is an OAuth token: sent as `Authorization: Bearer`, and
     /// swapped for the newest `ant` profile token when it is one.
     is_oauth: bool,
-    /// Where an OAuth token is refreshed after a 401.
+    /// Where `api_key` is refreshed after a 401: the `ant` profile for an
+    /// OAuth token, the apiKeyHelper for a key.
     profile: &'static crate::auth::ProfileTokens,
     base_url: String,
     /// Betas the credential itself requires, merged into every request's
@@ -182,7 +183,7 @@ impl ClaudeClient {
             client,
             api_key,
             is_oauth: cred.is_oauth(),
-            profile: &crate::auth::PROFILE_TOKENS,
+            profile: crate::auth::refreshable(cred.is_oauth()),
             base_url: ANTHROPIC_API_BASE.to_string(),
             credential_betas,
             retry_notifier: None,
@@ -201,7 +202,8 @@ impl ClaudeClient {
         self.base_url = url.into();
     }
 
-    /// Test-only: refresh OAuth tokens from `profile` instead of `ant`.
+    /// Test-only: refresh credentials from `profile` instead of `ant` or
+    /// the apiKeyHelper.
     #[cfg(test)]
     pub(crate) fn set_profile_for_test(&mut self, profile: &'static crate::auth::ProfileTokens) {
         self.profile = profile;
@@ -209,11 +211,7 @@ impl ClaudeClient {
 
     /// The credential to send now; see [`crate::auth::ProfileTokens`].
     fn current_secret(&self) -> String {
-        if self.is_oauth {
-            self.profile.live(&self.api_key)
-        } else {
-            self.api_key.clone()
-        }
+        self.profile.live(&self.api_key)
     }
 
     fn auth_header(
@@ -228,8 +226,8 @@ impl ClaudeClient {
         }
     }
 
-    /// POST `request` with retries. An OAuth profile token refused with 401
-    /// has expired: fetch a fresh one from `ant` and send once more.
+    /// POST `request` with retries. A profile token or helper key refused
+    /// with 401 has expired: fetch a fresh one and send once more.
     async fn send(
         &self,
         url: &str,
@@ -258,7 +256,7 @@ impl ClaudeClient {
         };
         let secret = self.current_secret();
         let resp = attempt(secret.clone()).await?;
-        if resp.status() != reqwest::StatusCode::UNAUTHORIZED || !self.is_oauth {
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
         let profile = self.profile;
@@ -1006,6 +1004,24 @@ mod credential_tests {
         let res = client(&url).messages_stream(request(), |_| {}).await;
         assert!(res.is_ok(), "{:?}", res.err());
         assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
+    }
+
+    /// An apiKeyHelper key is short-lived too: a 401 re-runs the helper and
+    /// retries with its new key, sent as `x-api-key`.
+    #[tokio::test]
+    async fn expired_helper_key_is_refreshed_and_retried() {
+        fn rotated() -> Option<String> {
+            Some("sk-new".into())
+        }
+        static HELPER: crate::auth::ProfileTokens = crate::auth::ProfileTokens::new(rotated);
+        HELPER.register("sk-old");
+        let (url, seen) = recording_server(vec![UNAUTHORIZED, OK_SSE]).await;
+        let mut c = ClaudeClient::with_credential(&Credential::ApiKey("sk-old".into())).unwrap();
+        c.set_base_url_for_test(&url);
+        c.set_profile_for_test(&HELPER);
+        let res = c.messages_stream(request(), |_| {}).await;
+        assert!(res.is_ok(), "{:?}", res.err());
+        assert_eq!(*seen.lock().unwrap(), ["sk-old", "sk-new"]);
     }
 
     /// A static key or ANTHROPIC_AUTH_TOKEN has nothing to refresh from: the

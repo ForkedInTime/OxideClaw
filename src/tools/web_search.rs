@@ -22,11 +22,7 @@ impl WebSearchTool {
     /// The credential to send now: an `ant` profile token is swapped for
     /// the newest one, since the copy taken at startup expires.
     fn current_secret(&self) -> String {
-        if self.auth_is_oauth {
-            crate::auth::PROFILE_TOKENS.live(&self.api_key)
-        } else {
-            self.api_key.clone()
-        }
+        crate::auth::refreshable(self.auth_is_oauth).live(&self.api_key)
     }
 
     /// The request headers, with `secret` in the wire format the credential
@@ -128,12 +124,12 @@ impl Tool for WebSearchTool {
         };
         let secret = self.current_secret();
         let mut response = send(secret.clone()).await?;
-        // An expired `ant` profile token: refresh it once, as the main client does.
+        // An expired profile token or helper key: refresh it once, as the
+        // main client does.
+        let store = crate::auth::refreshable(self.auth_is_oauth);
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && self.auth_is_oauth
             && let Ok(Some(fresh)) =
-                tokio::task::spawn_blocking(move || crate::auth::PROFILE_TOKENS.refresh(&secret))
-                    .await
+                tokio::task::spawn_blocking(move || store.refresh(&secret)).await
         {
             response = send(fresh).await?;
         }
