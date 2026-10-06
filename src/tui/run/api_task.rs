@@ -44,6 +44,112 @@ pub(super) struct ApiTask {
     pub(super) session_id: String,
     /// What is left of the `/budget` cap when the turn starts.
     pub(super) budget_remaining_usd: Option<f64>,
+    /// Where the task publishes its history as it goes; the spawner keeps
+    /// the other end in `App::turn_history`.
+    pub(super) history: TurnHistory,
+}
+
+/// Publish the turn's history so far: `messages` plus the results of the
+/// tool round in progress.
+fn publish_history(history: &TurnHistory, messages: &[Message], results: &[ContentBlock]) {
+    let mut h = messages.to_vec();
+    if !results.is_empty() {
+        h.push(Message {
+            role: Role::User,
+            content: results.to_vec(),
+        });
+    }
+    if let Ok(mut g) = history.lock() {
+        *g = h;
+    }
+}
+
+/// Every tool_use needs a tool_result in the next message or the next
+/// request is rejected. A turn cut short mid-round leaves some unanswered:
+/// the tools that never ran or never finished.
+fn close_dangling_tool_uses(messages: &mut Vec<Message>) {
+    let Some(i) = messages.iter().rposition(|m| m.role == Role::Assistant) else {
+        return;
+    };
+    let ids: Vec<String> = messages[i]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    if i + 1 == messages.len() {
+        messages.push(Message {
+            role: Role::User,
+            content: Vec::new(),
+        });
+    }
+    let results = &mut messages[i + 1].content;
+    for id in ids {
+        let answered = results.iter().any(
+            |b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if *tool_use_id == id),
+        );
+        if !answered {
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: vec![ToolResultContent::text(
+                    "Not completed: the turn was stopped before this tool finished.",
+                )],
+                is_error: Some(true),
+            });
+        }
+    }
+}
+
+/// The history to continue from after a turn ended without `Done`, with
+/// every unanswered tool_use closed, and whether the session file must be
+/// rewritten rather than appended to: when the turn compacted and that
+/// event is still queued, what is on disk is no prefix of it. `None` when
+/// the turn published nothing (it failed on its first request).
+fn recover_turn_history(
+    history: &TurnHistory,
+    current: &[Message],
+    saved_count: usize,
+) -> Option<(Vec<Message>, bool)> {
+    let mut partial = std::mem::take(&mut *history.lock().ok()?);
+    if partial.is_empty() {
+        return None;
+    }
+    close_dangling_tool_uses(&mut partial);
+    let saved = &current[..saved_count.min(current.len())];
+    let rewrite = !partial.starts_with(saved);
+    Some((partial, rewrite))
+}
+
+/// Take over the history of a turn that ended without `Done` (Esc, /budget,
+/// quit, an API error): the tools it ran already changed files, so dropping
+/// their calls and results would leave the model and the session file
+/// without any record of that work.
+pub(super) async fn adopt_turn_history(
+    history: &TurnHistory,
+    messages: &mut Vec<Message>,
+    saved_count: &mut usize,
+    session: &mut Session,
+    persist: bool,
+) {
+    let Some((partial, rewrite)) = recover_turn_history(history, messages, *saved_count) else {
+        return;
+    };
+    if persist {
+        if rewrite {
+            let _ = session.overwrite(&partial).await;
+        } else {
+            let _ = session
+                .append(&partial[(*saved_count).min(partial.len())..])
+                .await;
+        }
+        *saved_count = partial.len();
+    }
+    *messages = partial;
 }
 
 pub(super) async fn run_api_task(task: ApiTask) {
@@ -58,6 +164,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
         plan_mode,
         session_id,
         budget_remaining_usd,
+        history,
     } = task;
     let session_id = session_id.as_str();
     // Surface the client's retry backoff in the transcript. Without this a
@@ -119,7 +226,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
     loop {
         iterations += 1;
         if iterations > turn_limit {
-            let _ = tx.send(AppEvent::Error(format!(
+            let _ = tx.send(AppEvent::TurnFailed(format!(
                 "Stopped after {turn_limit} tool iterations — possible loop detected."
             )));
             return;
@@ -280,7 +387,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         continue;
                     }
 
-                    let _ = tx.send(AppEvent::Error(err_str));
+                    let _ = tx.send(AppEvent::TurnFailed(err_str));
                     return;
                 }
             }
@@ -310,10 +417,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         base: None,
                     });
                     messages = replacement;
+                    publish_history(&history, &messages, &[]);
                     continue; // retry outer loop with compacted history
                 }
                 Err(compact_err) => {
-                    let _ = tx.send(AppEvent::Error(format!(
+                    let _ = tx.send(AppEvent::TurnFailed(format!(
                         "Prompt too long and auto-compact failed: {compact_err}"
                     )));
                     return;
@@ -360,6 +468,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 role: Role::Assistant,
                 content: response.content.clone(),
             });
+            publish_history(&history, &messages, &[]);
         }
 
         if response.stop_reason == Some(StopReason::Refusal) {
@@ -466,6 +575,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
 
                 for block in &response.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
+                        publish_history(&history, &messages, &results);
                         let args = serde_json::to_string(input).unwrap_or_default();
                         let _ = tx.send(AppEvent::ToolCall {
                             name: name.clone(),
@@ -484,7 +594,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             }
                             let repeats = recent_calls.iter().filter(|c| **c == sig).count();
                             if repeats >= LOOP_THRESHOLD {
-                                let _ = tx.send(AppEvent::Error(format!(
+                                let _ = tx.send(AppEvent::TurnFailed(format!(
                                     "Loop detected: tool '{name}' called {} times with identical arguments in the last {} calls. \
                                      Pausing to prevent infinite loop. Send a new message to continue.",
                                     repeats, LOOP_WINDOW,
@@ -696,6 +806,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 role: Role::User,
                                 content,
                             });
+                            publish_history(&history, &messages, &[]);
                             auto_fix_retries += 1;
                             // Re-enter the outer loop to call the model again
                             // with the injected feedback in history.
@@ -738,6 +849,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     role: Role::User,
                     content: results,
                 });
+                publish_history(&history, &messages, &[]);
                 // Loop → send next request
             }
         }
@@ -863,4 +975,123 @@ pub(super) fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 pub(super) fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+#[cfg(test)]
+mod turn_history_tests {
+    use super::*;
+
+    fn text(role: Role, t: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "cargo test" }),
+        }
+    }
+
+    fn tool_result(id: &str, out: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: vec![ToolResultContent::text(out)],
+            is_error: None,
+        }
+    }
+
+    fn result_ids(m: &Message) -> Vec<(String, Option<bool>)> {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.clone(), *is_error)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Esc while the second of two tools runs: the first tool's result and
+    /// the call itself survive, and the unfinished one is answered so the
+    /// next request is not rejected for an orphaned tool_use.
+    #[test]
+    fn a_cancelled_round_keeps_finished_results_and_closes_the_rest() {
+        let history = TurnHistory::default();
+        let current = vec![text(Role::User, "q1"), text(Role::Assistant, "a1")];
+        let mut messages = current.clone();
+        messages.push(text(Role::User, "fix the tests"));
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![tool_use("t1"), tool_use("t2")],
+        });
+        publish_history(&history, &messages, &[tool_result("t1", "ok")]);
+
+        let (got, rewrite) = recover_turn_history(&history, &current, 2).unwrap();
+        assert!(!rewrite);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[..4], messages[..]);
+        assert_eq!(
+            result_ids(&got[4]),
+            vec![("t1".into(), None), ("t2".into(), Some(true))]
+        );
+        // Taken, not copied: a second recovery has nothing to adopt.
+        assert!(recover_turn_history(&history, &current, 2).is_none());
+    }
+
+    /// Esc after the assistant asked for tools but before any ran.
+    #[test]
+    fn unanswered_tool_uses_get_a_results_message() {
+        let mut m = vec![
+            text(Role::User, "go"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "running".into(),
+                    },
+                    tool_use("t1"),
+                ],
+            },
+        ];
+        close_dangling_tool_uses(&mut m);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[2].role, Role::User);
+        assert_eq!(result_ids(&m[2]), vec![("t1".into(), Some(true))]);
+
+        // A complete round is left alone.
+        let before = m.clone();
+        close_dangling_tool_uses(&mut m);
+        assert_eq!(m, before);
+    }
+
+    /// A turn that failed on its first request published nothing; the
+    /// caller keeps its own history (prompt at the tail).
+    #[test]
+    fn nothing_published_means_nothing_to_adopt() {
+        let history = TurnHistory::default();
+        assert!(recover_turn_history(&history, &[text(Role::User, "q")], 0).is_none());
+    }
+
+    /// The turn compacted its history (event still queued): the file holds
+    /// the old history, so it has to be rewritten, not appended to.
+    #[test]
+    fn a_compacted_turn_rewrites_the_session_file() {
+        let history = TurnHistory::default();
+        let current = vec![
+            text(Role::User, "q1"),
+            text(Role::Assistant, "a1"),
+            text(Role::User, "q2"),
+        ];
+        publish_history(&history, &[text(Role::User, "SUMMARY")], &[]);
+        let (got, rewrite) = recover_turn_history(&history, &current, 2).unwrap();
+        assert!(rewrite);
+        assert_eq!(got, vec![text(Role::User, "SUMMARY")]);
+    }
 }

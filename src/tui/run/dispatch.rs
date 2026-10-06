@@ -273,6 +273,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let pm = app.plan_mode;
             let budget_left = app.cost_tracker.remaining();
             let sid3 = session.id.clone();
+            let turn_history = TurnHistory::default();
+            app.turn_history = Some(turn_history.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -285,6 +287,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     plan_mode: pm,
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
+                    history: turn_history,
                 })
                 .await;
             });
@@ -1335,6 +1338,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let pm = app.plan_mode;
                 let budget_left = app.cost_tracker.remaining();
                 let sid3 = session.id.clone();
+                let turn_history = TurnHistory::default();
+                app.turn_history = Some(turn_history.clone());
                 let handle = tokio::spawn(async move {
                     run_api_task(ApiTask {
                         client: c2,
@@ -1347,6 +1352,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         plan_mode: pm,
                         budget_remaining_usd: budget_left,
                         session_id: sid3,
+                        history: turn_history,
                     })
                     .await;
                 });
@@ -2329,6 +2335,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let pm = app.plan_mode;
             let budget_left = app.cost_tracker.remaining();
             let sid3 = session.id.clone();
+            let turn_history = TurnHistory::default();
+            app.turn_history = Some(turn_history.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -2341,6 +2349,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     plan_mode: pm,
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
+                    history: turn_history,
                 })
                 .await;
             });
@@ -2366,6 +2375,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let pm = app.plan_mode;
             let budget_left = app.cost_tracker.remaining();
             let sid3 = session.id.clone();
+            let turn_history = TurnHistory::default();
+            app.turn_history = Some(turn_history.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -2378,6 +2389,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     plan_mode: pm,
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
+                    history: turn_history,
                 })
                 .await;
             });
@@ -2586,6 +2598,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let pm = app.plan_mode;
                 let budget_left = app.cost_tracker.remaining();
                 let sid4 = session.id.clone();
+                let turn_history = TurnHistory::default();
+                app.turn_history = Some(turn_history.clone());
                 let handle = tokio::spawn(async move {
                     run_api_task(ApiTask {
                         client: c2,
@@ -2598,6 +2612,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         plan_mode: pm,
                         budget_remaining_usd: budget_left,
                         session_id: sid4,
+                        history: turn_history,
                     })
                     .await;
                 });

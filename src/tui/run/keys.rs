@@ -508,6 +508,16 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             if let Some(handle) = app.api_task.take() {
                 handle.abort();
             }
+            if let Some(history) = app.turn_history.take() {
+                adopt_turn_history(
+                    &history,
+                    messages,
+                    saved_count,
+                    session,
+                    !config.no_session_persistence,
+                )
+                .await;
+            }
             if let Some(cancel) = app.browse_cancel.take() {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -727,6 +737,8 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             let budget_left = app.cost_tracker.remaining();
 
             let sid2 = session.id.clone();
+            let turn_history = TurnHistory::default();
+            app.turn_history = Some(turn_history.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -739,6 +751,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     plan_mode: pm,
                     budget_remaining_usd: budget_left,
                     session_id: sid2,
+                    history: turn_history,
                 })
                 .await;
             });

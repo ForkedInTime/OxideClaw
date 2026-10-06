@@ -34,6 +34,9 @@ pub enum AppEvent {
     },
     /// An API-level error
     Error(String),
+    /// The running API turn stopped early (API error, iteration cap,
+    /// failed compaction). What it did so far is in `App::turn_history`.
+    TurnFailed(String),
     /// Claude wants to run a sensitive tool — needs user permission
     PermissionRequest {
         tool_name: String,

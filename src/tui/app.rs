@@ -552,6 +552,9 @@ pub const MAX_ENTRIES: usize = 2000;
 /// Prevents a session parked in scrollback from growing without bound.
 pub const MAX_ENTRIES_HARD: usize = 10_000;
 
+/// History of the running API turn, published by the turn task as it goes.
+pub type TurnHistory = std::sync::Arc<std::sync::Mutex<Vec<crate::api::types::Message>>>;
+
 pub struct App {
     pub entries: Vec<ChatEntry>,
     /// Text currently being streamed (incomplete assistant message)
@@ -631,6 +634,10 @@ pub struct App {
     pub tool_stream_buf: String,
     /// Handle to the current API task — used to abort it on Escape
     pub api_task: Option<tokio::task::AbortHandle>,
+    /// The running API turn's history so far. Only `Done` hands the turn's
+    /// messages back, so a turn that is cancelled, stopped by /budget or
+    /// fails is recovered from here instead of losing its tool calls.
+    pub turn_history: Option<TurnHistory>,
 
     /// Active UI theme ("dark", "light", "solarized")
     pub theme: String,
@@ -816,6 +823,7 @@ impl App {
             vim_pending: None,
             tool_stream_buf: String::new(),
             api_task: None,
+            turn_history: None,
             theme: "dark".to_string(),
             voice_recording: false,
             voice_task: None,
@@ -1388,13 +1396,14 @@ impl App {
                 self.flush_streaming();
                 self.finish_loading_with_stats(tokens_out);
                 self.api_task = None;
+                self.turn_history = None;
                 self.tokens_in = tokens_in;
                 self.tokens_out = tokens_out;
                 self.cache_read_tokens = cache_read;
                 self.cache_write_tokens = cache_write;
                 self.scroll_to_bottom();
             }
-            AppEvent::Error(msg) => {
+            AppEvent::Error(msg) | AppEvent::TurnFailed(msg) => {
                 self.flush_streaming();
                 self.finish_loading_with_stats(0);
                 self.api_task = None;

@@ -140,7 +140,7 @@ use crate::session::{Session, entries_from_messages};
 use crate::skills::{load_skills, parse_skill_invocation};
 use crate::tools::todo::TodoState;
 use crate::tools::{DynTool, ToolContext, ToolOutput, all_tools_with_state_and_mcp};
-use crate::tui::app::{App, ChatEntry, Overlay};
+use crate::tui::app::{App, ChatEntry, Overlay, TurnHistory};
 use crate::tui::events::AppEvent;
 use crate::tui::render::draw;
 use anyhow::Result as AResult;
@@ -876,6 +876,16 @@ async fn run_loop(
                                 // tool loop rather than let it keep spending.
                                 if let Some(handle) = app.api_task.take() {
                                     handle.abort();
+                                    if let Some(history) = app.turn_history.take() {
+                                        adopt_turn_history(
+                                            &history,
+                                            &mut messages,
+                                            &mut saved_count,
+                                            &mut session,
+                                            !config.no_session_persistence,
+                                        )
+                                        .await;
+                                    }
                                     app.is_loading = false;
                                     app.turn_start = None;
                                     app.flush_streaming();
@@ -1104,9 +1114,21 @@ async fn run_loop(
                             });
                         }
                         // A failed API turn leaves its user message at the
-                        // tail of `messages` (only Done replaces it).
-                        AppEvent::Error(_) if app.api_task.is_some() => {
-                            let dropped = drop_unsent_images(&mut messages);
+                        // tail of `messages` (only Done replaces it) unless it
+                        // got as far as running tools.
+                        AppEvent::TurnFailed(_) => {
+                            let mut dropped = false;
+                            if let Some(history) = app.turn_history.take() {
+                                adopt_turn_history(
+                                    &history,
+                                    &mut messages,
+                                    &mut saved_count,
+                                    &mut session,
+                                    !config.no_session_persistence,
+                                )
+                                .await;
+                                dropped = drop_unsent_images(&mut messages);
+                            }
                             app.apply(ev);
                             if dropped {
                                 app.entries.push(ChatEntry::system(
@@ -1347,6 +1369,20 @@ async fn run_loop(
             if app.pending_user_question.take().is_some() {
                 app.entries
                     .push(ChatEntry::system("Shutdown: pending question cancelled."));
+            }
+            // Quitting mid-turn: keep what the turn did for --continue.
+            if let Some(handle) = app.api_task.take() {
+                handle.abort();
+            }
+            if let Some(history) = app.turn_history.take() {
+                adopt_turn_history(
+                    &history,
+                    &mut messages,
+                    &mut saved_count,
+                    &mut session,
+                    !config.no_session_persistence,
+                )
+                .await;
             }
 
             // Stop hooks — fire before exiting
