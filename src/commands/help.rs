@@ -129,6 +129,8 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/status", "show session status"),
             ("/cost", "show token usage & costs"),
             ("/stats", "detailed session statistics"),
+            ("/version", "show the OxideClaw version"),
+            ("/feedback", "open the issue tracker"),
             ("/clear", "clear chat history"),
             ("/compact", "summarize & compress context"),
             ("/exit", "quit oxideclaw"),
@@ -147,6 +149,15 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/output-style", "set output style preference"),
             ("/plan", "toggle plan mode (read-only)"),
             ("/advisor", "ask Claude for strategic advice"),
+            ("/budget", "set a session spend limit ($5, off)"),
+            (
+                "/router",
+                "auto-route easy turns to cheap models (on, off, low|medium|high <model>)",
+            ),
+            (
+                "/ultraplan",
+                "write a detailed implementation plan ([deep])",
+            ),
         ],
     ),
     (
@@ -160,6 +171,15 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/rewind", "undo last n exchanges (default 1)"),
             ("/summary", "summarize conversation so far"),
             ("/copy", "copy last response to clipboard"),
+            (
+                "/share",
+                "save session as markdown in cwd (clip: to clipboard)",
+            ),
+            (
+                "/teleport",
+                "export/import session context to another terminal",
+            ),
+            ("/thinkback", "per-turn token chart for this session"),
             (
                 "/undo",
                 "Rewind working tree to an earlier auto-commit turn ([N] or picker)",
@@ -218,6 +238,22 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/tasks", "show todo items"),
             ("/skills", "list available skills"),
             ("/insights", "show codebase insights"),
+            ("/index", "build the local code index ([force|stats])"),
+            (
+                "/rag",
+                "search the code index (<query>|status|rebuild|clear)",
+            ),
+            ("/remember", "save a memory"),
+            ("/forget", "remove matching memories"),
+            ("/agents", "list custom agents in .claude/agents"),
+            ("/init-verifiers", "create verifier skills for this project"),
+            ("/edit-claude-md", "open your user CLAUDE.md in $EDITOR"),
+            (
+                "/watch",
+                "act on AI:/AGENT: comments in files ([path|stop|status])",
+            ),
+            ("/sandbox", "sandbox Bash (enable, disable, network on|off)"),
+            ("/install-missing", "install missing system tools"),
         ],
     ),
     (
@@ -276,6 +312,11 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/release-notes", "open upstream release notes"),
             ("/keybindings", "show keyboard shortcuts"),
             ("/ide", "show IDE integration info"),
+            ("/statusline", "configure the status line from your PS1"),
+            ("/notifications", "notify on task completion (on, off)"),
+            ("/banner", "set a custom banner label"),
+            ("/color", "show terminal color settings"),
+            ("/terminal-setup", "terminal capability diagnostics"),
         ],
     ),
 ];
@@ -504,5 +545,43 @@ pub(super) fn cmd_color(args: &str) -> CommandAction {
         other => CommandAction::Message(format!(
             "Unknown option '{other}'.\nUsage: /color  — show color settings\nUse /theme to change the UI theme."
         )),
+    }
+}
+
+#[cfg(test)]
+mod help_listing_tests {
+    use super::*;
+
+    /// Headline commands were dispatched but missing from /help, so the
+    /// interactive menu never showed them.
+    #[test]
+    fn help_lists_the_user_facing_commands() {
+        let listed: Vec<&str> = HELP_CATEGORIES
+            .iter()
+            .flat_map(|(_, _, cmds)| cmds.iter())
+            .map(|(cmd, _)| cmd.split_whitespace().next().unwrap())
+            .collect();
+        for cmd in [
+            "/budget",
+            "/router",
+            "/index",
+            "/rag",
+            "/sandbox",
+            "/watch",
+            "/remember",
+            "/forget",
+            "/agents",
+            "/version",
+            "/share",
+            "/teleport",
+            "/thinkback",
+            "/ultraplan",
+            "/statusline",
+            "/notifications",
+            "/init-verifiers",
+            "/install-missing",
+        ] {
+            assert!(listed.contains(&cmd), "{cmd} missing from /help");
+        }
     }
 }

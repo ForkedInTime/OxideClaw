@@ -85,6 +85,14 @@ pub(super) fn cmd_rag(args: &str) -> CommandAction {
                 .into(),
         )
     };
+    // README/FEATURES and the SDK docs show `/rag search "auth"`: the quotes
+    // are not part of the query.
+    let unquote = |q: &str| -> String {
+        q.strip_prefix('"')
+            .and_then(|q| q.strip_suffix('"'))
+            .unwrap_or(q)
+            .to_string()
+    };
     let (first, rest) = split_first_word(query);
     match query {
         "" => usage(),
@@ -98,10 +106,10 @@ pub(super) fn cmd_rag(args: &str) -> CommandAction {
             if rest.is_empty() {
                 usage()
             } else {
-                CommandAction::RagSearch(rest.to_string())
+                CommandAction::RagSearch(unquote(rest))
             }
         }
-        _ => CommandAction::RagSearch(query.to_string()),
+        _ => CommandAction::RagSearch(unquote(query)),
     }
 }
 
@@ -470,7 +478,7 @@ mod rag_command_tests {
         ));
         for (args, want) in [
             ("search auth", "auth"),
-            ("search  \"TOCTOU\" ", "\"TOCTOU\""),
+            ("search  \"TOCTOU\" ", "TOCTOU"),
             ("auth middleware", "auth middleware"),
             ("searching parser", "searching parser"),
         ] {
@@ -480,6 +488,22 @@ mod rag_command_tests {
             }
         }
         assert!(matches!(cmd_rag("search"), CommandAction::Message(_)));
+    }
+
+    /// README/FEATURES show `/rag search "auth"`; the quotes used to be
+    /// searched for as part of the query.
+    #[test]
+    fn rag_accepts_the_documented_quoted_search_form() {
+        for args in ["search \"auth\"", "search auth", "auth", "\"auth\""] {
+            match cmd_rag(args) {
+                CommandAction::RagSearch(q) => assert_eq!(q, "auth", "/rag {args}"),
+                _ => panic!("/rag {args} did not search"),
+            }
+        }
+        match cmd_rag("how does search work") {
+            CommandAction::RagSearch(q) => assert_eq!(q, "how does search work"),
+            _ => panic!("plain query did not search"),
+        }
     }
 }
 

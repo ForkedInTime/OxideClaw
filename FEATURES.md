@@ -105,7 +105,6 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `/model` | Interactive model picker (Claude + Ollama) |
 | `/model <name>` | Switch to specific model |
 | `/model default` | Reset to default Claude model |
-| `/model list` | List all available models |
 | `/effort [low\|medium\|high\|max\|off]` | Set the API effort level (`output_config.effort`); prompt nudge on models without it |
 
 ### Session Management
@@ -114,8 +113,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 |---------|-------------|
 | `/session` | Browse and resume sessions |
 | `/session list` | List saved sessions |
-| `/session save` | Save current session |
-| `/session export` | Export session to file |
+| `/export` | Export current session to markdown (sessions save automatically) |
 | `/session delete` | Delete a session |
 
 ### Voice & TTS
@@ -132,7 +130,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 
 | Command | Description |
 |---------|-------------|
-| `/rag index` | Index current directory |
+| `/index` (or `/rag index`) | Index current directory |
 | `/rag search <query>` | Search the index |
 | `/rag status` | Show index stats |
 | `/rag clear` | Clear the index |
@@ -158,7 +156,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 |---------|-------------|
 | `/mcp` | List MCP plugins |
 | `/mcp add <uri>` | Add MCP plugin |
-| `/tools` | List available tools |
+| `/mcp tools` | List tools per MCP server |
 
 ---
 
@@ -291,13 +289,12 @@ All Claude model pricing is built in. Ollama models are always free. OpenAI-comp
 
 ## Session Management
 
-Save, resume, search, and export conversations.
+Sessions save automatically; resume, search, and export them.
 
 ```
 /session             # interactive session browser with previews
 /session list        # list saved sessions
-/session save        # save current session
-/session export      # export to file
+/export              # export the current session to markdown
 ```
 
 Sessions are stored in `$XDG_DATA_HOME/oxideclaw/sessions/` (default: `~/.local/share/oxideclaw/sessions/`).
