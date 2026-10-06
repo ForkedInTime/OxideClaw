@@ -1504,21 +1504,33 @@ mod subagent_gate_tests {
         );
         let host = tokio::spawn(async move {
             let mut asked = Vec::new();
+            let mut sub_ids = Vec::new();
+            let mut completed = Vec::new();
             while let Some(n) = approvals.recv().await {
-                if let SdkNotification::ToolApprovalNeeded {
-                    approval_id, tool, ..
-                } = n
-                {
-                    // Approve the Agent and the Edit, refuse the Bash.
-                    let deny = (tool == "Bash").then(|| "no".to_string());
-                    asked.push(tool);
-                    let _ = replies.send((approval_id, deny));
-                }
-                if asked.len() == 3 {
-                    break;
+                match n {
+                    SdkNotification::ToolApprovalNeeded {
+                        approval_id,
+                        tool,
+                        tool_use_id,
+                        ..
+                    } => {
+                        // Approve the Agent and the Edit, refuse the Bash.
+                        let deny = (tool == "Bash").then(|| "no".to_string());
+                        if tool_use_id.starts_with("subagent-") {
+                            sub_ids.push(tool_use_id);
+                        }
+                        asked.push(tool);
+                        let _ = replies.send((approval_id, deny));
+                    }
+                    SdkNotification::ToolCompleted {
+                        tool_use_id,
+                        success,
+                        ..
+                    } => completed.push((tool_use_id, success)),
+                    _ => {}
                 }
             }
-            asked
+            (asked, sub_ids, completed)
         });
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -1527,8 +1539,15 @@ mod subagent_gate_tests {
         .await
         .expect("child approval must not deadlock")
         .unwrap();
-        let asked = host.await.unwrap();
+        drop(s);
+        let (asked, sub_ids, completed) = host.await.unwrap();
         assert_eq!(asked, vec!["Agent", "Edit", "Bash"]);
+        // Each made-up sub-agent id is closed, or an ACP client shows the
+        // call spinning forever.
+        assert_eq!(
+            completed,
+            vec![(sub_ids[0].clone(), true), (sub_ids[1].clone(), false)]
+        );
         let got = outcomes.lock().unwrap();
         assert_eq!(got[0], GateOutcome::Allowed);
         assert!(matches!(got[1], GateOutcome::Denied(_)), "{got:?}");

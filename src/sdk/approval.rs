@@ -101,23 +101,44 @@ impl crate::permissions::PermissionAsker for SdkPolicyAsker {
         // children never consume each other's replies as stale.
         let mut rx = self.approval_rx.lock().await;
         let approval_id = uuid::Uuid::new_v4().to_string();
+        let tool_use_id = format!("subagent-{approval_id}");
         self.approval_tx
             .send(crate::sdk::protocol::SdkNotification::ToolApprovalNeeded {
                 session_id: self.session_id.clone(),
                 approval_id: approval_id.clone(),
                 tool: tool_name.to_string(),
                 args: input.clone(),
-                tool_use_id: format!("subagent-{approval_id}"),
+                tool_use_id: tool_use_id.clone(),
             })
             .ok()?;
         let timeout = std::time::Duration::from_secs(self.policy.timeout_seconds());
         let outcome = tokio::select! {
-            o = await_approval(&mut rx, &approval_id, timeout) => o,
-            _ = self.cancel.cancelled() => return None,
+            o = await_approval(&mut rx, &approval_id, timeout) => Some(o),
+            _ = self.cancel.cancelled() => None,
         };
-        match outcome {
-            ApprovalOutcome::Approved => Some(PermissionDecision::Allow),
-            _ => Some(PermissionDecision::Deny),
+        let ok = matches!(outcome, Some(ApprovalOutcome::Approved));
+        // Nothing else ever completes this made-up id: the child engine sends
+        // no tool/completed. Without this an ACP client shows the approved
+        // call spinning forever, and an SDK host waits on it.
+        let _ = self
+            .approval_tx
+            .send(crate::sdk::protocol::SdkNotification::ToolCompleted {
+                session_id: self.session_id.clone(),
+                tool: tool_name.to_string(),
+                tool_use_id,
+                success: ok,
+                output_summary: if ok {
+                    "Approved for sub-agent.".into()
+                } else {
+                    "Denied.".into()
+                },
+                duration_ms: 0,
+            });
+        outcome?;
+        if ok {
+            Some(PermissionDecision::Allow)
+        } else {
+            Some(PermissionDecision::Deny)
         }
     }
 }
