@@ -254,7 +254,8 @@ pub struct ApprovalGateMiddleware {
     current_url: Arc<tokio::sync::Mutex<String>>,
     approval_tx: mpsc::Sender<ApprovalPrompt>,
     step_counter: Arc<AtomicU32>,
-    /// Tracks consecutive denial count per action key ("{tool_name}:{target_text}").
+    /// Tracks consecutive denial count per action key ("{tool_name}:{target_text}",
+    /// or "activate:{label}" for clicks and Enter/Space).
     denial_counts: Mutex<HashMap<String, u32>>,
     /// Set when the same action is denied twice — triggers session termination.
     user_denied: AtomicBool,
@@ -374,18 +375,50 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             Some(r) if !r.is_empty() => super::normalize_ref(r),
             _ => input["selector"].as_str().unwrap_or("").to_string(),
         };
+        let key_lower = input["key"].as_str().map(|k| k.to_ascii_lowercase());
+        let is_submit_key = tool_name == "browser_press_key"
+            && matches!(key_lower.as_deref(), Some("enter" | "return"));
+        let is_activating_key = is_submit_key
+            || (tool_name == "browser_press_key"
+                && matches!(key_lower.as_deref(), Some("space" | " ")));
         // `target_text` is what we match against `button_patterns`. For refs,
         // resolve to the element's accessible name via the browser session's
         // ref-name map; otherwise fall back to the identifier.
-        let (target_text, visible_prices) = if let Some(session_arc) = &self.browser_session {
-            let session = session_arc.lock().await;
-            let name = session
-                .resolve_ref_name(&ref_or_selector)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| ref_or_selector.clone());
-            (name, self.gate.visible_prices_in(&session.last_page_text))
+        let (mut target_text, visible_prices, client) =
+            if let Some(session_arc) = &self.browser_session {
+                let session = session_arc.lock().await;
+                let name = session
+                    .resolve_ref_name(&ref_or_selector)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| ref_or_selector.clone());
+                (
+                    name,
+                    self.gate.visible_prices_in(&session.last_page_text),
+                    session.client().ok().cloned(),
+                )
+            } else {
+                (ref_or_selector.clone(), Vec::new(), None)
+            };
+        // Enter/Space press whatever has focus, which the input does not
+        // name. Ask the page, bounded like live_url; on failure keep the old
+        // behaviour rather than wedge the loop.
+        if is_activating_key
+            && let Some(c) = client
+            && let Ok(Some(label)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::browser::actions::active_element_label(&c, is_submit_key),
+            )
+            .await
+        {
+            target_text = label;
+        }
+        // A click and a key press on the same control are one action: a
+        // denied "Delete account" click must not get a fresh counter when
+        // retried as Tab + Enter.
+        let action_key = if tool_name == "browser_click" || is_activating_key {
+            format!("activate:{target_text}")
         } else {
-            (ref_or_selector.clone(), Vec::new())
+            format!("{tool_name}:{target_text}")
         };
 
         let gate_ctx = GateContext {
@@ -395,15 +428,6 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             form_field_signals: form_signals_for(tool_name, &target_text),
             visible_prices,
         };
-
-        let is_submit_key = tool_name == "browser_press_key"
-            && matches!(
-                input["key"]
-                    .as_str()
-                    .map(|k| k.to_ascii_lowercase())
-                    .as_deref(),
-                Some("enter") | Some("return")
-            );
 
         // Ask policy: force confirmation for every non-read-only tool.
         let verdict = if self.policy == BrowsePolicy::Ask {
@@ -426,11 +450,10 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         match verdict {
             GateVerdict::Allow => {
                 // Clear denial counter on approval for this action key.
-                let key = format!("{tool_name}:{target_text}");
                 self.denial_counts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(&key);
+                    .remove(&action_key);
                 MiddlewareVerdict::Allow
             }
             GateVerdict::RequireConfirmation { reason, .. } => {
@@ -475,11 +498,10 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                 match approved_opt {
                     Some(true) => {
                         // Approved — clear denial counter for this action.
-                        let key = format!("{tool_name}:{target_text}");
                         self.denial_counts
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .remove(&key);
+                            .remove(&action_key);
                         if gated_fill {
                             self.sensitive_fill_pending.store(true, Ordering::SeqCst);
                         }
@@ -487,11 +509,10 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                     }
                     Some(false) => {
                         // User explicitly denied — increment counter; terminate after 2 denials.
-                        let key = format!("{tool_name}:{target_text}");
                         let count = {
                             let mut counts =
                                 self.denial_counts.lock().unwrap_or_else(|e| e.into_inner());
-                            let entry = counts.entry(key).or_insert(0);
+                            let entry = counts.entry(action_key).or_insert(0);
                             *entry += 1;
                             *entry
                         };
@@ -718,6 +739,12 @@ mod price_signal_tests {
     /// Minimal CDP endpoint: answers every command, and reports `href` as
     /// the page location (what Chrome shows after following a redirect).
     async fn fake_cdp(href: &'static str) -> String {
+        fake_cdp_focused(href, "").await
+    }
+
+    /// As `fake_cdp`, with `focused` as the label of the control that has
+    /// keyboard focus.
+    async fn fake_cdp_focused(href: &'static str, focused: &'static str) -> String {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -727,8 +754,14 @@ mod price_signal_tests {
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             while let Some(Ok(Message::Text(t))) = ws.next().await {
                 let cmd: serde_json::Value = serde_json::from_str(&t).unwrap();
+                let expr = cmd["params"]["expression"].as_str().unwrap_or("");
                 let result = if cmd["method"] == "Runtime.evaluate" {
-                    json!({"result": {"type": "string", "value": href}})
+                    let value = if expr.contains("activeElement") {
+                        focused
+                    } else {
+                        href
+                    };
+                    json!({"result": {"type": "string", "value": value}})
                 } else {
                     json!({})
                 };
@@ -789,5 +822,95 @@ mod price_signal_tests {
         assert_eq!(host.await.unwrap(), 1, "the consent URL must prompt");
         assert_eq!(*shared.lock().await, consent);
         assert_eq!(session.lock().await.current_url, consent);
+    }
+
+    /// Middleware on a live (fake) page whose focused control is `focused`,
+    /// with a host that answers every prompt with `approve`.
+    async fn keyboard_middleware(
+        focused: &'static str,
+        approve: bool,
+    ) -> (ApprovalGateMiddleware, tokio::task::JoinHandle<Vec<String>>) {
+        let session = Arc::new(tokio::sync::Mutex::new(
+            crate::browser::BrowserSession::default(),
+        ));
+        {
+            let mut s = session.lock().await;
+            s.connect(&fake_cdp_focused("https://github.com/o/r/settings", focused).await)
+                .await
+                .unwrap();
+            s.set_refs_with_names(
+                std::collections::HashMap::from([("@e1".to_string(), 1i64)]),
+                std::collections::HashMap::from([(
+                    "@e1".to_string(),
+                    "Delete this repository".to_string(),
+                )]),
+            );
+        }
+        let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+        let mw = ApprovalGateMiddleware::new(
+            ApprovalGate::default(),
+            BrowsePolicy::Pattern,
+            Arc::new(tokio::sync::Mutex::new(
+                "https://github.com/o/r/settings".into(),
+            )),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            false,
+        )
+        .with_browser_session(Some(session));
+        let host = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(p) = rx.recv().await {
+                seen.push(p.target_text.clone());
+                let _ = p.reply.send(approve);
+            }
+            seen
+        });
+        (mw, host)
+    }
+
+    /// press_key names no element, so Enter or Space on a focused
+    /// "Delete this repository" button (or Enter in the confirm field of its
+    /// form) was matched against an empty label and went through.
+    #[tokio::test]
+    async fn enter_or_space_on_a_focused_destructive_button_is_gated() {
+        for key in ["Enter", "space", " "] {
+            let (mw, host) = keyboard_middleware("Delete this repository", true).await;
+            mw.before_tool("browser_press_key", &json!({"key": key}))
+                .await;
+            drop(mw);
+            assert_eq!(
+                host.await.unwrap(),
+                vec!["Delete this repository".to_string()],
+                "{key:?} must prompt with the focused control's label"
+            );
+        }
+        let (mw, host) = keyboard_middleware("", true).await;
+        mw.before_tool("browser_press_key", &json!({"key": "Enter"}))
+            .await;
+        drop(mw);
+        assert!(host.await.unwrap().is_empty(), "nothing focused: no prompt");
+    }
+
+    /// Denying the click and then pressing Enter on the same button is the
+    /// same action twice, so the session ends instead of starting a fresh
+    /// denial counter for the keyboard route.
+    #[tokio::test]
+    async fn a_denied_click_retried_as_enter_counts_as_the_second_denial() {
+        let (mw, host) = keyboard_middleware("Delete this repository", false).await;
+        assert!(matches!(
+            mw.before_tool("browser_click", &json!({"ref": "@e1"}))
+                .await,
+            MiddlewareVerdict::Deny { .. }
+        ));
+        assert!(!mw.is_user_denied());
+        assert!(matches!(
+            mw.before_tool("browser_press_key", &json!({"key": "Enter"}))
+                .await,
+            MiddlewareVerdict::Deny { .. }
+        ));
+        assert!(mw.is_user_denied(), "second denial must end the session");
+        drop(mw);
+        assert_eq!(host.await.unwrap().len(), 2);
     }
 }

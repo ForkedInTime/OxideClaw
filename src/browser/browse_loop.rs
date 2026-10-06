@@ -118,7 +118,7 @@ fn build_browse_system_prompt(goal: &str, max_steps: u32) -> String {
          - When you believe the goal is achieved (or you're stuck), call browse_done(summary, achieved).\n\
          - Keep summaries under 2 sentences — they may be spoken aloud.\n\
          - You have {max_steps} steps total.\n\
-         - If approval is denied, try a different approach or call browse_done(achieved=false)."
+         - If approval is denied, do not retry that action another way (keyboard, another ref); try a different approach or call browse_done(achieved=false)."
     )
 }
 

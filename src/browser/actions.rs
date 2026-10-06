@@ -171,6 +171,54 @@ pub async fn current_url(client: &CdpClient) -> Option<String> {
     resp["result"]["value"].as_str().map(|s| s.to_string())
 }
 
+/// Label of the control a key press on the focused element would activate,
+/// so the approval gate can match it like a click. Enter and Space press the
+/// focused button or link; Enter in a text input also submits its form
+/// through the form's default button (`implicit_submit`). Without this,
+/// "Tab to Delete account, press Enter" or "fill the confirm field, press
+/// Enter" got past every button pattern. Returns `None` on error or when the
+/// focus is on nothing that activates (Enter in a textarea adds a newline).
+pub async fn active_element_label(client: &CdpClient, implicit_submit: bool) -> Option<String> {
+    let expression = format!(
+        r#"(() => {{
+  const implicitSubmit = {implicit_submit};
+  let el = document.activeElement;
+  // Same-origin frames expose their focus; cross-origin ones stay opaque.
+  while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME') && el.contentDocument) {{
+    el = el.contentDocument.activeElement;
+  }}
+  if (!el) return '';
+  const label = (e) => (e.getAttribute('aria-label') || e.innerText || e.value || e.getAttribute('alt') || '').trim();
+  const type = (e) => (e.getAttribute('type') || '').toLowerCase();
+  const isSubmit = (e) => (e.tagName === 'BUTTON' && (type(e) === '' || type(e) === 'submit'))
+    || (e.tagName === 'INPUT' && (type(e) === 'submit' || type(e) === 'image'));
+  if (el.tagName === 'BUTTON' || el.tagName === 'A' || el.getAttribute('role') === 'button'
+      || (el.tagName === 'INPUT' && ['submit', 'button', 'image', 'reset'].includes(type(el)))) {{
+    return label(el);
+  }}
+  if (implicitSubmit && el.tagName === 'INPUT' && el.form) {{
+    // form.elements covers controls bound with form="id" but skips image inputs.
+    const def = Array.from(el.form.elements).find(isSubmit)
+      || el.form.querySelector('input[type=image]');
+    return def ? label(def) : '';
+  }}
+  return '';
+}})()"#
+    );
+    let resp = client
+        .send(
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true }),
+        )
+        .await
+        .ok()?;
+    resp["result"]["value"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Click an element by @ref.
 pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<String> {
     let node_id = session.resolve_ref(element_ref)?;
