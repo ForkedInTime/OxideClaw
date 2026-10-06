@@ -1569,7 +1569,8 @@ mod cli_parse_tests {
 
     #[test]
     fn unquoted_prompt_words_and_double_dash_still_collect() {
-        let cli = Cli::try_parse_from(["oxideclaw", "-p", "fix", "the", "doctor", "--verbose"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["oxideclaw", "-p", "fix", "the", "doctor", "--verbose"]).unwrap();
         assert_eq!(cli.prompt, vec!["fix", "the", "doctor"]);
         assert!(cli.verbose);
         assert!(cli.command.is_none());
