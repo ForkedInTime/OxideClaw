@@ -131,7 +131,17 @@ impl PermissionState {
 
         // MCP tools are arbitrary third-party code (write_file, push_files,
         // start_process...), so they prompt like Bash unless a rule allows them.
-        if !SENSITIVE_TOOLS.contains(&tool_name) && !tool_name.starts_with("mcp__") {
+        // ExitWorktree with discard_changes force-deletes uncommitted work;
+        // a plain exit is refused by git when there is any, so it is safe.
+        let discards_work = tool_name == "ExitWorktree"
+            && input
+                .and_then(|i| i.get("discard_changes"))
+                .and_then(|v| v.as_bool())
+                == Some(true);
+        if !SENSITIVE_TOOLS.contains(&tool_name)
+            && !tool_name.starts_with("mcp__")
+            && !discards_work
+        {
             return CheckResult::Allow;
         }
 
@@ -986,6 +996,22 @@ mod tests {
         assert!(matches!(
             state().check_with_input("Read", Some(&input)),
             CheckResult::Allow
+        ));
+    }
+
+    /// A forced ExitWorktree deletes uncommitted work, so it prompts; a
+    /// plain one cannot (git refuses), so it does not.
+    #[test]
+    fn exit_worktree_prompts_only_when_discarding_changes() {
+        let plain = serde_json::json!({});
+        let force = serde_json::json!({ "discard_changes": true });
+        assert!(matches!(
+            state().check_with_input("ExitWorktree", Some(&plain)),
+            CheckResult::Allow
+        ));
+        assert!(matches!(
+            state().check_with_input("ExitWorktree", Some(&force)),
+            CheckResult::Ask
         ));
     }
 

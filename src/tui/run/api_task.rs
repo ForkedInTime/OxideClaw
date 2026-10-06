@@ -10,7 +10,8 @@ pub(super) const MAX_TOOL_ITERATIONS: u32 = 50;
 /// Destructive tools blocked when plan mode is active. PowerShell runs
 /// commands like Bash; Agent spawns a sub-agent with its own (unblocked)
 /// tools; the browser actions click and type on live sites; MCP tools can
-/// do anything their server does and do not say whether they write.
+/// do anything their server does and do not say whether they write;
+/// ExitWorktree deletes the worktree directory.
 pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "Bash",
     "PowerShell",
@@ -20,6 +21,7 @@ pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "NotebookEdit",
     "MemoryWrite",
     "EnterWorktree",
+    "ExitWorktree",
     "Agent",
     "browser_click",
     "browser_fill",

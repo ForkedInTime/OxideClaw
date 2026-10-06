@@ -168,6 +168,12 @@ pub struct ExitWorktreeTool {
     pub state: WorktreeState,
 }
 
+#[derive(Deserialize)]
+struct ExitInput {
+    #[serde(default)]
+    discard_changes: bool,
+}
+
 #[async_trait]
 impl Tool for ExitWorktreeTool {
     fn name(&self) -> &str {
@@ -176,45 +182,161 @@ impl Tool for ExitWorktreeTool {
 
     fn description(&self) -> &str {
         "Exit the current git worktree and return to the original working directory. \
-        The worktree branch is preserved; the worktree directory is removed."
+        Removes the worktree directory and keeps its branch. Uncommitted changes block \
+        removal unless discard_changes is true; commit them on the branch first to keep them."
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        json!({ "type": "object", "properties": {} })
+        json!({
+            "type": "object",
+            "properties": {
+                "discard_changes": {
+                    "type": "boolean",
+                    "description": "Delete the worktree even if it has uncommitted or untracked changes. Those changes are lost. Default false."
+                }
+            }
+        })
     }
 
-    async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        let session = self.state.lock().unwrap_or_else(|e| e.into_inner()).take();
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let input: ExitInput = serde_json::from_value(input)?;
+        // Cloned, not taken: if git refuses, the session must stay open so
+        // the model can commit and retry.
+        let session = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(s) = session else {
+            return Ok(ToolOutput::error("Not currently in a worktree session."));
+        };
 
-        match session {
-            None => Ok(ToolOutput::error("Not currently in a worktree session.")),
-            Some(s) => {
-                // Remove the worktree
-                let output = Command::new("git")
-                    .args([
-                        "worktree",
-                        "remove",
-                        "--force",
-                        s.path.to_str().unwrap_or(""),
-                    ])
-                    .current_dir(&s.original_cwd)
-                    .output()
-                    .await?;
-
-                let msg = if output.status.success() {
-                    format!(
-                        "Exited worktree '{}'. Returned to {}. Branch '{}' preserved.",
-                        s.path.display(),
-                        s.original_cwd.display(),
-                        s.branch,
-                    )
-                } else {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    format!("Worktree removed (with warnings): {err}")
-                };
-
-                Ok(ToolOutput::success(msg))
-            }
+        // Without --force git refuses to delete modified or untracked files,
+        // which are unrecoverable once gone: the branch still points at the
+        // commit the worktree was created from.
+        let mut args = vec!["worktree", "remove"];
+        if input.discard_changes {
+            args.push("--force");
         }
+        args.push(s.path.to_str().unwrap_or(""));
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&s.original_cwd)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Ok(ToolOutput::error(format!(
+                "git worktree remove failed: {}\nThe worktree is still open. To keep its changes, \
+                 commit them on branch '{}' first (git -C '{}' add -A && git -C '{}' commit -m ...), \
+                 then call ExitWorktree again; or call ExitWorktree with discard_changes=true to \
+                 delete them.",
+                err.trim(),
+                s.branch,
+                s.path.display(),
+                s.path.display(),
+            )));
+        }
+
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(ToolOutput::success(format!(
+            "Exited worktree '{}'. Returned to {}. Branch '{}' preserved.",
+            s.path.display(),
+            s.original_cwd.display(),
+            s.branch,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A repo inside its own temp dir, so the sibling worktree EnterWorktree
+    /// creates next to it is cleaned up with it.
+    fn repo() -> (tempfile::TempDir, PathBuf) {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        (outer, root)
+    }
+
+    async fn enter(state: &WorktreeState, root: &std::path::Path) -> PathBuf {
+        let out = EnterWorktreeTool {
+            state: state.clone(),
+        }
+        .execute(json!({"name": "wt"}), &ToolContext::new(root.to_path_buf()))
+        .await
+        .unwrap();
+        assert!(!out.is_error);
+        state.lock().unwrap().as_ref().unwrap().path.clone()
+    }
+
+    /// ExitWorktree ran `git worktree remove --force`, deleting uncommitted
+    /// work and reporting success even when removal failed.
+    #[tokio::test]
+    async fn exit_keeps_uncommitted_work_unless_told_to_discard_it() {
+        let (_outer, root) = repo();
+        let state = new_worktree_state();
+        let wt = enter(&state, &root).await;
+        std::fs::write(wt.join("work.rs"), "fn main() {}").unwrap();
+        let exit = ExitWorktreeTool {
+            state: state.clone(),
+        };
+        let ctx = ToolContext::new(root.clone());
+
+        let out = exit.execute(json!({}), &ctx).await.unwrap();
+        assert!(out.is_error, "a dirty worktree must not be removed");
+        assert!(wt.join("work.rs").exists(), "uncommitted work was deleted");
+        assert!(state.lock().unwrap().is_some(), "session must stay open");
+
+        let out = exit
+            .execute(json!({"discard_changes": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(!wt.exists());
+        assert!(state.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_clean_worktree_exits_without_force() {
+        let (_outer, root) = repo();
+        let state = new_worktree_state();
+        let wt = enter(&state, &root).await;
+        let out = ExitWorktreeTool {
+            state: state.clone(),
+        }
+        .execute(json!({}), &ToolContext::new(root))
+        .await
+        .unwrap();
+        assert!(!out.is_error);
+        assert!(!wt.exists());
+        assert!(state.lock().unwrap().is_none());
     }
 }
