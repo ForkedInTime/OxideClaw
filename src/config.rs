@@ -1133,7 +1133,7 @@ impl Config {
         // prompt — broad, direct, no artificial restrictions, no Claude-specific framing.
         let is_external =
             crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
-        if is_external {
+        let external_prompt = is_external.then(|| {
             let provider_label = if crate::api::is_ollama_model(model) {
                 format!("Ollama ({})", crate::api::strip_ollama_prefix(model))
             } else if let Some((prov, bare)) = crate::api::parse_provider_model(model) {
@@ -1142,7 +1142,7 @@ impl Config {
                 model.to_string()
             };
 
-            let external_prompt = format!(
+            format!(
                 "You are a highly capable AI coding assistant running inside OxideClaw, \
                  a terminal-based coding agent.\n\
                  \n\
@@ -1168,24 +1168,18 @@ impl Config {
                 cwd = cwd,
                 platform = platform,
                 shell_name = shell_name,
-            );
-            let base = if self.claudemd.is_empty() {
-                external_prompt
-            } else {
-                format!(
-                    "{external_prompt}\n\n<claude_md>\n{}</claude_md>",
-                    self.claudemd
-                )
-            };
-            return if self.agentsmd.is_empty() {
-                base
-            } else {
-                format!("{base}\n\n<agents_md>\n{}</agents_md>", self.agentsmd)
-            };
-        }
+            )
+        });
 
-        let base = format!(
-            r#"You are OxideClaw, an interactive CLI agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+        // Only the base differs for external models: override, CLAUDE.md,
+        // AGENTS.md, memory, output style and --append-system-prompt (which
+        // also carries spawn and sub-agent role prompts) apply to every
+        // provider.
+        let base = if let Some(external_prompt) = external_prompt {
+            external_prompt
+        } else {
+            format!(
+                r#"You are OxideClaw, an interactive CLI agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
 
 IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
 IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
@@ -1314,16 +1308,19 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
      /skill-name [args]           — expand a saved skill
  - When the user asks to switch models, tell them to type the /model command themselves. You cannot switch models.
  - Always use the full prefix when referring to non-Anthropic models (e.g. ollama:dolphin3, groq:llama-3.3-70b-versatile)."#,
-            cwd = cwd,
-            git = if is_git { "Yes" } else { "No" },
-            platform = platform,
-            shell_name = shell_name,
-            os_version = os_version,
-            model = model,
-        );
+                cwd = cwd,
+                git = if is_git { "Yes" } else { "No" },
+                platform = platform,
+                shell_name = shell_name,
+                os_version = os_version,
+                model = model,
+            )
+        };
 
-        // Append co-authored-by preference before any overrides
-        let base = if self.include_co_authored_by {
+        // Append co-authored-by preference before any overrides. The trailer
+        // names an Anthropic address, so it would misattribute an external
+        // model's commits.
+        let base = if self.include_co_authored_by && !is_external {
             format!(
                 "{base}\n\n# Co-Authored-By\nWhen creating git commits or pull requests, always add a Co-Authored-By trailer:\n   Co-Authored-By: {model} <noreply@anthropic.com>",
                 model = model
@@ -1886,5 +1883,67 @@ mod atomic_settings_write_tests {
         let path = dir.path().join("deep").join("settings.json");
         write_json_atomic(&path, "{}").unwrap();
         assert!(path.exists());
+    }
+}
+
+#[cfg(test)]
+mod external_system_prompt_tests {
+    use super::*;
+
+    /// Ollama / OpenAI-compat models used to get only the generic prompt plus
+    /// CLAUDE.md/AGENTS.md: --system-prompt, --append-system-prompt (spawn and
+    /// sub-agent role prompts ride on it), output styles and memory vanished.
+    #[test]
+    fn external_models_get_override_append_style_and_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::MemoryStore::open(dir.path())
+            .unwrap()
+            .add(
+                "k",
+                "MEMORY-MARKER",
+                crate::memory::Category::Decision,
+                "test",
+            )
+            .unwrap();
+        let cfg = Config {
+            cwd: dir.path().to_path_buf(),
+            model: "ollama:qwen3".into(),
+            system_prompt_override: Some("OVERRIDE-MARKER".into()),
+            append_system_prompt: Some("APPEND-MARKER".into()),
+            output_style_prompt: Some("STYLE-MARKER".into()),
+            claudemd: "CLAUDE-MD-MARKER".into(),
+            agentsmd: "AGENTS-MD-MARKER".into(),
+            include_co_authored_by: true,
+            ..Default::default()
+        };
+        let prompt = cfg.build_system_prompt();
+        for marker in [
+            "OVERRIDE-MARKER",
+            "APPEND-MARKER",
+            "STYLE-MARKER",
+            "MEMORY-MARKER",
+            "CLAUDE-MD-MARKER",
+            "AGENTS-MD-MARKER",
+        ] {
+            assert!(prompt.contains(marker), "missing {marker}:\n{prompt}");
+        }
+        assert!(prompt.ends_with("APPEND-MARKER"));
+        assert!(
+            !prompt.contains("noreply@anthropic.com"),
+            "an external model's commits must not be attributed to Anthropic"
+        );
+    }
+
+    #[test]
+    fn external_models_keep_their_own_base_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cwd: dir.path().to_path_buf(),
+            model: "groq:llama-3.3-70b-versatile".into(),
+            ..Default::default()
+        };
+        let prompt = cfg.build_system_prompt();
+        assert!(prompt.starts_with("You are a highly capable AI coding assistant"));
+        assert!(!prompt.contains("You are OxideClaw, an interactive CLI agent"));
     }
 }
