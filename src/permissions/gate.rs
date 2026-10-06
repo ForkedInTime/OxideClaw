@@ -332,11 +332,15 @@ mod tests {
     #[tokio::test]
     async fn bypass_gate_still_honours_deny_rules() {
         let g = PermissionGate::bypass_with_deny(&["Bash(git push:*)".into()]);
-        assert!(matches!(
-            g.decide("Bash", &json!({"command": "git push origin main"}))
-                .await,
-            GateOutcome::Denied(_)
-        ));
+        for cmd in ["git push origin main", "git push", "git push\torigin"] {
+            assert!(
+                matches!(
+                    g.decide("Bash", &json!({ "command": cmd })).await,
+                    GateOutcome::Denied(_)
+                ),
+                "{cmd:?}"
+            );
+        }
         assert_eq!(
             g.decide("Bash", &json!({"command": "git status"})).await,
             GateOutcome::Allowed

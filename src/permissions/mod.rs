@@ -151,12 +151,14 @@ fn rule_matches(rule: &str, tool_name: &str, input: Option<&serde_json::Value>) 
         }
         let inner = rule[paren_start + 1..].trim_end_matches(')');
 
-        // Extract prefix: support both "prefix:git " and "git:*" shorthand
-        let prefix = if let Some(rest) = inner.strip_prefix("prefix:") {
-            rest.to_string()
-        } else if inner.ends_with(":*") {
-            // "git:*" → command must start with "git "
-            format!("{} ", inner.trim_end_matches(":*"))
+        // `prefix:git ` is a literal starts_with. `git:*` names a command
+        // word: it covers `git` alone and `git` followed by any whitespace,
+        // but not `gitk`. Turning it into the string "git " missed the bare
+        // command, so `Bash(git push:*)` in deny never stopped `git push`.
+        let (base, word) = if let Some(rest) = inner.strip_prefix("prefix:") {
+            (rest, false)
+        } else if let Some(base) = inner.strip_suffix(":*") {
+            (base, true)
         } else {
             return false;
         };
@@ -164,17 +166,29 @@ fn rule_matches(rule: &str, tool_name: &str, input: Option<&serde_json::Value>) 
         // Check the input's "command" field for Bash, or "file_path" for file tools
         if let Some(inp) = input {
             return match tool_name {
-                "Bash" | "PowerShell" => inp["command"]
-                    .as_str()
-                    .unwrap_or("")
-                    .starts_with(prefix.as_str()),
+                "Bash" | "PowerShell" => {
+                    let cmd = inp["command"].as_str().unwrap_or("");
+                    if word {
+                        let cmd = cmd.trim();
+                        cmd.strip_prefix(base)
+                            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+                    } else {
+                        cmd.starts_with(base)
+                    }
+                }
                 // Paths are compared after resolving `.` and `..`, so
                 // `Edit(prefix:/proj/src/)` does not cover
                 // `/proj/src/../../.bashrc`, and a deny on `~/.ssh/` is not
                 // dodged by `~/./.ssh/id_rsa`.
                 "Write" | "Edit" | "Read" => {
-                    normalize_lexically(inp["file_path"].as_str().unwrap_or(""))
-                        .starts_with(prefix.as_str())
+                    let path = normalize_lexically(inp["file_path"].as_str().unwrap_or(""));
+                    if word {
+                        let base = base.trim_end_matches('/');
+                        path.strip_prefix(base)
+                            .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+                    } else {
+                        path.starts_with(base)
+                    }
                 }
                 _ => false,
             };
@@ -750,6 +764,36 @@ mod tests {
             st.check_with_input("PowerShell", Some(&asked)),
             CheckResult::Ask
         ));
+    }
+
+    /// `Bash(git push:*)` reached rule_matches as the prefix "git push ",
+    /// so the bare `git push` (which pushes to upstream) and a tab-separated
+    /// `git push\torigin` slipped past the deny under a blanket allow.
+    #[test]
+    fn colon_star_rules_cover_the_bare_command() {
+        let st = PermissionState::new(false, &["Bash".into()], &["Bash(git push:*)".into()]);
+        let check = |c: &str| check_compound_command(&st, "Bash", c);
+        for cmd in [
+            "git push",
+            "git push origin main",
+            "git push\torigin",
+            "cd x && git push",
+        ] {
+            assert!(matches!(check(cmd), CheckResult::Deny), "{cmd:?}");
+        }
+        for cmd in ["git pushx", "git status"] {
+            assert!(matches!(check(cmd), CheckResult::Allow), "{cmd:?}");
+        }
+        let allow = PermissionState::new(false, &["Bash(git status:*)".into()], &[]);
+        assert!(matches!(
+            check_compound_command(&allow, "Bash", "git status"),
+            CheckResult::Allow
+        ));
+        let read = PermissionState::new(false, &[], &["Read(/home/u/.ssh:*)".into()]);
+        let r =
+            |p: &str| read.check_with_input("Read", Some(&serde_json::json!({ "file_path": p })));
+        assert!(matches!(r("/home/u/.ssh/id_rsa"), CheckResult::Deny));
+        assert!(matches!(r("/home/u/.sshx"), CheckResult::Allow));
     }
 
     #[test]
