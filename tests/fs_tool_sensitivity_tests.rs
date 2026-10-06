@@ -101,6 +101,69 @@ async fn symlink_cannot_be_used_to_overwrite_credentials() {
     );
 }
 
+/// `keys/newdir/../authorized_keys`: `newdir` does not exist, so neither the
+/// path nor its parent could be canonicalized and only the literal (harmless)
+/// path was checked — while create_dir_all + rename landed in `~/.ssh`.
+#[tokio::test]
+async fn write_through_symlink_plus_missing_dir_and_dotdot_is_refused() {
+    let (td, proj) = fixture();
+    std::os::unix::fs::symlink(td.path().join(".ssh"), proj.join("keys")).unwrap();
+    std::fs::create_dir(proj.join("plain")).unwrap();
+    let ctx = ToolContext::new(proj.clone());
+
+    let sneaky = proj.join("keys/newdir/../authorized_keys");
+    let out = FileWriteTool
+        .execute(
+            json!({"file_path": sneaky.to_str().unwrap(), "content": "pwned\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "must be refused: {}", text(&out));
+    assert!(!td.path().join(".ssh/authorized_keys").exists());
+    assert!(!td.path().join(".ssh/newdir").exists());
+
+    let benign = proj.join("plain/newdir/../ok.txt");
+    let out = FileWriteTool
+        .execute(
+            json!({"file_path": benign.to_str().unwrap(), "content": "fine\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(proj.join("plain/ok.txt")).unwrap(),
+        "fine\n"
+    );
+}
+
+/// The `.git` write protection was purely lexical: a repo-shipped `g -> .git`
+/// link reached `.git/hooks` under an innocent name.
+#[tokio::test]
+async fn write_through_symlink_into_git_dir_is_refused() {
+    let (_td, proj) = fixture();
+    std::fs::create_dir_all(proj.join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink(proj.join(".git"), proj.join("g")).unwrap();
+    let ctx = ToolContext::new(proj.clone());
+
+    for p in ["g/hooks/pre-commit", "g/newdir/../hooks/post-checkout"] {
+        let abs = proj.join(p);
+        let out = FileWriteTool
+            .execute(
+                json!({"file_path": abs.to_str().unwrap(), "content": "#!/bin/sh\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{p} must be refused: {}", text(&out));
+    }
+    assert_eq!(
+        std::fs::read_dir(proj.join(".git/hooks")).unwrap().count(),
+        0
+    );
+}
+
 /// Ordinary files must keep working — a guard that blocks real work gets
 /// disabled, which is worse than no guard.
 #[tokio::test]

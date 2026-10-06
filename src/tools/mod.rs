@@ -261,7 +261,8 @@ fn has_component_ignore_case(path: &std::path::Path, name: &str) -> bool {
 /// Returns Some(error ToolOutput) if `path` is inside a protected directory.
 /// The resolved path is checked too: a repo can commit `gl -> .git`, and a
 /// write to `gl/config` adding `core.fsmonitor` runs code on the next git
-/// command.
+/// command; `link/newdir/../x` otherwise reaches `.git/hooks` under an
+/// innocent name.
 pub fn check_protected_path(path: &std::path::Path) -> Option<ToolOutput> {
     let resolved = resolve_for_sensitivity_check(path);
     for &protected in PROTECTED_DIRS {
@@ -454,27 +455,38 @@ pub fn denied_read_globs() -> Vec<(&'static str, String)> {
 /// That needs no unusual privileges: a repository can simply *ship* a symlink
 /// called `README.md`, and asking the agent to read it exfiltrates the target.
 ///
-/// For paths that do not exist yet (a fresh write) the nearest existing
-/// ancestor is resolved and the rest re-attached, so `link/newdir/x` is seen
-/// through `link` even though Write has yet to create `newdir`. Falls back to
-/// the input unchanged when nothing can be resolved — a check on the literal
-/// path is never worse than the old behaviour.
+/// For paths that do not exist yet (a fresh write) it canonicalizes the deepest
+/// existing ancestor and replays the rest lexically. Checking only the parent
+/// was bypassable: in `link/newdir/../authorized_keys` the parent cannot be
+/// canonicalized (`newdir` does not exist yet), so the literal path was checked
+/// while `create_dir_all` + rename landed in the link's target. Replaying is
+/// exact: components past the deepest existing ancestor cannot be symlinks, and
+/// a `..` among them pops into a prefix that is already symlink-free. Falls back
+/// to the input unchanged only when no ancestor resolves.
 pub fn resolve_for_sensitivity_check(path: &std::path::Path) -> std::path::PathBuf {
-    let mut missing = Vec::new();
-    let mut cur = path;
-    loop {
-        if let Ok(mut real) = std::fs::canonicalize(cur) {
-            real.extend(missing.iter().rev());
-            return real;
-        }
-        match (cur.parent(), cur.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name);
-                cur = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
+    use std::path::Component;
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
     }
+    for anc in path.ancestors().skip(1) {
+        let Ok(mut real) = std::fs::canonicalize(anc) else {
+            continue;
+        };
+        let Ok(rest) = path.strip_prefix(anc) else {
+            break;
+        };
+        for c in rest.components() {
+            match c {
+                Component::Normal(n) => real.push(n),
+                Component::ParentDir => {
+                    real.pop();
+                }
+                _ => {}
+            }
+        }
+        return real;
+    }
+    path.to_path_buf()
 }
 
 /// [`check_sensitive_path`] applied to both the supplied path and its symlink
