@@ -181,6 +181,19 @@ fn render_history(messages: &[Message]) -> String {
     out
 }
 
+/// Output budget for the summary request. A detailed 9-section summary of up
+/// to ~180k tokens of history, plus adaptive thinking, does not fit in the
+/// usual turn budget. Streaming makes a large cap safe; Claude 3.x (other
+/// than 3.7) cannot emit that much, so it keeps the configured value.
+fn summary_max_tokens(config: &Config) -> u32 {
+    let configured = config.max_tokens_for(&config.model);
+    let model = crate::commands::resolve_model_alias(&config.model);
+    if model.starts_with("claude-3-") && !model.starts_with("claude-3-7") {
+        return configured;
+    }
+    configured.max(32_000)
+}
+
 /// API-based compaction: asks Claude to summarise the full conversation,
 /// then returns a replacement history with a single user message containing
 /// the summary, prefixed so Claude knows the context is compacted.
@@ -196,7 +209,7 @@ pub async fn summarize_compact(
 
     let request = MessagesRequest {
         model: config.model.clone(),
-        max_tokens: 4096,
+        max_tokens: summary_max_tokens(config),
         system: crate::api::types::SystemContent::Plain(SUMMARISE_SYSTEM.to_string()),
         messages: vec![Message {
             role: Role::User,
@@ -204,18 +217,39 @@ pub async fn summarize_compact(
         }],
         tools: vec![],
         stream: None,
+        // Thinking stays at the API default (adaptive on current models, and
+        // Opus/Sonnet 5.5 and Fable reject `disabled`); medium effort keeps it
+        // from eating the output budget the summary itself needs.
         thinking: None,
-        output_config: None,
+        output_config: crate::api::thinking::supports_effort(&config.model).then(|| {
+            crate::api::types::OutputConfig {
+                effort: "medium".into(),
+            }
+        }),
         betas: vec![],
         session_id: None,
     };
 
     let mut summary_text = String::new();
-    client
+    let resp = client
         .messages_stream(request, |chunk| {
             summary_text.push_str(chunk);
         })
         .await?;
+
+    // Every caller replaces (and the TUI persists) the history on Ok, so a
+    // cut-off summary would silently drop the newest work (sections 8 and 9
+    // come last). Fail instead and let the caller keep or snip the original.
+    if matches!(
+        resp.stop_reason,
+        Some(StopReason::MaxTokens | StopReason::Refusal | StopReason::ModelContextWindowExceeded)
+    ) || summary_text.trim().is_empty()
+    {
+        anyhow::bail!(
+            "compaction summary incomplete (stop reason: {:?}); history left unchanged",
+            resp.stop_reason
+        );
+    }
 
     // Return a replacement history: one user message with the summary,
     // wrapped so the model understands the context was compacted.
@@ -230,4 +264,130 @@ pub async fn summarize_compact(
     }];
 
     Ok(replacement)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn sse(stop_reason: &str, text: &str) -> String {
+        let events = [
+            r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#.to_string(),
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.to_string(),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}).to_string(),
+            r#"{"type":"content_block_stop","index":0}"#.to_string(),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":5}}).to_string(),
+            r#"{"type":"message_stop"}"#.to_string(),
+        ];
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// One-shot Anthropic stand-in that records the request body it was sent.
+    async fn serve_once(response: String) -> (String, Arc<Mutex<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let len = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= split + 4 + len || n == 0 {
+                        *sink.lock().unwrap() = text[split + 4..].to_string();
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn backend(base: &str) -> ApiBackend {
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(base);
+        ApiBackend::Anthropic(c)
+    }
+
+    fn history() -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "refactor auth".into(),
+            }],
+        }]
+    }
+
+    fn config() -> Config {
+        Config {
+            model: "claude-sonnet-5".into(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_summary_is_an_error_not_a_replacement() {
+        let (url, _) = serve_once(sse("max_tokens", "1. Primary Request: refac")).await;
+        let res = summarize_compact(&backend(&url), &history(), &config()).await;
+        assert!(
+            res.is_err(),
+            "a max_tokens summary must not replace history"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_summary_is_an_error() {
+        let (url, _) = serve_once(sse("end_turn", "  ")).await;
+        let res = summarize_compact(&backend(&url), &history(), &config()).await;
+        assert!(res.is_err(), "an empty summary must not replace history");
+    }
+
+    #[tokio::test]
+    async fn complete_summary_requests_a_real_budget() {
+        let (url, seen) = serve_once(sse("end_turn", "1. Primary Request: auth")).await;
+        let out = summarize_compact(&backend(&url), &history(), &config())
+            .await
+            .expect("complete summary");
+        let ContentBlock::Text { text } = &out[0].content[0] else {
+            panic!("summary should be text");
+        };
+        assert!(text.contains("1. Primary Request: auth"));
+
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()).unwrap();
+        assert!(body["max_tokens"].as_u64().unwrap() >= 32_000, "{body}");
+        assert_eq!(body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn legacy_claude_3_keeps_its_configured_cap() {
+        let mut cfg = config();
+        cfg.max_tokens = 8_192;
+        cfg.model = "claude-3-5-sonnet-20241022".into();
+        assert_eq!(summary_max_tokens(&cfg), 8_192);
+        cfg.model = "claude-haiku-4-5".into();
+        assert_eq!(summary_max_tokens(&cfg), 32_000);
+    }
 }
