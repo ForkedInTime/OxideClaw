@@ -93,7 +93,7 @@ oxideclaw
 
 **Windows (PowerShell):**
 ```powershell
-"ANTHROPIC_API_KEY=sk-ant-..." | Out-File -FilePath $HOME\.env -Encoding utf8 -Append
+Add-Content -Path $HOME\.env -Value 'ANTHROPIC_API_KEY=sk-ant-...' -Encoding ascii
 oxideclaw
 ```
 

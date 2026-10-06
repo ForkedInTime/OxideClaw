@@ -1767,6 +1767,19 @@ mod dotenv_allowlist_tests {
         );
     }
 
+    /// `Out-File -Encoding utf8` in Windows PowerShell 5.1 writes a BOM; the
+    /// first key must still be recognised, not read as "\u{feff}KEY".
+    #[test]
+    fn load_dotenv_ignores_a_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "\u{feff}OLLAMA_HOST=http://bom.invalid:1\r\n").unwrap();
+        assert_eq!(
+            load_dotenv(&path, PROJECT_UNTRUSTED_ENV_KEYS),
+            vec!["OLLAMA_HOST"]
+        );
+    }
+
     /// A credential from an untrusted repo's `.env` picks the account that
     /// receives every prompt; each one the loader accepts must be gated.
     #[test]

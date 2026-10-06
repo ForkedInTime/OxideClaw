@@ -412,9 +412,13 @@ pub fn read_config_file(path: &Path) -> Result<Option<String>, String> {
     if buf.len() as u64 > MAX_CONFIG_BYTES {
         return Err(format!("larger than {} KiB", MAX_CONFIG_BYTES / 1024));
     }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|_| "not valid UTF-8".into())
+    // Windows PowerShell 5.1's `Out-File -Encoding utf8` (and Notepad) prefix
+    // a BOM; left in, it glues onto the first `.env` key or frontmatter marker.
+    let mut text = String::from_utf8(buf).map_err(|_| "not valid UTF-8".to_string())?;
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(Some(text))
 }
 
 /// User-facing text for `Settings::load_errors`.
