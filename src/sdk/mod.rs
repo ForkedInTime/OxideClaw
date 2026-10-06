@@ -29,7 +29,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The approval gate a browse run is blocked on, keyed by browse session id:
 /// `(step, reply)`. A run waits on at most one prompt at a time.
-type PendingBrowse = Arc<std::sync::Mutex<HashMap<String, (u32, oneshot::Sender<bool>)>>>;
+/// Per browse session: the waiting prompt's `approval_id` and its reply.
+type PendingBrowse = Arc<std::sync::Mutex<HashMap<String, (u64, oneshot::Sender<bool>)>>>;
 
 /// Headless SDK server — reads NDJSON requests, writes NDJSON responses.
 pub struct SdkServer;
@@ -423,9 +424,10 @@ impl SdkServer {
                         appr_pending
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .insert(appr_sid.clone(), (prompt.step, prompt.reply));
+                            .insert(appr_sid.clone(), (prompt.id, prompt.reply));
                         let notif = SdkNotification::BrowseApprovalNeeded {
                             session_id: appr_sid.clone(),
+                            approval_id: prompt.id,
                             step: prompt.step,
                             tool_name: prompt.tool_name,
                             target_text: prompt.target_text,
@@ -502,23 +504,27 @@ impl SdkServer {
 
             // BrowseApprovalReply has no request id — it's a fire-and-forget
             // host reply, so a mismatch can only be logged, not answered.
+            // Matched on `approval_id`, not `step`: the step number repeats
+            // after a denied or expired prompt, so a late approval of one
+            // action would grant the next.
             SdkRequest::BrowseApprovalReply {
                 session_id,
+                approval_id,
                 step,
                 approved,
             } => {
                 let mut pending = pending_browse.lock().unwrap_or_else(|e| e.into_inner());
                 match pending.remove(&session_id) {
-                    Some((want, reply)) if want == step => {
+                    Some((want, reply)) if want == approval_id => {
                         if reply.send(approved).is_err() {
                             eprintln!(
-                                "[sdk] browse/approval_reply for {session_id} step {step} arrived after the gate timed out"
+                                "[sdk] browse/approval_reply for {session_id} approval {approval_id} (step {step}) arrived after the gate timed out"
                             );
                         }
                     }
                     Some((want, reply)) => {
                         eprintln!(
-                            "[sdk] browse/approval_reply for {session_id} names step {step}, but step {want} is waiting; ignored"
+                            "[sdk] browse/approval_reply for {session_id} names approval {approval_id}, but approval {want} is waiting; ignored"
                         );
                         pending.insert(session_id, (want, reply));
                     }
@@ -710,10 +716,11 @@ mod browse_tests {
         }
     }
 
-    fn reply(session_id: &str, step: u32, approved: bool) -> SdkRequest {
+    fn reply(session_id: &str, approval_id: u64, approved: bool) -> SdkRequest {
         SdkRequest::BrowseApprovalReply {
             session_id: session_id.into(),
-            step,
+            approval_id,
+            step: 3,
             approved,
         }
     }
@@ -721,13 +728,14 @@ mod browse_tests {
     /// The reply used to be dropped on the floor, so every gated browse
     /// action timed out into a deny no matter what the host answered.
     #[tokio::test]
-    async fn approval_reply_reaches_the_waiting_gate_only_for_its_step() {
+    async fn approval_reply_reaches_the_waiting_gate_only_for_its_prompt() {
         let mut h = Harness::new();
         let cfg = Config::default();
         let (tx, mut rx) = oneshot::channel();
         h.pending.lock().unwrap().insert("browse-1".into(), (3, tx));
 
-        // Wrong step and unknown session: ignored, prompt still waiting.
+        // A late reply to an expired prompt at the same step (approval 2),
+        // and an unknown session: ignored, prompt still waiting.
         h.handle(&cfg, reply("browse-1", 2, true)).await;
         h.handle(&cfg, reply("browse-9", 3, true)).await;
         assert!(rx.try_recv().is_err());

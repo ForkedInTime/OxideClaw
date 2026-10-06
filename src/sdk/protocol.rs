@@ -234,6 +234,10 @@ pub enum SdkRequest {
     #[serde(rename = "browse/approval_reply")]
     BrowseApprovalReply {
         session_id: String,
+        /// The `approval_id` of the `browse/approval_needed` being answered.
+        approval_id: u64,
+        /// Informational; steps repeat after a denied or expired prompt.
+        #[serde(default)]
         step: u32,
         approved: bool,
     },
@@ -412,6 +416,8 @@ pub enum SdkNotification {
     #[serde(rename = "browse/approval_needed")]
     BrowseApprovalNeeded {
         session_id: String,
+        /// Unique per prompt; echo it in `browse/approval_reply`.
+        approval_id: u64,
         step: u32,
         tool_name: String,
         target_text: String,

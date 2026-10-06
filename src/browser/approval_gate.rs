@@ -252,8 +252,20 @@ fn gate_trip_phrase(tool_name: &str) -> String {
     format!("Approval needed to {action}. Please answer.")
 }
 
+/// Source of [`ApprovalPrompt::id`]: never repeats in this process.
+static PROMPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh, never-repeating id for an approval prompt.
+pub fn next_prompt_id() -> u64 {
+    PROMPT_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// Approval prompt sent to the host (TUI/SDK/voice).
 pub struct ApprovalPrompt {
+    /// Unique per prompt. `step` repeats after a denied or timed-out prompt
+    /// (the step counter only moves for allowed calls), so a late reply
+    /// must be matched on this instead.
+    pub id: u64,
     pub step: u32,
     pub tool_name: String,
     pub target_text: String,
@@ -484,6 +496,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                 let step = self.step_counter.load(Ordering::Relaxed) + 1;
                 let (tx, rx) = oneshot::channel();
                 let prompt = ApprovalPrompt {
+                    id: next_prompt_id(),
                     step,
                     tool_name: tool_name.to_string(),
                     target_text: target_text.clone(),
@@ -691,6 +704,43 @@ mod wiring_tests {
             2,
             "fill and the Enter that submits it must both prompt"
         );
+    }
+
+    /// A denied prompt leaves the step counter where it was, so the next
+    /// gated action has the same step; only the prompt id tells them apart.
+    #[tokio::test]
+    async fn prompts_at_the_same_step_get_distinct_ids() {
+        let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+        let mw = ApprovalGateMiddleware::new(
+            ApprovalGate::default(),
+            BrowsePolicy::Pattern,
+            Arc::new(tokio::sync::Mutex::new(
+                "https://shop.example/account".into(),
+            )),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            false,
+        );
+        let host = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(p) = rx.recv().await {
+                seen.push((p.step, p.id));
+                let _ = p.reply.send(false);
+            }
+            seen
+        });
+        let fill = json!({"selector": "Card number", "value": "4111"});
+        for _ in 0..2 {
+            assert!(matches!(
+                mw.before_tool("browser_fill", &fill).await,
+                MiddlewareVerdict::Deny { .. }
+            ));
+        }
+        drop(mw);
+        let seen = host.await.unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, seen[1].0, "same step");
+        assert_ne!(seen[0].1, seen[1].1, "distinct prompt ids");
     }
 
     #[tokio::test]

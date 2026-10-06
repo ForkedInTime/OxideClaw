@@ -196,10 +196,10 @@ Progress then streams as `browse/progress`, `browse/approval_needed` and exactly
 
 ### `browse/approval_reply`
 
-Answer a `browse/approval_needed` prompt. It has no `id` and gets no response. `session_id` and `step` must match the pending prompt; anything else is logged to stderr and ignored. An unanswered prompt is denied after 60 seconds.
+Answer a `browse/approval_needed` prompt. It has no `id` and gets no response. `session_id` and `approval_id` must match the pending prompt; anything else is logged to stderr and ignored. `step` is optional and informational: a step number repeats after a denied or expired prompt, so it cannot identify one. An unanswered prompt is denied after 60 seconds.
 
 ```json
-{"type": "browse/approval_reply", "session_id": "browse-1712345678901", "step": 4, "approved": true}
+{"type": "browse/approval_reply", "session_id": "browse-1712345678901", "approval_id": 7, "step": 4, "approved": true}
 ```
 
 ---
@@ -384,6 +384,7 @@ The approval gate is holding an action. Answer with `browse/approval_reply`.
 {
   "type": "browse/approval_needed",
   "session_id": "browse-1712345678901",
+  "approval_id": 7,
   "step": 4,
   "tool_name": "browser_click",
   "target_text": "Delete repository",

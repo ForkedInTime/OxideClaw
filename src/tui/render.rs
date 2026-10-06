@@ -1418,6 +1418,7 @@ mod permission_popup_tests {
         app.show_welcome = false;
         let (reply, _rx) = tokio::sync::oneshot::channel();
         app.browse_approval = Some(crate::browser::approval_gate::ApprovalPrompt {
+            id: 1,
             step: 3,
             tool_name: "browser_click".into(),
             target_text: "BROWSE-TARGET".into(),
