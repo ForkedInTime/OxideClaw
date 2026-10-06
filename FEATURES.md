@@ -283,7 +283,7 @@ The status bar shows running cost. Budget limits halt execution before overspend
 
 ### Per-Model Pricing
 
-All Claude model pricing is built in. Ollama models are always free. OpenAI-compatible providers use configurable pricing.
+All Claude model pricing is built in. Ollama and LM Studio models are always free. Other OpenAI-compatible providers use built-in rough estimates, flagged as estimated in `/cost`.
 
 ---
 

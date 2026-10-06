@@ -49,6 +49,13 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
     };
     let m = model.to_ascii_lowercase();
 
+    // Ollama and LM Studio run on the user's own hardware: free, and checked
+    // first so a local GGUF named after a Claude or GPT model is not billed
+    // at that model's rate (which tripped /budget on free inference).
+    if m.starts_with("ollama:") || m.starts_with("lmstudio:") {
+        return published(0.0, 0.0);
+    }
+
     // Anthropic list prices per million tokens (docs, 2026-06). Newer
     // generations are cheaper than older ones, so match the generation, not
     // just the family — "opus" alone would charge Opus 5 at Opus 4.1 rates.
@@ -93,9 +100,6 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         } else {
             published(1.0, 5.0)
         }
-    } else if m.starts_with("ollama:") {
-        // Local models are free
-        published(0.0, 0.0)
     } else if m.contains("groq:") || m.contains("together:") {
         // Rough estimate for hosted open-source models
         rough(0.5, 1.0)
@@ -523,6 +527,26 @@ mod price_table_tests {
         assert!(
             !model_price("ollama:llama3").estimated,
             "local is exactly free"
+        );
+    }
+
+    /// LM Studio fell through to the unknown-model Sonnet rate, so a
+    /// /budget cap stopped sessions running on free local inference.
+    #[test]
+    fn local_providers_are_free() {
+        for model in [
+            "ollama:llama3",
+            "lmstudio:qwen2.5-coder",
+            "lmstudio:claude-sonnet-distill",
+            "ollama:gpt-oss",
+        ] {
+            let p = model_price(model);
+            assert_eq!((p.input, p.output), (0.0, 0.0), "{model}");
+            assert!(!p.estimated, "{model}");
+        }
+        assert!(
+            model_price("openai-compat:my-model").estimated,
+            "an arbitrary endpoint is still a flagged guess"
         );
     }
 
