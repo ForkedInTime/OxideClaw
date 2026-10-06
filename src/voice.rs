@@ -441,10 +441,92 @@ fn install_xtts_server_script(dir: &std::path::Path) -> Result<PathBuf> {
     Ok(script)
 }
 
+/// Directory holding the server script and its token (0700).
+fn xtts_dir() -> PathBuf {
+    crate::config::Config::data_dir().join("xtts")
+}
+
 /// Path of the XTTS v2 server script, refreshed from the copy embedded in
 /// this binary.
 fn xtts_server_script() -> Result<PathBuf> {
-    install_xtts_server_script(&crate::config::Config::data_dir().join("xtts"))
+    install_xtts_server_script(&xtts_dir())
+}
+
+const XTTS_TOKEN_FILE: &str = "token";
+
+/// The secret our XTTS servers prove they hold. Kept on disk, not per launch,
+/// so a server left running by an earlier session is still recognised.
+fn read_xtts_token(dir: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(dir.join(XTTS_TOKEN_FILE)).ok()?;
+    let t = t.trim();
+    (t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())).then(|| t.to_string())
+}
+
+fn load_or_create_xtts_token(dir: &std::path::Path) -> Result<String> {
+    if let Some(t) = read_xtts_token(dir) {
+        return Ok(t);
+    }
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let tmp = dir.join(format!(".{XTTS_TOKEN_FILE}.{}.tmp", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    std::io::Write::write_all(&mut opts.open(&tmp)?, token.as_bytes())?;
+    std::fs::rename(&tmp, dir.join(XTTS_TOKEN_FILE))?;
+    Ok(token)
+}
+
+/// What a genuine server answers to `/health?nonce=<nonce>`.
+fn xtts_health_proof(token: &str, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{token}:{nonce}"))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Is the listener on `port` one of our XTTS servers? A bare TCP connect
+/// trusted anything on the port, and every reply was then POSTed to it.
+/// Blocking but bounded: callers include the TUI thread.
+fn probe_xtts_server(port: u16, token: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let Ok(mut sock) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let _ = sock.set_write_timeout(Some(Duration::from_millis(300)));
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let request = format!("GET /health?nonce={nonce} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+    if sock.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while buf.len() < 8192 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || sock.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let resp = String::from_utf8_lossy(&buf);
+    let ok_status = resp
+        .lines()
+        .next()
+        .is_some_and(|l| l.split_whitespace().nth(1) == Some("200"));
+    ok_status && resp.contains(&xtts_health_proof(token, &nonce))
 }
 
 /// Find the Python interpreter inside the TTS uv tool venv.
@@ -463,9 +545,9 @@ fn tts_python() -> Option<String> {
     None
 }
 
-/// Check if the XTTS v2 server is already running.
+/// Check if our XTTS v2 server is running.
 pub fn xtts_server_running() -> bool {
-    std::net::TcpStream::connect(format!("127.0.0.1:{XTTS_SERVER_PORT}")).is_ok()
+    read_xtts_token(&xtts_dir()).is_some_and(|t| probe_xtts_server(XTTS_SERVER_PORT, &t))
 }
 
 /// Start the XTTS v2 background server if not already running.
@@ -478,6 +560,16 @@ pub async fn ensure_xtts_server() -> Result<u16> {
 
     let script = xtts_server_script()
         .map_err(|e| anyhow!("Could not write the XTTS v2 server script: {e}"))?;
+    let token = load_or_create_xtts_token(&xtts_dir())
+        .map_err(|e| anyhow!("Could not write the XTTS v2 server token: {e}"))?;
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, XTTS_SERVER_PORT));
+    if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok() {
+        return Err(anyhow!(
+            "Port {XTTS_SERVER_PORT} is in use by a program that is not OxideClaw's XTTS v2 server \
+             (Coqui's tts-server also defaults to it). If it is an XTTS server left by an older \
+             OxideClaw, /voice speak off stops it."
+        ));
+    }
     let python = tts_python()
         .ok_or_else(|| anyhow!("No Python for TTS venv. Run: uv tool install TTS --python 3.11"))?;
 
@@ -491,6 +583,8 @@ pub async fn ensure_xtts_server() -> Result<u16> {
     // user's keystrokes.
     let mut child = std::process::Command::new(&python)
         .args(&args)
+        // Env, not argv: argv is world-readable through `ps`.
+        .env("OXIDECLAW_XTTS_TOKEN", &token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -555,78 +649,13 @@ pub fn stop_xtts_server() {
 
 // ── Server-based synthesis ───────────────────────────────────────────────────
 
-/// Synthesise via the XTTS v2 server (fast — model stays loaded in GPU VRAM).
-async fn speak_via_server(text: &str, stop_rx: tokio::sync::oneshot::Receiver<()>) -> Result<bool> {
-    let clean = strip_for_speech(text);
-    if clean.is_empty() {
-        return Ok(false);
-    }
-
-    let words: Vec<&str> = clean.split_whitespace().collect();
-    let truncated = words.len() > TTS_WORD_LIMIT;
-    let speech_text = if truncated {
-        words[..TTS_WORD_LIMIT].join(" ") + ". Response trimmed."
-    } else {
-        clean
-    };
-
-    // Build JSON payload
-    let clone_path = voice_clone_sample_path().filter(|p| p.exists());
-    let body = tts_request_body(&speech_text, clone_path.as_deref());
-
-    let wav_out = scratch_path("xtts-server", "wav");
-    tokio::pin!(stop_rx);
-
-    // HTTP POST to server
-    let mut curl = Command::new("curl")
-        .args([
-            "-s",
-            "-X",
-            "POST",
-            &format!("http://127.0.0.1:{XTTS_SERVER_PORT}/tts"),
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body,
-            "--output",
-            &wav_out.display().to_string(),
-            "--max-time",
-            "30",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    tokio::select! {
-        biased;
-        _ = &mut stop_rx => {
-            let _ = curl.kill().await;
-            let _ = tokio::fs::remove_file(&wav_out).await;
-            return Ok(truncated);
-        }
-        status = curl.wait() => {
-            if !status?.success() {
-                return Err(anyhow!("XTTS v2 server request failed"));
-            }
-        }
-    }
-
-    // Verify we got a real WAV (not an error page)
-    let meta = tokio::fs::metadata(&wav_out).await?;
-    if meta.len() < 1000 {
-        let _ = tokio::fs::remove_file(&wav_out).await;
-        return Err(anyhow!("XTTS v2 server returned invalid audio"));
-    }
-
-    play_wav(&wav_out, stop_rx).await?;
-    Ok(truncated)
-}
-
-/// Synthesise via XTTS v2 server using ONLY the default speaker (no clone).
-async fn speak_via_server_default(
+/// Synthesise via the XTTS v2 server (fast — model stays loaded in GPU VRAM),
+/// with the clone sample if given, else the default speaker. `stop_rx` is
+/// borrowed so a failed request can fall back to the CLI with it.
+async fn speak_via_server(
     text: &str,
-    stop_rx: tokio::sync::oneshot::Receiver<()>,
+    speaker_wav: Option<&std::path::Path>,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
     let clean = strip_for_speech(text);
     if clean.is_empty() {
@@ -641,14 +670,14 @@ async fn speak_via_server_default(
         clean
     };
 
-    let body = tts_request_body(&speech_text, None);
-
-    let wav_out = scratch_path("xtts-test", "wav");
-    tokio::pin!(stop_rx);
+    let body = tts_request_body(&speech_text, speaker_wav);
+    let wav_out = scratch_path("xtts-server", "wav");
 
     let mut curl = Command::new("curl")
         .args([
             "-s",
+            // An HTTP error must fail here, not be saved as the "audio".
+            "--fail",
             "-X",
             "POST",
             &format!("http://127.0.0.1:{XTTS_SERVER_PORT}/tts"),
@@ -668,25 +697,27 @@ async fn speak_via_server_default(
 
     tokio::select! {
         biased;
-        _ = &mut stop_rx => {
+        _ = &mut *stop_rx => {
             let _ = curl.kill().await;
             let _ = tokio::fs::remove_file(&wav_out).await;
             return Ok(truncated);
         }
         status = curl.wait() => {
             if !status?.success() {
+                let _ = tokio::fs::remove_file(&wav_out).await;
                 return Err(anyhow!("XTTS v2 server request failed"));
             }
         }
     }
 
+    // Verify we got a real WAV (not an error page)
     let meta = tokio::fs::metadata(&wav_out).await?;
     if meta.len() < 1000 {
         let _ = tokio::fs::remove_file(&wav_out).await;
         return Err(anyhow!("XTTS v2 server returned invalid audio"));
     }
 
-    play_wav(&wav_out, stop_rx).await?;
+    play_wav(&wav_out, std::pin::Pin::new(stop_rx)).await?;
     Ok(truncated)
 }
 
@@ -700,9 +731,14 @@ pub async fn speak(
     _voice_model: Option<&str>,
     stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
+    let mut stop_rx = stop_rx;
     // ── Try XTTS v2 server first (fastest — model pre-loaded in VRAM) ──────
     if xtts_server_running() {
-        return speak_via_server(text, stop_rx).await;
+        let clone = voice_clone_sample_path().filter(|p| p.exists());
+        match speak_via_server(text, clone.as_deref(), &mut stop_rx).await {
+            Err(_) if xtts_available() => {}
+            done => return done,
+        }
     }
 
     // ── XTTS v2 CLI fallback (cold start each call) ───────────────────────
@@ -729,8 +765,12 @@ pub async fn speak_default_only(
     text: &str,
     stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
+    let mut stop_rx = stop_rx;
     if xtts_server_running() {
-        return speak_via_server_default(text, stop_rx).await;
+        match speak_via_server(text, None, &mut stop_rx).await {
+            Err(_) if xtts_available() => {}
+            done => return done,
+        }
     }
     if xtts_available() {
         return speak_xtts_default(text, stop_rx).await;
@@ -1512,5 +1552,94 @@ mod xtts_ready_tests {
             .to_string();
         assert!(err.contains("failed to start"), "{err}");
         assert!(child.try_wait().unwrap().is_some(), "server left running");
+    }
+}
+
+#[cfg(test)]
+mod xtts_probe_tests {
+    use super::{load_or_create_xtts_token, probe_xtts_server, read_xtts_token, xtts_health_proof};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve one connection: `respond` maps the request line to a response.
+    fn serve_once(respond: impl FnOnce(&str) -> Option<String> + Send + 'static) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            match respond(req.lines().next().unwrap_or("")) {
+                Some(resp) => {
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+                // Hold the connection open without answering.
+                None => std::thread::sleep(std::time::Duration::from_secs(5)),
+            }
+        });
+        port
+    }
+
+    fn ok(body: &str) -> String {
+        format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}")
+    }
+
+    /// Same digest Python's `hashlib.sha256(f"{token}:{nonce}".encode())`
+    /// gives, so the embedded server and the probe agree.
+    #[test]
+    fn proof_matches_the_server_script_formula() {
+        assert_eq!(
+            xtts_health_proof("tok", "abc"),
+            "7bda1c65a4b6804545292196a701b7aedc1a4c480b8cb09c04a884dd01980b1c"
+        );
+        assert!(super::XTTS_SERVER_PY.contains(r#"hashlib.sha256(f"{TOKEN}:{nonce}".encode())"#));
+    }
+
+    /// Coqui's tts-server (also on 5002) and anything else that answers
+    /// /health without the proof used to count as our server.
+    #[test]
+    fn a_foreign_listener_is_not_our_server() {
+        let port = serve_once(|_| Some(ok(r#"{"status":"ok","gpu":false}"#)));
+        assert!(!probe_xtts_server(port, &"a".repeat(64)));
+
+        let port = serve_once(|_| Some("HTTP/1.0 404 Not Found\r\n\r\n".into()));
+        assert!(!probe_xtts_server(port, &"a".repeat(64)));
+
+        let started = std::time::Instant::now();
+        let port = serve_once(|_| None);
+        assert!(!probe_xtts_server(port, &"a".repeat(64)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_server_holding_the_token_is_recognised() {
+        let token = "b".repeat(64);
+        let t = token.clone();
+        let port = serve_once(move |line| {
+            let nonce = line.split("nonce=").nth(1)?.split_whitespace().next()?;
+            let proof = xtts_health_proof(&t, nonce);
+            Some(ok(&format!(r#"{{"status":"ok","proof":"{proof}"}}"#)))
+        });
+        assert!(probe_xtts_server(port, &token));
+    }
+
+    #[test]
+    fn token_is_private_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_xtts_token(dir.path()).is_none());
+        let a = load_or_create_xtts_token(dir.path()).unwrap();
+        assert_eq!(a.len(), 64);
+        assert_eq!(load_or_create_xtts_token(dir.path()).unwrap(), a);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
