@@ -320,33 +320,71 @@ fn rule_matches(
     // `/proj/src/../../.bashrc`, a deny on `~/.ssh/` is not dodged by
     // `~/./.ssh/id_rsa`, and a relative `.env` is the project's `.env`.
     let path = normalize_lexically(&cwd.join(raw).to_string_lossy());
+    let home = dirs::home_dir().unwrap_or_default();
+    if path_rule_hit(inner, &path, cwd, &home, deny) {
+        return RuleMatch::Match;
+    }
+    if !deny {
+        return RuleMatch::NoMatch;
+    }
+    // A repository can ship `notes.md -> .env`: the tool follows the link,
+    // so a deny rule also covers the file the path really reaches, and a
+    // project or home directory reached through a symlink.
+    let real = normalize_lexically(
+        &crate::tools::resolve_for_sensitivity_check(Path::new(&path)).to_string_lossy(),
+    );
+    let real_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let real_home = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+    for p in [&path, &real] {
+        for c in [cwd, real_cwd.as_path()] {
+            for h in [home.as_path(), real_home.as_path()] {
+                if (p != &path || c != cwd || h != home.as_path())
+                    && path_rule_hit(inner, p, c, h, deny)
+                {
+                    return RuleMatch::Match;
+                }
+            }
+        }
+    }
+    RuleMatch::NoMatch
+}
+
+/// Letter case does not tell files apart on the default macOS (APFS) and
+/// Windows (NTFS) filesystems, so path rules must not either: `.ENV` opens
+/// the same file `Read(./.env)` denies.
+const FOLD_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+fn fold_case(s: String) -> String {
+    if FOLD_CASE { s.to_lowercase() } else { s }
+}
+
+/// One normalized absolute `path` against a `prefix:`, `:*` or
+/// gitignore-style path rule, with `cwd` and `home` as the anchors.
+fn path_rule_hit(inner: &str, path: &str, cwd: &Path, home: &Path, deny: bool) -> bool {
     let anchor = |base: &str| -> String {
         let p = if let Some(rest) = base
             .strip_prefix('~')
             .filter(|r| r.is_empty() || r.starts_with('/'))
         {
-            format!("{}{rest}", dirs::home_dir().unwrap_or_default().display())
+            format!("{}{rest}", home.display())
         } else {
             cwd.join(base).to_string_lossy().into_owned()
         };
-        normalize_lexically(&p)
+        fold_case(normalize_lexically(&p))
     };
     if let Some(prefix) = inner.strip_prefix("prefix:") {
-        return RuleMatch::from_bool(path.starts_with(&anchor(prefix)));
+        return fold_case(path.to_string()).starts_with(&anchor(prefix));
     }
     if let Some(base) = inner.strip_suffix(":*") {
         let base = anchor(base);
         let base = base.trim_end_matches('/');
-        return RuleMatch::from_bool(
-            path.strip_prefix(base)
-                .is_some_and(|r| r.is_empty() || r.starts_with('/')),
-        );
+        return fold_case(path.to_string())
+            .strip_prefix(base)
+            .is_some_and(|r| r.is_empty() || r.starts_with('/'));
     }
-    RuleMatch::from_bool(
-        glob_rule_patterns(inner, cwd, deny)
-            .iter()
-            .any(|pat| glob_covers(pat, &path)),
-    )
+    glob_rule_patterns(inner, cwd, home, deny)
+        .iter()
+        .any(|pat| glob_covers(pat, path))
 }
 
 /// A bare tool-name rule. MCP tools are named `mcp__<server>__<tool>`, so
@@ -380,7 +418,7 @@ pub fn blocked_entry_matches(entry: &str, tool_name: &str) -> bool {
 }
 
 /// The absolute glob(s) a gitignore-style path rule stands for.
-fn glob_rule_patterns(inner: &str, cwd: &Path, deny: bool) -> Vec<glob::Pattern> {
+fn glob_rule_patterns(inner: &str, cwd: &Path, home: &Path, deny: bool) -> Vec<glob::Pattern> {
     let pat = inner.trim_end_matches('/');
     let esc = |p: &Path| glob::Pattern::escape(&p.to_string_lossy());
     let mut out = Vec::new();
@@ -390,10 +428,7 @@ fn glob_rule_patterns(inner: &str, cwd: &Path, deny: bool) -> Vec<glob::Pattern>
         .strip_prefix('~')
         .filter(|r| r.is_empty() || r.starts_with('/'))
     {
-        out.push(format!(
-            "{}{rest}",
-            esc(&dirs::home_dir().unwrap_or_default())
-        ));
+        out.push(format!("{}{rest}", esc(home)));
     } else if let Some(rest) = pat.strip_prefix('/') {
         out.push(format!("{}/{rest}", esc(cwd)));
         if deny {
@@ -416,7 +451,7 @@ fn glob_rule_patterns(inner: &str, cwd: &Path, deny: bool) -> Vec<glob::Pattern>
 /// naming a directory covers everything inside it.
 fn glob_covers(pat: &glob::Pattern, path: &str) -> bool {
     let opts = glob::MatchOptions {
-        case_sensitive: true,
+        case_sensitive: !FOLD_CASE,
         require_literal_separator: true,
         require_literal_leading_dot: false,
     };
@@ -447,8 +482,42 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 /// Resolve `.` and `..` without touching the filesystem. A relative path
 /// that climbs above its start keeps its leading `..`, so it never matches
-/// a prefix rule written for a directory below.
+/// a prefix rule written for a directory below. On Windows `\` separates
+/// too and the root carries a drive or UNC prefix (see `normalize_windows`).
 fn normalize_lexically(path: &str) -> String {
+    if cfg!(windows) {
+        return normalize_windows(path);
+    }
+    normalize_posix(path)
+}
+
+/// Windows form of [`normalize_lexically`]: `\` becomes `/`, a `\\?\`
+/// verbatim prefix (what `canonicalize` returns) is dropped, and a drive
+/// (`C:`) or UNC share (`//server/share`) prefix stays in front of the
+/// resolved rest, so `C:\proj\..\Users` cannot hide its `..`.
+fn normalize_windows(path: &str) -> String {
+    let mut p = path.replace('\\', "/");
+    if let Some(rest) = p.strip_prefix("//?/UNC/") {
+        p = format!("//{rest}");
+    } else if let Some(rest) = p.strip_prefix("//?/") {
+        p = rest.to_string();
+    }
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        let drive = p[..2].to_ascii_uppercase();
+        return format!("{drive}{}", normalize_posix(&p[2..]));
+    }
+    if let Some(unc) = p.strip_prefix("//") {
+        let mut it = unc.splitn(3, '/');
+        let server = it.next().unwrap_or("");
+        let share = it.next().unwrap_or("");
+        let rest = format!("/{}", it.next().unwrap_or(""));
+        return format!("//{server}/{share}{}", normalize_posix(&rest));
+    }
+    normalize_posix(&p)
+}
+
+fn normalize_posix(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
@@ -1080,6 +1149,99 @@ mod tests {
             return check_compound_command(st, tool, input["command"].as_str().unwrap());
         }
         st.check_with_input(tool, Some(&input))
+    }
+
+    /// The path rules saw only the lexical path, so a repo-shipped
+    /// `notes.md -> .env` read the denied file.
+    #[cfg(unix)]
+    #[test]
+    fn deny_rules_follow_symlinks() {
+        use serde_json::json;
+        let proj = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(".env", root.join("notes.md")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let out = std::fs::canonicalize(outside.path()).unwrap();
+        std::fs::write(out.join("creds"), "x").unwrap();
+        std::os::unix::fs::symlink(out.join("creds"), root.join("readme.md")).unwrap();
+
+        let deny = vec![
+            "Read(./.env)".to_string(),
+            format!("Read(/{}/**)", out.display()),
+        ];
+        let st = PermissionState::new(false, &[], &deny).with_cwd(&root);
+        for f in ["notes.md", "readme.md"] {
+            assert!(
+                matches!(
+                    st.check_with_input("Read", Some(&json!({ "file_path": f }))),
+                    CheckResult::Deny
+                ),
+                "{f}"
+            );
+        }
+        std::fs::write(root.join("plain.md"), "ok").unwrap();
+        assert!(matches!(
+            st.check_with_input("Read", Some(&json!({ "file_path": "plain.md" }))),
+            CheckResult::Allow
+        ));
+
+        // The project opened through a symlink, the file named by its real path.
+        let via = outside.path().join("via");
+        std::os::unix::fs::symlink(&root, &via).unwrap();
+        let st = PermissionState::new(false, &[], &deny[..1]).with_cwd(&via);
+        let real = root.join(".env").display().to_string();
+        assert!(matches!(
+            st.check_with_input("Read", Some(&json!({ "file_path": real }))),
+            CheckResult::Deny
+        ));
+    }
+
+    #[test]
+    fn windows_paths_normalize_with_their_root() {
+        assert_eq!(
+            normalize_windows(r"C:\proj\src\..\..\Users\u\.ssh\id_rsa"),
+            "C:/Users/u/.ssh/id_rsa"
+        );
+        assert_eq!(normalize_windows(r"\\?\c:\proj\.env"), "C:/proj/.env");
+        assert_eq!(normalize_windows(r"\\srv\share\a\..\..\b"), "//srv/share/b");
+        assert_eq!(normalize_windows(r"src\..\..\x"), "../x");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn path_rules_ignore_letter_case_where_the_filesystem_does() {
+        use serde_json::json;
+        let st = at_proj(
+            &[],
+            &[
+                "Read(./.env)",
+                "Read(./secrets/**)",
+                "Read(prefix:/proj/keys/)",
+            ],
+        );
+        for f in [".ENV", "SECRETS/key.pem", "/proj/KEYS/a"] {
+            assert!(
+                matches!(
+                    check(&st, "Read", json!({ "file_path": f })),
+                    CheckResult::Deny
+                ),
+                "{f}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backslash_dotdot_cannot_dodge_a_home_rule() {
+        use serde_json::json;
+        let home = dirs::home_dir().unwrap_or_default();
+        let st = at_proj(&[], &["Read(~/.ssh/**)"]);
+        let sneaky = format!(r"{}\x\..\.ssh\id_rsa", home.display());
+        assert!(matches!(
+            check(&st, "Read", json!({ "file_path": sneaky })),
+            CheckResult::Deny
+        ));
     }
 
     /// The Claude Code rule forms (`Read(./.env)`, `Read(~/.ssh/**)`,
