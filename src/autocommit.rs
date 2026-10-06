@@ -84,7 +84,61 @@ pub(crate) fn git_cmd(cwd: &Path) -> std::process::Command {
     cmd.env("LC_ALL", "C");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    // A sandboxed Bash call can write `.git/` when cwd is the repo root, and
+    // these commands run on the host: a planted fsmonitor or hook (e.g.
+    // `reference-transaction` on our update-ref) would run outside the
+    // sandbox. Plumbing needs neither, so neither is ever honoured.
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]);
     cmd
+}
+
+/// Repo-local `filter.*` drivers as first seen by this process, per git dir.
+static TRUSTED_FILTERS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Refuse to run the repo's clean/smudge filters if a repo-local filter
+/// driver appeared or changed since this process first looked (the first
+/// call pins what is trusted, so call it at startup). `add -A` and
+/// `checkout-index` run those commands on the host, so a sandboxed command
+/// that rewrote `.git/config` would otherwise escape on the next snapshot or
+/// /undo. Filters are not simply disabled: that would store LFS/git-crypt
+/// files raw and /undo would write pointers or ciphertext over them.
+/// Global and system config are outside any sandbox's reach and not checked.
+pub fn check_filters_unchanged(cwd: &Path) -> anyhow::Result<()> {
+    let git_dir = git_output(git_cmd(cwd).args(["rev-parse", "--absolute-git-dir"]))?;
+    let out = git_cmd(cwd)
+        .args(["config", "--show-scope", "--get-regexp", r"^filter\."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    // Exit 1 is "no such keys"; anything else means git could not tell us.
+    if !out.status.success() && out.status.code() != Some(1) {
+        anyhow::bail!("git config --show-scope failed; not running repo filters");
+    }
+    let local: String = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.starts_with("global\t") && !l.starts_with("system\t"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let mut guard = TRUSTED_FILTERS.lock().unwrap_or_else(|e| e.into_inner());
+    let trusted = guard
+        .get_or_insert_with(Default::default)
+        .entry(PathBuf::from(git_dir))
+        .or_insert_with(|| local.clone());
+    if *trusted != local {
+        anyhow::bail!(
+            "the repository's git filter configuration changed during this session, \
+             so OxideClaw will not run it (it could have been written from inside \
+             the sandbox). Review the filter.* entries in .git/config, then restart \
+             OxideClaw to resume auto-commit and /undo."
+        );
+    }
+    Ok(())
 }
 
 /// Return true if `cwd` is inside a git work tree. Uses
@@ -170,6 +224,7 @@ fn stage_worktree(
     seed_tree: Option<&str>,
     temp_index: &Path,
 ) -> anyhow::Result<String> {
+    check_filters_unchanged(cwd)?;
     // Seed from the parent's tree so `add -A` only records diffs relative to
     // it, which makes empty-turn detection accurate even when the user's real
     // index has other staging.
@@ -213,7 +268,7 @@ fn commit_tree(cwd: &Path, tree: &str, parents: &[&str], msg: &str) -> anyhow::R
         .env("GIT_AUTHOR_EMAIL", "noreply@oxideclaw.local")
         .env("GIT_COMMITTER_NAME", "oxideclaw")
         .env("GIT_COMMITTER_EMAIL", "noreply@oxideclaw.local")
-        .args(["commit-tree", tree, "-m", msg]);
+        .args(["commit-tree", "--no-gpg-sign", tree, "-m", msg]);
     for p in parents {
         cmd.args(["-p", p]);
     }
@@ -521,6 +576,7 @@ pub fn restore_to(
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
         .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
     let prefix = format!("{}/", toplevel.display());
+    check_filters_unchanged(cwd)?;
     let checkout_status = git_cmd(&toplevel)
         .env("GIT_INDEX_FILE", &temp_index)
         .args(["checkout-index", "-a", "-f", "--prefix", &prefix])
@@ -1389,6 +1445,125 @@ mod restore_tests {
             "expected only.txt as orphan: {:?}",
             report.orphaned_files
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sandbox_escape_tests {
+    use super::git_detection_tests::init_test_repo;
+    use super::snapshot_tests::write_file;
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A script that leaves `marker` behind; as a filter it passes data
+    /// through, otherwise it exits without reading stdin (an fsmonitor hook
+    /// that waits on stdin hangs git).
+    fn script(path: &Path, marker: &Path, filter: bool) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let tail = if filter { "cat\n" } else { "" };
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\ntouch '{}'\n{tail}", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn git_config(repo: &Path, k: &str, v: &str) {
+        let s = Command::new("git")
+            .args(["config", k, v])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(s.success());
+    }
+
+    fn turn(
+        repo: &Path,
+        commits: &mut Vec<String>,
+        pos: &mut usize,
+        n: u32,
+    ) -> anyhow::Result<SnapshotOutcome> {
+        write_file(repo, "f.txt", &format!("turn {n}\n"));
+        snapshot_turn(
+            repo,
+            &AutoCommitConfig::default(),
+            "escape",
+            "p",
+            n,
+            commits,
+            pos,
+            None,
+        )
+    }
+
+    /// What a sandboxed command can plant in a writable `.git/` without any
+    /// filter: a hook that our update-ref fires, and an fsmonitor that our
+    /// `add -A` runs. Neither may execute on the host.
+    #[test]
+    fn planted_hooks_and_fsmonitor_never_run() {
+        let td = init_test_repo();
+        let marker = td.path().join("pwned");
+        script(
+            &td.path().join(".git/hooks/reference-transaction"),
+            &marker,
+            false,
+        );
+        let mon = td.path().join(".git/mon.sh");
+        script(&mon, &marker, false);
+        git_config(td.path(), "core.fsmonitor", &mon.display().to_string());
+
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        let out = turn(td.path(), &mut commits, &mut pos, 1).unwrap();
+        assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
+        restore_to(td.path(), &commits, 0).unwrap();
+        assert!(
+            !marker.exists(),
+            "a planted hook or fsmonitor ran on the host"
+        );
+    }
+
+    /// A filter driver added mid-session (as from inside the sandbox) is not
+    /// run by the next snapshot or /undo; one present from the start is
+    /// trusted, so LFS/git-crypt repos keep working.
+    #[test]
+    fn a_filter_added_mid_session_is_refused_but_a_preexisting_one_runs() {
+        let td = init_test_repo();
+        let trusted = td.path().join("trusted-ran");
+        script(&td.path().join(".git/ok.sh"), &trusted, true);
+        git_config(
+            td.path(),
+            "filter.ok.clean",
+            &td.path().join(".git/ok.sh").display().to_string(),
+        );
+        write_file(
+            td.path(),
+            ".gitattributes",
+            "*.txt filter=ok\n*.bin filter=evil\n",
+        );
+
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        let out = turn(td.path(), &mut commits, &mut pos, 1).unwrap();
+        assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
+        assert!(
+            trusted.exists(),
+            "a filter configured before the session must run"
+        );
+
+        let marker = td.path().join("pwned");
+        let evil = td.path().join(".git/evil.sh");
+        script(&evil, &marker, true);
+        git_config(td.path(), "filter.evil.clean", &evil.display().to_string());
+        git_config(td.path(), "filter.evil.smudge", &evil.display().to_string());
+        write_file(td.path(), "x.bin", "data\n");
+
+        let err = turn(td.path(), &mut commits, &mut pos, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("filter configuration changed"),
+            "{err}"
+        );
+        assert!(restore_to(td.path(), &commits, 0).is_err());
+        assert!(!marker.exists(), "a planted filter ran on the host");
     }
 }
 

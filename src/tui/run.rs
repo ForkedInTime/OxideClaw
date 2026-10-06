@@ -534,6 +534,10 @@ async fn run_loop(
         hooks::run_session_start_hooks(hook_cfg, &session.id, &config.cwd).await;
     }
 
+    // Pin the repo's filter drivers before any (possibly sandboxed) tool runs;
+    // snapshots and /undo refuse to run drivers that change after this.
+    let _ = oxideclaw::autocommit::check_filters_unchanged(&config.cwd);
+
     // Move pre-rename shadow refs first so /undo history survives, then prune
     // (keeps the configured number of newest sessions).
     if let Err(e) = oxideclaw::autocommit::migrate_legacy_refs(&config.cwd) {
@@ -1097,7 +1101,13 @@ async fn run_loop(
                                         ));
                                     }
                                     Err(e) => {
+                                        // Visible for the same reason as a conflict, and a
+                                        // refused (possibly tampered) repo filter must not
+                                        // go unnoticed.
                                         tracing::warn!("autoCommit: snapshot failed: {e}");
+                                        app.entries.push(crate::tui::app::ChatEntry::error(
+                                            format!("⚠ Auto-commit failed — this turn was not added to /undo history.\n{e}"),
+                                        ));
                                     }
                                 }
                             }

@@ -401,6 +401,8 @@ OxideClaw supports multiple sandbox backends for tool isolation:
 | `firejail` | Firejail — security sandbox with profiles |
 | `strict` | Best-effort denylist of catastrophic command literals — NOT isolation; no filesystem or network restriction (the only option on macOS/Windows) |
 
+The project directory stays writable inside the sandbox, `.git/` included, so OxideClaw's own git snapshots (auto-commit, `/undo`, `/redo`) never run repository hooks or `core.fsmonitor`, and they stop with a warning if a repo-local `filter.*` driver appears or changes mid-session instead of running it outside the sandbox. Restart after reviewing `.git/config` to resume them.
+
 ---
 
 ## Configuration
