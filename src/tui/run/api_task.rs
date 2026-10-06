@@ -307,6 +307,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     let _ = tx.send(AppEvent::Compacted {
                         replacement: replacement.clone(),
                         summary_len,
+                        base: None,
                     });
                     messages = replacement;
                     continue; // retry outer loop with compacted history

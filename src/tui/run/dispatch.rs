@@ -109,14 +109,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if messages.is_empty() {
                 app.entries
                     .push(ChatEntry::system("Nothing to compact yet."));
+            } else if app.compacting {
+                app.entries.push(ChatEntry::system(
+                    "Already compacting — wait for it to finish.",
+                ));
             } else {
                 app.entries
                     .push(ChatEntry::system("Compacting conversation…"));
                 snip_compact(messages);
+                app.compacting = true;
                 let c2 = client.clone();
                 let msgs = messages.clone();
                 let cfg = config.clone();
                 let tx2 = tx.clone();
+                let sid = session.id.clone();
                 tokio::spawn(async move {
                     match summarize_compact(&c2, &msgs, &cfg).await {
                         Ok(r) => {
@@ -134,10 +140,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             let _ = tx2.send(AppEvent::Compacted {
                                 replacement: r,
                                 summary_len,
+                                base: Some((sid, msgs)),
                             });
                         }
                         Err(e) => {
-                            let _ = tx2.send(AppEvent::Error(format!("Compact failed: {e}")));
+                            let _ =
+                                tx2.send(AppEvent::CompactFailed(format!("Compact failed: {e}")));
                         }
                     }
                 });

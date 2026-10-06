@@ -557,6 +557,8 @@ pub struct App {
     /// Text currently being streamed (incomplete assistant message)
     pub streaming: String,
     pub is_loading: bool,
+    /// A background /compact or auto-compaction is in flight.
+    pub compacting: bool,
 
     // Input line (stored as chars for safe unicode indexing)
     pub input: Vec<char>,
@@ -779,6 +781,7 @@ impl App {
             entries: Vec::new(),
             streaming: String::new(),
             is_loading: false,
+            compacting: false,
             input: Vec::new(),
             cursor: 0,
             scroll: 0,
@@ -1429,6 +1432,11 @@ impl App {
                 self.entries.push(ChatEntry::system(format!(
                     "Context compacted — history replaced with {summary_len}-char summary."
                 )));
+                self.scroll_to_bottom();
+            }
+            AppEvent::CompactFailed(msg) => {
+                self.compacting = false;
+                self.entries.push(ChatEntry::error(msg));
                 self.scroll_to_bottom();
             }
             AppEvent::SystemMessage(msg) => {

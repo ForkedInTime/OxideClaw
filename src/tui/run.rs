@@ -33,6 +33,24 @@ fn short_id(id: &str, n: usize) -> &str {
     }
 }
 
+/// History after a background compaction of `base` finishes. The user may
+/// have sent turns meanwhile (kept after the summary) or switched, cleared,
+/// rewound or resumed the conversation (`None`: the summary would replace
+/// history it never saw, or be written into another session's file).
+fn merge_compaction(
+    current: &[Message],
+    mut replacement: Vec<Message>,
+    base_session_id: &str,
+    base: &[Message],
+    session_id: &str,
+) -> Option<Vec<Message>> {
+    if base_session_id != session_id || !current.starts_with(base) {
+        return None;
+    }
+    replacement.extend_from_slice(&current[base.len()..]);
+    Some(replacement)
+}
+
 /// A user message that starts an exchange: typed text, not a tool result.
 /// /rewind cuts at these; resume counts them to realign the turn counter.
 fn is_prompt(m: &Message) -> bool {
@@ -380,6 +398,8 @@ async fn run_loop(
     // Tokens across every API call of the running turn.
     let mut turn_tokens: (u64, u64) = (0, 0);
     let mut consecutive_compact_count: u32 = 0;
+    // A finished background compaction waiting for the running turn to end.
+    let mut pending_compact: Option<(Vec<Message>, usize, (String, Vec<Message>))> = None;
     let mut saved_count: usize = 0;
     // Turn counter for file history snapshots (increments on each user prompt sent to API)
     let mut turn_counter: usize = 0;
@@ -1020,7 +1040,14 @@ async fn run_loop(
                                 }
                             }
                         }
-                        AppEvent::Compacted { ref replacement, summary_len } => {
+                        AppEvent::Compacted { replacement, summary_len, base: Some(base) } => {
+                            // Background result: applied once no turn is in
+                            // flight, below, so it never lands between a
+                            // turn's start and its Done.
+                            app.compacting = false;
+                            pending_compact = Some((replacement, summary_len, base));
+                        }
+                        AppEvent::Compacted { ref replacement, summary_len, base: None } => {
                             consecutive_compact_count = 0; // successful compact resets thrash counter
                             messages = replacement.clone();
                             if !config.no_session_persistence {
@@ -1031,6 +1058,7 @@ async fn run_loop(
                             app.apply(AppEvent::Compacted {
                                 replacement: replacement.clone(),
                                 summary_len,
+                                base: None,
                             });
                         }
                         AppEvent::VoiceBrowse(ref goal) => {
@@ -1165,8 +1193,38 @@ async fn run_loop(
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
 
-        // Auto-compact after API turn completes
-        if !app.is_loading && last_tokens_in > 0 {
+        if !app.is_loading
+            && let Some((replacement, summary_len, (base_sid, base))) = pending_compact.take()
+        {
+            match merge_compaction(&messages, replacement, &base_sid, &base, &session.id) {
+                Some(merged) => {
+                    consecutive_compact_count = 0;
+                    messages = merged;
+                    if !config.no_session_persistence {
+                        saved_count = messages.len();
+                        let _ = session.overwrite(&messages).await;
+                    }
+                    // The last turn's token count measured the history
+                    // that was just summarised.
+                    last_tokens_in = 0;
+                    app.apply(AppEvent::Compacted {
+                        replacement: Vec::new(),
+                        summary_len,
+                        base: None,
+                    });
+                }
+                None => {
+                    app.entries.push(ChatEntry::system(
+                        "Compaction discarded: the conversation changed while it ran.",
+                    ));
+                    app.scroll_to_bottom();
+                }
+            }
+        }
+
+        // Auto-compact after API turn completes. Not while a compaction is
+        // already running: its result is about to replace this history.
+        if !app.is_loading && !app.compacting && last_tokens_in > 0 {
             match compact_needed(last_tokens_in, app.context_window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
@@ -1210,6 +1268,7 @@ async fn run_loop(
                                 hooks::run_pre_compact_hooks(hook_cfg, &session.id, &config.cwd)
                                     .await;
                             }
+                            app.compacting = true;
                             let c2 = client.clone();
                             let msgs = messages.clone();
                             let cfg = config.clone();
@@ -1241,11 +1300,13 @@ async fn run_loop(
                                         let _ = tx2.send(AppEvent::Compacted {
                                             replacement: r,
                                             summary_len,
+                                            base: Some((sid, msgs)),
                                         });
                                     }
                                     Err(e) => {
-                                        let _ = tx2
-                                            .send(AppEvent::Error(format!("Compact failed: {e}")));
+                                        let _ = tx2.send(AppEvent::CompactFailed(format!(
+                                            "Compact failed: {e}"
+                                        )));
                                     }
                                 }
                             });
@@ -1410,5 +1471,63 @@ mod resume_turn_counter_tests {
         let msgs = vec![user_text("a"), tool_result, user_text("b"), user_text("c")];
         assert_eq!(resume_turn_counter(tmp.path(), &msgs), 3);
         assert_eq!(resume_turn_counter(&tmp.path().join("missing"), &[]), 0);
+    }
+}
+
+#[cfg(test)]
+mod merge_compaction_tests {
+    use super::*;
+
+    fn text(role: Role, t: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    fn base() -> Vec<Message> {
+        vec![
+            text(Role::User, "q1"),
+            text(Role::Assistant, "a1"),
+            text(Role::User, "q2"),
+            text(Role::Assistant, "a2"),
+        ]
+    }
+
+    /// A turn sent while the summary was streaming must survive it, after
+    /// the summary instead of being wiped from context and disk.
+    #[test]
+    fn turn_sent_during_compaction_is_kept_after_the_summary() {
+        let summary = vec![text(Role::User, "SUMMARY")];
+        let mut current = base();
+        current.push(text(Role::User, "q3"));
+        current.push(text(Role::Assistant, "a3"));
+        let merged = merge_compaction(&current, summary.clone(), "s1", &base(), "s1").unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                summary[0].clone(),
+                text(Role::User, "q3"),
+                text(Role::Assistant, "a3"),
+            ]
+        );
+        assert_eq!(
+            merge_compaction(&base(), summary.clone(), "s1", &base(), "s1").unwrap(),
+            summary
+        );
+    }
+
+    /// /clear and /resume switch the session; /rewind or /undo rewrite the
+    /// history. A late summary of the old history must not be written over
+    /// any of them.
+    #[test]
+    fn changed_or_switched_conversation_discards_the_summary() {
+        let summary = vec![text(Role::User, "SUMMARY")];
+        assert!(merge_compaction(&base(), summary.clone(), "s1", &base(), "s2").is_none());
+        assert!(merge_compaction(&[], summary.clone(), "s1", &base(), "s1").is_none());
+        assert!(merge_compaction(&base()[..2], summary.clone(), "s1", &base(), "s1").is_none());
+        let mut rewritten = base();
+        rewritten[1] = text(Role::Assistant, "other");
+        assert!(merge_compaction(&rewritten, summary, "s1", &base(), "s1").is_none());
     }
 }

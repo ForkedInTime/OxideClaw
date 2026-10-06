@@ -44,7 +44,16 @@ pub enum AppEvent {
     Compacted {
         replacement: Vec<Message>,
         summary_len: usize,
+        /// For a compaction that ran in the background between turns: the
+        /// session id and the exact history it summarised. The user can keep
+        /// working meanwhile, so the result is only valid if the history
+        /// still starts with that snapshot. `None` for a turn's own
+        /// mid-turn compaction, which the turn already continued from.
+        base: Option<(String, Vec<Message>)>,
     },
+    /// A background compaction failed. Separate from `Error`, which ends the
+    /// running turn's loading state.
+    CompactFailed(String),
     /// Informational notice from the harness (not from Claude)
     SystemMessage(String),
     /// Claude called AskUserQuestion — show a text-input dialog
