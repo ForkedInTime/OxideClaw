@@ -366,10 +366,26 @@ where
     Ok(String::from_utf8_lossy(&kept).into_owned())
 }
 
+/// Hooks are written in POSIX shell syntax. Under fish, nu or xonsh a guard
+/// fails to parse, exits non-2, and the tool it was meant to block runs, so
+/// those shells fall back to `sh`. A POSIX-family `$SHELL` is kept: bash
+/// users' `[[ ... ]]` guards would exit 127 (allow) under dash.
+fn hook_shell(login_shell: Option<&str>) -> String {
+    login_shell
+        .filter(|s| {
+            matches!(
+                std::path::Path::new(s).file_name().and_then(|n| n.to_str()),
+                Some("sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "yash")
+            )
+        })
+        .unwrap_or("sh")
+        .to_string()
+}
+
 async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     use tokio::process::Command;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
+    let shell = hook_shell(std::env::var("SHELL").ok().as_deref());
 
     let mut cmd = Command::new(&shell);
     cmd.arg("-c").arg(&hook.command);
@@ -550,6 +566,17 @@ mod tests {
         HookEntry {
             matcher: String::new(),
             command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn hooks_run_under_a_posix_shell_even_for_fish_or_nu_users() {
+        for non_posix in ["/usr/bin/fish", "/usr/local/bin/nu", "/usr/bin/xonsh", ""] {
+            assert_eq!(hook_shell(Some(non_posix)), "sh", "{non_posix}");
+        }
+        assert_eq!(hook_shell(None), "sh");
+        for posix in ["/bin/bash", "/usr/bin/zsh", "/bin/sh", "/bin/dash"] {
+            assert_eq!(hook_shell(Some(posix)), posix);
         }
     }
 

@@ -353,7 +353,7 @@ Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, unknown session, 
 
 ## Hooks
 
-User-defined shell commands that run at lifecycle events. Configure them under `"hooks"` in `settings.json`; each entry is `{ "matcher": "<tool name or *>", "command": "<sh -c command>" }`.
+User-defined shell commands that run at lifecycle events. Configure them under `"hooks"` in `settings.json`; each entry is `{ "matcher": "<tool name or *>", "command": "<shell command>" }`. The command runs via `$SHELL -c` when `$SHELL` is a POSIX-family shell (sh, bash, dash, zsh, ksh, mksh, ash, yash) and via `sh -c` otherwise, so fish or nu users' POSIX hooks still parse.
 
 | Event | When | Environment |
 |-------|------|-------------|

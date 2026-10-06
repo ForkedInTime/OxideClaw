@@ -22,7 +22,8 @@ pub struct HookEntry {
     /// Tool name to match (empty or "*" = all tools)
     #[serde(default)]
     pub matcher: String,
-    /// Shell command to execute (passed to sh -c)
+    /// Shell command to execute: `$SHELL -c` when $SHELL is a POSIX-family
+    /// shell (bash, zsh, dash, ...), otherwise `sh -c`.
     pub command: String,
 }
 
