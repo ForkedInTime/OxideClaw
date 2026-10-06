@@ -121,6 +121,7 @@ pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process
                     "wav",
                     &out.display().to_string(),
                 ])
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?
@@ -137,6 +138,7 @@ pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process
                     "16",
                     &out.display().to_string(),
                 ])
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?
@@ -154,6 +156,7 @@ pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process
                 "-y",
                 &out.display().to_string(),
             ])
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?,
@@ -383,6 +386,14 @@ pub const TTS_WORD_LIMIT: usize = 200;
 /// "Daisy Studious" — clear, warm female voice from the XTTS v2 multi-dataset model.
 pub const XTTS_DEFAULT_SPEAKER: &str = "Daisy Studious";
 
+/// Coqui asks for the XTTS v2 (CPML) license with `input()` the first time
+/// it downloads the model. OxideClaw gives its helpers no stdin, so that
+/// prompt fails instead of reading the TUI's keystrokes, and the user has to
+/// answer it once in a normal shell.
+pub const XTTS_FIRST_RUN_HINT: &str = "First run: download the XTTS v2 model and accept its CPML license once in a normal shell:\n  \
+     tts --model_name tts_models/multilingual/multi-dataset/xtts_v2 --text hi \
+     --speaker_idx 'Daisy Studious' --language_idx en --out_path /tmp/xtts-check.wav";
+
 /// Port for the XTTS v2 background server.
 const XTTS_SERVER_PORT: u16 = 5002;
 
@@ -475,23 +486,55 @@ pub async fn ensure_xtts_server() -> Result<u16> {
         args.push("--cpu".into());
     }
 
-    // Spawn detached server process
-    let _child = std::process::Command::new(&python)
+    // Detached server. An inherited stdin would be the TUI's raw-mode tty:
+    // Coqui's first-run license prompt would block on it forever and eat the
+    // user's keystrokes.
+    let mut child = std::process::Command::new(&python)
         .args(&args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| anyhow!("Failed to start XTTS v2 server: {e}"))?;
 
-    // Wait for server to become ready (up to 60s for model loading)
-    for _ in 0..120 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if xtts_server_running() {
-            return Ok(XTTS_SERVER_PORT);
+    // Up to 60s for model loading.
+    await_xtts_ready(
+        &mut child,
+        120,
+        std::time::Duration::from_millis(500),
+        xtts_server_running,
+    )
+    .await?;
+    Ok(XTTS_SERVER_PORT)
+}
+
+/// Wait for a freshly spawned XTTS server to listen. A server that exits
+/// first is reported at once rather than after the full timeout, and one
+/// that never comes up is killed so repeated `/voice` commands do not pile
+/// up stuck Python processes.
+async fn await_xtts_ready(
+    child: &mut std::process::Child,
+    attempts: u32,
+    interval: std::time::Duration,
+    ready: impl Fn() -> bool,
+) -> Result<()> {
+    for _ in 0..attempts {
+        tokio::time::sleep(interval).await;
+        if ready() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(anyhow!(
+                "XTTS v2 server exited before it was ready ({status}).\n{XTTS_FIRST_RUN_HINT}"
+            ));
         }
     }
-
-    Err(anyhow!("XTTS v2 server failed to start within 60 seconds"))
+    let _ = child.kill();
+    let _ = child.wait();
+    let secs = (interval * attempts).as_secs();
+    Err(anyhow!(
+        "XTTS v2 server failed to start within {secs} seconds.\n{XTTS_FIRST_RUN_HINT}"
+    ))
 }
 
 /// Stop the XTTS v2 server if running. Only a process *listening* on the
@@ -550,6 +593,7 @@ async fn speak_via_server(text: &str, stop_rx: tokio::sync::oneshot::Receiver<()
             "--max-time",
             "30",
         ])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -617,6 +661,7 @@ async fn speak_via_server_default(
             "--max-time",
             "30",
         ])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -737,6 +782,7 @@ async fn speak_xtts_default(
     }
     let mut tts_proc = Command::new("tts")
         .args(&cli_args)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -752,7 +798,8 @@ async fn speak_xtts_default(
             if !status?.success() {
                 return Err(anyhow!(
                     "XTTS v2 synthesis failed.\n\
-                     Install:  uv tool install TTS --python 3.11 --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'"
+                     Install:  uv tool install TTS --python 3.11 --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'\n\
+                     {XTTS_FIRST_RUN_HINT}"
                 ));
             }
         }
@@ -781,6 +828,7 @@ async fn play_wav(
             let mut child = Command::new(player)
                 .args(*args)
                 .arg(&path_str)
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?;
@@ -1076,6 +1124,8 @@ pub fn voice_status(enabled: bool, tts_enabled: bool) -> String {
             out.push_str("\n\n  Setup needed — XTTS v2:\n\
                            \n    uv tool install TTS --python 3.11 \\\n\
                              \x20     --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'");
+            out.push_str("\n\n  ");
+            out.push_str(XTTS_FIRST_RUN_HINT);
         }
         if !player_ok {
             out.push_str(
@@ -1335,6 +1385,7 @@ pub async fn speak_cloned(
     }
     let mut tts_proc = Command::new("tts")
         .args(&cli_args)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -1350,7 +1401,8 @@ pub async fn speak_cloned(
             if !status?.success() {
                 return Err(anyhow!(
                     "XTTS v2 synthesis failed.\n\
-                     Install:  uv tool install TTS --python 3.11 --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'"
+                     Install:  uv tool install TTS --python 3.11 --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'\n\
+                     {XTTS_FIRST_RUN_HINT}"
                 ));
             }
         }
@@ -1420,5 +1472,45 @@ mod xtts_server_script_tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod xtts_ready_tests {
+    use super::await_xtts_ready;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_server_that_exits_on_its_license_prompt_is_reported_at_once() {
+        // Stand-in for Coqui's first-run `input()`: with stdin at EOF the read
+        // fails and the process exits, exactly like the real prompt.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read answer || exit 3; sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = await_xtts_ready(&mut child, 200, Duration::from_millis(50), || false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+        assert!(err.contains("exited before it was ready"), "{err}");
+        assert!(err.contains("CPML license"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_listens_is_killed_on_timeout() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let err = await_xtts_ready(&mut child, 3, Duration::from_millis(20), || false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to start"), "{err}");
+        assert!(child.try_wait().unwrap().is_some(), "server left running");
     }
 }

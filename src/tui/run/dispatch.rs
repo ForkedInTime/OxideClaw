@@ -658,13 +658,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let has_player = crate::voice::audio_player_available();
 
                 if !has_xtts {
-                    app.entries.push(ChatEntry::system(
+                    app.entries.push(ChatEntry::system(format!(
                         "Cannot enable TTS — XTTS v2 not found.\n\n\
                          Install:\n\
                            uv tool install TTS --python 3.11 \\\n\
-                             --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'"
-                            .to_string(),
-                    ));
+                             --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'\n\n{}",
+                        crate::voice::XTTS_FIRST_RUN_HINT
+                    )));
                 } else if !has_player {
                     app.entries.push(ChatEntry::system(
                         "Cannot enable TTS — no audio player.\n\
