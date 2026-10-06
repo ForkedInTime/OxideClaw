@@ -1332,15 +1332,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 .join("plugins.json");
             if let Ok(content) = std::fs::read_to_string(&plugins_path)
                 && let Ok(mut plugins) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(obj) = plugins.as_object_mut()
+                && obj.remove(&name).is_some()
             {
-                if let Some(obj) = plugins.as_object_mut()
-                    && obj.remove(&name).is_some()
-                {
-                    let _ = crate::config::write_json_atomic(
-                        &plugins_path,
-                        &serde_json::to_string_pretty(&plugins).unwrap_or_default(),
-                    );
-                }
+                let _ = crate::config::write_json_atomic(
+                    &plugins_path,
+                    &serde_json::to_string_pretty(&plugins).unwrap_or_default(),
+                );
             }
             let msg = if removed {
                 format!(
