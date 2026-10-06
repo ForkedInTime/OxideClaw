@@ -190,11 +190,7 @@ impl BrowserSession {
 
     /// Resolve an @eN ref to a backend node ID.
     pub fn resolve_ref(&self, r: &str) -> Result<i64> {
-        let key = if r.starts_with('@') {
-            r.to_string()
-        } else {
-            format!("@{r}")
-        };
+        let key = normalize_ref(r);
         self.refs.get(&key).copied().ok_or_else(|| {
             anyhow::anyhow!("Element ref '{key}' not found. Run browser_snapshot first.")
         })
@@ -202,12 +198,19 @@ impl BrowserSession {
 
     /// Resolve an @eN ref to its accessible name, if one was captured.
     pub fn resolve_ref_name(&self, r: &str) -> Option<&str> {
-        let key = if r.starts_with('@') {
-            r.to_string()
-        } else {
-            format!("@{r}")
-        };
+        let key = normalize_ref(r);
         self.ref_names.get(&key).map(|s| s.as_str())
+    }
+}
+
+/// Canonical `@eN` spelling of an element ref. The tools accept a bare `eN`
+/// too, so every check keyed on the ref (approval gate, loop detector) must
+/// normalize the same way or the bare spelling slips past it.
+pub fn normalize_ref(r: &str) -> String {
+    if r.starts_with('@') {
+        r.to_string()
+    } else {
+        format!("@{r}")
     }
 }
 

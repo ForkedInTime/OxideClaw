@@ -327,27 +327,23 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         }
 
         let url = self.current_url.lock().await.clone();
-        // `ref_or_selector` is the raw identifier (e.g. "@e2" or ".btn-submit").
-        // It's what we use for the denial-counter key so the same action is
-        // tracked consistently across retries.
-        let ref_or_selector = input["ref"]
-            .as_str()
-            .or_else(|| input["selector"].as_str())
-            .unwrap_or("")
-            .to_string();
-        // `target_text` is what we match against `button_patterns`. For @eN
-        // refs, resolve to the element's accessible name via the browser
-        // session's ref-name map; otherwise fall back to the raw identifier.
+        // `ref_or_selector` is the element identifier, with refs normalized to
+        // "@eN": the tools also accept a bare "eN", and the raw spelling would
+        // skip name resolution below (so "Delete account" never matched) and
+        // split the denial counter across spellings.
+        let ref_or_selector = match input["ref"].as_str() {
+            Some(r) if !r.is_empty() => super::normalize_ref(r),
+            _ => input["selector"].as_str().unwrap_or("").to_string(),
+        };
+        // `target_text` is what we match against `button_patterns`. For refs,
+        // resolve to the element's accessible name via the browser session's
+        // ref-name map; otherwise fall back to the identifier.
         let (target_text, visible_prices) = if let Some(session_arc) = &self.browser_session {
             let session = session_arc.lock().await;
-            let name = if ref_or_selector.starts_with('@') {
-                session
-                    .resolve_ref_name(&ref_or_selector)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| ref_or_selector.clone())
-            } else {
-                ref_or_selector.clone()
-            };
+            let name = session
+                .resolve_ref_name(&ref_or_selector)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| ref_or_selector.clone());
             (name, self.gate.visible_prices_in(&session.last_page_text))
         } else {
             (ref_or_selector.clone(), Vec::new())
@@ -634,5 +630,49 @@ mod price_signal_tests {
             1,
             "the visible price must have prompted"
         );
+    }
+
+    /// The tools accept a bare "e1" as well as "@e1"; the gate must resolve
+    /// the element name for both spellings or a page can steer the model
+    /// past it with "click ref e1".
+    #[tokio::test]
+    async fn bare_refs_are_resolved_before_pattern_checks() {
+        for (tool, input, name) in [
+            ("browser_click", json!({"ref": "e1"}), "Delete account"),
+            (
+                "browser_fill",
+                json!({"ref": "e1", "value": "4111"}),
+                "Card number",
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+            let session = Arc::new(tokio::sync::Mutex::new(
+                crate::browser::BrowserSession::default(),
+            ));
+            session.lock().await.set_refs_with_names(
+                std::collections::HashMap::from([("@e1".to_string(), 1i64)]),
+                std::collections::HashMap::from([("@e1".to_string(), name.to_string())]),
+            );
+            let mw = ApprovalGateMiddleware::new(
+                ApprovalGate::default(),
+                BrowsePolicy::Pattern,
+                Arc::new(tokio::sync::Mutex::new("https://app.example/home".into())),
+                tx,
+                Arc::new(AtomicU32::new(0)),
+                false,
+            )
+            .with_browser_session(Some(session));
+            let host = tokio::spawn(async move {
+                let mut n = 0;
+                while let Some(p) = rx.recv().await {
+                    n += 1;
+                    let _ = p.reply.send(true);
+                }
+                n
+            });
+            mw.before_tool(tool, &input).await;
+            drop(mw);
+            assert_eq!(host.await.unwrap(), 1, "{tool} on bare ref must prompt");
+        }
     }
 }

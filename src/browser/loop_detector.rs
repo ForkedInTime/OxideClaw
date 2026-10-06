@@ -121,11 +121,15 @@ impl LoopDetectorMiddleware {
 #[async_trait]
 impl ToolMiddleware for LoopDetectorMiddleware {
     async fn before_tool(&self, _tool_name: &str, input: &serde_json::Value) -> MiddlewareVerdict {
-        let target = ["ref", "selector", "url", "key"]
-            .iter()
-            .find_map(|k| input[*k].as_str())
-            .unwrap_or("")
-            .to_string();
+        // Normalize refs so alternating "e7" / "@e7" still reads as a repeat.
+        let target = match input["ref"].as_str() {
+            Some(r) if !r.is_empty() => super::normalize_ref(r),
+            _ => ["selector", "url", "key"]
+                .iter()
+                .find_map(|k| input[*k].as_str())
+                .unwrap_or("")
+                .to_string(),
+        };
         *self.last_target.lock().unwrap_or_else(|e| e.into_inner()) = target;
         if self.stopped.load(Ordering::SeqCst) {
             return MiddlewareVerdict::Deny {
@@ -190,6 +194,17 @@ mod fingerprint_tests {
         for _ in 0..5 {
             mw.before_tool("browser_click", &json!({"ref": "@e1"}))
                 .await;
+            mw.after_tool("browser_click", "Clicked. Title: Home").await;
+        }
+        assert!(mw.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn alternating_ref_spellings_still_stop() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mw = LoopDetectorMiddleware::new(tx);
+        for r in ["e1", "@e1", "e1", "@e1", "e1"] {
+            mw.before_tool("browser_click", &json!({"ref": r})).await;
             mw.after_tool("browser_click", "Clicked. Title: Home").await;
         }
         assert!(mw.is_stopped());
