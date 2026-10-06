@@ -114,7 +114,13 @@ impl Tool for WebFetchTool {
 
 /// Convert HTML to plain readable text using html2text
 fn html_to_text(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), 100)
+    // `from_read` .expect()s, and deeply nested lists/quotes in a fetched page
+    // return TooNarrow; under panic=abort that kills the whole agent. Width
+    // overflow is harmless for text that only goes to the model.
+    html2text::config::plain()
+        .allow_width_overflow()
+        .string_from_read(html.as_bytes(), 100)
+        .unwrap_or_else(|_| html.to_string())
 }
 
 #[cfg(test)]
@@ -139,6 +145,21 @@ mod tests {
                 ToolResultContent::Text { text } => text.as_str(),
             })
             .collect()
+    }
+
+    /// Deep nesting used to hit html2text's TooNarrow `.expect()` and abort.
+    #[test]
+    fn deeply_nested_html_converts_without_panicking() {
+        for tag in ["<ol><li>", "<ul><li>", "<blockquote>"] {
+            let html = format!("{}leaf-text", tag.repeat(200));
+            // Overflowed lines wrap mid-word under list/quote prefixes; only
+            // the content matters.
+            let out: String = html_to_text(&html)
+                .chars()
+                .filter(|c| c.is_alphabetic() || *c == '-')
+                .collect();
+            assert!(out.contains("leaf-text"), "{tag}");
+        }
     }
 
     /// The default policy must refuse loopback *before connecting*, and
