@@ -290,6 +290,10 @@ mod tests {
         let root = outer.path().join("repo");
         std::fs::create_dir(&root).unwrap();
         git(&root, &["init", "-q"]);
+        // The tools' own git calls do not get the helper's env isolation;
+        // local config overrides the user's global hooks and fsmonitor.
+        git(&root, &["config", "core.hooksPath", "/dev/null"]);
+        git(&root, &["config", "core.fsmonitor", "false"]);
         git(
             &root,
             &[
