@@ -130,14 +130,19 @@ pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<
         anyhow::bail!("Navigation failed: {err}");
     }
 
-    // Wait for load event
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Ok(ev)) if ev.method == "Page.loadEventFired" => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) => break, // Channel lagged, page likely loaded
-            Err(_) => anyhow::bail!("Page load timed out after {timeout_ms}ms"),
+    // A same-document navigation (only the #fragment changed, as in a
+    // hash-routed SPA) has no loaderId and never fires Page.loadEventFired;
+    // waiting for it ran out the whole timeout and reported a failure.
+    let same_document = result["loaderId"].as_str().is_none_or(str::is_empty);
+    if !same_document {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(ev)) if ev.method == "Page.loadEventFired" => break,
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break, // Channel lagged, page likely loaded
+                Err(_) => anyhow::bail!("Page load timed out after {timeout_ms}ms"),
+            }
         }
     }
     // A redirect may have taken the page somewhere the preflight would refuse.
@@ -346,6 +351,9 @@ pub async fn screenshot(client: &CdpClient, full_page: bool) -> Result<String> {
             "width": width, "height": height,
             "scale": 1,
         });
+        // Without it Chrome rasterizes only the viewport and the clip below
+        // the fold comes back blank.
+        params["captureBeyondViewport"] = json!(true);
     }
     let result = client.send("Page.captureScreenshot", params).await?;
     let data = result["data"].as_str().unwrap_or("").to_string();
@@ -596,5 +604,127 @@ mod landed_url_tests {
             ensure_page_allowed(&client).await.unwrap();
             assert!(navs.lock().unwrap().is_empty(), "{href}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cdp_request_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    type Log = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// CDP endpoint that answers every command with `reply(method, params)`
+    /// (a reply holding an "error" key is sent as a CDP error) and records
+    /// each command it receives. It never emits events.
+    async fn scripted_cdp(reply: fn(&str, &Value) -> Value) -> (String, Log) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let log: Log = Arc::default();
+        let seen = log.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&t).unwrap();
+                let method = cmd["method"].as_str().unwrap_or("").to_string();
+                let r = reply(&method, &cmd["params"]);
+                seen.lock().unwrap().push((method, cmd["params"].clone()));
+                let msg = match r.get("error") {
+                    Some(e) => json!({"id": cmd["id"], "error": e}),
+                    None => json!({"id": cmd["id"], "result": r}),
+                };
+                if ws
+                    .send(Message::Text(msg.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (format!("ws://{addr}"), log)
+    }
+
+    fn sent(log: &Log, method: &str) -> Vec<Value> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == method)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
+    fn page(method: &str, _: &Value) -> Value {
+        match method {
+            "Runtime.evaluate" => {
+                json!({"result": {"type": "string", "value": "http://127.0.0.1:3000/#/settings"}})
+            }
+            _ => json!({}),
+        }
+    }
+
+    /// Chrome answers a fragment-only navigation without a loaderId and
+    /// never fires Page.loadEventFired; navigate waited out the timeout.
+    #[tokio::test]
+    async fn a_same_document_navigation_does_not_wait_for_a_load_event() {
+        fn reply(method: &str, params: &Value) -> Value {
+            match method {
+                "Page.navigate" => json!({"frameId": "F1"}),
+                _ => page(method, params),
+            }
+        }
+        let (ws, _) = scripted_cdp(reply).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_millis(2_000),
+            navigate(&client, "http://127.0.0.1:3000/#/settings", 5_000),
+        )
+        .await
+        .expect("navigate waited for a load event that never comes");
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_document_still_waits_for_its_load_event() {
+        fn reply(method: &str, params: &Value) -> Value {
+            match method {
+                "Page.navigate" => json!({"frameId": "F1", "loaderId": "L1"}),
+                _ => page(method, params),
+            }
+        }
+        let (ws, _) = scripted_cdp(reply).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let err = navigate(&client, "http://127.0.0.1:3000/other", 200)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn full_page_screenshots_capture_beyond_the_viewport() {
+        fn reply(method: &str, _: &Value) -> Value {
+            match method {
+                "Page.getLayoutMetrics" => {
+                    json!({"cssContentSize": {"width": 800.0, "height": 3500.0}})
+                }
+                "Page.captureScreenshot" => json!({"data": "iVBOR"}),
+                _ => json!({}),
+            }
+        }
+        let (ws, log) = scripted_cdp(reply).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        assert_eq!(screenshot(&client, true).await.unwrap(), "iVBOR");
+        let shot = sent(&log, "Page.captureScreenshot").remove(0);
+        assert_eq!(shot["captureBeyondViewport"], true);
+        assert_eq!(shot["clip"]["height"], 3500.0);
+
+        screenshot(&client, false).await.unwrap();
+        let shot = sent(&log, "Page.captureScreenshot").remove(1);
+        assert!(shot.get("clip").is_none() && shot.get("captureBeyondViewport").is_none());
     }
 }
