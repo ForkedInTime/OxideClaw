@@ -1146,6 +1146,19 @@ async fn run_loop(
                             // to mis-transcribe destructive commands).
                             let goal_str = goal.clone();
                             app.apply(ev);
+                            // Transcription runs without is_loading, so a typed
+                            // turn (or a typed /browse) can start meanwhile; two
+                            // runs would share is_loading and stack prompts.
+                            if app.is_loading || app.browse_progress_rx.is_some() {
+                                app.entries.push(ChatEntry::system(format!(
+                                    "/browse (voice) ignored: a turn or browse is already running. Transcript: {goal_str}"
+                                )));
+                                app.scroll_to_bottom();
+                                match rx.try_recv() {
+                                    Ok(next) => { ev = next; continue; }
+                                    Err(_) => break,
+                                }
+                            }
                             let max = config.browse_max_steps;
                             app.entries.push(ChatEntry::system(format!(
                                 "🌐 /browse (voice) — goal: {goal_str} (max {max} steps, policy: Pattern)"

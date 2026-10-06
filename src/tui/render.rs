@@ -138,12 +138,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, outer[2], app, &full_input, tc);
     draw_status(f, outer[3], app, tc);
 
+    // Same precedence as handle_key, so the dialog on screen is always the
+    // one a keypress answers ('a' on a hidden permission prompt is Always).
     if app.overlay.is_some() {
         draw_overlay(f, area, app, tc);
-    } else if app.browse_approval.is_some() {
-        draw_browse_approval(f, area, app, tc);
     } else if app.pending_permission.is_some() {
         draw_permission(f, area, app, tc);
+    } else if app.browse_approval.is_some() {
+        draw_browse_approval(f, area, app, tc);
     } else if app.pending_user_question.is_some() {
         draw_ask_user(f, area, app);
     }
@@ -1406,6 +1408,34 @@ mod permission_popup_tests {
             let mut term = Terminal::new(TestBackend::new(w, 10)).unwrap();
             term.draw(|f| draw(f, &mut app)).unwrap();
         }
+    }
+
+    /// With a browse step and a tool permission both waiting, keys answer the
+    /// permission prompt first, so that is the one that must be on screen.
+    #[test]
+    fn permission_prompt_is_drawn_over_a_pending_browse_approval() {
+        let mut app = app_with_command("echo PERMISSION-CMD");
+        app.show_welcome = false;
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.browse_approval = Some(crate::browser::approval_gate::ApprovalPrompt {
+            step: 3,
+            tool_name: "browser_click".into(),
+            target_text: "BROWSE-TARGET".into(),
+            url: "https://example.com".into(),
+            reason: "submit".into(),
+            reply,
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("PERMISSION-CMD"), "{screen}");
+        assert!(!screen.contains("BROWSE-TARGET"), "{screen}");
     }
 
     /// Raw ESC/BEL in the dialog or in chat must never reach the terminal:
