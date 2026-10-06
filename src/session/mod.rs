@@ -192,8 +192,15 @@ impl Session {
         let original_len = file.metadata().await?.len();
         // A failed write (ENOSPC, EIO) can leave part of the batch behind;
         // cut it off so the caller can retry the whole batch and the next
-        // append does not glue onto half a line.
-        if let Err(e) = file.write_all(&batch).await {
+        // append does not glue onto half a line. tokio's File reports a
+        // buffered write as done before it runs: only `flush` returns its
+        // result (`sync_all` would swallow it).
+        let written = async {
+            file.write_all(&batch).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(e) = written {
             let _ = file.set_len(original_len).await;
             return Err(e.into());
         }
@@ -848,6 +855,19 @@ mod durability_tests {
         // does not have to relocate the global sessions directory.
         let content = std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap_or_default();
         parse_message_lines(id, &content)
+    }
+
+    /// tokio's File buffers a write and reports Ok before the blocking write
+    /// runs; `sync_all` then swallowed its ENOSPC, so a failed append
+    /// returned Ok with a torn line on disk. `/dev/full` fails every write.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_failed_append_is_reported() {
+        let mut s = Session::at_path("s", PathBuf::from("/dev/full"));
+        let err = s.append(&[msg("one")]).await.unwrap_err();
+        // The write's own error, not a later fsync complaint about the device.
+        let io = err.downcast_ref::<std::io::Error>().expect("io error");
+        assert_eq!(io.raw_os_error(), Some(28), "{err}"); // ENOSPC
     }
 
     /// Recovery used to drop the torn line in memory only: the next append
