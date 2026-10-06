@@ -236,7 +236,7 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 /undo                   # step back to any previous turn
 ```
 
-`.env` files auto-load from `$CWD/.env`, `~/.env`, or `~/.config/oxideclaw/.env`.
+`.env` files auto-load from `$CWD/.env`, `~/.env`, or `~/.config/oxideclaw/.env`. A project `.env` can set `OLLAMA_HOST` and `ANTHROPIC_MODEL` only after you `/trust` that folder.
 
 ---
 

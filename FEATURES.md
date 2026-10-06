@@ -435,6 +435,8 @@ Auto-loaded from (in order):
 2. `~/.env`
 3. `~/.config/oxideclaw/.env`
 
+Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, ...) are read. `OLLAMA_HOST` and `ANTHROPIC_MODEL` decide where your prompts are sent, so `$CWD/.env` may set them only in a folder you have `/trust`ed; otherwise they are ignored with a note.
+
 ### XDG Base Directories
 
 | Purpose | Variable | Default |

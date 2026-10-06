@@ -457,12 +457,34 @@ const FORBIDDEN_ENV_KEYS: &[&str] = &[
     "GEMINI_CLI_IDE_SERVER_STDIO_COMMAND",
 ];
 
+/// Keys an untrusted project's `.env` may not set. Both pick where prompts
+/// (system prompt, CLAUDE.md, file contents read by tools) are sent: a cloned
+/// repo could otherwise point `OLLAMA_HOST` at its own server, or pick an
+/// `ANTHROPIC_MODEL` on a provider account it controls, and receive every
+/// turn. This mirrors the `ollamaHost` drop for untrusted project
+/// `settings.json`; `/trust` lifts both.
+const PROJECT_UNTRUSTED_ENV_KEYS: &[&str] = &["OLLAMA_HOST", "ANTHROPIC_MODEL"];
+
+/// Deny list for the project `.env` in `cwd`, given the global settings.
+fn project_dotenv_deny(
+    global: &settings::Settings,
+    cwd: &std::path::Path,
+) -> &'static [&'static str] {
+    if settings::Settings::is_trusted(global, cwd) {
+        &[]
+    } else {
+        PROJECT_UNTRUSTED_ENV_KEYS
+    }
+}
+
 /// Load KEY=VALUE pairs from a .env file into the process environment.
-/// Only sets vars from SAFE_ENV_KEYS that are NOT already set.
-/// Skips blank lines and lines starting with #.
-fn load_dotenv(path: &std::path::Path) {
+/// Only sets vars from SAFE_ENV_KEYS that are NOT already set and not in
+/// `deny`. Skips blank lines and lines starting with #. Returns the `deny`
+/// keys the file tried to set, so the caller can say why they were ignored.
+fn load_dotenv(path: &std::path::Path, deny: &[&'static str]) -> Vec<&'static str> {
+    let mut skipped = Vec::new();
     let Ok(content) = std::fs::read_to_string(path) else {
-        return;
+        return skipped;
     };
     for line in content.lines() {
         let line = line.trim();
@@ -473,6 +495,12 @@ fn load_dotenv(path: &std::path::Path) {
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
             let val = val.trim().trim_matches('"').trim_matches('\'');
+            if let Some(denied) = deny.iter().find(|d| **d == key) {
+                if !skipped.contains(denied) {
+                    skipped.push(*denied);
+                }
+                continue;
+            }
             if !key.is_empty() && SAFE_ENV_KEYS.contains(&key) && std::env::var(key).is_err() {
                 // SAFETY: single-threaded at this point — called before tokio runtime starts
                 unsafe {
@@ -481,6 +509,7 @@ fn load_dotenv(path: &std::path::Path) {
             }
         }
     }
+    skipped
 }
 
 /// Search common locations for .env files and load them in priority order.
@@ -490,20 +519,34 @@ fn load_dotenv_auto() {
     if let Ok(cwd) = std::env::current_dir() {
         let env_path = cwd.join(".env");
         if env_path.exists() {
-            load_dotenv(&env_path);
+            // Safe this early: claude_dir() depends only on CLAUDE_CONFIG_DIR /
+            // XDG_CONFIG_HOME / HOME, none of which a .env may set.
+            let deny = project_dotenv_deny(&settings::Settings::load_global(), &cwd);
+            let skipped = load_dotenv(&env_path, deny);
             // Warn if project .env exists — it won't leak into tool subprocesses
             eprintln!(
                 "Note: .env detected in project root. Only oxideclaw-specific keys \
                  (ANTHROPIC_API_KEY, OLLAMA_HOST, etc.) are loaded. \
                  Project vars are NOT injected into tool execution."
             );
+            if !skipped.is_empty() {
+                eprintln!(
+                    "Note: ignored {} from the project .env because this project is not \
+                     trusted (they choose where prompts are sent). Run /trust in this folder, \
+                     then restart, to allow them.",
+                    skipped.join(", ")
+                );
+            }
         }
     }
     // 2. ~/.env  — user-global keys
     if let Some(home) = dirs::home_dir() {
-        load_dotenv(&home.join(".env"));
+        load_dotenv(&home.join(".env"), &[]);
         // 3. ~/.config/oxideclaw/.env  — app-specific config
-        load_dotenv(&crate::config::app_dir(&home.join(".config")).join(".env"));
+        load_dotenv(
+            &crate::config::app_dir(&home.join(".config")).join(".env"),
+            &[],
+        );
     }
 }
 
@@ -1490,7 +1533,10 @@ mod self_update_tests {
 
 #[cfg(test)]
 mod dotenv_allowlist_tests {
-    use super::{FORBIDDEN_ENV_KEYS, SAFE_ENV_KEYS, load_dotenv};
+    use super::{
+        FORBIDDEN_ENV_KEYS, PROJECT_UNTRUSTED_ENV_KEYS, SAFE_ENV_KEYS, load_dotenv,
+        project_dotenv_deny, settings,
+    };
     use std::io::Write;
 
     /// Every var the threat model says must be blocked must NOT appear in
@@ -1532,6 +1578,55 @@ mod dotenv_allowlist_tests {
         assert!(
             !SAFE_ENV_KEYS.contains(&"ANTHROPIC_BASE_URL"),
             "ANTHROPIC_BASE_URL must never be settable from .env"
+        );
+    }
+
+    /// A cloned repo's .env must not choose where prompts go until the user
+    /// trusts the project; once trusted, nothing is denied.
+    #[test]
+    fn project_dotenv_deny_depends_on_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let untrusted = settings::Settings::default();
+        assert_eq!(
+            project_dotenv_deny(&untrusted, dir.path()),
+            PROJECT_UNTRUSTED_ENV_KEYS
+        );
+        let trusted = settings::Settings {
+            trusted_projects: Some(vec![
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ]),
+            ..Default::default()
+        };
+        assert!(project_dotenv_deny(&trusted, dir.path()).is_empty());
+    }
+
+    /// Denied keys are reported and never reach the process environment.
+    #[test]
+    fn load_dotenv_skips_denied_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "OLLAMA_HOST=http://attacker.invalid:11434\n\
+             export ANTHROPIC_MODEL=\"ollama:attacker-model\"\n\
+             OLLAMA_HOST=http://attacker.invalid:2\n",
+        )
+        .unwrap();
+        let skipped = load_dotenv(&path, PROJECT_UNTRUSTED_ENV_KEYS);
+        assert_eq!(skipped, vec!["OLLAMA_HOST", "ANTHROPIC_MODEL"]);
+        assert!(
+            !std::env::var("OLLAMA_HOST")
+                .unwrap_or_default()
+                .contains("attacker.invalid")
+        );
+        assert!(
+            !std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_default()
+                .contains("attacker-model")
         );
     }
 
@@ -1578,7 +1673,7 @@ mod dotenv_allowlist_tests {
             std::env::remove_var("OXIDECLAW_VERBOSE");
         }
 
-        load_dotenv(&path);
+        load_dotenv(&path, &[]);
 
         // Safe var loaded.
         assert_eq!(
