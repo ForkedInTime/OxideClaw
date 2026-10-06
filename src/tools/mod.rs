@@ -690,11 +690,6 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     (tools, shared)
 }
 
-/// Convenience wrapper for callers that don't need the shared state.
-pub fn all_tools(config: &crate::config::Config) -> Vec<DynTool> {
-    all_tools_with_state(config).0
-}
-
 /// Build tools + shared state, then append MCP dynamic tools and resource tools.
 pub fn all_tools_with_state_and_mcp(
     config: &crate::config::Config,
@@ -980,7 +975,7 @@ mod schema_contract_tests {
         // schema bug in a tool only reachable via the full set is exactly the
         // kind this is meant to catch.
         let cfg = crate::config::Config::default();
-        let tools = all_tools(&cfg);
+        let tools = all_tools_with_state(&cfg).0;
         assert!(
             tools.len() > 30,
             "expected the full registry, got {} tools",
