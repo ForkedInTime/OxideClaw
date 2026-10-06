@@ -2222,7 +2222,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
             }
         }
-        CommandAction::TrustProject { status_only } => {
+        CommandAction::TrustProject { mode } => {
+            use crate::commands::TrustMode;
             let global = crate::settings::Settings::load_global();
             let trusted = crate::settings::Settings::is_trusted(&global, &config.cwd);
             let canonical = config
@@ -2234,13 +2235,43 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // An unparsable global file reads as an empty trust list: saying
             // "NOT trusted", or saving [this project] over the user's list
             // (a wrong-typed value still parses as JSON), would both be wrong.
-            let msg = if !global.load_errors.is_empty() {
-                format!(
+            let save = |list: Vec<String>| {
+                crate::config::Config::save_user_setting("trustedProjects", serde_json::json!(list))
+            };
+            let msg = match mode {
+                _ if !global.load_errors.is_empty() => format!(
                     "Cannot check or change trust for {canonical}.\n{}",
                     crate::settings::load_errors_notice(&global.load_errors)
-                )
-            } else if status_only || trusted {
-                format!(
+                ),
+                TrustMode::Revoke => {
+                    let mut list = global.trusted_projects.unwrap_or_default();
+                    if !crate::settings::Settings::remove_trusted(&mut list, &config.cwd) {
+                        format!("Project {canonical} is not trusted.")
+                    } else {
+                        match save(list) {
+                            Ok(()) => format!(
+                                "Revoked trust for {canonical}. Its settings hooks, \
+                                 apiKeyHelper and MCP servers, and OLLAMA_HOST / \
+                                 ANTHROPIC_MODEL from its .env, will be ignored — restart \
+                                 oxideclaw to apply."
+                            ),
+                            Err(e) => format!("Could not save trust: {e}"),
+                        }
+                    }
+                }
+                TrustMode::Grant if !trusted => {
+                    let mut list = global.trusted_projects.unwrap_or_default();
+                    list.push(canonical.clone());
+                    match save(list) {
+                        Ok(()) => format!(
+                            "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
+                             servers will be honoured, and so will OLLAMA_HOST / ANTHROPIC_MODEL \
+                             from its .env — restart oxideclaw to apply."
+                        ),
+                        Err(e) => format!("Could not save trust: {e}"),
+                    }
+                }
+                TrustMode::Grant | TrustMode::Status => format!(
                     "Project {canonical} is {}.{}",
                     if trusted { "trusted" } else { "NOT trusted" },
                     if config.untrusted_project_config.is_empty() {
@@ -2251,21 +2282,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             config.untrusted_project_config.join(", ")
                         )
                     }
-                )
-            } else {
-                let mut list = global.trusted_projects.unwrap_or_default();
-                list.push(canonical.clone());
-                match crate::config::Config::save_user_setting(
-                    "trustedProjects",
-                    serde_json::json!(list),
-                ) {
-                    Ok(()) => format!(
-                        "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
-                         servers will be honoured, and so will OLLAMA_HOST / ANTHROPIC_MODEL \
-                         from its .env — restart oxideclaw to apply."
-                    ),
-                    Err(e) => format!("Could not save trust: {e}"),
-                }
+                ),
             };
             app.entries.push(ChatEntry::system(msg));
         }

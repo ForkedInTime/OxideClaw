@@ -440,6 +440,23 @@ impl Settings {
             .any(|p| p == cwd)
     }
 
+    /// Drop every `trustedProjects` entry naming `cwd`, by canonical path or
+    /// by its literal spelling (an entry whose directory is gone no longer
+    /// canonicalizes). Returns whether anything was removed.
+    pub fn remove_trusted(list: &mut Vec<String>, cwd: &Path) -> bool {
+        let canonical = cwd.canonicalize().ok();
+        let before = list.len();
+        list.retain(|p| {
+            let path = Path::new(p);
+            let same = path == cwd
+                || canonical
+                    .as_deref()
+                    .is_some_and(|c| path == c || path.canonicalize().ok().as_deref() == Some(c));
+            !same
+        });
+        list.len() != before
+    }
+
     /// Merge with the trust rule applied: an untrusted project contributes
     /// nothing that runs code, widens permissions, loosens the sandbox, or
     /// sends data somewhere new — no hooks, `apiKeyHelper`, MCP servers,
@@ -1229,6 +1246,32 @@ mod project_trust_tests {
         );
         assert!(!Settings::is_trusted(&global, &canonical.join("sub")));
         assert!(!Settings::is_trusted(&Settings::default(), &canonical));
+    }
+
+    #[test]
+    fn revoking_trust_removes_every_spelling_of_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(canonical.join("sub")).unwrap();
+        let other = canonical.join("sub").to_string_lossy().into_owned();
+        let mut list = vec![
+            canonical.to_string_lossy().into_owned(),
+            other.clone(),
+            canonical
+                .join("sub")
+                .join("..")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        assert!(Settings::remove_trusted(&mut list, &canonical));
+        assert_eq!(list, vec![other.clone()]);
+        let global = Settings {
+            trusted_projects: Some(list.clone()),
+            ..Settings::default()
+        };
+        assert!(!Settings::is_trusted(&global, &canonical));
+        assert!(!Settings::remove_trusted(&mut list, &canonical));
+        assert_eq!(list, vec![other]);
     }
 }
 

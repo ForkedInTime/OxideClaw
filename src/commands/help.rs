@@ -171,7 +171,7 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
                 "Show auto-commit status (enabled, session ID, turns recorded)",
             ),
             (
-                "/trust",
+                "/trust [status|revoke]",
                 "Trust this project: honour its settings hooks, apiKeyHelper and MCP servers",
             ),
         ],

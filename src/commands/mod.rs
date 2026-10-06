@@ -285,8 +285,9 @@ pub enum CommandAction {
     AutoCommitStatus,
     /// `/trust` — add the current project to the global `trustedProjects`
     /// list so its `.claude/settings.json` hooks, `apiKeyHelper` and MCP
-    /// servers are honoured. `/trust status` reports without changing anything.
-    TrustProject { status_only: bool },
+    /// servers are honoured. `/trust status` reports without changing
+    /// anything; `/trust revoke` removes the project from the list.
+    TrustProject { mode: TrustMode },
     /// Start an autonomous browser run.
     Browse {
         goal: String,
@@ -399,9 +400,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "undo" => cmd_undo(args),
         "redo" => cmd_redo(args),
         "autocommit" => cmd_autocommit(args),
-        "trust" => CommandAction::TrustProject {
-            status_only: args.trim() == "status",
-        },
+        "trust" => cmd_trust(args),
         "browser" => {
             let url = args.trim().to_string();
             if url == "close" {
@@ -595,6 +594,53 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
 }
 
 // ── Individual commands ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustMode {
+    Grant,
+    Status,
+    Revoke,
+}
+
+/// Only a bare `/trust` grants trust. Granting lets the project's settings
+/// run code, so a typo'd status check (`/trust Status`, `/trust check`) must
+/// not do it.
+fn cmd_trust(args: &str) -> CommandAction {
+    let mode = match args.trim().to_ascii_lowercase().as_str() {
+        "" => TrustMode::Grant,
+        "status" => TrustMode::Status,
+        "revoke" | "untrust" | "off" => TrustMode::Revoke,
+        _ => return CommandAction::Message("Usage: /trust [status|revoke]".into()),
+    };
+    CommandAction::TrustProject { mode }
+}
+
+#[cfg(test)]
+mod trust_command_tests {
+    use super::{CommandAction, TrustMode, cmd_trust};
+
+    #[test]
+    fn only_a_bare_trust_grants() {
+        let mode = |a: &str| match cmd_trust(a) {
+            CommandAction::TrustProject { mode } => Some(mode),
+            CommandAction::Message(m) => {
+                assert!(m.contains("Usage"), "{m}");
+                None
+            }
+            _ => panic!("{a:?}: unexpected action"),
+        };
+        assert_eq!(mode(""), Some(TrustMode::Grant));
+        assert_eq!(mode("  "), Some(TrustMode::Grant));
+        assert_eq!(mode("status"), Some(TrustMode::Status));
+        assert_eq!(mode("Status"), Some(TrustMode::Status));
+        assert_eq!(mode("revoke"), Some(TrustMode::Revoke));
+        assert_eq!(mode("untrust"), Some(TrustMode::Revoke));
+        assert_eq!(mode("OFF"), Some(TrustMode::Revoke));
+        for typo in ["check", "?", "help", "--status", "stauts"] {
+            assert_eq!(mode(typo), None, "{typo:?} must not grant trust");
+        }
+    }
+}
 
 #[cfg(test)]
 mod model_catalogue_tests {
