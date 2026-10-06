@@ -1134,10 +1134,26 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let settings = crate::settings::Settings::load(&config.cwd);
             let mut reloaded = Vec::new();
 
-            if let Some(model) = settings.model {
-                let resolved = crate::commands::resolve_model_alias(&model);
-                config.model = resolved.clone();
-                app.set_model(resolved);
+            if let Some(model) = reloaded_model(
+                settings.model.as_deref(),
+                &mut config.settings_model,
+                &config.model,
+            ) {
+                config.model = model.clone();
+                app.set_model(model);
+                // The backend family (Anthropic / Ollama / OpenAI-compat) is
+                // fixed when the client is built.
+                match ApiBackend::new_with_auth(
+                    &config.model,
+                    &config.api_key,
+                    config.auth_is_oauth,
+                    &config.ollama_host,
+                ) {
+                    Ok(new_client) => *client = new_client,
+                    Err(e) => app
+                        .entries
+                        .push(ChatEntry::error(format!("Backend error: {e}"))),
+                }
                 reloaded.push("model");
             }
             if let Some(ref theme) = settings.theme {
@@ -1182,6 +1198,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // Reload CLAUDE.md + AGENTS.md
             config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
             config.agentsmd = crate::config::Config::load_agents_md(&config.cwd);
+            // Turns send this string, not config; without the rebuild the
+            // refreshed files never reached the model until a restart.
+            *system_prompt = config.build_system_prompt();
 
             let mut msg = if reloaded.is_empty() {
                 "Settings reloaded (no changes detected). CLAUDE.md + AGENTS.md refreshed."
@@ -2228,8 +2247,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 ) {
                     Ok(()) => format!(
                         "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
-                         servers will be honoured — run /reload (or restart) to apply. \
-                         OLLAMA_HOST / ANTHROPIC_MODEL from its .env apply after a restart."
+                         servers will be honoured, and so will OLLAMA_HOST / ANTHROPIC_MODEL \
+                         from its .env — restart oxideclaw to apply."
                     ),
                     Err(e) => format!("Could not save trust: {e}"),
                 }
@@ -2650,6 +2669,23 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
     Ok(())
 }
 
+/// The model /reload should switch to, if any. Only a settings.json model
+/// that changed since it was last read counts: `--model` and
+/// `ANTHROPIC_MODEL` outrank settings at startup, and a reload made to pick
+/// up a CLAUDE.md edit used to revert them silently.
+fn reloaded_model(
+    settings_model: Option<&str>,
+    last_seen: &mut Option<String>,
+    current: &str,
+) -> Option<String> {
+    let resolved = settings_model.map(crate::commands::resolve_model_alias);
+    if resolved == *last_seen {
+        return None;
+    }
+    last_seen.clone_from(&resolved);
+    resolved.filter(|m| m != current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2671,5 +2707,38 @@ mod tests {
             );
         }
         assert!(closed.iter().any(|n| n == "Read"), "non-shell tools stay");
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::reloaded_model;
+
+    /// Started with `--model ollama:qwen` while settings say a Claude model:
+    /// a reload that leaves settings.json's model alone keeps the CLI model
+    /// (switching it also left the Ollama client serving a Claude model).
+    #[test]
+    fn unchanged_settings_model_keeps_a_cli_or_env_model() {
+        let mut seen = Some("claude-sonnet-4-6".to_string());
+        assert_eq!(
+            reloaded_model(Some("claude-sonnet-4-6"), &mut seen, "ollama:qwen"),
+            None
+        );
+        assert_eq!(reloaded_model(None, &mut None, "ollama:qwen"), None);
+    }
+
+    /// Editing settings.json's model is what /reload applies, once.
+    #[test]
+    fn edited_settings_model_is_applied() {
+        let mut seen = Some("claude-sonnet-4-6".to_string());
+        assert_eq!(
+            reloaded_model(Some("ollama:llama3"), &mut seen, "claude-sonnet-4-6"),
+            Some("ollama:llama3".to_string())
+        );
+        assert_eq!(seen.as_deref(), Some("ollama:llama3"));
+        assert_eq!(
+            reloaded_model(Some("ollama:llama3"), &mut seen, "ollama:llama3"),
+            None
+        );
     }
 }

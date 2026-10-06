@@ -146,6 +146,12 @@ pub struct Config {
     /// Use `ollama:<name>` to route to a local Ollama instance instead.
     pub model: String,
 
+    /// settings.json's `model` (alias-resolved) as last read. /reload
+    /// switches models only when this changes, so a `--model` or
+    /// `ANTHROPIC_MODEL` choice, which outranks settings, survives it.
+    #[serde(skip)]
+    pub settings_model: Option<String>,
+
     /// Max tokens per response (global fallback)
     pub max_tokens: u32,
 
@@ -419,6 +425,7 @@ impl Default for Config {
             auth_source: None,
             auth_warnings: Vec::new(),
             model: crate::api::default_model().to_string(),
+            settings_model: None,
             max_tokens: crate::api::default_max_tokens(),
             max_tokens_by_model: HashMap::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -516,6 +523,7 @@ impl Config {
         cfg.apply_browser_settings(&settings);
         if let Some(model) = settings.model {
             cfg.model = crate::commands::resolve_model_alias(&model);
+            cfg.settings_model = Some(cfg.model.clone());
         }
         if let Some(mt) = settings.max_tokens {
             cfg.max_tokens = mt;
