@@ -88,8 +88,9 @@ fn cell_label(cell: &Cell, index: usize) -> String {
         .unwrap_or_else(|| format!("cell-{}", index + 1))
 }
 
-/// Resolve the target cell. A real id always wins; `cell-N` and `cell_number`
-/// are 1-based positions so notebooks without ids stay editable.
+/// Resolve the target cell. A real id always wins; `cell-N` names the Nth cell
+/// only when that cell has no id (what `cell_label` shows), and `cell_number`
+/// is a plain 1-based position, so notebooks without ids stay editable.
 fn target_index(cells: &[Cell], cell_id: Option<&str>, cell_number: Option<u64>) -> Result<usize> {
     let position = |n: u64| -> Result<usize> {
         match usize::try_from(n) {
@@ -104,8 +105,15 @@ fn target_index(cells: &[Cell], cell_id: Option<&str>, cell_number: Option<u64>)
         if let Some(i) = cells.iter().position(|c| c.id.as_deref() == Some(id)) {
             return Ok(i);
         }
-        if let Some(n) = id.strip_prefix("cell-").and_then(|n| n.parse::<u64>().ok()) {
-            return position(n);
+        // `cell-N` is only the label NotebookRead gives an id-less cell; a
+        // stale or made-up id must not retarget whatever cell is Nth.
+        if let Some(n) = id
+            .strip_prefix("cell-")
+            .and_then(|n| n.parse::<usize>().ok())
+            && n >= 1
+            && cells.get(n - 1).is_some_and(|c| c.id.is_none())
+        {
+            return Ok(n - 1);
         }
         return Err(anyhow!("Cell not found: {id}"));
     }
@@ -501,6 +509,27 @@ mod tests {
             )
             .await;
         assert!(out.is_err(), "out-of-range cell_number must be rejected");
+    }
+
+    /// In a notebook whose cells have ids, `cell-1` is a stale or made-up id,
+    /// not "the first cell": it used to delete whatever cell came first.
+    #[tokio::test]
+    async fn an_unknown_cell_n_id_is_not_a_position_when_cells_have_ids() {
+        const NEW: &str = r##"{"cells":[{"id":"abc","cell_type":"markdown","source":["# keep"],"metadata":{}}],"nbformat":4,"nbformat_minor":5,"metadata":{}}"##;
+        let dir = tempfile::tempdir().unwrap();
+        let nb = dir.path().join("new.ipynb");
+        std::fs::write(&nb, NEW).unwrap();
+        let out = NotebookEditTool
+            .execute(
+                json!({"notebook_path": "new.ipynb", "edit_mode": "delete", "cell_id": "cell-1"}),
+                &ctx(dir.path()),
+            )
+            .await;
+        match out {
+            Ok(o) => assert!(o.is_error, "{}", text(&o)),
+            Err(e) => assert!(e.to_string().contains("Cell not found"), "{e}"),
+        }
+        assert_eq!(std::fs::read_to_string(&nb).unwrap(), NEW);
     }
 
     #[tokio::test]
