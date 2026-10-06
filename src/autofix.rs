@@ -302,19 +302,24 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
     // Drain both pipes while the command runs. Reading only after exit
     // deadlocked any run printing more than a pipe buffer (64 KiB — a normal
     // `cargo test`): the child blocked on write and was reported as timed out.
+    // Results come back over a channel so the wait for them can be bounded:
+    // a process that left the group (setsid) can hold a pipe open forever.
     fn drain(
         pipe: Option<impl std::io::Read + Send + 'static>,
-    ) -> std::thread::JoinHandle<Vec<u8>> {
+        is_stdout: bool,
+        tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    ) {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
                 let _ = p.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = tx.send((is_stdout, buf));
+        });
     }
-    let out_reader = drain(child.stdout.take());
-    let err_reader = drain(child.stderr.take());
+    let (tx, rx) = std::sync::mpsc::channel();
+    drain(child.stdout.take(), true, tx.clone());
+    drain(child.stderr.take(), false, tx);
 
     // Poll until exit or timeout. `timeout_secs == 0` means "wait forever".
     let timeout = std::time::Duration::from_secs(timeout_secs);
@@ -323,7 +328,29 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
     let poll = std::time::Duration::from_millis(100);
 
     let status = loop {
-        match child.try_wait() {
+        // Background jobs the command left behind (`server &`, a daemon)
+        // keep the pipes open, so the reads below would wait on them past
+        // the timeout. Kill the group while the exited leader is still an
+        // unreaped zombie: that keeps its pgid from being reused, so the
+        // kill cannot reach an unrelated group.
+        #[cfg(unix)]
+        let exited = exited_unreaped(child.id());
+        #[cfg(not(unix))]
+        let exited: Option<bool> = None;
+        #[cfg(unix)]
+        if exited == Some(true) {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
+        // Reap only after that kill, or an exit between the two calls would
+        // skip it. Without waitid, fall back to plain polling.
+        let polled = if exited == Some(false) {
+            Ok(None)
+        } else {
+            child.try_wait()
+        };
+        match polled {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if has_timeout && start.elapsed() >= timeout {
@@ -346,8 +373,21 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
             }
         }
     };
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let got = if has_timeout {
+            rx.recv_timeout((start + timeout).saturating_duration_since(std::time::Instant::now()))
+        } else {
+            rx.recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        };
+        match got {
+            Ok((true, buf)) => stdout = buf,
+            Ok((false, buf)) => stderr = buf,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return CommandResult::Timeout,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 
     if status.success() {
         CommandResult::Pass
@@ -364,6 +404,23 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
         };
         CommandResult::Fail { stderr: combined }
     }
+}
+
+/// Whether `pid` has exited but is not yet reaped (`WNOWAIT` leaves it a
+/// zombie for the `try_wait` that follows). `None` if waitid failed.
+#[cfg(unix)]
+fn exited_unreaped(pid: u32) -> Option<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // WNOHANG with nothing to report returns 0 and leaves si_pid zero.
+    (rc == 0).then(|| unsafe { info.si_pid() } != 0)
 }
 
 /// Aggregate outcome of `run_checks`: lint + tests combined.
@@ -786,6 +843,48 @@ mod tests {
             ),
             CommandResult::Pass
         ));
+    }
+
+    /// A job the command backgrounds holds the pipes open; the check used
+    /// to wait for it however long it lived, past the timeout.
+    #[cfg(unix)]
+    #[test]
+    fn leftover_background_jobs_do_not_hold_the_check() {
+        let td = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+        let r = run_command(td.path(), "sleep 30 & echo 'test failed'; exit 1", 20);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        match r {
+            CommandResult::Fail { stderr } => assert_eq!(stderr.trim(), "test failed"),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// A job that escaped the process group is out of reach of the kill;
+    /// the timeout still bounds the wait for its pipes.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_outside_the_group_cannot_outlast_the_timeout() {
+        if std::process::Command::new("setsid")
+            .arg("true")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+        let r = run_command(td.path(), "setsid sleep 15 & exit 0", 2);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(r, CommandResult::Timeout), "{r:?}");
     }
 
     #[cfg(unix)]

@@ -912,12 +912,24 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // After EnterWorktree the edits are in the worktree,
                     // not the main checkout.
                     let work_cwd = crate::tools::session_cwd(&tools, &config.cwd);
-                    let action = crate::autofix::run_auto_fix_check(
-                        &work_cwd,
-                        &config.auto_fix,
-                        &config.autonomy,
-                        auto_fix_retries,
-                    );
+                    // Lint and tests can run for minutes; keep them off the
+                    // async worker that also drives the UI channel.
+                    let (auto_fix, autonomy) = (config.auto_fix.clone(), config.autonomy.clone());
+                    let action = match tokio::task::spawn_blocking(move || {
+                        crate::autofix::run_auto_fix_check(
+                            &work_cwd,
+                            &auto_fix,
+                            &autonomy,
+                            auto_fix_retries,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(action) => action,
+                        Err(e) => crate::autofix::AutoFixAction::Continue {
+                            status: Some(format!("Auto-fix check failed: {e}")),
+                        },
+                    };
                     auto_fix_touched.clear();
 
                     match action {
