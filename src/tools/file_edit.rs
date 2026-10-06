@@ -92,9 +92,15 @@ impl Tool for FileEditTool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
 
+        let crlf = super::crlf_fallback(&content, &input.old_string, &input.new_string);
+        let (old, new) = match &crlf {
+            Some((o, n)) => (o.as_str(), n.as_str()),
+            None => (input.old_string.as_str(), input.new_string.as_str()),
+        };
+
         if input.replace_all {
-            let new_content = content.replace(&input.old_string, &input.new_string);
-            let count = content.matches(&input.old_string as &str).count();
+            let new_content = content.replace(old, new);
+            let count = content.matches(old).count();
             if count == 0 {
                 return Ok(ToolOutput::error(format!(
                     "old_string not found in {}",
@@ -109,14 +115,14 @@ impl Tool for FileEditTool {
         }
 
         // Require exactly one occurrence
-        let count = content.matches(&input.old_string as &str).count();
+        let count = content.matches(old).count();
         match count {
             0 => Ok(ToolOutput::error(format!(
                 "old_string not found in {}",
                 path.display()
             ))),
             1 => {
-                let new_content = content.replacen(&input.old_string, &input.new_string, 1);
+                let new_content = content.replacen(old, new, 1);
                 super::atomic_write(&path, &new_content).await?;
                 Ok(ToolOutput::success(format!(
                     "Edit applied successfully to {}",

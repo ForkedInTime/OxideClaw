@@ -398,6 +398,27 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
     write_result
 }
 
+/// CRLF forms of an Edit's `old`/`new` strings, when the raw `old` cannot match
+/// only because of line endings.
+///
+/// Read shows files through `str::lines()`, which drops the `\r`, so on a CRLF
+/// file (the default checkout on Windows) the model writes an LF-joined
+/// multi-line `old_string` that never matches. Raw matches always win, so LF and
+/// mixed-ending files behave exactly as before; only a zero-match multi-line
+/// `old` in a file that has CRLF falls back, and then `new` is converted too so
+/// inserted lines keep the file's endings.
+pub fn crlf_fallback(content: &str, old: &str, new: &str) -> Option<(String, String)> {
+    if !old.contains('\n')
+        || old.contains('\r')
+        || !content.contains("\r\n")
+        || content.contains(old)
+    {
+        return None;
+    }
+    let to_crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+    Some((to_crlf(old), to_crlf(new)))
+}
+
 /// Deny-listed read paths expressed as ripgrep exclusion globs.
 ///
 /// The Grep tool has two backends — a `ripgrep` subprocess and a pure-Rust

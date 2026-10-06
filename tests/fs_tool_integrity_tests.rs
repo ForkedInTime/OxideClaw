@@ -2,7 +2,8 @@
 //! atomic as documented, and result sets must be bounded.
 
 use oxideclaw::tools::{
-    Tool, ToolContext, file_write::FileWriteTool, glob::GlobTool, multi_edit::MultiEditTool,
+    Tool, ToolContext, file_edit::FileEditTool, file_write::FileWriteTool, glob::GlobTool,
+    multi_edit::MultiEditTool,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -231,5 +232,68 @@ async fn glob_small_result_sets_are_untouched() {
     assert!(
         !body.contains("matches shown"),
         "no notice expected: {body}"
+    );
+}
+
+/// Read shows CRLF files with the `\r` stripped, so the model's multi-line
+/// old_string is LF-joined. Edit and MultiEdit matched it against the raw bytes
+/// and every multi-line edit to a Windows checkout failed with "not found".
+#[tokio::test]
+async fn multi_line_edits_match_crlf_files_and_keep_their_endings() {
+    let td = TempDir::new().unwrap();
+    let ctx = ToolContext::new(PathBuf::from(td.path()));
+    let crlf = "fn a() {\r\n    1\r\n}\r\nx\r\n";
+    std::fs::write(td.path().join("e.rs"), crlf).unwrap();
+    std::fs::write(td.path().join("m.rs"), crlf).unwrap();
+
+    let out = FileEditTool
+        .execute(
+            json!({"file_path": "e.rs", "old_string": "fn a() {\n    1\n}", "new_string": "fn a() {\n    2\n}"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("e.rs")).unwrap(),
+        "fn a() {\r\n    2\r\n}\r\nx\r\n"
+    );
+
+    let out = MultiEditTool
+        .execute(
+            json!({"edits": [
+                {"file_path": "m.rs", "old_string": "    1\n}", "new_string": "    1\n    3\n}"},
+                {"file_path": "m.rs", "old_string": "}\nx", "new_string": "}\ny", "replace_all": true}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("m.rs")).unwrap(),
+        "fn a() {\r\n    1\r\n    3\r\n}\r\ny\r\n"
+    );
+}
+
+/// The CRLF fallback only applies when the raw string has no match, so an
+/// LF old_string that matches a mixed-ending file is used verbatim.
+#[tokio::test]
+async fn edit_keeps_raw_matches_in_mixed_ending_files() {
+    let td = TempDir::new().unwrap();
+    let ctx = ToolContext::new(PathBuf::from(td.path()));
+    std::fs::write(td.path().join("mix.txt"), "a\nb\r\nc\r\n").unwrap();
+
+    let out = FileEditTool
+        .execute(
+            json!({"file_path": "mix.txt", "old_string": "a\nb", "new_string": "A\nB"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("mix.txt")).unwrap(),
+        "A\nB\r\nc\r\n"
     );
 }

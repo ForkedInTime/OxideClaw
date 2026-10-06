@@ -174,19 +174,25 @@ impl Tool for MultiEditTool {
                 },
             };
 
+            let crlf = super::crlf_fallback(&content, &edit.old_string, &edit.new_string);
+            let (old, new) = match &crlf {
+                Some((o, n)) => (o.as_str(), n.as_str()),
+                None => (edit.old_string.as_str(), edit.new_string.as_str()),
+            };
+
             if edit.replace_all {
-                let count = content.matches(&edit.old_string as &str).count();
+                let count = content.matches(old).count();
                 if count == 0 {
                     results.push(format!("{} ✗ old_string not found", label));
                     had_error = true;
                     failed_files.insert(path.clone());
                     continue;
                 }
-                let new_content = content.replace(&edit.old_string, &edit.new_string);
+                let new_content = content.replace(old, new);
                 staged.insert(path.clone(), new_content);
                 results.push(format!("{} ✓ Replaced {} occurrence(s)", label, count));
             } else {
-                let count = content.matches(&edit.old_string as &str).count();
+                let count = content.matches(old).count();
                 match count {
                     0 => {
                         results.push(format!("{} ✗ old_string not found", label));
@@ -194,7 +200,7 @@ impl Tool for MultiEditTool {
                         failed_files.insert(path.clone());
                     }
                     1 => {
-                        let new_content = content.replacen(&edit.old_string, &edit.new_string, 1);
+                        let new_content = content.replacen(old, new, 1);
                         staged.insert(path.clone(), new_content);
                         results.push(format!("{} ✓ Edit applied", label));
                     }
