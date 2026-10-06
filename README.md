@@ -139,11 +139,10 @@ The first five rows are where OxideClaw stands apart. The rest is table stakes, 
 tree-sitter AST parsing, SQLite FTS5 semantic search. Index your whole repo in seconds. Indexes stay on disk and update incrementally.
 
 ```
-> /rag search "TOCTOU"
-HAS match "search TOCTOU" — 10 results
-  src/tools/read.rs:12 (module `search`, rust)
-  src/session/mod.rs:17 (comment, rust)
-  ...
+> /rag search TOCTOU
+RAG search: 'TOCTOU' — 1 results
+
+  src/session/mod.rs:247-258 (function `load_messages`, rust)
 ```
 
 ### 💰 &nbsp; Smart model router + live cost dashboard

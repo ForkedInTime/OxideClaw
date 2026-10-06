@@ -71,20 +71,36 @@ pub(super) fn cmd_index(args: &str) -> CommandAction {
 
 pub(super) fn cmd_rag(args: &str) -> CommandAction {
     let query = args.trim();
-    match query {
-        "" => CommandAction::Message(
-            "Usage: /rag <query|status|rebuild|clear>\n\
-             \n  /rag <query>   — search the codebase index\
-             \n  /rag status    — show index statistics\
-             \n  /rag rebuild   — force full re-index\
-             \n  /rag clear     — delete the index\
+    let usage = || {
+        CommandAction::Message(
+            "Usage: /rag <query|search <query>|index|status|rebuild|clear>\n\
+             \n  /rag <query>         — search the codebase index\
+             \n  /rag search <query>  — same, explicitly\
+             \n  /rag index           — index the current directory (incremental)\
+             \n  /rag status          — show index statistics\
+             \n  /rag rebuild         — force full re-index\
+             \n  /rag clear           — delete the index\
              \n\n  Example: /rag authentication middleware\
              \n  Example: /rag how does the streaming API work"
                 .into(),
-        ),
+        )
+    };
+    let (first, rest) = split_first_word(query);
+    match query {
+        "" => usage(),
+        "index" => CommandAction::IndexProject { force: false },
         "status" | "stats" | "info" => CommandAction::RagStatus,
         "rebuild" | "reindex" | "force" => CommandAction::IndexProject { force: true },
         "clear" | "reset" | "delete" => CommandAction::RagClear,
+        // The documented `/rag search <q>` searched for the word "search"
+        // too, which matched every `search` module ahead of the real hits.
+        _ if first == "search" => {
+            if rest.is_empty() {
+                usage()
+            } else {
+                CommandAction::RagSearch(rest.to_string())
+            }
+        }
         _ => CommandAction::RagSearch(query.to_string()),
     }
 }
@@ -431,3 +447,30 @@ pub(super) fn cmd_sandbox(args: &str, ctx: &CommandContext) -> CommandAction {
 }
 
 // ── Teleport ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod rag_command_tests {
+    use super::{CommandAction, cmd_rag};
+
+    /// README and FEATURES document `/rag index` and `/rag search <q>`;
+    /// both were searches for the literal words.
+    #[test]
+    fn documented_rag_subcommands_are_subcommands() {
+        assert!(matches!(
+            cmd_rag("index"),
+            CommandAction::IndexProject { force: false }
+        ));
+        for (args, want) in [
+            ("search auth", "auth"),
+            ("search  \"TOCTOU\" ", "\"TOCTOU\""),
+            ("auth middleware", "auth middleware"),
+            ("searching parser", "searching parser"),
+        ] {
+            match cmd_rag(args) {
+                CommandAction::RagSearch(q) => assert_eq!(q, want, "{args:?}"),
+                _ => panic!("{args:?}: expected a search"),
+            }
+        }
+        assert!(matches!(cmd_rag("search"), CommandAction::Message(_)));
+    }
+}

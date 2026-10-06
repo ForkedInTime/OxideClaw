@@ -1470,7 +1470,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             )];
                             for r in &results {
                                 lines.push(format!(
-                                    "  {} {}:{}-{} ({} `{}`)",
+                                    "  {}:{}-{} ({} `{}`, {})",
                                     r.file_path,
                                     r.start_line,
                                     r.end_line,
