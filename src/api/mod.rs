@@ -59,6 +59,27 @@ where
     }
 }
 
+/// Drop thinking blocks that carry no signature before history goes to
+/// Anthropic. OpenAI-compatible reasoning models (DeepSeek, vLLM, QwQ) produce
+/// unsigned `Thinking` blocks, and Anthropic rejects any history containing one
+/// with a 400 — so after `/model claude-…` (or resuming such a session) every
+/// turn would fail. Genuine Anthropic thinking always has a signature. An
+/// assistant turn left empty keeps a placeholder text block, because removing
+/// it would put two user turns back to back, which is also a 400.
+pub(crate) fn strip_unsigned_thinking(messages: &mut [Message]) {
+    for msg in messages {
+        let before = msg.content.len();
+        msg.content.retain(
+            |b| !matches!(b, ContentBlock::Thinking { signature, .. } if signature.is_empty()),
+        );
+        if msg.content.is_empty() && before > 0 {
+            msg.content.push(ContentBlock::Text {
+                text: "(no response)".into(),
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 #[allow(dead_code)] // api_key retained for future authenticated-header injection
 pub struct ClaudeClient {
@@ -166,7 +187,8 @@ impl ClaudeClient {
 
     /// Non-streaming API call — mirrors callModel() in services/api/claude.ts
     #[allow(dead_code)] // used by SDK/headless mode (non-streaming path)
-    pub async fn messages(&self, request: MessagesRequest) -> Result<MessagesResponse> {
+    pub async fn messages(&self, mut request: MessagesRequest) -> Result<MessagesResponse> {
+        strip_unsigned_thinking(&mut request.messages);
         let url = format!("{}/v1/messages", self.base_url);
         debug!("POST {url} model={}", request.model);
 
@@ -207,6 +229,7 @@ impl ClaudeClient {
         mut on_text: impl FnMut(&str),
     ) -> Result<StreamedResponse> {
         request.stream = Some(true);
+        strip_unsigned_thinking(&mut request.messages);
         let url = format!("{}/v1/messages", self.base_url);
         debug!("POST {url} stream=true model={}", request.model);
 
@@ -558,6 +581,64 @@ impl ApiBackend {
             Self::OpenAiCompat(c) => c.take_tools_notice(),
             Self::Anthropic(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_thinking_tests {
+    use super::*;
+
+    fn thinking(signature: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: "hmm".into(),
+            signature: signature.into(),
+        }
+    }
+
+    #[test]
+    fn unsigned_thinking_is_dropped_and_signed_kept() {
+        let mut msgs = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    thinking(""),
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![thinking("sig"), ContentBlock::Text { text: "ok".into() }],
+            },
+        ];
+        strip_unsigned_thinking(&mut msgs);
+        let json = serde_json::to_string(&msgs).unwrap();
+        assert!(!json.contains(r#""signature":"""#), "{json}");
+        assert!(json.contains(r#""signature":"sig""#), "{json}");
+        assert_eq!(msgs[1].content.len(), 1);
+        assert!(matches!(msgs[1].content[0], ContentBlock::ToolUse { .. }));
+    }
+
+    /// An assistant turn made only of reasoning must not vanish: that would
+    /// leave two consecutive user turns.
+    #[test]
+    fn thinking_only_turn_keeps_a_placeholder() {
+        let mut msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![thinking("")],
+        }];
+        strip_unsigned_thinking(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(&msgs[0].content[..], [ContentBlock::Text { text }] if !text.trim().is_empty())
+        );
     }
 }
 
