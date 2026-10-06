@@ -399,7 +399,7 @@ async fn run_loop(
     let mut turn_tokens: (u64, u64) = (0, 0);
     let mut consecutive_compact_count: u32 = 0;
     // A finished background compaction waiting for the running turn to end.
-    let mut pending_compact: Option<(Vec<Message>, usize, (String, Vec<Message>))> = None;
+    let mut pending_compact: Option<AppEvent> = None;
     let mut saved_count: usize = 0;
     // Turn counter for file history snapshots (increments on each user prompt sent to API)
     let mut turn_counter: usize = 0;
@@ -1045,7 +1045,11 @@ async fn run_loop(
                             // flight, below, so it never lands between a
                             // turn's start and its Done.
                             app.compacting = false;
-                            pending_compact = Some((replacement, summary_len, base));
+                            pending_compact = Some(AppEvent::Compacted {
+                                replacement,
+                                summary_len,
+                                base: Some(base),
+                            });
                         }
                         AppEvent::Compacted { ref replacement, summary_len, base: None } => {
                             consecutive_compact_count = 0; // successful compact resets thrash counter
@@ -1194,7 +1198,11 @@ async fn run_loop(
         }
 
         if !app.is_loading
-            && let Some((replacement, summary_len, (base_sid, base))) = pending_compact.take()
+            && let Some(AppEvent::Compacted {
+                replacement,
+                summary_len,
+                base: Some((base_sid, base)),
+            }) = pending_compact.take()
         {
             match merge_compaction(&messages, replacement, &base_sid, &base, &session.id) {
                 Some(merged) => {
