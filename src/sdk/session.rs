@@ -322,7 +322,7 @@ impl SdkSession {
             // Context health — input_tokens represents the full conversation context
             // sent to the model (system + messages + tools), which is the real measure
             // of how full the context window is.
-            let window = crate::compact::compaction_window(&self.config, None);
+            let window = crate::compact::compaction_window(&self.config, None, None);
             let used_pct = ((input_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
             self.send_notif(SdkNotification::ContextHealth {
                 session_id: self.session_id.clone(),

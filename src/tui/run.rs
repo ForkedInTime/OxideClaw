@@ -945,7 +945,8 @@ async fn run_loop(
         // sufficient — no need to police ~40 individual push sites.
         app.trim_entries();
         // /model, /router and /reload can all change it between frames.
-        app.context_window = compaction_window(&config, Some(&app.router));
+        app.context_window =
+            compaction_window(&config, Some(&app.router), Some(&config.phase_router));
 
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);

@@ -48,7 +48,14 @@ pub fn thresholds(window: u64) -> (u64, u64, u64) {
 /// The window to compact against: the smallest among the configured model and
 /// every model a router may send the next turn to. A history that is fine on a
 /// 1M model is a prompt-too-long 400 once a simple prompt routes to Haiku.
-pub fn compaction_window(config: &Config, router: Option<&crate::router::RouterConfig>) -> u64 {
+///
+/// The phase router is passed in rather than read from `config`: only the TUI
+/// phase-routes, and headless/SDK sessions always send `config.model`.
+pub fn compaction_window(
+    config: &Config,
+    router: Option<&crate::router::RouterConfig>,
+    phase: Option<&crate::router::PhaseRouterConfig>,
+) -> u64 {
     let mut models: Vec<&str> = vec![&config.model];
     if let Some(r) = router.filter(|r| r.enabled) {
         models.extend([
@@ -58,8 +65,7 @@ pub fn compaction_window(config: &Config, router: Option<&crate::router::RouterC
             r.super_high_model.as_str(),
         ]);
     }
-    let p = &config.phase_router;
-    if p.enabled {
+    if let Some(p) = phase.filter(|p| p.enabled) {
         models.extend([
             p.research_model.as_str(),
             p.plan_model.as_str(),
@@ -231,13 +237,22 @@ fn render_history(messages: &[Message]) -> String {
 /// to ~180k tokens of history, plus adaptive thinking, does not fit in the
 /// usual turn budget. Streaming makes a large cap safe; Claude 3.x (other
 /// than 3.7) cannot emit that much, so it keeps the configured value.
-fn summary_max_tokens(config: &Config) -> u32 {
+///
+/// Capped at what the window has left after `prompt`: models before 4.5
+/// reject a request whose input plus `max_tokens` exceeds the window, and
+/// auto-summarise starts at 90% full.
+fn summary_max_tokens(config: &Config, prompt: &str) -> u32 {
     let configured = config.max_tokens_for(&config.model);
     let model = crate::commands::resolve_model_alias(&config.model);
     if model.starts_with("claude-3-") && !model.starts_with("claude-3-7") {
         return configured;
     }
-    configured.max(32_000)
+    let window = crate::api::context_window_for_model(&config.model);
+    // ~3.5 chars/token is conservative for code-heavy text; the constant
+    // covers the system prompt and message framing.
+    let est_input = (prompt.len() as u64 * 2 / 7) + 2_000;
+    let room = window.saturating_sub(est_input).min(u32::MAX as u64) as u32;
+    configured.max(32_000).min(room).max(configured.min(4_096))
 }
 
 /// API-based compaction: asks Claude to summarise the full conversation,
@@ -255,7 +270,7 @@ pub async fn summarize_compact(
 
     let request = MessagesRequest {
         model: config.model.clone(),
-        max_tokens: summary_max_tokens(config),
+        max_tokens: summary_max_tokens(config, &prompt),
         system: crate::api::types::SystemContent::Plain(SUMMARISE_SYSTEM.to_string()),
         messages: vec![Message {
             role: Role::User,
@@ -439,21 +454,26 @@ mod tests {
     #[test]
     fn routed_sessions_compact_for_the_smallest_candidate() {
         let cfg = config();
-        assert_eq!(compaction_window(&cfg, None), 1_000_000);
+        assert_eq!(compaction_window(&cfg, None, None), 1_000_000);
 
         let mut router = crate::router::RouterConfig::new(&cfg.model);
         assert_eq!(
-            compaction_window(&cfg, Some(&router)),
+            compaction_window(&cfg, Some(&router), None),
             1_000_000,
             "router off"
         );
         router.enabled = true;
         // Default low tier is Haiku 4.5 (200k).
-        assert_eq!(compaction_window(&cfg, Some(&router)), 200_000);
+        assert_eq!(compaction_window(&cfg, Some(&router), None), 200_000);
 
         let mut phased = config();
         phased.phase_router.enabled = true;
-        assert_eq!(compaction_window(&phased, None), 200_000);
+        assert_eq!(
+            compaction_window(&phased, None, Some(&phased.phase_router)),
+            200_000
+        );
+        // Headless and SDK sessions never phase-route.
+        assert_eq!(compaction_window(&phased, None, None), 1_000_000);
     }
 
     #[test]
@@ -461,9 +481,28 @@ mod tests {
         let mut cfg = config();
         cfg.max_tokens = 8_192;
         cfg.model = "claude-3-5-sonnet-20241022".into();
-        assert_eq!(summary_max_tokens(&cfg), 8_192);
+        assert_eq!(summary_max_tokens(&cfg, ""), 8_192);
         cfg.model = "claude-haiku-4-5".into();
-        assert_eq!(summary_max_tokens(&cfg), 32_000);
+        assert_eq!(summary_max_tokens(&cfg, ""), 32_000);
+    }
+
+    /// At 90% of a 200k window the history leaves no room for 32k of
+    /// output; models before 4.5 reject input + max_tokens over the window.
+    #[test]
+    fn summary_budget_fits_in_what_the_window_has_left() {
+        let mut cfg = config();
+        cfg.max_tokens = 8_192;
+        cfg.model = "claude-sonnet-4-0".into();
+        let window = crate::api::context_window_for_model(&cfg.model);
+        assert_eq!(window, 200_000);
+        let prompt = "x".repeat(600_000);
+        let got = summary_max_tokens(&cfg, &prompt) as u64;
+        let est_input = prompt.len() as u64 * 2 / 7 + 2_000;
+        assert!(got + est_input <= window, "{got}");
+        assert!(got >= 4_096);
+        // Plenty of room on a 1M window.
+        cfg.model = "claude-sonnet-5".into();
+        assert_eq!(summary_max_tokens(&cfg, &prompt), 32_000);
     }
 }
 

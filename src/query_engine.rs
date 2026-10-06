@@ -346,7 +346,7 @@ impl QueryEngine {
             }
 
             // Context compaction check
-            let window = compaction_window(&self.config, None);
+            let window = compaction_window(&self.config, None, None);
             match compact_needed(response.usage.input_tokens, window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
