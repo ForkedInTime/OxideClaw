@@ -313,46 +313,89 @@ fn launch_args(
     args
 }
 
-/// Search common Chrome/Chromium binary locations (Linux + macOS).
+/// Find an installed Chromium-based browser: Chrome, Chromium, Brave or
+/// Edge, on PATH or in its usual install location.
 pub fn find_chrome() -> Option<PathBuf> {
-    // PATH lookup via `which` (Linux/macOS)
-    let candidates = [
-        "google-chrome-stable",
-        "google-chrome",
-        "chromium-browser",
-        "chromium",
-        "chrome",
-    ];
-    for name in &candidates {
-        if let Ok(output) = std::process::Command::new("which").arg(name).output()
-            && output.status.success()
-        {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
+    if let Some(p) = std::env::var_os("PATH").and_then(|path| find_on_path(&path)) {
+        return Some(p);
     }
-    // Well-known paths — Linux + macOS
-    let known: &[&str] = &[
+    let mut known: Vec<PathBuf> = [
         // Linux
         "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
         "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
         "/snap/bin/chromium",
+        "/usr/bin/brave-browser",
+        "/usr/bin/microsoft-edge-stable",
+        "/usr/bin/microsoft-edge",
         // macOS
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
         "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    ];
-    for path in known {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    // Windows installers rarely put the browser on PATH.
+    if cfg!(windows) {
+        for root in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
+            let Some(root) = std::env::var_os(root) else {
+                continue;
+            };
+            for rel in [
+                r"Google\Chrome\Application\chrome.exe",
+                r"Microsoft\Edge\Application\msedge.exe",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+                r"Chromium\Application\chrome.exe",
+            ] {
+                known.push(PathBuf::from(&root).join(rel));
+            }
         }
     }
-    None
+    known.into_iter().find(|p| p.is_file())
+}
+
+/// First browser executable found in the directories of `path` (a PATH
+/// value). Walked here rather than through `which`, which stock Windows
+/// does not have.
+fn find_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    const NAMES: [&str; 10] = [
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium-browser",
+        "chromium",
+        "chrome",
+        "brave-browser",
+        "brave",
+        "microsoft-edge-stable",
+        "microsoft-edge",
+        "msedge",
+    ];
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    NAMES.iter().find_map(|name| {
+        let file = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        };
+        dirs.iter()
+            .map(|d| d.join(&file))
+            .find(|p| is_executable(p))
+    })
+}
+
+fn is_executable(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
 }
 
 /// Spawn a background task that subscribes to CDP events and pushes
@@ -558,6 +601,24 @@ mod tests {
                 args.contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into())
             );
             assert_eq!(args.last().unwrap(), "about:blank");
+        }
+    }
+
+    /// Only Chrome and Chromium were looked for, through `which`, so a
+    /// machine with just Brave or Edge (and any Windows machine) had none.
+    #[cfg(unix)]
+    #[test]
+    fn brave_or_edge_on_path_is_found() {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["brave-browser", "microsoft-edge"] {
+            let empty = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join(name);
+            std::fs::write(&exe, "").unwrap();
+            let path = std::env::join_paths([empty.path(), dir.path()]).unwrap();
+            assert_eq!(find_on_path(&path), None, "not executable yet");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(find_on_path(&path), Some(exe));
         }
     }
 
