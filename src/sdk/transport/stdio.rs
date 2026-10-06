@@ -50,6 +50,10 @@ impl Transport for StdioTransport {
                         eprintln!("[sdk] Warning: line exceeds 4MB, skipping");
                         continue;
                     }
+                    (LineRead::InvalidUtf8, _) => {
+                        eprintln!("[sdk] Warning: line is not valid UTF-8, skipping");
+                        continue;
+                    }
                     (LineRead::Line, line) => line,
                 },
             };
@@ -89,6 +93,9 @@ pub(crate) enum LineRead {
     Line,
     /// The line exceeded `max` bytes; it was drained and discarded.
     TooLong,
+    /// The line was not valid UTF-8; it was discarded. Not fatal: one bad
+    /// line from the host must not end the session.
+    InvalidUtf8,
 }
 
 /// Read lines on a task of their own and hand them over a channel.
@@ -108,7 +115,10 @@ pub(crate) fn spawn_line_reader<R: AsyncBufRead + Unpin + Send + 'static>(
         loop {
             let mut line = String::new();
             let read = read_line_bounded(&mut reader, &mut line, max).await;
-            let last = !matches!(read, Ok(LineRead::Line | LineRead::TooLong));
+            let last = !matches!(
+                read,
+                Ok(LineRead::Line | LineRead::TooLong | LineRead::InvalidUtf8)
+            );
             if tx.send(read.map(|r| (r, line))).await.is_err() || last {
                 break;
             }
@@ -126,29 +136,37 @@ pub(crate) async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     max: usize,
 ) -> std::io::Result<LineRead> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    // Bytes, not `read_line`: that fails with InvalidData on any non-UTF-8
+    // input, including a valid line whose cap lands mid-character, and the
+    // error stopped the reader and with it the whole server.
     // Read at most `max + 1` bytes of the line; a full read without a
     // newline means the line is longer than allowed.
+    let mut bytes = Vec::new();
     let n = {
         let mut limited = AsyncReadExt::take(&mut *reader, max as u64 + 1);
-        limited.read_line(buf).await?
+        limited.read_until(b'\n', &mut bytes).await?
     };
     if n == 0 {
         return Ok(LineRead::Eof);
     }
-    if buf.ends_with('\n') {
-        return Ok(LineRead::Line);
+    if bytes.ends_with(b"\n") {
+        return Ok(match String::from_utf8(bytes) {
+            Ok(line) => {
+                buf.push_str(&line);
+                LineRead::Line
+            }
+            Err(_) => LineRead::InvalidUtf8,
+        });
     }
     // No newline within the cap: drain the rest of the line in bounded
     // chunks and report it as over-long.
-    buf.clear();
-    let mut scratch = String::new();
     loop {
-        scratch.clear();
+        bytes.clear();
         let n = {
             let mut limited = AsyncReadExt::take(&mut *reader, max as u64);
-            limited.read_line(&mut scratch).await?
+            limited.read_until(b'\n', &mut bytes).await?
         };
-        if n == 0 || scratch.ends_with('\n') {
+        if n == 0 || bytes.ends_with(b"\n") {
             return Ok(LineRead::TooLong);
         }
     }
@@ -244,6 +262,42 @@ mod bounded_read_tests {
         assert!(notifs > 0, "the notification branch never won");
         assert_eq!(got[0], big);
         assert_eq!(got[1], "ok");
+        assert!(matches!(lines.recv().await, Some(Ok((LineRead::Eof, _)))));
+    }
+
+    /// A cap landing inside a multi-byte character used to surface as an
+    /// InvalidData error that stopped the reader.
+    #[tokio::test]
+    async fn an_over_long_line_cut_mid_character_is_too_long_not_an_error() {
+        let mut data = format!("aaa{}", "日".repeat(10)).into_bytes();
+        data.extend_from_slice(b"\nok\n");
+        let mut r = BufReader::new(std::io::Cursor::new(data));
+        let mut buf = String::new();
+        // Cap 4 -> the first read takes 5 bytes: "aaa" + 2 of 3 bytes of 日.
+        assert_eq!(
+            read_line_bounded(&mut r, &mut buf, 4).await.unwrap(),
+            LineRead::TooLong
+        );
+        buf.clear();
+        assert_eq!(
+            read_line_bounded(&mut r, &mut buf, 4).await.unwrap(),
+            LineRead::Line
+        );
+        assert_eq!(buf.trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_utf8_line_is_reported_and_the_reader_keeps_going() {
+        let data = b"\xff\xfe{}\nok\n".to_vec();
+        let mut lines = spawn_line_reader(BufReader::new(std::io::Cursor::new(data)), 1024);
+        assert!(matches!(
+            lines.recv().await,
+            Some(Ok((LineRead::InvalidUtf8, _)))
+        ));
+        match lines.recv().await {
+            Some(Ok((LineRead::Line, l))) => assert_eq!(l.trim(), "ok"),
+            other => panic!("unexpected {other:?}"),
+        }
         assert!(matches!(lines.recv().await, Some(Ok((LineRead::Eof, _)))));
     }
 

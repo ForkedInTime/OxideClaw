@@ -83,6 +83,11 @@ impl AcpServer {
                             rpc::PARSE_ERROR,
                             format!("line exceeds {MAX_LINE_BYTES} bytes"),
                         )],
+                        (LineRead::InvalidUtf8, _) => vec![rpc::error(
+                            &Value::Null,
+                            rpc::PARSE_ERROR,
+                            "line is not valid UTF-8",
+                        )],
                         (LineRead::Line, line) => {
                             let line = line.trim();
                             if line.is_empty() {
@@ -843,15 +848,21 @@ mod tests {
 
     /// Feed `lines`, close stdin, collect every frame the server wrote.
     async fn drive(cfg: Config, lines: &[String]) -> Vec<Value> {
+        let mut input = Vec::new();
+        for l in lines {
+            input.extend_from_slice(l.as_bytes());
+            input.push(b'\n');
+        }
+        drive_raw(cfg, &input).await
+    }
+
+    async fn drive_raw(cfg: Config, input: &[u8]) -> Vec<Value> {
         use tokio::io::AsyncReadExt;
         let (client, server) = tokio::io::duplex(1 << 20);
         let (srv_r, srv_w) = tokio::io::split(server);
         let (mut cli_r, mut cli_w) = tokio::io::split(client);
         let task = tokio::spawn(AcpServer::run(cfg, tokio::io::BufReader::new(srv_r), srv_w));
-        for l in lines {
-            cli_w.write_all(l.as_bytes()).await.unwrap();
-            cli_w.write_all(b"\n").await.unwrap();
-        }
+        cli_w.write_all(input).await.unwrap();
         // A dropped WriteHalf does not close a duplex; shutdown does.
         cli_w.shutdown().await.unwrap();
         drop(cli_w);
@@ -972,6 +983,18 @@ mod tests {
         // The cancel produced nothing; initialize still answered.
         assert_eq!(out[1]["id"], json!(0));
         assert_eq!(out.len(), 2);
+    }
+
+    /// One non-UTF-8 line used to end the whole ACP process.
+    #[tokio::test]
+    async fn a_non_utf8_line_is_a_parse_error_not_a_crash() {
+        let (cfg, _dir) = test_config();
+        let mut input = b"\xff\xfe\n".to_vec();
+        input.extend_from_slice(init_line().as_bytes());
+        input.push(b'\n');
+        let out = drive_raw(cfg, &input).await;
+        assert_eq!(out[0]["error"]["code"], json!(rpc::PARSE_ERROR));
+        assert_eq!(out[1]["id"], json!(0));
     }
 
     /// `session/cancel` mid-turn must answer the prompt with `cancelled`
