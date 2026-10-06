@@ -97,7 +97,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Collect input to String once — reused in both height calc and draw_input.
     let full_input: String = app.input.iter().collect();
-    let usable_w = area.width.saturating_sub(2) as usize; // ">" + space prefix
+    // ">" + space prefix; max(1) keeps a 1-2 column pane from dividing by 0.
+    let usable_w = (area.width.saturating_sub(2) as usize).max(1);
     let visual_lines: u16 = full_input
         .split('\n')
         .map(|line| {
@@ -872,9 +873,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     }
 
     // Right side: "● model-name" — clean, no token counts (matches oxideclaw)
-    let right_text = format!("● {} ", app.model_short);
-    let right_width = right_text.len() as u16;
-    let left_width = area.width.saturating_sub(right_width);
+    // Measured in display columns and clamped to the bar: provider ids like
+    // `openrouter:meta-llama/llama-3.1-405b-instruct` are wider than a narrow
+    // split pane, and an oversized Rect made Paragraph index outside the
+    // buffer, which aborts the process (panic = "abort").
+    let right_line = Line::from(Span::styled(
+        format!("● {} ", app.model_short),
+        Style::default().fg(tc.assistant),
+    ));
+    let right_width = u16::try_from(right_line.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let left_width = area.width - right_width;
 
     let left_area = Rect {
         x: area.x,
@@ -890,10 +900,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     };
 
     f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
-    f.render_widget(
-        Paragraph::new(Span::styled(right_text, Style::default().fg(tc.assistant))),
-        right_area,
-    );
+    f.render_widget(Paragraph::new(right_line), right_area);
 }
 
 // ── Browse approval dialog ────────────────────────────────────────────────────
@@ -1384,6 +1391,21 @@ mod permission_popup_tests {
         assert!(flat.contains("TAIL-DIR"), "{screen}");
         assert!(screen.contains("end of command"), "{screen}");
         assert!(app.pending_permission.unwrap().fully_shown);
+    }
+
+    /// A model id wider than the terminal used to index outside the status
+    /// bar buffer and abort the whole process.
+    #[test]
+    fn narrow_terminal_with_long_model_id_does_not_panic() {
+        let mut app = crate::tui::app::App::new(
+            "openrouter:meta-llama/llama-3.1-405b-instruct",
+            std::path::Path::new("/tmp"),
+        );
+        app.show_welcome = false;
+        for w in [1, 2, 10, 40, 47, 48, 80] {
+            let mut term = Terminal::new(TestBackend::new(w, 10)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
     }
 
     /// Raw ESC/BEL in the dialog or in chat must never reach the terminal:
