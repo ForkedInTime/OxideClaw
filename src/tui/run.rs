@@ -237,10 +237,13 @@ fn resume_tty() {
     }
 }
 
+/// `initial_input` is pre-filled for the user to review (deep links);
+/// `initial_prompt` is sent as if typed and submitted (`oxideclaw "<prompt>"`).
 pub async fn run_tui(
     config: Config,
     resume_id: Option<String>,
     initial_input: Option<String>,
+    initial_prompt: Option<String>,
 ) -> Result<()> {
     // The release profile aborts on panic, so no destructor will restore the
     // terminal: do it in the hook, before the message prints, or the user is
@@ -285,7 +288,7 @@ pub async fn run_tui(
         )?;
         KEYBOARD_ENHANCED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = run_loop(config, resume_id, initial_input).await;
+    let result = run_loop(config, resume_id, initial_input, initial_prompt).await;
     disable_raw_mode()?;
     let mut cleanup = io::stdout();
     if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -364,6 +367,7 @@ async fn run_loop(
     mut config: Config,
     resume_id: Option<String>,
     initial_input: Option<String>,
+    initial_prompt: Option<String>,
 ) -> Result<()> {
     // Compute welcome-screen height and create the first terminal.
     let (init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -648,6 +652,39 @@ async fn run_loop(
                 }
             }
         });
+    }
+
+    // The user's own argv, so it is sent like a typed prompt (`oxideclaw
+    // /init`). A startup overlay would take the Enter, so then it waits in
+    // the input box instead.
+    if let Some(text) = initial_prompt {
+        app.input = text.chars().collect();
+        app.cursor = app.input.len();
+        if app.overlay.is_some() {
+            app.entries.push(ChatEntry::system(
+                "Your command-line prompt is in the input box — press Enter to send it.",
+            ));
+        } else {
+            handle_key(KeyCtx {
+                key: crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                app: &mut app,
+                messages: &mut messages,
+                client: &mut client,
+                tools: &tools,
+                config: &mut config,
+                perm_state: &perm_state,
+                skills: &skills,
+                system_prompt: &mut system_prompt,
+                tx: &tx,
+                todo_state: &todo_state,
+                session: &mut session,
+                saved_count: &mut saved_count,
+                mcp_statuses: &mcp_statuses,
+                turn_counter: &mut turn_counter,
+                spawn_registry: &spawn_registry,
+            })
+            .await?;
+        }
     }
 
     loop {

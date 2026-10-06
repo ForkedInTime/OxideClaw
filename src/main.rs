@@ -286,7 +286,8 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
 
-    /// Prompt to send (used with --print). Flags may come before or after
+    /// Prompt to send: with --print, answer it and exit; without, open the
+    /// TUI and send it as the first message. Flags may come before or after
     /// it; quote the prompt or put it after `--` if it contains words that
     /// start with `-`.
     // Not trailing_var_arg: that swallowed every flag after the first prompt
@@ -672,7 +673,7 @@ async fn main() -> Result<()> {
                 if let Some(dir) = cwd {
                     config.retarget_cwd(std::path::PathBuf::from(dir));
                 }
-                return tui::run_tui(config, None, Some(query)).await;
+                return tui::run_tui(config, None, Some(query), None).await;
             }
         }
     }
@@ -1212,7 +1213,14 @@ async fn main() -> Result<()> {
     };
 
     // Interactive TUI mode
-    tui::run_tui(config, resume_id, None).await
+    tui::run_tui(config, resume_id, None, interactive_prompt(&cli.prompt)).await
+}
+
+/// Positional words without `-p` start the TUI with that prompt already
+/// sent, so `oxideclaw /init` runs /init. They used to be dropped silently.
+fn interactive_prompt(words: &[String]) -> Option<String> {
+    let text = words.join(" ");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Self-update: download the latest release from GitHub and replace the running binary.
@@ -1696,6 +1704,23 @@ mod cli_parse_tests {
 
         let cli = Cli::try_parse_from(["oxideclaw", "-p", "--", "fix", "-x", "flag"]).unwrap();
         assert_eq!(cli.prompt, vec!["fix", "-x", "flag"]);
+    }
+
+    #[test]
+    fn positional_words_become_the_interactive_prompt() {
+        let cli = Cli::try_parse_from(["oxideclaw", "/init"]).unwrap();
+        assert!(!cli.print);
+        assert_eq!(
+            super::interactive_prompt(&cli.prompt).as_deref(),
+            Some("/init")
+        );
+        let cli = Cli::try_parse_from(["oxideclaw", "explain", "main.rs", "--verbose"]).unwrap();
+        assert_eq!(
+            super::interactive_prompt(&cli.prompt).as_deref(),
+            Some("explain main.rs")
+        );
+        let cli = Cli::try_parse_from(["oxideclaw"]).unwrap();
+        assert_eq!(super::interactive_prompt(&cli.prompt), None);
     }
 
     /// These flags parsed and then did nothing, so `--worktree foo` edited the
