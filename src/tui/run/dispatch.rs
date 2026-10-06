@@ -2079,8 +2079,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                     format!("turn {new_pos}")
                                 };
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[undo] rewound to {label} ({} files restored){}",
+                                    "[undo] rewound to {label} ({} files restored{}){}",
                                     report.files_restored,
+                                    report.removed_note(),
                                     report.saved_edits_note()
                                 )));
                             }
@@ -2168,8 +2169,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                     tracing::warn!("[redo] failed to save meta: {e}");
                                 }
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[redo] advanced to turn {new_pos} ({} files restored){}",
+                                    "[redo] advanced to turn {new_pos} ({} files restored{}){}",
                                     report.files_restored,
+                                    report.removed_note(),
                                     report.saved_edits_note()
                                 )));
                             }

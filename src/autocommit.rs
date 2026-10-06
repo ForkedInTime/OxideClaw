@@ -57,8 +57,10 @@ pub struct RestoreReport {
     /// that actually changed on disk — files that were already at the
     /// target content are included in this count.
     pub files_restored: u32,
-    /// Files in the working tree that do NOT exist in the target tree. They
-    /// are left untouched; the caller may mention them in a system message.
+    /// Files a snapshot had that the target tree does not (files the undone
+    /// turns created), removed from the working tree, repo-relative. Left on
+    /// disk, the next turn's snapshot recorded them again and discarded the
+    /// redo history. Files no snapshot ever held are never touched.
     pub orphaned_files: Vec<PathBuf>,
     /// Commit holding the working tree as it was before the restore, when no
     /// snapshot had it (edits made after the last turn). Reachable from
@@ -80,6 +82,28 @@ impl RestoreReport {
             ),
             None => String::new(),
         }
+    }
+
+    /// ", N removed: a, b" for the restore message, or "" when nothing was.
+    pub fn removed_note(&self) -> String {
+        const SHOWN: usize = 5;
+        if self.orphaned_files.is_empty() {
+            return String::new();
+        }
+        let mut names: Vec<String> = self
+            .orphaned_files
+            .iter()
+            .take(SHOWN)
+            .map(|p| p.display().to_string())
+            .collect();
+        if self.orphaned_files.len() > SHOWN {
+            names.push(format!("+{} more", self.orphaned_files.len() - SHOWN));
+        }
+        format!(
+            ", {} removed: {}",
+            self.orphaned_files.len(),
+            names.join(", ")
+        )
     }
 }
 
@@ -279,10 +303,12 @@ fn tree_of_commit(cwd: &Path, commit: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Count the number of file entries in a tree via `git ls-tree -r --name-only <tree>`.
+/// Count the number of file entries in a tree via `git ls-tree -r --full-tree --name-only <tree>`.
 fn count_tree_files(cwd: &Path, tree: &str) -> u32 {
     let out = git_cmd(cwd)
-        .args(["ls-tree", "-r", "--name-only", tree])
+        // Paths from the root even when cwd is a subdirectory, where plain
+        // `ls-tree -r` lists only that subdirectory's part of the tree.
+        .args(["ls-tree", "-r", "--full-tree", "--name-only", tree])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -567,28 +593,9 @@ pub fn snapshot_turn(
 
 fn list_tree_files(cwd: &Path, tree: &str) -> Vec<String> {
     git_cmd(cwd)
-        .args(["ls-tree", "-r", "--name-only", tree])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Lists files in the user's real git index via `git ls-files`. Only used
-/// as a fallback in `restore_to` when there are zero shadow commits yet
-/// (can't query a snapshot tree that doesn't exist).
-fn list_tracked_files(cwd: &Path) -> Vec<String> {
-    git_cmd(cwd)
-        .args(["ls-files"])
+        // Paths from the root even when cwd is a subdirectory, where plain
+        // `ls-tree -r` lists only that subdirectory's part of the tree.
+        .args(["ls-tree", "-r", "--full-tree", "--name-only", tree])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -656,24 +663,14 @@ pub fn restore_to(
         anyhow::bail!("could not resolve target tree");
     }
 
-    let target_files: std::collections::HashSet<String> =
-        list_tree_files(cwd, &tree_sha).into_iter().collect();
-    // Determine "current" files from the latest auto-commit tree (not the real
-    // git index, which may lag behind the snapshot chain).
-    let current_files: Vec<String> = if let Some(latest) = auto_commits.last() {
-        if let Some(latest_tree) = tree_of_commit(cwd, latest) {
-            list_tree_files(cwd, &latest_tree)
-        } else {
-            list_tracked_files(cwd)
-        }
-    } else {
-        list_tracked_files(cwd)
-    };
-    let orphaned_files: Vec<PathBuf> = current_files
-        .iter()
-        .filter(|f| !target_files.contains(*f))
-        .map(PathBuf::from)
-        .collect();
+    let target_files = list_tree_files(cwd, &tree_sha);
+    // Only files some snapshot recorded are ever removed; a file the user
+    // created after the last turn is not the undone turns' doing.
+    let snapshotted: std::collections::HashSet<String> = auto_commits
+        .last()
+        .and_then(|latest| tree_of_commit(cwd, latest))
+        .map(|tree| list_tree_files(cwd, &tree).into_iter().collect())
+        .unwrap_or_default();
 
     let recovery = recovery_ref(session_id);
     let (saved_edits, live_tree) = save_unrecorded_worktree(cwd, &recovery, auto_commits)?;
@@ -681,27 +678,39 @@ pub fn restore_to(
     // Write only what differs from the live tree. `checkout-index -a` on a
     // fresh index rewrote every file (bumping every mtime, so builds redid
     // everything) and wrote out paths a sparse checkout had left out. Paths
-    // absent from the target are skipped (`d`): orphans stay on disk.
-    let changed = git_cmd(cwd)
-        .args([
-            "diff-tree",
-            "-r",
-            "-z",
-            "--name-only",
-            "--no-renames",
-            "--diff-filter=d",
-            &live_tree,
-            &tree_sha,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !changed.status.success() {
-        anyhow::bail!(
-            "git diff-tree failed: {}",
-            String::from_utf8_lossy(&changed.stderr)
-        );
-    }
+    // absent from the target are skipped (`d`) here and removed below.
+    let diff_tree = |filter: &str| -> anyhow::Result<Vec<u8>> {
+        let out = git_cmd(cwd)
+            .args([
+                "diff-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                filter,
+                &live_tree,
+                &tree_sha,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git diff-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(out.stdout)
+    };
+    let changed = diff_tree("--diff-filter=d")?;
+    // Safe to delete: save_unrecorded_worktree just made sure the live tree
+    // is held by a snapshot or the recovery ref.
+    let orphaned_files: Vec<String> = diff_tree("--diff-filter=D")?
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .filter(|p| snapshotted.contains(p))
+        .collect();
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
@@ -724,7 +733,7 @@ pub fn restore_to(
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
     let prefix = format!("{}/", toplevel.display());
-    if !changed.stdout.is_empty() {
+    if !changed.is_empty() {
         use std::io::Write;
         let mut child = git_cmd(&toplevel)
             .env("GIT_INDEX_FILE", &temp_index)
@@ -735,7 +744,7 @@ pub fn restore_to(
         let written = child
             .stdin
             .take()
-            .map(|mut w| w.write_all(&changed.stdout))
+            .map(|mut w| w.write_all(&changed))
             .transpose();
         let checkout_status = child.wait()?;
         written?;
@@ -744,9 +753,31 @@ pub fn restore_to(
         }
     }
 
+    for rel in &orphaned_files {
+        let path = toplevel.join(rel);
+        // A path that became a directory (or a submodule checkout) is not
+        // the file the snapshot recorded.
+        let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir());
+        if !is_file {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("[undo] could not remove {}: {e}", path.display());
+            continue;
+        }
+        // Drop directories the turn created; remove_dir refuses non-empty ones.
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| *d != toplevel && d.starts_with(&toplevel)) {
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+
     Ok(RestoreReport {
         files_restored: target_files.len() as u32,
-        orphaned_files,
+        orphaned_files: orphaned_files.into_iter().map(PathBuf::from).collect(),
         saved_edits,
         recovery_ref: recovery,
     })
@@ -1608,6 +1639,124 @@ mod restore_tests {
             "expected new.txt to be flagged as orphaned: {:?}",
             report.orphaned_files
         );
+        assert!(!td.path().join("new.txt").exists());
+        assert!(report.removed_note().contains("1 removed: new.txt"));
+    }
+
+    /// /undo left files the undone turn created on disk, so the next turn's
+    /// snapshot recorded them again and truncated the redo history.
+    #[test]
+    fn undo_removes_created_files_and_the_next_turn_keeps_redo() {
+        let td = init_test_repo();
+        write_file(td.path(), "a.txt", "a\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        write_file(td.path(), "src/gen/new.rs", "fn x() {}\n");
+        snapshot_turn(td.path(), &cfg, "s", "add", 1, &mut commits, &mut pos, None).unwrap();
+
+        let report = restore_to(td.path(), "s", &commits, 0).unwrap();
+        pos = 0;
+        assert_eq!(report.orphaned_files, vec![PathBuf::from("src/gen/new.rs")]);
+        assert!(!td.path().join("src/gen/new.rs").exists());
+        assert!(!td.path().join("src").exists(), "empty dirs left behind");
+        assert_eq!(report.saved_edits, None);
+
+        // A turn that changed nothing must not record anything or drop redo.
+        let outcome = snapshot_turn(
+            td.path(),
+            &cfg,
+            "s",
+            "noop",
+            2,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome, SnapshotOutcome::NoChanges);
+        assert_eq!(commits.len(), 1);
+
+        restore_to(td.path(), "s", &commits, 1).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("src/gen/new.rs")).unwrap(),
+            "fn x() {}\n"
+        );
+    }
+
+    /// Run from a subdirectory, `ls-tree -r` saw none of the root's files:
+    /// the restored count was 0 and root-level orphans went unnoticed.
+    #[test]
+    fn undo_from_a_subdirectory_counts_and_removes_root_files() {
+        let td = init_test_repo();
+        write_file(td.path(), "top.txt", "t\n");
+        write_file(td.path(), "pkg/x.txt", "x\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        let sub = td.path().join("pkg");
+        pin_filters(&sub).unwrap();
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        write_file(td.path(), "root_new.txt", "n\n");
+        snapshot_turn(&sub, &cfg, "s", "add", 1, &mut commits, &mut pos, None).unwrap();
+
+        let report = restore_to(&sub, "s", &commits, 0).unwrap();
+        assert_eq!(report.files_restored, 2);
+        assert_eq!(report.orphaned_files, vec![PathBuf::from("root_new.txt")]);
+        assert!(!td.path().join("root_new.txt").exists());
+        assert!(td.path().join("top.txt").exists());
+    }
+
+    /// A file the user wrote after the last turn is not an orphan of the
+    /// undone turns, even though the target tree lacks it.
+    #[test]
+    fn undo_keeps_files_no_snapshot_recorded() {
+        let td = init_test_repo();
+        write_file(td.path(), "a.txt", "a\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        write_file(td.path(), "turn.txt", "t\n");
+        snapshot_turn(td.path(), &cfg, "s", "add", 1, &mut commits, &mut pos, None).unwrap();
+        write_file(td.path(), "mine.txt", "m\n");
+
+        let report = restore_to(td.path(), "s", &commits, 0).unwrap();
+        assert_eq!(report.orphaned_files, vec![PathBuf::from("turn.txt")]);
+        assert!(td.path().join("mine.txt").exists());
+        assert!(report.saved_edits.is_some(), "mine.txt saved to recovery");
+    }
+
+    #[test]
+    fn removed_note_caps_the_list() {
+        let report = RestoreReport {
+            files_restored: 0,
+            orphaned_files: (0..7).map(|i| PathBuf::from(format!("f{i}"))).collect(),
+            saved_edits: None,
+            recovery_ref: String::new(),
+        };
+        assert_eq!(
+            report.removed_note(),
+            ", 7 removed: f0, f1, f2, f3, f4, +2 more"
+        );
+        let none = RestoreReport {
+            orphaned_files: Vec::new(),
+            ..report
+        };
+        assert_eq!(none.removed_note(), "");
     }
 
     #[test]

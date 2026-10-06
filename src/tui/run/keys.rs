@@ -114,8 +114,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     format!("turn {target_pos}")
                                 };
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[undo] rewound to {label} ({} files restored){}",
+                                    "[undo] rewound to {label} ({} files restored{}){}",
                                     report.files_restored,
+                                    report.removed_note(),
                                     report.saved_edits_note()
                                 )));
                             }
@@ -148,8 +149,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     tracing::warn!("[redo] failed to save meta: {e}");
                                 }
                                 app.entries.push(ChatEntry::system(format!(
-                                    "[redo] advanced to turn {target_pos} ({} files restored){}",
+                                    "[redo] advanced to turn {target_pos} ({} files restored{}){}",
                                     report.files_restored,
+                                    report.removed_note(),
                                     report.saved_edits_note()
                                 )));
                             }

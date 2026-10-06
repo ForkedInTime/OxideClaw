@@ -143,13 +143,13 @@ fn undo_past_session_start_is_clamped() {
     assert_eq!(new_pos, 0);
     let report = restore_to(td.path(), "test", &commits, new_pos).unwrap();
     // Session base had the initial "base\n" README. a.txt exists only in the
-    // shadow commits, so restoring to position 0 reports it as orphaned (Task 5
-    // reports orphans rather than deleting them; the caller decides the policy).
+    // shadow commits, so restoring to position 0 removes it and reports it.
     assert!(
         report.orphaned_files.iter().any(|p| p.ends_with("a.txt")),
         "expected a.txt to be reported as orphaned, got {:?}",
         report.orphaned_files
     );
+    assert!(!td.path().join("a.txt").exists());
     assert_eq!(read(td.path(), "README.md"), "base\n");
 }
 
