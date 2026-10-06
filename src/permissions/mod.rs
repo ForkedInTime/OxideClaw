@@ -8,6 +8,7 @@
 ///
 /// "Always allow" decisions are remembered for the session.
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub mod gate;
@@ -59,6 +60,9 @@ struct Inner {
     deny_list: HashSet<String>,
     /// Whether the user enabled --dangerously-skip-permissions
     bypass: bool,
+    /// Project root that relative path rules (`Read(./.env)`) and relative
+    /// tool paths resolve against. Unset means the process directory.
+    cwd: Option<PathBuf>,
 }
 
 impl PermissionState {
@@ -82,6 +86,12 @@ impl PermissionState {
         }
     }
 
+    /// Resolve relative path rules against `cwd` (the project root).
+    pub fn with_cwd(self, cwd: &Path) -> Self {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).cwd = Some(cwd.to_path_buf());
+        self
+    }
+
     /// Check with optional tool input for prefix-rule matching.
     pub fn check_with_input(
         &self,
@@ -89,6 +99,11 @@ impl PermissionState {
         input: Option<&serde_json::Value>,
     ) -> CheckResult {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = inner
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
 
         // Deny list first — an explicit `permissions.deny` holds even under
         // `--dangerously-skip-permissions`; bypass skips *prompts*, it does
@@ -97,13 +112,15 @@ impl PermissionState {
         // an allow rule only if it covers every file.
         let hits = |rule: &str, any: bool| {
             if tool_name == "MultiEdit" {
-                multi_edit_matches(rule, input, any)
+                multi_edit_matches(rule, input, &cwd, any)
             } else {
-                rule_matches(rule, tool_name, input)
+                rule_matches(rule, tool_name, input, &cwd, any)
             }
         };
+        // A deny rule this tool cannot parse blocks the tool: failing open
+        // would hand `Read(./.env)`-style secrets to the model unannounced.
         for rule in &inner.deny_list {
-            if hits(rule, true) {
+            if hits(rule, true) != RuleMatch::NoMatch {
                 return CheckResult::Deny;
             }
         }
@@ -118,7 +135,7 @@ impl PermissionState {
 
         // Check always-allowed — also supports prefix rules
         for rule in &inner.always_allowed {
-            if hits(rule, false) {
+            if hits(rule, false) == RuleMatch::Match {
                 return CheckResult::Allow;
             }
         }
@@ -136,68 +153,254 @@ impl PermissionState {
     }
 }
 
+/// How one rule relates to one tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleMatch {
+    Match,
+    NoMatch,
+    /// The rule names this tool but its specifier is not one we parse. A
+    /// deny rule like that blocks the tool outright (a rule the user wrote
+    /// must never silently do nothing); an allow rule like that is ignored.
+    Unsupported,
+}
+
+impl RuleMatch {
+    fn from_bool(hit: bool) -> Self {
+        if hit { Self::Match } else { Self::NoMatch }
+    }
+}
+
+/// Tools that take a file path, and the input field that carries it.
+fn path_field(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "Read" | "Write" | "Edit" | "LSP" => Some("file_path"),
+        "Grep" | "Glob" => Some("path"),
+        "NotebookRead" | "NotebookEdit" => Some("notebook_path"),
+        _ => None,
+    }
+}
+
+/// Whether a parenthesised rule for `rule_tool` speaks for `tool_name`.
+/// As in Claude Code, a `Read(...)` rule guards every tool that reads a
+/// file and an `Edit(...)` rule every tool that writes one; otherwise
+/// `deny: ["Read(./.env)"]` is dodged by `Grep` with `path: ".env"`.
+/// MultiEdit is applied per file by `multi_edit_matches`.
+fn rule_covers(rule_tool: &str, tool_name: &str) -> bool {
+    rule_tool.eq_ignore_ascii_case(tool_name)
+        || (rule_tool.eq_ignore_ascii_case("Read")
+            && matches!(tool_name, "Grep" | "Glob" | "NotebookRead" | "LSP"))
+        || (rule_tool.eq_ignore_ascii_case("Edit") && matches!(tool_name, "Write" | "NotebookEdit"))
+}
+
+/// Whether OxideClaw understands `rule`. Shared by the matcher and the
+/// startup warning so the two cannot disagree.
+pub fn rule_is_supported(rule: &str) -> bool {
+    let Some((tool, rest)) = rule.split_once('(') else {
+        return true;
+    };
+    let inner = rest.strip_suffix(')').unwrap_or(rest);
+    if inner.is_empty() {
+        return false;
+    }
+    let tool = tool.to_ascii_lowercase();
+    match tool.as_str() {
+        "bash" | "powershell" => true,
+        "webfetch" => inner.strip_prefix("domain:").is_some_and(|d| !d.is_empty()),
+        "read" | "write" | "edit" | "multiedit" | "grep" | "glob" | "notebookread"
+        | "notebookedit" | "lsp" => {
+            inner.starts_with("prefix:")
+                || inner.ends_with(":*")
+                || glob::Pattern::new(inner).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Check whether a permission rule entry matches the given tool call.
 ///
-/// Rule syntax:
-///   - `"Bash"` — matches any Bash call
-///   - `"Bash(git:*)"` or `"Bash(prefix:git )"` — matches Bash when command starts with `git `
-///   - `"Edit"` — matches any Edit call
-fn rule_matches(rule: &str, tool_name: &str, input: Option<&serde_json::Value>) -> bool {
-    // Parse: ToolName or ToolName(prefix:...) or ToolName(command:*)
-    if let Some(paren_start) = rule.find('(') {
-        let rule_tool = &rule[..paren_start];
-        if !rule_tool.eq_ignore_ascii_case(tool_name) {
-            return false;
-        }
-        let inner = rule[paren_start + 1..].trim_end_matches(')');
-
-        // `prefix:git ` is a literal starts_with. `git:*` names a command
-        // word: it covers `git` alone and `git` followed by any whitespace,
-        // but not `gitk`. Turning it into the string "git " missed the bare
-        // command, so `Bash(git push:*)` in deny never stopped `git push`.
-        let (base, word) = if let Some(rest) = inner.strip_prefix("prefix:") {
-            (rest, false)
-        } else if let Some(base) = inner.strip_suffix(":*") {
-            (base, true)
-        } else {
-            return false;
-        };
-
-        // Check the input's "command" field for Bash, or "file_path" for file tools
-        if let Some(inp) = input {
-            return match tool_name {
-                "Bash" | "PowerShell" => {
-                    let cmd = inp["command"].as_str().unwrap_or("");
-                    if word {
-                        let cmd = cmd.trim();
-                        cmd.strip_prefix(base)
-                            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
-                    } else {
-                        cmd.starts_with(base)
-                    }
-                }
-                // Paths are compared after resolving `.` and `..`, so
-                // `Edit(prefix:/proj/src/)` does not cover
-                // `/proj/src/../../.bashrc`, and a deny on `~/.ssh/` is not
-                // dodged by `~/./.ssh/id_rsa`.
-                "Write" | "Edit" | "Read" => {
-                    let path = normalize_lexically(inp["file_path"].as_str().unwrap_or(""));
-                    if word {
-                        let base = base.trim_end_matches('/');
-                        path.strip_prefix(base)
-                            .is_some_and(|r| r.is_empty() || r.starts_with('/'))
-                    } else {
-                        path.starts_with(base)
-                    }
-                }
-                _ => false,
-            };
-        }
-        false
-    } else {
-        // Simple name match
-        rule.eq_ignore_ascii_case(tool_name)
+/// Rule syntax (the Claude Code forms plus OxideClaw's `prefix:`):
+///   - `"Bash"` — any Bash call
+///   - `"Bash(git:*)"` — `git` alone or followed by arguments (not `gitk`)
+///   - `"Bash(prefix:git )"` — command starts with the literal `git `
+///   - `"Bash(npm run *)"` — `*` is a wildcard; a trailing ` *` also
+///     covers the bare `npm run`; no `*` means the exact command
+///   - `"Read(./.env)"`, `"Edit(src/**)"`, `"Read(~/.ssh/**)"`,
+///     `"Read(//etc/passwd)"` — gitignore-style globs: `//` is absolute,
+///     `~/` is home, anything else is relative to the project root, a name
+///     with no `/` matches at any depth, and a directory covers its contents
+///   - `"WebFetch(domain:example.com)"` — that host and its subdomains
+///
+/// `deny` is true for the deny list: `Read(/x)` (Claude Code: relative to
+/// the project) then also matches the absolute `/x`, since a deny rule
+/// that silently misses is the failure that matters.
+fn rule_matches(
+    rule: &str,
+    tool_name: &str,
+    input: Option<&serde_json::Value>,
+    cwd: &Path,
+    deny: bool,
+) -> RuleMatch {
+    let Some((rule_tool, rest)) = rule.split_once('(') else {
+        return RuleMatch::from_bool(rule.eq_ignore_ascii_case(tool_name));
+    };
+    if !rule_covers(rule_tool, tool_name) {
+        return RuleMatch::NoMatch;
     }
+    if !rule_is_supported(rule) {
+        return RuleMatch::Unsupported;
+    }
+    let inner = rest.strip_suffix(')').unwrap_or(rest);
+    let Some(inp) = input else {
+        return RuleMatch::NoMatch;
+    };
+
+    if matches!(tool_name, "Bash" | "PowerShell") {
+        let raw = inp["command"].as_str().unwrap_or("");
+        if let Some(prefix) = inner.strip_prefix("prefix:") {
+            return RuleMatch::from_bool(raw.starts_with(prefix));
+        }
+        // Runs of whitespace compare as one space, so `git  push` and
+        // `git\tpush` do not slip past a `git push` rule.
+        let cmd = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `git:*` names a command word: `git` alone or followed by
+        // whitespace, never `gitk`.
+        let word = |base: &str| {
+            cmd.strip_prefix(base)
+                .is_some_and(|r| r.is_empty() || r.starts_with(' '))
+        };
+        if let Some(base) = inner.strip_suffix(":*") {
+            return RuleMatch::from_bool(word(base));
+        }
+        let inner = inner.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hit = wildcard_match(&inner, &cmd)
+            || inner
+                .strip_suffix(" *")
+                .is_some_and(|base| wildcard_match(base, &cmd));
+        return RuleMatch::from_bool(hit);
+    }
+
+    if tool_name == "WebFetch" {
+        let domain = inner.trim_start_matches("domain:").to_ascii_lowercase();
+        let host = url::Url::parse(inp["url"].as_str().unwrap_or(""))
+            .ok()
+            .and_then(|u| {
+                u.host_str()
+                    .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+            });
+        return RuleMatch::from_bool(host.is_some_and(|h| {
+            h == domain
+                || h.strip_suffix(domain.as_str())
+                    .is_some_and(|s| s.ends_with('.'))
+        }));
+    }
+
+    let Some(field) = path_field(tool_name) else {
+        return RuleMatch::Unsupported;
+    };
+    // Grep and Glob search the working directory when no path is given.
+    let raw = match inp[field].as_str() {
+        Some(p) => p,
+        None if matches!(tool_name, "Grep" | "Glob") => "",
+        None => return RuleMatch::NoMatch,
+    };
+    // Paths are compared absolute and after resolving `.` and `..`, the way
+    // the tools resolve them, so `Edit(prefix:/proj/src/)` does not cover
+    // `/proj/src/../../.bashrc`, a deny on `~/.ssh/` is not dodged by
+    // `~/./.ssh/id_rsa`, and a relative `.env` is the project's `.env`.
+    let path = normalize_lexically(&cwd.join(raw).to_string_lossy());
+    let anchor = |base: &str| -> String {
+        let p = if let Some(rest) = base
+            .strip_prefix('~')
+            .filter(|r| r.is_empty() || r.starts_with('/'))
+        {
+            format!("{}{rest}", dirs::home_dir().unwrap_or_default().display())
+        } else {
+            cwd.join(base).to_string_lossy().into_owned()
+        };
+        normalize_lexically(&p)
+    };
+    if let Some(prefix) = inner.strip_prefix("prefix:") {
+        return RuleMatch::from_bool(path.starts_with(&anchor(prefix)));
+    }
+    if let Some(base) = inner.strip_suffix(":*") {
+        let base = anchor(base);
+        let base = base.trim_end_matches('/');
+        return RuleMatch::from_bool(
+            path.strip_prefix(base)
+                .is_some_and(|r| r.is_empty() || r.starts_with('/')),
+        );
+    }
+    RuleMatch::from_bool(
+        glob_rule_patterns(inner, cwd, deny)
+            .iter()
+            .any(|pat| glob_covers(pat, &path)),
+    )
+}
+
+/// The absolute glob(s) a gitignore-style path rule stands for.
+fn glob_rule_patterns(inner: &str, cwd: &Path, deny: bool) -> Vec<glob::Pattern> {
+    let pat = inner.trim_end_matches('/');
+    let esc = |p: &Path| glob::Pattern::escape(&p.to_string_lossy());
+    let mut out = Vec::new();
+    if let Some(abs) = pat.strip_prefix("//") {
+        out.push(format!("/{abs}"));
+    } else if let Some(rest) = pat
+        .strip_prefix('~')
+        .filter(|r| r.is_empty() || r.starts_with('/'))
+    {
+        out.push(format!(
+            "{}{rest}",
+            esc(&dirs::home_dir().unwrap_or_default())
+        ));
+    } else if let Some(rest) = pat.strip_prefix('/') {
+        out.push(format!("{}/{rest}", esc(cwd)));
+        if deny {
+            out.push(format!("/{rest}"));
+        }
+    } else {
+        let rel = pat.strip_prefix("./").unwrap_or(pat);
+        if rel.contains('/') || pat.starts_with("./") {
+            out.push(format!("{}/{rel}", esc(cwd)));
+        } else {
+            out.push(format!("{}/**/{rel}", esc(cwd)));
+        }
+    }
+    out.iter()
+        .filter_map(|p| glob::Pattern::new(&normalize_lexically(p)).ok())
+        .collect()
+}
+
+/// `pat` matches `path` or one of its parent directories, so a rule
+/// naming a directory covers everything inside it.
+fn glob_covers(pat: &glob::Pattern, path: &str) -> bool {
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    Path::new(path)
+        .ancestors()
+        .any(|p| pat.matches_with(&p.to_string_lossy(), opts))
+}
+
+/// `*` matches any run of characters; everything else is literal.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    if text.len() < first.len() + last.len() || !text.starts_with(first) || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Resolve `.` and `..` without touching the filesystem. A relative path
@@ -234,10 +437,18 @@ fn normalize_lexically(path: &str) -> String {
 
 /// `rule` against a MultiEdit call: a rule naming MultiEdit, or an Edit rule
 /// applied to each edit's `file_path` (`any` for deny, all for allow).
-fn multi_edit_matches(rule: &str, input: Option<&serde_json::Value>, any: bool) -> bool {
-    if rule_matches(rule, "MultiEdit", input) {
-        return true;
-    }
+fn multi_edit_matches(
+    rule: &str,
+    input: Option<&serde_json::Value>,
+    cwd: &Path,
+    any: bool,
+) -> RuleMatch {
+    // A parenthesised MultiEdit rule is an Edit rule over each file.
+    let rule = match rule.split_once('(') {
+        None => return RuleMatch::from_bool(rule.eq_ignore_ascii_case("MultiEdit")),
+        Some((tool, rest)) if tool.eq_ignore_ascii_case("MultiEdit") => format!("Edit({rest}"),
+        Some(_) => rule.to_string(),
+    };
     let files: Vec<serde_json::Value> = input
         .and_then(|i| i.get("edits"))
         .and_then(|e| e.as_array())
@@ -249,13 +460,18 @@ fn multi_edit_matches(rule: &str, input: Option<&serde_json::Value>, any: bool) 
         })
         .unwrap_or_default();
     if files.is_empty() {
-        return rule_matches(rule, "Edit", None);
+        return rule_matches(&rule, "Edit", None, cwd, any);
     }
-    let hit = |f: &serde_json::Value| rule_matches(rule, "Edit", Some(f));
-    if any {
-        files.iter().any(hit)
+    let results: Vec<RuleMatch> = files
+        .iter()
+        .map(|f| rule_matches(&rule, "Edit", Some(f), cwd, any))
+        .collect();
+    if results.contains(&RuleMatch::Unsupported) {
+        RuleMatch::Unsupported
+    } else if any {
+        RuleMatch::from_bool(results.contains(&RuleMatch::Match))
     } else {
-        files.iter().all(hit)
+        RuleMatch::from_bool(results.iter().all(|r| *r == RuleMatch::Match))
     }
 }
 
@@ -794,6 +1010,171 @@ mod tests {
             |p: &str| read.check_with_input("Read", Some(&serde_json::json!({ "file_path": p })));
         assert!(matches!(r("/home/u/.ssh/id_rsa"), CheckResult::Deny));
         assert!(matches!(r("/home/u/.sshx"), CheckResult::Allow));
+    }
+
+    fn at_proj(allow: &[&str], deny: &[&str]) -> PermissionState {
+        let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        PermissionState::new(false, &v(allow), &v(deny)).with_cwd(Path::new("/proj"))
+    }
+
+    fn check(st: &PermissionState, tool: &str, input: serde_json::Value) -> CheckResult {
+        if is_command_tool(tool) {
+            return check_compound_command(st, tool, input["command"].as_str().unwrap());
+        }
+        st.check_with_input(tool, Some(&input))
+    }
+
+    /// The Claude Code rule forms (`Read(./.env)`, `Read(~/.ssh/**)`,
+    /// `WebFetch(domain:x)`, exact `Bash(cmd)`) used to return "no match",
+    /// so a deny list copied from ~/.claude/settings.json did nothing.
+    #[test]
+    fn claude_code_path_rules_are_enforced() {
+        use serde_json::json;
+        let st = at_proj(&[], &["Read(./.env)", "Read(./secrets)", "Read(.npmrc)"]);
+        let denied = |tool: &str, input| matches!(check(&st, tool, input), CheckResult::Deny);
+        assert!(denied("Read", json!({ "file_path": "/proj/.env" })));
+        assert!(denied("Read", json!({ "file_path": ".env" })));
+        assert!(denied("Read", json!({ "file_path": "/proj/src/../.env" })));
+        assert!(denied("Grep", json!({ "pattern": ".", "path": ".env" })));
+        assert!(denied(
+            "Read",
+            json!({ "file_path": "/proj/secrets/prod/key.pem" })
+        ));
+        // A name with no slash matches at any depth.
+        assert!(denied("Read", json!({ "file_path": "/proj/web/.npmrc" })));
+        assert!(denied("Read", json!({ "file_path": "/proj/.npmrc" })));
+        assert!(!denied("Read", json!({ "file_path": "/proj/src/main.rs" })));
+        assert!(!denied("Read", json!({ "file_path": "/proj/web/.env" })));
+        assert!(!denied("Grep", json!({ "pattern": "x", "path": "src" })));
+
+        let home = dirs::home_dir().unwrap_or_default();
+        let st = at_proj(&[], &["Read(~/.ssh/**)", "Read(//etc/shadow)"]);
+        let key = home.join(".ssh/id_rsa").display().to_string();
+        assert!(matches!(
+            check(&st, "Read", json!({ "file_path": key })),
+            CheckResult::Deny
+        ));
+        assert!(matches!(
+            check(&st, "Read", json!({ "file_path": "/etc/shadow" })),
+            CheckResult::Deny
+        ));
+
+        // `/x` is project-relative (Claude Code); a deny also covers `/x`.
+        let st = at_proj(&["Edit(/src/**)"], &["Read(/private/**)"]);
+        for p in ["/proj/private/a", "/private/a"] {
+            assert!(
+                matches!(
+                    check(&st, "Read", json!({ "file_path": p })),
+                    CheckResult::Deny
+                ),
+                "{p}"
+            );
+        }
+        assert!(matches!(
+            check(&st, "Edit", json!({ "file_path": "/proj/src/a/b.rs" })),
+            CheckResult::Allow
+        ));
+        assert!(matches!(
+            check(&st, "Write", json!({ "file_path": "src/new.rs" })),
+            CheckResult::Allow
+        ));
+        assert!(matches!(
+            check(&st, "Edit", json!({ "file_path": "/src/a.rs" })),
+            CheckResult::Ask
+        ));
+        assert!(matches!(
+            check(&st, "Edit", json!({ "file_path": "/proj/src/../b.rs" })),
+            CheckResult::Ask
+        ));
+    }
+
+    #[test]
+    fn claude_code_command_and_domain_rules_are_enforced() {
+        use serde_json::json;
+        let st = PermissionState::new(
+            true,
+            &[],
+            &[
+                "Bash(git push)".into(),
+                "Bash(npm run *)".into(),
+                "WebFetch(domain:evil.com)".into(),
+            ],
+        );
+        let bash = |c: &str| {
+            matches!(
+                check(&st, "Bash", json!({ "command": c })),
+                CheckResult::Deny
+            )
+        };
+        assert!(bash("git push"));
+        assert!(bash("git  push"));
+        assert!(bash("ls && git push"));
+        assert!(!bash("git push origin"), "no `*` means the exact command");
+        assert!(bash("npm run"));
+        assert!(bash("npm run build --watch"));
+        assert!(!bash("npm runner"));
+        let fetch = |u: &str| {
+            matches!(
+                check(&st, "WebFetch", json!({ "url": u, "prompt": "x" })),
+                CheckResult::Deny
+            )
+        };
+        assert!(fetch("https://evil.com/x"));
+        assert!(fetch("https://api.EVIL.com./x"));
+        assert!(!fetch("https://notevil.com/x"));
+        assert!(!fetch("https://evil.com.example.org/"));
+    }
+
+    /// A deny rule we cannot parse fails closed for that tool; an allow
+    /// rule we cannot parse grants nothing.
+    #[test]
+    fn unsupported_rules_fail_closed_on_deny_only() {
+        use serde_json::json;
+        let st = PermissionState::new(
+            false,
+            &["Bash()".into()],
+            &["WebFetch(https://x)".into(), "Agent(Explore)".into()],
+        );
+        assert!(matches!(
+            check(
+                &st,
+                "WebFetch",
+                json!({ "url": "https://ok.org", "prompt": "x" })
+            ),
+            CheckResult::Deny
+        ));
+        assert!(matches!(
+            check(&st, "Agent", json!({ "prompt": "x" })),
+            CheckResult::Deny
+        ));
+        assert!(matches!(
+            check(&st, "Read", json!({ "file_path": "/a" })),
+            CheckResult::Allow
+        ));
+        assert!(matches!(
+            check(&st, "Bash", json!({ "command": "ls" })),
+            CheckResult::Ask
+        ));
+        for ok in [
+            "Bash",
+            "Bash(git:*)",
+            "Bash(ls)",
+            "Read(./.env)",
+            "Read(~/.ssh/**)",
+            "Edit(prefix:/p/)",
+            "WebFetch(domain:a.b)",
+        ] {
+            assert!(rule_is_supported(ok), "{ok}");
+        }
+        for bad in [
+            "Bash()",
+            "WebFetch(https://x)",
+            "WebFetch(domain:)",
+            "Agent(Explore)",
+            "Read([)",
+        ] {
+            assert!(!rule_is_supported(bad), "{bad}");
+        }
     }
 
     #[test]

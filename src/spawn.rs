@@ -313,7 +313,8 @@ async fn run_spawned_agent(
     let tools = default_tools(crate::net_policy::NetPolicy::from_config(&config));
     // The user asked for an autonomous background agent: no prompts. Settings
     // deny rules still hold (PermissionState checks them before bypass).
-    let gate = crate::permissions::PermissionGate::bypass_with_deny(&config.permissions_deny);
+    let gate =
+        crate::permissions::PermissionGate::bypass_with_deny(&config.permissions_deny, &config.cwd);
     let mut engine = QueryEngine::new(config, tools)?.with_permission_gate(gate);
 
     // Race the agent against the cancel signal

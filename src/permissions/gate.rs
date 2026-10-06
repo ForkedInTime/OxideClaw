@@ -73,7 +73,8 @@ impl PermissionGate {
                 cfg.dangerously_skip_permissions,
                 &cfg.permissions_allow,
                 &cfg.permissions_deny,
-            ),
+            )
+            .with_cwd(&cfg.cwd),
             false,
             None,
         )
@@ -83,13 +84,17 @@ impl PermissionGate {
     /// to run autonomously (`/spawn`).
     #[cfg(test)]
     pub fn bypass() -> Self {
-        Self::bypass_with_deny(&[])
+        Self::bypass_with_deny(&[], std::path::Path::new("/"))
     }
 
     /// No prompts, but `permissions.deny` still holds: the user's written
     /// rules are not something "autonomous" waives.
-    pub fn bypass_with_deny(deny: &[String]) -> Self {
-        Self::new(PermissionState::new(true, &[], deny), false, None)
+    pub fn bypass_with_deny(deny: &[String], cwd: &std::path::Path) -> Self {
+        Self::new(
+            PermissionState::new(true, &[], deny).with_cwd(cwd),
+            false,
+            None,
+        )
     }
 
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
@@ -331,8 +336,17 @@ mod tests {
 
     #[tokio::test]
     async fn bypass_gate_still_honours_deny_rules() {
-        let g = PermissionGate::bypass_with_deny(&["Bash(git push:*)".into()]);
-        for cmd in ["git push origin main", "git push", "git push\torigin"] {
+        let g = PermissionGate::bypass_with_deny(
+            &["Bash(git push:*)".into(), "Bash(git reset --hard)".into()],
+            std::path::Path::new("/proj"),
+        );
+        for cmd in [
+            "git push origin main",
+            "git push",
+            "git push\torigin",
+            "git reset --hard",
+            "git  reset --hard",
+        ] {
             assert!(
                 matches!(
                     g.decide("Bash", &json!({ "command": cmd })).await,

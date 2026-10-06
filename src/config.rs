@@ -545,6 +545,20 @@ impl Config {
         cfg.hooks = settings.hooks;
         cfg.permissions_allow = settings.permissions.allow;
         cfg.permissions_deny = settings.permissions.deny;
+        // A rule we cannot parse used to do nothing at all, silently.
+        for (rule, effect) in cfg
+            .permissions_deny
+            .iter()
+            .map(|r| (r, "it blocks every call to that tool"))
+            .chain(cfg.permissions_allow.iter().map(|r| (r, "it is ignored")))
+        {
+            if !crate::permissions::rule_is_supported(rule) {
+                eprintln!(
+                    "Warning: permissions rule `{rule}` uses syntax OxideClaw does not \
+                     understand; {effect}."
+                );
+            }
+        }
         if let Some(effort) = settings.effort {
             cfg.effort = Some(effort);
         }

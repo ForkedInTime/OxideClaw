@@ -306,7 +306,8 @@ async fn run_loop(
         config.dangerously_skip_permissions,
         &config.permissions_allow,
         &config.permissions_deny,
-    );
+    )
+    .with_cwd(&config.cwd);
     let skills = load_skills().await;
 
     let mut app = App::new(&config.model, &config.cwd);
