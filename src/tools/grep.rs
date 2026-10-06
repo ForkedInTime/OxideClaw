@@ -499,8 +499,9 @@ mod deny_rule_tests {
         let (_dir, ctx) = setup();
         let input = content(json!({"pattern": "NEEDLE", "output_mode": "content"}));
         let mut outs = vec![run_with_regex(&input, &ctx).await.unwrap()];
+        // On Windows deny rules always go to the walker (run_with_rg bails).
         let rg = std::process::Command::new("rg").arg("--version").output();
-        if rg.is_ok_and(|o| o.status.success()) {
+        if !cfg!(windows) && rg.is_ok_and(|o| o.status.success()) {
             outs.push(run_with_rg(&input, &ctx).await.unwrap());
         }
         for out in &outs {

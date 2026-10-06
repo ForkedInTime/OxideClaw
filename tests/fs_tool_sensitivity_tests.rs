@@ -39,6 +39,15 @@ fn text(o: &oxideclaw::tools::ToolOutput) -> String {
 /// otherwise they silently run the fallback backend and prove nothing about rg.
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Whether `rg` is on PATH. Call while holding PATH_LOCK.
+fn rg_available() -> bool {
+    std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Secrets outside the project, a project dir, and links pointing out of it.
 fn fixture() -> (TempDir, PathBuf) {
     let td = TempDir::new().unwrap();
@@ -221,6 +230,8 @@ async fn grep_does_not_return_private_key_contents() {
     )
     .unwrap();
 
+    // Not while the fallback test has PATH emptied.
+    let _path = PATH_LOCK.lock().await;
     let ctx = ToolContext::new(proj);
     let out = GrepTool
         .execute(
@@ -252,6 +263,12 @@ async fn grep_deny_list_ignores_key_suffix_case() {
     std::fs::write(proj.join("ok.txt"), "CASESECRET\n").unwrap();
 
     let _path = PATH_LOCK.lock().await;
+    // Without rg, GrepTool uses the walker, which already matched suffixes
+    // case-insensitively: the test would pass with or without the fix.
+    assert!(
+        rg_available(),
+        "ripgrep must be installed: this test covers the rg --iglob path"
+    );
     let ctx = ToolContext::new(proj);
     let out = GrepTool
         .execute(

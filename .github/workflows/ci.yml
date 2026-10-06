@@ -24,6 +24,17 @@ jobs:
       # old bare `cargo check` rather than adding to it — same build, more
       # coverage, no extra CI time. `-D warnings` is the point: clippy was clean
       # but ungated, so nothing stopped it drifting back one PR at a time.
+      # Grep's rg backend is tested directly (the deny-list globs), so rg
+      # must be on PATH or those tests would only exercise the fallback.
+      - name: Install ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install ripgrep (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
+      - name: Install ripgrep (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y
       - name: Lint (clippy, warnings are errors)
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
