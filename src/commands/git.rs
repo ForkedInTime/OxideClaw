@@ -94,27 +94,7 @@ pub(super) fn cmd_review(args: &str) -> CommandAction {
 }
 
 pub(super) fn cmd_lint(ctx: &CommandContext) -> CommandAction {
-    // Detect project type from the working directory
-    let cwd = &ctx.config.cwd;
-    let mut checks = Vec::new();
-
-    if cwd.join("Cargo.toml").exists() {
-        checks.push("cargo clippy --all-targets -- -D warnings");
-        checks.push("cargo test");
-    }
-    if cwd.join("package.json").exists() {
-        checks.push("npm run lint 2>/dev/null || npx eslint . 2>/dev/null || true");
-        checks.push("npm test 2>/dev/null || true");
-    }
-    if cwd.join("pyproject.toml").exists() || cwd.join("setup.py").exists() {
-        checks.push("ruff check . 2>/dev/null || python -m flake8 . 2>/dev/null || true");
-        checks.push("python -m pytest 2>/dev/null || true");
-    }
-    if cwd.join("go.mod").exists() {
-        checks.push("go vet ./...");
-        checks.push("go test ./...");
-    }
-
+    let checks = lint_checks(&ctx.config.cwd);
     if checks.is_empty() {
         return CommandAction::Message(
             "No recognized project type found (Cargo.toml, package.json, pyproject.toml, go.mod)."
@@ -131,8 +111,37 @@ pub(super) fn cmd_lint(ctx: &CommandContext) -> CommandAction {
          2. Fix the root cause in the source code\n\
          3. Re-run the failing command to verify the fix\n\
          4. Repeat until all commands pass with zero errors/warnings\n\n\
+         If a command fails only because its tool or script is not installed or \
+         configured, say so and skip it; do not count it as passing.\n\n\
          Report what you fixed when done."
     ))
+}
+
+// No `2>/dev/null` or `|| true`: Jest and npm report failures on stderr,
+// and a forced exit 0 told the fix loop that failing checks had passed.
+fn lint_checks(cwd: &std::path::Path) -> Vec<&'static str> {
+    let mut checks = Vec::new();
+    if cwd.join("Cargo.toml").exists() {
+        checks.push("cargo clippy --all-targets -- -D warnings");
+        checks.push("cargo test");
+    }
+    if cwd.join("package.json").exists() {
+        checks.push("npm run lint --if-present 2>&1");
+        checks.push("npm test 2>&1");
+    }
+    if cwd.join("pyproject.toml").exists() || cwd.join("setup.py").exists() {
+        // ruff when installed, else flake8 — never both, so flake8's result
+        // cannot mask ruff's findings.
+        checks.push(
+            "if command -v ruff >/dev/null 2>&1; then ruff check .; else python -m flake8 .; fi 2>&1",
+        );
+        checks.push("python -m pytest 2>&1");
+    }
+    if cwd.join("go.mod").exists() {
+        checks.push("go vet ./...");
+        checks.push("go test ./...");
+    }
+    checks
 }
 
 pub(super) fn cmd_branch(ctx: &CommandContext) -> CommandAction {
@@ -312,7 +321,7 @@ pub(super) fn cmd_init_verifiers() -> CommandAction {
 
 ## Goal
 
-Create one or more verifier skills that can be used by the Verify agent to automatically verify code changes in this project or folder. You may create multiple verifiers if the project has different verification needs (e.g., both web UI and API endpoints).
+Create one or more verifier skills that the agent can load (via the Skill tool, or as `/<verifier-name>`) to verify code changes in this project or folder. You may create multiple verifiers if the project has different verification needs (e.g., both web UI and API endpoints).
 
 **Do NOT create verifiers for unit tests or typechecking.** Those are already handled by the standard build/test workflow and don't need dedicated verifier skills. Focus on functional verification: web UI (Playwright), CLI (Tmux), and API (HTTP) verifiers.
 
@@ -372,7 +381,7 @@ For each distinct area, use AskUserQuestion to confirm:
 1. **Verifier name** — suggest based on detection:
    - Single area: "verifier-playwright", "verifier-cli", "verifier-api"
    - Multiple areas: "verifier-<project>-<type>" (e.g., "verifier-frontend-playwright")
-   - MUST include "verifier" in the name for auto-discovery
+   - Use lowercase letters, digits and hyphens only: the name becomes the file name and the `/<verifier-name>` command
 
 2. **Project-specific questions** based on type (dev server command, URL, ready signal, etc.)
 
@@ -380,7 +389,7 @@ For each distinct area, use AskUserQuestion to confirm:
 
 ## Phase 4: Generate Verifier Skill
 
-Write the skill file to `.claude/skills/<verifier-name>/SKILL.md`.
+Write the skill file to `.claude/skills/<verifier-name>.md` — a single flat file. OxideClaw only loads `*.md` files directly inside `.claude/skills/`, never from subfolders.
 
 Use this template:
 
@@ -419,7 +428,7 @@ After verification:
 
 ## Self-Update
 
-If verification fails because this skill's instructions are outdated (not because the feature under test is broken), use AskUserQuestion to confirm and then Edit this SKILL.md with a minimal targeted fix.
+If verification fails because this skill's instructions are outdated (not because the feature under test is broken), use AskUserQuestion to confirm and then Edit this skill file with a minimal targeted fix.
 ```
 
 Allowed tools by type:
@@ -430,8 +439,8 @@ Allowed tools by type:
 ## Phase 5: Confirm Creation
 
 After writing the skill file(s), inform the user:
-1. Where each skill was created (always in `.claude/skills/`)
-2. How the Verify agent will discover them (folder name must contain "verifier")
+1. Where each skill was created (always `.claude/skills/<verifier-name>.md`)
+2. How to use them: ask the agent to run the Skill tool with the verifier name (works immediately; DiscoverSkills lists it), or type `/<verifier-name>` after restarting OxideClaw
 3. That they can edit the skills to customize them
 4. That they can run /init-verifiers again to add more verifiers for other areas"#.into()
     )
@@ -494,4 +503,48 @@ pub(super) fn cmd_issue(args: &str) -> CommandAction {
          3. Use the gh CLI: gh issue create --title '...' --body '...'\n\
          4. Return the issue URL."
     ))
+}
+
+#[cfg(test)]
+mod prompt_command_tests {
+    use super::*;
+
+    /// `npm test 2>/dev/null || true` hid Jest's stderr report and exited 0,
+    /// so /lint's fix loop saw failing tests as passing.
+    #[test]
+    fn lint_checks_keep_stderr_and_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["package.json", "pyproject.toml"] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let checks = lint_checks(dir.path());
+        assert_eq!(checks.len(), 4);
+        for c in &checks {
+            assert!(!c.contains("2>/dev/null"), "{c}");
+            assert!(!c.contains("|| true"), "{c}");
+            assert!(c.ends_with("2>&1"), "{c}");
+        }
+        assert!(checks.contains(&"npm test 2>&1"));
+    }
+
+    #[test]
+    fn init_verifiers_writes_a_skill_file_oxideclaw_loads() {
+        let CommandAction::SendPrompt(prompt) = cmd_init_verifiers() else {
+            panic!("expected a prompt");
+        };
+        // Skills are flat `<dir>/<name>.md` files; a `<name>/SKILL.md`
+        // folder is skipped by load_skills, DiscoverSkills and the Skill tool.
+        assert!(prompt.contains("`.claude/skills/<verifier-name>.md`"));
+        assert!(!prompt.contains("SKILL.md"));
+        assert!(!prompt.contains("Verify agent"));
+
+        let tpl_start = prompt.find("Use this template:\n\n```\n").unwrap()
+            + "Use this template:\n\n```\n".len();
+        let tpl_len = prompt[tpl_start..].find("\n```").unwrap();
+        let content = prompt[tpl_start..tpl_start + tpl_len]
+            .replace("<verifier-name>", "verifier-cli")
+            .replace("<description based on type>", "Verify the CLI");
+        let skill = crate::skills::parse_skill_from_content(&content, "fallback").unwrap();
+        assert_eq!(skill.name, "verifier-cli");
+    }
 }
