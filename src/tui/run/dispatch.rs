@@ -119,10 +119,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             } else {
                 app.entries
                     .push(ChatEntry::system("Compacting conversation…"));
-                snip_compact(messages);
                 app.compacting = true;
                 let c2 = client.clone();
-                let msgs = messages.clone();
+                // Snip only what is summarised: a failed summary must leave
+                // the live history as it was.
+                let base = messages.clone();
+                let mut msgs = base.clone();
+                snip_compact(&mut msgs, &config.model);
                 let cfg = config.clone();
                 let tx2 = tx.clone();
                 let sid = session.id.clone();
@@ -143,7 +146,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             let _ = tx2.send(AppEvent::Compacted {
                                 replacement: r,
                                 summary_len,
-                                base: Some((sid, msgs)),
+                                base: Some((sid, base)),
                             });
                         }
                         Err(e) => {

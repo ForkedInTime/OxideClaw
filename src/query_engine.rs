@@ -382,7 +382,7 @@ impl QueryEngine {
                             "{}",
                             "Auto-compacting: stripping old tool results (snipCompact)…".yellow()
                         );
-                        snip_compact(&mut self.messages);
+                        snip_compact(&mut self.messages, &self.config.model);
                     } else {
                         eprintln!(
                             "{}",
@@ -392,10 +392,11 @@ impl QueryEngine {
                 }
                 // Summarising now would replace the assistant tool_use that the
                 // results appended below answer, orphaning them (a 400). Snip
-                // this round; summarise once the model stops calling tools.
+                // this round (a no-op mid-round on models whose thinking is
+                // bound to the history); summarise once tool calls stop.
                 CompactNeeded::Summarise if response.stop_reason == Some(StopReason::ToolUse) => {
                     if self.config.auto_compact_enabled {
-                        snip_compact(&mut self.messages);
+                        snip_compact(&mut self.messages, &self.config.model);
                     }
                 }
                 CompactNeeded::Summarise => {
@@ -415,7 +416,7 @@ impl QueryEngine {
                                     "{}",
                                     format!("Compact failed: {e}. Falling back to snip.").red()
                                 );
-                                snip_compact(&mut self.messages);
+                                snip_compact(&mut self.messages, &self.config.model);
                             }
                         }
                     } else {

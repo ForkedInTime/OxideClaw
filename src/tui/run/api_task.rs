@@ -469,7 +469,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
             let _ = tx.send(AppEvent::SystemMessage(
                 "Prompt too long — auto-compacting context…".into(),
             ));
-            match crate::compact::summarize_compact(&client, &messages, &config).await {
+            // The history already overflows the window as sent; summarise a
+            // snipped copy so the summary request has a chance to fit.
+            let mut snipped = messages.clone();
+            crate::compact::snip_compact(&mut snipped, &config.model);
+            match crate::compact::summarize_compact(&client, &snipped, &config).await {
                 Ok(replacement) => {
                     let summary_len = replacement
                         .first()
@@ -895,9 +899,16 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             }
                         }
 
+                        // Stored cut, as the request copy is: compaction
+                        // renders the stored history, not what was sent.
+                        let mut content = output.content;
+                        for c in &mut content {
+                            let ToolResultContent::Text { text } = c;
+                            crate::compact::budget_tool_result(text);
+                        }
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
-                            content: output.content,
+                            content,
                             is_error: if output.is_error { Some(true) } else { None },
                         });
                     }

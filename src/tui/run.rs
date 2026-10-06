@@ -65,17 +65,26 @@ fn short_id(id: &str, n: usize) -> &str {
 /// have sent turns meanwhile (kept after the summary) or switched, cleared,
 /// rewound or resumed the conversation (`None`: the summary would replace
 /// history it never saw, or be written into another session's file).
+///
+/// The kept turns' thinking was produced with the full history before it;
+/// on models that bind thinking to the conversation, replaying it after the
+/// summary is a 400, so it is dropped.
 fn merge_compaction(
     current: &[Message],
     mut replacement: Vec<Message>,
     base_session_id: &str,
     base: &[Message],
     session_id: &str,
+    model: &str,
 ) -> Option<Vec<Message>> {
     if base_session_id != session_id || !current.starts_with(base) {
         return None;
     }
+    let summary_len = replacement.len();
     replacement.extend_from_slice(&current[base.len()..]);
+    if crate::api::thinking::binds_thinking_to_conversation(model) {
+        crate::compact::drop_thinking(&mut replacement[summary_len..]);
+    }
     Some(replacement)
 }
 
@@ -1518,7 +1527,14 @@ async fn run_loop(
                 base: Some((base_sid, base)),
             }) = pending_compact.take()
         {
-            match merge_compaction(&messages, replacement, &base_sid, &base, &session.id) {
+            match merge_compaction(
+                &messages,
+                replacement,
+                &base_sid,
+                &base,
+                &session.id,
+                &config.model,
+            ) {
                 Some(merged) => {
                     consecutive_compact_count = 0;
                     messages = merged;
@@ -1558,7 +1574,7 @@ async fn run_loop(
                 }
                 CompactNeeded::Snip => {
                     if config.auto_compact_enabled {
-                        snip_compact(&mut messages);
+                        snip_compact(&mut messages, &config.model);
                         app.entries.push(ChatEntry::system(
                             "Auto-compacted (snip): stripped old tool results.",
                         ));
@@ -1580,7 +1596,6 @@ async fn run_loop(
                             ));
                             consecutive_compact_count = 0;
                         } else {
-                            snip_compact(&mut messages); // immediate safety snip
                             app.entries
                                 .push(ChatEntry::system("Auto-compacting (summarise)…"));
                             // PreCompact hooks
@@ -1592,7 +1607,11 @@ async fn run_loop(
                             }
                             app.compacting = true;
                             let c2 = client.clone();
-                            let msgs = messages.clone();
+                            // Snip only the copy being summarised, so a
+                            // failed summary leaves the live history intact.
+                            let base = messages.clone();
+                            let mut msgs = base.clone();
+                            snip_compact(&mut msgs, &config.model);
                             let cfg = config.clone();
                             let tx2 = tx.clone();
                             let sid = session.id.clone();
@@ -1622,7 +1641,7 @@ async fn run_loop(
                                         let _ = tx2.send(AppEvent::Compacted {
                                             replacement: r,
                                             summary_len,
-                                            base: Some((sid, msgs)),
+                                            base: Some((sid, base)),
                                         });
                                     }
                                     Err(e) => {
@@ -1886,6 +1905,8 @@ mod resume_turn_counter_tests {
 mod merge_compaction_tests {
     use super::*;
 
+    const M: &str = "claude-sonnet-5";
+
     fn text(role: Role, t: &str) -> Message {
         Message {
             role,
@@ -1910,7 +1931,7 @@ mod merge_compaction_tests {
         let mut current = base();
         current.push(text(Role::User, "q3"));
         current.push(text(Role::Assistant, "a3"));
-        let merged = merge_compaction(&current, summary.clone(), "s1", &base(), "s1").unwrap();
+        let merged = merge_compaction(&current, summary.clone(), "s1", &base(), "s1", M).unwrap();
         assert_eq!(
             merged,
             vec![
@@ -1920,9 +1941,40 @@ mod merge_compaction_tests {
             ]
         );
         assert_eq!(
-            merge_compaction(&base(), summary.clone(), "s1", &base(), "s1").unwrap(),
+            merge_compaction(&base(), summary.clone(), "s1", &base(), "s1", M).unwrap(),
             summary
         );
+    }
+
+    /// Opus 5.5's thinking is bound to everything before it: a kept turn
+    /// replayed after the summary with its thinking would be a 400.
+    #[test]
+    fn kept_turns_lose_their_thinking_on_conversation_bound_models() {
+        let summary = vec![text(Role::User, "SUMMARY")];
+        let mut current = base();
+        current.push(text(Role::User, "q3"));
+        current.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::Text { text: "a3".into() },
+            ],
+        });
+        let merged = merge_compaction(
+            &current,
+            summary.clone(),
+            "s1",
+            &base(),
+            "s1",
+            "claude-opus-5-5",
+        )
+        .unwrap();
+        assert_eq!(merged[2], text(Role::Assistant, "a3"));
+        let kept = merge_compaction(&current, summary, "s1", &base(), "s1", M).unwrap();
+        assert_eq!(kept[2], current[5], "older models keep their thinking");
     }
 
     /// /clear and /resume switch the session; /rewind or /undo rewrite the
@@ -1931,12 +1983,12 @@ mod merge_compaction_tests {
     #[test]
     fn changed_or_switched_conversation_discards_the_summary() {
         let summary = vec![text(Role::User, "SUMMARY")];
-        assert!(merge_compaction(&base(), summary.clone(), "s1", &base(), "s2").is_none());
-        assert!(merge_compaction(&[], summary.clone(), "s1", &base(), "s1").is_none());
-        assert!(merge_compaction(&base()[..2], summary.clone(), "s1", &base(), "s1").is_none());
+        assert!(merge_compaction(&base(), summary.clone(), "s1", &base(), "s2", M).is_none());
+        assert!(merge_compaction(&[], summary.clone(), "s1", &base(), "s1", M).is_none());
+        assert!(merge_compaction(&base()[..2], summary.clone(), "s1", &base(), "s1", M).is_none());
         let mut rewritten = base();
         rewritten[1] = text(Role::Assistant, "other");
-        assert!(merge_compaction(&rewritten, summary, "s1", &base(), "s1").is_none());
+        assert!(merge_compaction(&rewritten, summary, "s1", &base(), "s1", M).is_none());
     }
 }
 

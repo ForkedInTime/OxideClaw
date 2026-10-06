@@ -150,6 +150,23 @@ pub fn rejects_disabled_thinking(model: &str) -> bool {
     (family == "opus" || family == "sonnet") && model_version(&model).is_some_and(|v| v >= (5, 5))
 }
 
+/// Models whose thinking signatures cover the system prompt, the tools and
+/// every earlier message: replaying a block after any of those changed is a
+/// 400 ("bound to a different conversation") on enforced accounts. Fable
+/// 5.1+ and Opus/Sonnet 5.5+; Mythos does not run the check.
+pub fn binds_thinking_to_conversation(model: &str) -> bool {
+    let model = canonical(model);
+    let Some((_, family)) = family_of(&model) else {
+        return false;
+    };
+    let version = model_version(&model);
+    match family {
+        "fable" => version.is_some_and(|v| v >= (5, 1)),
+        "opus" | "sonnet" => version.is_some_and(|v| v >= (5, 5)),
+        _ => false,
+    }
+}
+
 /// Opus 5 accepts `{"type":"disabled"}` only at effort `high` or below; at
 /// `xhigh`/`max` the same request is a 400.
 fn disabled_needs_low_effort(model: &str) -> bool {
@@ -276,6 +293,23 @@ mod tests {
         assert_eq!(model_version("claude-3-opus-20240229"), Some((3, 0)));
         assert_eq!(model_version("llama3.2"), None);
         assert_eq!(model_version("groq:llama-3.3-70b"), None);
+    }
+
+    #[test]
+    fn conversation_bound_thinking_is_fable_5_1_and_opus_sonnet_5_5() {
+        for m in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            assert!(binds_thinking_to_conversation(m), "{m}");
+        }
+        for m in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-haiku-4-5",
+            "ollama:llama3.2",
+        ] {
+            assert!(!binds_thinking_to_conversation(m), "{m}");
+        }
     }
 
     // ── capability matrix (live-verified 2026-09-11) ─────────────────────

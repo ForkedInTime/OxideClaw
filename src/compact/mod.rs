@@ -111,27 +111,70 @@ pub fn compact_needed(input_tokens: u64, window: u64) -> CompactNeeded {
 
 // ── snipCompact ─────────────────────────────────────────────────────────────
 
+const SNIP_PLACEHOLDER: &str = "[content removed by snipCompact to reduce context size]";
+
 /// Client-side compaction: replace ToolResult content in old messages with a
 /// short placeholder, keeping the most recent `SNIP_KEEP_RECENT` messages
-/// entirely untouched.
+/// entirely untouched. Returns whether anything changed.
 ///
 /// This mirrors the snipCompactIfNeeded strategy: tool call *structure* is
 /// preserved (Claude can see what tools were invoked) but the large payloads
 /// that fill the context window are cleared.
-pub fn snip_compact(messages: &mut [Message]) {
+///
+/// On models that bind thinking to the conversation, editing a message
+/// invalidates every later thinking block, so those are dropped from the
+/// first edited message on. Earlier blocks still chain correctly.
+pub fn snip_compact(messages: &mut [Message], model: &str) -> bool {
     let len = messages.len();
     if len <= SNIP_KEEP_RECENT {
-        return;
+        return false;
+    }
+    let binds = crate::api::thinking::binds_thinking_to_conversation(model);
+    // A tool round still waiting on its results needs its thinking replayed,
+    // and after the edit that thinking is a 400: snip once the round ends.
+    if binds
+        && messages.last().is_some_and(|m| {
+            m.role == Role::Assistant
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        })
+    {
+        return false;
     }
     let snip_until = len - SNIP_KEEP_RECENT;
 
-    for msg in messages[..snip_until].iter_mut() {
+    let mut first_changed = None;
+    for (i, msg) in messages[..snip_until].iter_mut().enumerate() {
         for block in msg.content.iter_mut() {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                *content = vec![ToolResultContent::text(
-                    "[content removed by snipCompact to reduce context size]",
-                )];
+            if let ContentBlock::ToolResult { content, .. } = block
+                && !matches!(content.as_slice(), [ToolResultContent::Text { text }] if text == SNIP_PLACEHOLDER)
+            {
+                *content = vec![ToolResultContent::text(SNIP_PLACEHOLDER)];
+                first_changed.get_or_insert(i);
             }
+        }
+    }
+    let Some(first) = first_changed else {
+        return false;
+    };
+    if binds {
+        drop_thinking(&mut messages[first..]);
+    }
+    true
+}
+
+/// Remove every thinking block. A turn left empty keeps a placeholder text
+/// block: dropping it would put two user turns back to back, a 400.
+pub fn drop_thinking(messages: &mut [Message]) {
+    for msg in messages {
+        let before = msg.content.len();
+        msg.content
+            .retain(|b| !matches!(b, ContentBlock::Thinking { .. }));
+        if msg.content.is_empty() && before > 0 {
+            msg.content.push(ContentBlock::Text {
+                text: "(no response)".into(),
+            });
         }
     }
 }
@@ -180,6 +223,33 @@ Here is the conversation to summarize:
 
 ";
 
+/// Largest tool result, in characters, rendered into the summary prompt. The
+/// history being summarised already overflows the window; whole results
+/// (Bash keeps up to 1 MB) would make the summary request overflow too.
+const SUMMARY_TOOL_RESULT_MAX_CHARS: usize = 8_000;
+
+/// `text` cut to `max` characters, keeping the head and tail (the command
+/// and its final error are usually at the ends).
+fn elide_middle(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    let total = text.chars().count();
+    if total <= max {
+        return text.into();
+    }
+    let half = max / 2;
+    let head_end = text.char_indices().nth(half).map_or(text.len(), |(i, _)| i);
+    let tail_start = text
+        .char_indices()
+        .nth(total - half)
+        .map_or(text.len(), |(i, _)| i);
+    format!(
+        "{}\n[... {} chars elided ...]\n{}",
+        &text[..head_end],
+        total - 2 * half,
+        &text[tail_start..]
+    )
+    .into()
+}
+
 /// Build a plain-text rendering of the message history suitable for sending
 /// to the summarisation model.
 fn render_history(messages: &[Message]) -> String {
@@ -216,6 +286,7 @@ fn render_history(messages: &[Message]) -> String {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let text = elide_middle(&text, SUMMARY_TOOL_RESULT_MAX_CHARS);
                     out.push_str(&format!("[Tool {label}: {text}]\n"));
                 }
                 ContentBlock::Thinking { thinking, .. } => {
@@ -503,6 +574,150 @@ mod tests {
         // Plenty of room on a 1M window.
         cfg.model = "claude-sonnet-5".into();
         assert_eq!(summary_max_tokens(&cfg, &prompt), 32_000);
+    }
+}
+
+#[cfg(test)]
+mod snip_tests {
+    use super::*;
+
+    fn tool_round(i: usize) -> [Message; 2] {
+        [
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: format!("sig{i}"),
+                    },
+                    ContentBlock::ToolUse {
+                        id: format!("t{i}"),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: vec![ToolResultContent::text(format!("result {i}"))],
+                    is_error: None,
+                }],
+            },
+        ]
+    }
+
+    /// 30 tool rounds, then a final answer that thought before replying.
+    fn history() -> Vec<Message> {
+        let mut h = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "go".into() }],
+        }];
+        // Round 0's result is already a placeholder from an earlier snip.
+        for i in 0..30 {
+            h.extend(tool_round(i));
+        }
+        let ContentBlock::ToolResult { content, .. } = &mut h[2].content[0] else {
+            unreachable!()
+        };
+        *content = vec![ToolResultContent::text(SNIP_PLACEHOLDER)];
+        h.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "final".into(),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ],
+        });
+        h
+    }
+
+    fn thinking_at(h: &[Message]) -> Vec<usize> {
+        (0..h.len())
+            .filter(|&i| {
+                h[i].content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bound_thinking_after_the_first_edit_is_dropped() {
+        let mut h = history();
+        assert!(snip_compact(&mut h, "claude-opus-5-5"));
+        // Messages 0-2 are unchanged (round 0 was snipped before), so the
+        // thinking in message 1 still matches its prefix; message 4 is the
+        // first edit, so every block from there on is stale.
+        assert_eq!(thinking_at(&h), vec![1, 3]);
+        let ContentBlock::ToolResult { content, .. } = &h[4].content[0] else {
+            panic!()
+        };
+        assert_eq!(content[0], ToolResultContent::text(SNIP_PLACEHOLDER));
+        assert_eq!(
+            h.last().unwrap().content,
+            vec![ContentBlock::Text {
+                text: "done".into()
+            }]
+        );
+
+        // Nothing left to snip: a second pass changes nothing.
+        let before = h.clone();
+        assert!(!snip_compact(&mut h, "claude-opus-5-5"));
+        assert_eq!(h, before);
+    }
+
+    #[test]
+    fn unbound_models_keep_their_thinking() {
+        let mut h = history();
+        let all = thinking_at(&h);
+        assert!(snip_compact(&mut h, "claude-sonnet-5"));
+        assert_eq!(thinking_at(&h), all);
+    }
+
+    /// Mid tool round the pending turn's thinking must be replayed, and an
+    /// edit before it would invalidate it.
+    #[test]
+    fn bound_models_do_not_snip_mid_tool_round() {
+        let mut h = history();
+        h.pop();
+        h.push(tool_round(99)[0].clone());
+        let before = h.clone();
+        assert!(!snip_compact(&mut h, "claude-fable-5-1"));
+        assert_eq!(h, before);
+        assert!(snip_compact(&mut h, "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn summary_prompt_elides_the_middle_of_huge_tool_results() {
+        let big = format!(
+            "{}{}{}",
+            "a".repeat(50_000),
+            "é".repeat(100_000),
+            "z".repeat(50_000)
+        );
+        let h = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t".into(),
+                content: vec![ToolResultContent::text(big)],
+                is_error: None,
+            }],
+        }];
+        let out = render_history(&h);
+        assert!(
+            out.chars().count() < SUMMARY_TOOL_RESULT_MAX_CHARS + 200,
+            "{}",
+            out.len()
+        );
+        assert!(out.contains(&"a".repeat(4_000)));
+        assert!(out.contains(&"z".repeat(4_000)));
+        assert!(out.contains("[... 192000 chars elided ...]"));
     }
 }
 
