@@ -376,9 +376,11 @@ impl Settings {
     /// nothing that runs code, widens permissions, loosens the sandbox, or
     /// sends data somewhere new — no hooks, `apiKeyHelper`, MCP servers,
     /// auto-fix commands, allow rules, shell, voice URL or Ollama host — and
-    /// cannot switch off the user's own hooks with `disableAllHooks`. Deny
-    /// rules and settings that only tighten still apply. What was dropped is
-    /// listed in `untrusted_project_config`.
+    /// cannot switch off the user's own hooks with `disableAllHooks`, delete
+    /// the user's sessions with `cleanupPeriodDays`, loosen `autonomy` or
+    /// `browseDefaultPolicy`, or replace the user's `browseApprovalPatterns`.
+    /// Deny rules and settings that only tighten still apply. What was
+    /// dropped is listed in `untrusted_project_config`.
     pub fn merge_with_trust(
         global: Settings,
         mut project: Settings,
@@ -454,6 +456,37 @@ impl Settings {
             }
             if project.disable_all_hooks == Some(true) {
                 project.disable_all_hooks = None;
+            }
+            // Cleanup deletes sessions from every project, at startup.
+            if project.cleanup_period_days.take().is_some() {
+                dropped.push("cleanupPeriodDays".into());
+            }
+            // Only the strictest values may override the user's choice.
+            if project.autonomy.as_deref().is_some_and(|a| a != "suggest") {
+                project.autonomy = None;
+                dropped.push("autonomy".into());
+            }
+            if project
+                .browse_default_policy
+                .as_deref()
+                .is_some_and(|p| !p.trim().eq_ignore_ascii_case("ask"))
+            {
+                project.browse_default_policy = None;
+                dropped.push("browseDefaultPolicy".into());
+            }
+            // The project list replaces the global one on merge; an untrusted
+            // repo may add approval patterns but not remove the user's.
+            if let (Some(project_patterns), Some(global_patterns)) = (
+                project.browse_approval_patterns.as_mut(),
+                global.browse_approval_patterns.as_ref(),
+            ) {
+                let mut union = global_patterns.clone();
+                for p in project_patterns.drain(..) {
+                    if !union.contains(&p) {
+                        union.push(p);
+                    }
+                }
+                *project_patterns = union;
             }
             let had_mcp = !project.mcp_servers.is_empty()
                 || mcp_extra
@@ -920,6 +953,60 @@ mod project_trust_tests {
 
         let trusted = Settings::merge_with_trust(global, project(), None, true);
         assert_eq!(trusted.disable_all_hooks, Some(true));
+    }
+
+    /// A repo must not delete the user's sessions or loosen autonomy and
+    /// browse approval; the strictest values still apply.
+    #[test]
+    fn an_untrusted_project_cannot_loosen_cleanup_autonomy_or_browse() {
+        let global = Settings {
+            autonomy: Some("suggest".into()),
+            browse_default_policy: Some("ask".into()),
+            browse_approval_patterns: Some(vec!["(?i)transfer".into()]),
+            ..Settings::default()
+        };
+        let project = || Settings {
+            cleanup_period_days: Some(1),
+            autonomy: Some("full-auto".into()),
+            browse_default_policy: Some("pattern".into()),
+            browse_approval_patterns: Some(vec![]),
+            ..Settings::default()
+        };
+        let merged = Settings::merge_with_trust(global.clone(), project(), None, false);
+        assert_eq!(merged.cleanup_period_days, None);
+        assert_eq!(merged.autonomy.as_deref(), Some("suggest"));
+        assert_eq!(merged.browse_default_policy.as_deref(), Some("ask"));
+        assert_eq!(
+            merged.browse_approval_patterns,
+            Some(vec!["(?i)transfer".to_string()])
+        );
+        for key in ["cleanupPeriodDays", "autonomy", "browseDefaultPolicy"] {
+            assert!(
+                merged.untrusted_project_config.contains(&key.to_string()),
+                "{key} should be reported"
+            );
+        }
+
+        let tightening = Settings {
+            autonomy: Some("suggest".into()),
+            browse_default_policy: Some("ASK".into()),
+            browse_approval_patterns: Some(vec!["(?i)wire".into()]),
+            ..Settings::default()
+        };
+        let merged = Settings::merge_with_trust(global.clone(), tightening, None, false);
+        assert_eq!(merged.autonomy.as_deref(), Some("suggest"));
+        assert_eq!(merged.browse_default_policy.as_deref(), Some("ASK"));
+        assert_eq!(
+            merged.browse_approval_patterns,
+            Some(vec!["(?i)transfer".to_string(), "(?i)wire".to_string()])
+        );
+        assert!(merged.untrusted_project_config.is_empty());
+
+        let trusted = Settings::merge_with_trust(global, project(), None, true);
+        assert_eq!(trusted.cleanup_period_days, Some(1));
+        assert_eq!(trusted.autonomy.as_deref(), Some("full-auto"));
+        assert_eq!(trusted.browse_default_policy.as_deref(), Some("pattern"));
+        assert_eq!(trusted.browse_approval_patterns, Some(vec![]));
     }
 
     #[test]
