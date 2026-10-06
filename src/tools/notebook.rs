@@ -240,11 +240,20 @@ impl Tool for NotebookEditTool {
                     .position(|c| c.id.as_deref() == Some(cell_id))
                     .ok_or_else(|| anyhow!("Cell not found: {cell_id}"))?;
 
+                // nbformat v4 requires `metadata` on every cell and `outputs` +
+                // `execution_count` on code cells; without them Jupyter refuses
+                // to open the notebook. Markdown/raw cells must not carry them.
+                let mut extra = std::collections::HashMap::new();
+                extra.insert("metadata".to_string(), json!({}));
+                if cell_type == "code" {
+                    extra.insert("outputs".to_string(), json!([]));
+                    extra.insert("execution_count".to_string(), Value::Null);
+                }
                 let new_cell = Cell {
                     id: Some(uuid::Uuid::new_v4().to_string().chars().take(8).collect()),
                     cell_type,
                     source: CellSource::from_text(new_source),
-                    extra: Default::default(),
+                    extra,
                 };
 
                 let insert_at = if input.edit_mode == "insert_before" {
@@ -357,5 +366,37 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(std::fs::read_to_string(&nb).unwrap().contains("y = 2"));
+    }
+
+    /// Inserted cells used to be written as bare {id, cell_type, source},
+    /// which nbformat rejects ("missing an expected key: metadata").
+    #[tokio::test]
+    async fn inserted_cells_carry_the_keys_nbformat_requires() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb = dir.path().join("a.ipynb");
+        std::fs::write(&nb, NB).unwrap();
+        for (mode, ty) in [("insert_after", "code"), ("insert_before", "markdown")] {
+            let out = NotebookEditTool
+                .execute(
+                    json!({"notebook_path": "a.ipynb", "edit_mode": mode, "cell_id": "c1",
+                           "new_source": format!("new {ty}"), "cell_type": ty}),
+                    &ctx(dir.path()),
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+        }
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&nb).unwrap()).unwrap();
+        let cells = v["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 3);
+        let md = &cells[0];
+        assert_eq!(md["cell_type"], "markdown");
+        assert_eq!(md["metadata"], json!({}));
+        assert!(md.get("outputs").is_none() && md.get("execution_count").is_none());
+        let code = &cells[2];
+        assert_eq!(code["cell_type"], "code");
+        assert_eq!(code["metadata"], json!({}));
+        assert_eq!(code["outputs"], json!([]));
+        assert!(code.get("execution_count").is_some_and(Value::is_null));
     }
 }
