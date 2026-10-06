@@ -172,12 +172,15 @@ pub(super) async fn adopt_turn_history(
     if persist {
         if rewrite {
             let _ = session.overwrite(&partial).await;
-        } else {
-            let _ = session
-                .append(&partial[(*saved_count).min(partial.len())..])
-                .await;
+            *saved_count = partial.len();
+        } else if session
+            .append(&partial[(*saved_count).min(partial.len())..])
+            .await
+            .is_ok()
+        {
+            // A failed append leaves the count, so the next turn retries it.
+            *saved_count = partial.len();
         }
-        *saved_count = partial.len();
     }
     *messages = partial;
 }

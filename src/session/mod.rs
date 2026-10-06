@@ -117,13 +117,39 @@ impl Session {
         let meta = SessionMeta::load(id)
             .await
             .with_context(|| format!("Session '{id}' not found"))?;
-        let messages = Self::load_messages(id).await?;
         let s = Self {
             id: id.to_string(),
             meta,
             path: Self::jsonl_path(id),
         };
+        let messages = s.load_and_heal().await?;
         Ok((s, messages))
+    }
+
+    /// Load this session's transcript, first rewriting the file if its tail
+    /// was torn by a crash mid-append. Dropping the torn line only in memory
+    /// was one-shot: the next append glued onto the fragment, and the session
+    /// then refused to load ("corrupt at line N").
+    async fn load_and_heal(&self) -> Result<Vec<Message>> {
+        let content = match fs::read_to_string(&self.path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let (mut messages, torn) = parse_intact_lines(&self.id, &content)?;
+        if torn {
+            // The intact lines, not the repaired list: repair stubs are
+            // rebuilt on every load, and persisting one would put two user
+            // turns in a row on disk once the next prompt is appended.
+            if let Err(e) = self.overwrite(&messages).await {
+                tracing::warn!(
+                    "session {}: could not rewrite torn transcript: {e}",
+                    self.id
+                );
+            }
+        }
+        repair_loaded(&self.id, &mut messages);
+        Ok(messages)
     }
 
     /// Turn this into a copy under a new id: new files holding the same
@@ -152,21 +178,28 @@ impl Session {
             return Ok(());
         }
 
+        let mut batch = Vec::new();
+        for msg in new_messages {
+            serde_json::to_writer(&mut batch, msg)?;
+            batch.push(b'\n');
+        }
+
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .await?;
-
-        for msg in new_messages {
-            let line = serde_json::to_string(msg)?;
-            file.write_all(line.as_bytes()).await?;
-            file.write_all(b"\n").await?;
+        let original_len = file.metadata().await?.len();
+        // A failed write (ENOSPC, EIO) can leave part of the batch behind;
+        // cut it off so the caller can retry the whole batch and the next
+        // append does not glue onto half a line.
+        if let Err(e) = file.write_all(&batch).await {
+            let _ = file.set_len(original_len).await;
+            return Err(e.into());
         }
         // Durability. Without this the turn is reported as saved while the bytes
         // may still be in the page cache, so a crash loses it — and can leave a
-        // half-written final line behind (see `load_messages`, which tolerates
-        // exactly that).
+        // half-written final line behind (see `load_and_heal`).
         file.sync_all().await?;
 
         // Update preview from first user message if not yet set
@@ -590,9 +623,19 @@ fn repair_dangling_tool_uses(messages: &mut Vec<Message>) -> usize {
 /// behaviour can be tested against an explicit file rather than the global
 /// sessions directory.
 fn parse_message_lines(id: &str, content: &str) -> Result<Vec<Message>> {
+    let (mut out, _) = parse_intact_lines(id, content)?;
+    repair_loaded(id, &mut out);
+    Ok(out)
+}
+
+/// The messages of every intact line, and whether the tail is torn (a final
+/// line was dropped or the file does not end in a newline) and the file
+/// must be rewritten before anything is appended to it.
+fn parse_intact_lines(id: &str, content: &str) -> Result<(Vec<Message>, bool)> {
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let total = lines.len();
     let mut out = Vec::with_capacity(total);
+    let mut torn = !content.is_empty() && !content.ends_with('\n');
 
     for (i, line) in lines.into_iter().enumerate() {
         match serde_json::from_str::<Message>(line) {
@@ -609,6 +652,7 @@ fn parse_message_lines(id: &str, content: &str) -> Result<Vec<Message>> {
                         "session {id}: discarding incomplete final line \
                              (likely an interrupted write): {e}"
                     );
+                    torn = true;
                     break;
                 }
                 // Corruption anywhere else is not a torn write. Skipping it
@@ -624,18 +668,20 @@ fn parse_message_lines(id: &str, content: &str) -> Result<Vec<Message>> {
             }
         }
     }
-    // Recovery above can leave an assistant `tool_use` unanswered (its
-    // `tool_result` was the torn line). The API rejects that outright, so repair
-    // before the history is ever sent.
-    let repaired = repair_dangling_tool_uses(&mut out);
+    Ok((out, torn))
+}
+
+/// Recovery can leave an assistant `tool_use` unanswered (its `tool_result`
+/// was the torn line). The API rejects that outright, so repair before the
+/// history is ever sent.
+fn repair_loaded(id: &str, messages: &mut Vec<Message>) {
+    let repaired = repair_dangling_tool_uses(messages);
     if repaired > 0 {
         tracing::warn!(
             "session {id}: synthesised {repaired} missing tool result(s) for an \
              interrupted turn"
         );
     }
-
-    Ok(out)
 }
 
 /// Atomic file write: write to a sibling temp file, fsync, then rename over
@@ -802,6 +848,30 @@ mod durability_tests {
         // does not have to relocate the global sessions directory.
         let content = std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap_or_default();
         parse_message_lines(id, &content)
+    }
+
+    /// Recovery used to drop the torn line in memory only: the next append
+    /// glued onto the fragment and the following resume refused the whole
+    /// session as corrupt mid-file. Same for a complete final line whose
+    /// newline never made it to disk.
+    #[tokio::test]
+    async fn a_resumed_torn_session_still_loads_after_the_next_append() {
+        for torn_tail in [Some(14), Some(usize::MAX)] {
+            let d = tempfile::tempdir().unwrap();
+            write_jsonl(
+                d.path(),
+                "s",
+                &[msg("one"), msg("two"), msg("three")],
+                torn_tail,
+            );
+            let mut s = Session::at_path("s", d.path().join("s.jsonl"));
+            let mut loaded = s.load_and_heal().await.unwrap();
+            loaded.push(msg("four"));
+            let start = if torn_tail == Some(14) { 2 } else { 3 };
+            s.append(&loaded[start..]).await.unwrap();
+            let reloaded = s.load_and_heal().await.unwrap();
+            assert_eq!(reloaded, loaded, "{torn_tail:?}");
+        }
     }
 
     /// The regression: a crash mid-append leaves the final line cut off. That

@@ -967,8 +967,12 @@ async fn run_loop(
                             messages = new_messages.clone();
                             if !config.no_session_persistence && new_messages.len() > saved_count {
                                 let to_save = new_messages[saved_count..].to_vec();
-                                saved_count = new_messages.len();
-                                let _ = session.append(&to_save).await;
+                                // Only count what reached disk, so a failed
+                                // write is retried with the next turn.
+                                match session.append(&to_save).await {
+                                    Ok(()) => saved_count = new_messages.len(),
+                                    Err(e) => tracing::warn!("session: could not save turn: {e}"),
+                                }
                             }
                             // Per-turn token totals (cost itself is recorded per API call
                             // on `AppEvent::Usage`).
@@ -1721,8 +1725,8 @@ mod rewind_persistence_tests {
     async fn done(session: &mut Session, saved_count: &mut usize, new_messages: &[Message]) {
         if new_messages.len() > *saved_count {
             let to_save = new_messages[*saved_count..].to_vec();
-            *saved_count = new_messages.len();
             session.append(&to_save).await.unwrap();
+            *saved_count = new_messages.len();
         }
     }
 
