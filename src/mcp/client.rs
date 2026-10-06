@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::Duration;
@@ -50,6 +50,10 @@ pub(crate) trait McpTransport: Send + Sync {
 pub(crate) struct StdioTransport {
     stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    /// Set by the reader, under the `pending` lock, once stdout hits EOF.
+    /// A request registered after the reader's final drain would otherwise
+    /// wait out the full timeout for a reply that can never come.
+    closed: Arc<AtomicBool>,
 }
 
 impl StdioTransport {
@@ -103,6 +107,11 @@ impl StdioTransport {
 
         // Reader task: child stdout → pending oneshots
         let pending_clone = Arc::clone(&pending);
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_clone = Arc::clone(&closed);
+        // Weak, so the reader never keeps the child's stdin open after the
+        // transport is dropped: stdin EOF is how the server learns to exit.
+        let reply_tx = stdin_tx.downgrade();
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -112,29 +121,51 @@ impl StdioTransport {
                     continue;
                 }
                 // Ignore malformed / partial lines
-                if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
-                    let Some(id) = resp.id.as_ref().and_then(|v| v.as_u64()) else {
-                        continue; // notification — ignore
-                    };
-                    let result = if let Some(err) = resp.error {
-                        Err(anyhow!("MCP error {}: {}", err.code, err.message))
-                    } else {
-                        Ok(resp.result.unwrap_or(Value::Null))
-                    };
-                    let mut pending = pending_clone.lock().await;
-                    if let Some(tx) = pending.remove(&id) {
-                        let _ = tx.send(result);
+                let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                if let Some(method) = msg.get("method").and_then(Value::as_str) {
+                    // A server-to-client request must get an answer, or a
+                    // server that sent one (ping, roots/list, sampling)
+                    // blocks on it. Its id is from the server's own counter,
+                    // so it must never resolve one of our pending calls.
+                    if let Some(id) = msg.get("id")
+                        && let Some(tx) = reply_tx.upgrade()
+                    {
+                        let _ = tx.send(server_request_reply(id, method).to_string());
                     }
+                    continue; // a notification needs nothing
+                }
+                let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(msg) else {
+                    continue;
+                };
+                let Some(id) = resp.id.as_ref().and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let result = if let Some(err) = resp.error {
+                    Err(anyhow!("MCP error {}: {}", err.code, err.message))
+                } else {
+                    Ok(resp.result.unwrap_or(Value::Null))
+                };
+                let mut pending = pending_clone.lock().await;
+                if let Some(tx) = pending.remove(&id) {
+                    let _ = tx.send(result);
                 }
             }
-            // Process exited — drain any remaining pending requests with an error
+            // Process exited — fail every pending request, and every later
+            // one (`call` checks the flag under this same lock).
             let mut pending = pending_clone.lock().await;
+            closed_clone.store(true, Ordering::SeqCst);
             for (_, tx) in pending.drain() {
                 let _ = tx.send(Err(anyhow!("MCP server process exited")));
             }
         });
 
-        Ok(Self { stdin_tx, pending })
+        Ok(Self {
+            stdin_tx,
+            pending,
+            closed,
+        })
     }
 }
 
@@ -147,17 +178,24 @@ impl McpTransport for StdioTransport {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(anyhow!("MCP server process exited"));
+            }
             pending.insert(id, tx);
         }
 
-        self.stdin_tx
-            .send(json)
-            .map_err(|_| anyhow!("MCP server stdin closed"))?;
+        if self.stdin_tx.send(json).is_err() {
+            self.pending.lock().await.remove(&id);
+            return Err(anyhow!("MCP server stdin closed"));
+        }
 
-        tokio::time::timeout(REQUEST_TIMEOUT, rx)
-            .await
-            .map_err(|_| anyhow!("MCP request timed out ({})", method))?
-            .map_err(|_| anyhow!("MCP server disconnected"))?
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(reply) => reply.map_err(|_| anyhow!("MCP server disconnected"))?,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(anyhow!("MCP request timed out ({})", method))
+            }
+        }
     }
 
     async fn notify(&self, method: &str) {
@@ -165,6 +203,20 @@ impl McpTransport for StdioTransport {
         if let Ok(json) = serde_json::to_string(&req) {
             let _ = self.stdin_tx.send(json);
         }
+    }
+}
+
+/// Our answer to a server-to-client request. We offer no client
+/// capabilities, so only `ping` is ours to serve.
+fn server_request_reply(id: &Value, method: &str) -> Value {
+    if method == "ping" {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("Method not found: {method}") }
+        })
     }
 }
 
@@ -477,7 +529,9 @@ impl McpClient {
         // 1. initialize
         let params = json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "roots": { "listChanged": false }, "sampling": {} },
+            // Nothing here answers roots/list or sampling/createMessage; a
+            // server told we do waits on them until its own timeout.
+            "capabilities": {},
             "clientInfo": {
                 "name": "oxideclaw",
                 "version": env!("CARGO_PKG_VERSION")
@@ -882,6 +936,32 @@ mod tests {
         // Must have stopped at MAX_PAGES (256), not consumed all 300.
         assert_eq!(mock.calls().len(), 256, "must cap at MAX_PAGES");
     }
+
+    /// `initialize` used to claim roots and sampling, which nothing here
+    /// serves; servers that believed it waited on requests never answered.
+    #[tokio::test]
+    async fn initialize_claims_no_client_capabilities() {
+        let mock = Arc::new(MockTransport::new(HashMap::from([
+            (
+                "initialize".to_string(),
+                vec![json!({ "capabilities": {} })],
+            ),
+            ("tools/list".to_string(), vec![json!({ "tools": [] })]),
+        ])));
+        struct Shared(Arc<MockTransport>);
+        #[async_trait]
+        impl McpTransport for Shared {
+            async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+                self.0.call(id, method, params).await
+            }
+        }
+        let mut c = client_with_mock(MockTransport::new(HashMap::new()));
+        c.transport = Box::new(Shared(Arc::clone(&mock)));
+        c.init().await.unwrap();
+        let calls = mock.calls();
+        assert_eq!(calls[0].0, "initialize");
+        assert_eq!(calls[0].1["capabilities"], json!({}));
+    }
 }
 
 #[cfg(test)]
@@ -1110,5 +1190,68 @@ mod hardening_tests {
             out.starts_with("[binary resource file:///shot.png (image/png"),
             "{out}"
         );
+    }
+
+    #[cfg(unix)]
+    fn sh_server(script: &str) -> (String, Vec<String>) {
+        ("sh".to_string(), vec!["-c".to_string(), script.to_string()])
+    }
+
+    /// A server's own request reuses ids from its counter: it was taken for
+    /// the reply to our call with the same id (resolving it with null), and
+    /// nothing was ever written back, so the server waited forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_answers_server_requests_and_keeps_them_off_our_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cmd, args) = sh_server(
+            r#"read l
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"s2","method":"sampling/createMessage","params":{}}'
+read r1; read r2
+printf '{"jsonrpc":"2.0","id":1,"result":{"r1":%s,"r2":%s}}\n' "$r1" "$r2"
+cat >/dev/null"#,
+        );
+        let t = StdioTransport::connect(&cmd, &args, &HashMap::new(), dir.path())
+            .await
+            .unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(10), t.call(1, "initialize", json!({})))
+            .await
+            .expect("server never got its answers")
+            .unwrap();
+        assert_eq!(out["r1"]["id"], json!(1));
+        assert_eq!(out["r1"]["result"], json!({}));
+        assert_eq!(out["r2"]["id"], json!("s2"));
+        assert_eq!(out["r2"]["error"]["code"], json!(-32601));
+    }
+
+    /// A call made after the server died sat in the pending map the reader
+    /// had already drained, and hung for the full 60 s request timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_call_after_server_exit_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cmd, args) = sh_server(
+            r#"read l
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'"#,
+        );
+        let t = StdioTransport::connect(&cmd, &args, &HashMap::new(), dir.path())
+            .await
+            .unwrap();
+        t.call(1, "initialize", json!({})).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !t.closed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader never saw EOF");
+        let err = tokio::time::timeout(Duration::from_secs(5), t.call(2, "tools/call", json!({})))
+            .await
+            .expect("call after exit hung")
+            .unwrap_err();
+        assert!(err.to_string().contains("exited"), "{err}");
+        assert!(t.pending.lock().await.is_empty());
     }
 }
