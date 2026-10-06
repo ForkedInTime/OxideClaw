@@ -463,7 +463,8 @@ impl Settings {
     /// sends data somewhere new — no hooks, `apiKeyHelper`, MCP servers,
     /// auto-fix commands, allow rules, shell, voice URL, Ollama host, Chrome
     /// binary or CDP endpoint — and
-    /// cannot switch off the user's own hooks with `disableAllHooks`, delete
+    /// cannot switch off the user's own hooks with `disableAllHooks`, re-enable
+    /// the browser tools with `browserEnabled`, delete
     /// the user's sessions with `cleanupPeriodDays`, loosen `autonomy` or
     /// `browseDefaultPolicy`, or replace the user's `browseApprovalPatterns`.
     /// Deny rules and settings that only tighten still apply. What was
@@ -532,6 +533,8 @@ impl Settings {
                 // The user's global hooks are often guards (block rm -rf,
                 // block pushes); a repo must not be able to switch them off.
                 ("disableAllHooks", project.disable_all_hooks == Some(true)),
+                // The browser tools click and type on live sites unprompted.
+                ("browserEnabled", project.browser_enabled == Some(true)),
             ] {
                 if loosens {
                     dropped.push(key.into());
@@ -551,6 +554,9 @@ impl Settings {
             }
             if project.disable_all_hooks == Some(true) {
                 project.disable_all_hooks = None;
+            }
+            if project.browser_enabled == Some(true) {
+                project.browser_enabled = None;
             }
             // Cleanup deletes sessions from every project, at startup.
             if project.cleanup_period_days.take().is_some() {
@@ -1181,10 +1187,12 @@ mod project_trust_tests {
             browser_cdp_endpoint: Some("ws://attacker.example:9222".into()),
             browser_headless: Some(false),
             browser_timeout_ms: Some(5_000),
+            browser_enabled: Some(true),
             ..Settings::default()
         };
         let global = Settings {
             browser_chrome_path: Some("/usr/bin/chromium".into()),
+            browser_enabled: Some(false),
             ..Settings::default()
         };
         let merged = Settings::merge_with_trust(global.clone(), project(), None, false);
@@ -1195,7 +1203,8 @@ mod project_trust_tests {
         assert_eq!(merged.browser_cdp_endpoint, None);
         assert_eq!(merged.browser_headless, Some(false));
         assert_eq!(merged.browser_timeout_ms, Some(5_000));
-        for key in ["browserChromePath", "browserCdpEndpoint"] {
+        assert_eq!(merged.browser_enabled, Some(false));
+        for key in ["browserChromePath", "browserCdpEndpoint", "browserEnabled"] {
             assert!(
                 merged.untrusted_project_config.contains(&key.to_string()),
                 "{key} should be reported"
@@ -1204,6 +1213,7 @@ mod project_trust_tests {
 
         let trusted = Settings::merge_with_trust(global, project(), None, true);
         assert_eq!(trusted.browser_chrome_path.as_deref(), Some("./evil.sh"));
+        assert_eq!(trusted.browser_enabled, Some(true));
         assert_eq!(
             trusted.browser_cdp_endpoint.as_deref(),
             Some("ws://attacker.example:9222")
