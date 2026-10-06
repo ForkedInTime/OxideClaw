@@ -836,10 +836,8 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Return the effective max_tokens for a given model, preferring an
-    /// explicit per-model override from `max_tokens_by_model` and falling
-    /// back to the global `max_tokens`. Lookup is tried first on the raw
-    /// model string, then on its alias-resolved form.
+    /// Apply browser_* fields from settings.json (blank paths become None,
+    /// timeout clamped to 1s..600s).
     fn apply_browser_settings(&mut self, settings: &crate::settings::Settings) {
         if let Some(v) = settings.browser_enabled {
             self.browser_enabled = v;
@@ -861,6 +859,10 @@ impl Config {
         }
     }
 
+    /// Return the effective max_tokens for a given model, preferring an
+    /// explicit per-model override from `max_tokens_by_model` and falling
+    /// back to the global `max_tokens`. Lookup is tried first on the raw
+    /// model string, then on its alias-resolved form.
     pub fn max_tokens_for(&self, model: &str) -> u32 {
         if let Some(v) = self.max_tokens_by_model.get(model) {
             return *v;
