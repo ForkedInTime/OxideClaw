@@ -394,10 +394,13 @@ fn dogfood_undo_to_session_base_keeps_pre_session_uncommitted_work() {
     let report = restore_to(td.path(), "test", &commits, 0).unwrap();
     assert_eq!(read(td.path(), "README.md"), "base\nuser edit\n");
     assert_eq!(report.saved_edits, None, "the live tree was turn 1's");
+    assert!(
+        !td.path().join("agent.rs").exists(),
+        "the file the undone turn created is gone"
+    );
 
     // A clean tree needs no base commit: HEAD already is the base.
     git(td.path(), &["checkout", "-q", "--", "README.md"]);
-    fs::remove_file(td.path().join("agent.rs")).unwrap();
     assert_eq!(snapshot_base(td.path()).unwrap(), None);
 }
 
