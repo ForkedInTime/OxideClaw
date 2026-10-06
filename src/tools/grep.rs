@@ -121,6 +121,58 @@ impl Tool for GrepTool {
     }
 }
 
+/// The user's `permissions.deny` Read/Grep rules, which this search must
+/// skip inside the directories it walks.
+fn read_deny(ctx: &ToolContext) -> crate::permissions::ReadDeny {
+    ctx.permission_gate
+        .as_ref()
+        .map(|g| g.read_deny("Grep"))
+        .unwrap_or_default()
+}
+
+/// `/`-separated form of a path, for comparing with deny globs.
+fn slash_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// `path` is `dir` or inside it.
+fn within(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    path == dir || dir.is_empty() || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
+}
+
+/// Translate deny globs (absolute) into rg exclusions. rg anchors a
+/// leading-`/` glob at its working directory `base`, so a glob under `base`
+/// becomes `!/<rel>` (plus `!/<rel>/**`, so a denied directory's contents go
+/// too). `None` when a glob could match under `root` but is not under
+/// `base`: rg cannot express it and the caller must use the walker.
+fn rg_exclusions<'a>(
+    patterns: impl Iterator<Item = &'a str>,
+    base: &str,
+    root: &str,
+) -> Option<Vec<String>> {
+    let base = base.trim_end_matches('/');
+    let mut out = Vec::new();
+    for p in patterns {
+        if let Some(rel) = p.strip_prefix(base).and_then(|r| r.strip_prefix('/')) {
+            if rel.is_empty() {
+                return None;
+            }
+            out.push(format!("!/{rel}"));
+            out.push(format!("!/{rel}/**"));
+            continue;
+        }
+        // The literal directory the glob starts with; if neither it nor the
+        // search root contains the other, the glob cannot match anything here.
+        let lit_end = p.find(['*', '?', '[']).unwrap_or(p.len());
+        let lit_dir = p[..lit_end].rsplit_once('/').map_or("", |(d, _)| d);
+        if within(root, lit_dir) || within(lit_dir, root) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput> {
     let mut args: Vec<String> = Vec::new();
 
@@ -186,11 +238,51 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
     {
         return Ok(err);
     }
-    args.push(search_path.to_string_lossy().into_owned());
+    let deny = read_deny(ctx);
+    if deny.denies(&search_path) {
+        return Ok(ToolOutput::error(
+            "Permission denied: a permissions.deny rule covers this path.",
+        ));
+    }
+    let mut search_arg = search_path.clone();
+    let mut rg_cwd = ctx.cwd.clone();
+    if !deny.is_empty() && search_path.is_dir() {
+        // rg matches its globs against paths relative to the directory it
+        // runs in (as the OS reports it, symlinks resolved), so both sides
+        // must be canonical. Windows canonical paths carry a `\\?\` prefix
+        // rg does not use: leave those searches to the walker.
+        if cfg!(windows) {
+            anyhow::bail!("deny rules are enforced by the walker on Windows");
+        }
+        let (Ok(base), Ok(root)) = (
+            std::fs::canonicalize(&ctx.cwd),
+            std::fs::canonicalize(&search_path),
+        ) else {
+            anyhow::bail!("cannot resolve the search root for deny rules");
+        };
+        let Some(excl) = rg_exclusions(deny.patterns(), &slash_path(&base), &slash_path(&root))
+        else {
+            anyhow::bail!("deny rules need the walker for this search root");
+        };
+        let flag = if crate::permissions::PATH_RULES_FOLD_CASE {
+            "--iglob"
+        } else {
+            "--glob"
+        };
+        // Before `--` and the pattern, like the other globs.
+        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        for g in excl.into_iter().rev() {
+            args.insert(at, g);
+            args.insert(at, flag.into());
+        }
+        search_arg = root;
+        rg_cwd = base;
+    }
+    args.push(search_arg.to_string_lossy().into_owned());
 
     let output = Command::new("rg")
         .args(&args)
-        .current_dir(&ctx.cwd)
+        .current_dir(&rg_cwd)
         .output()
         .await?;
 
@@ -229,6 +321,13 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
         None => ctx.cwd.clone(),
     };
 
+    let deny = read_deny(ctx);
+    if deny.denies(&search_path) {
+        return Ok(ToolOutput::error(
+            "Permission denied: a permissions.deny rule covers this path.",
+        ));
+    }
+
     let glob_re = input.glob.as_ref().and_then(|g| {
         let escaped = regex::escape(g)
             .replace(r"\*\*", ".*")
@@ -244,6 +343,10 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
+            // The user's deny rules prune whole directories, like rg's globs.
+            if deny.denies(e.path()) {
+                return false;
+            }
             // Skip VCS metadata and common vendor dirs — matches rg's default
             // ignore set plus .jj / .sl (v2.1.92 fix).
             if e.file_type().is_dir() {
@@ -325,4 +428,96 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
     }
 
     Ok(ToolOutput::success(output))
+}
+
+#[cfg(test)]
+mod rg_exclusion_tests {
+    use super::rg_exclusions;
+
+    #[test]
+    fn globs_under_rgs_directory_are_anchored_there() {
+        let pats = ["/proj/secrets", "/proj/**/.npmrc", "/home/u/.ssh/**"];
+        let got = rg_exclusions(pats.into_iter(), "/proj", "/proj").unwrap();
+        assert_eq!(
+            got,
+            ["!/secrets", "!/secrets/**", "!/**/.npmrc", "!/**/.npmrc/**"]
+        );
+        // A search of a subdirectory still runs in /proj.
+        assert!(rg_exclusions(pats.into_iter(), "/proj", "/proj/src").is_some());
+    }
+
+    #[test]
+    fn a_glob_rg_cannot_anchor_falls_back_to_the_walker() {
+        // Searching ~ from /proj: the ~/.ssh rule applies but is not under /proj.
+        assert!(rg_exclusions(["/home/u/.ssh/**"].into_iter(), "/proj", "/home/u").is_none());
+        assert!(rg_exclusions(["/proj"].into_iter(), "/proj", "/proj").is_none());
+    }
+}
+
+#[cfg(test)]
+mod deny_rule_tests {
+    use super::*;
+    use crate::permissions::{PermissionGate, PermissionState};
+
+    fn setup() -> (tempfile::TempDir, ToolContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("web")).unwrap();
+        std::fs::write(root.join("secrets/prod.yml"), "token: NEEDLE-prod\n").unwrap();
+        std::fs::write(root.join("web/creds.txt"), "NEEDLE-creds\n").unwrap();
+        std::fs::write(root.join("src/a.txt"), "NEEDLE-src\n").unwrap();
+        let deny = vec!["Read(./secrets)".to_string(), "Read(creds.txt)".to_string()];
+        let mut ctx = ToolContext::new(root.to_path_buf());
+        ctx.permission_gate = Some(PermissionGate::new(
+            PermissionState::new(false, &[], &deny).with_cwd(root),
+            false,
+            None,
+        ));
+        (dir, ctx)
+    }
+
+    fn content(ctx_input: serde_json::Value) -> GrepInput {
+        serde_json::from_value(ctx_input).unwrap()
+    }
+
+    fn text(out: &ToolOutput) -> String {
+        out.content
+            .iter()
+            .map(|c| {
+                let super::super::ToolResultContent::Text { text } = c;
+                text.as_str()
+            })
+            .collect()
+    }
+
+    /// `Read(./secrets)` only stopped a Grep whose path named the denied
+    /// directory; a project-wide search printed `secrets/prod.yml`.
+    #[tokio::test]
+    async fn a_directory_search_skips_what_read_rules_deny() {
+        let (_dir, ctx) = setup();
+        let input = content(json!({"pattern": "NEEDLE", "output_mode": "content"}));
+        let mut outs = vec![run_with_regex(&input, &ctx).await.unwrap()];
+        let rg = std::process::Command::new("rg").arg("--version").output();
+        if rg.is_ok_and(|o| o.status.success()) {
+            outs.push(run_with_rg(&input, &ctx).await.unwrap());
+        }
+        for out in &outs {
+            let t = text(out);
+            assert!(t.contains("NEEDLE-src"), "{t}");
+            assert!(!t.contains("NEEDLE-prod"), "{t}");
+            assert!(!t.contains("NEEDLE-creds"), "{t}");
+        }
+
+        let ctx_glob = ctx;
+        let out = super::super::glob::GlobTool
+            .execute(json!({"pattern": "**/*"}), &ctx_glob)
+            .await
+            .unwrap();
+        let t = text(&out);
+        assert!(t.contains("a.txt"), "{t}");
+        assert!(!t.contains("prod.yml"), "{t}");
+        assert!(!t.contains("creds.txt"), "{t}");
+    }
 }

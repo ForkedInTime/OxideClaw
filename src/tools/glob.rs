@@ -79,11 +79,19 @@ impl Tool for GlobTool {
             require_literal_leading_dot: false,
         };
 
+        // What the user's deny rules keep from Glob: the per-call check only
+        // sees the base directory, not the files listed under it.
+        let deny = ctx
+            .permission_gate
+            .as_ref()
+            .map(|g| g.read_deny("Glob"))
+            .unwrap_or_default();
+
         let mut entries: Vec<(SystemTime, String)> = glob_with(&full_pattern, options)
             .map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?
             .filter_map(|entry| {
                 let path = entry.ok()?;
-                if path.is_dir() {
+                if path.is_dir() || deny.denies(&path) {
                     return None;
                 }
                 // Skip files inside VCS metadata or common vendor dirs (v2.1.92: + .jj, .sl).

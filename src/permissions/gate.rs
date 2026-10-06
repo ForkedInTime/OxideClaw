@@ -77,6 +77,11 @@ impl PermissionGate {
         }
     }
 
+    /// See [`PermissionState::read_deny`].
+    pub fn read_deny(&self, tool_name: &str) -> super::ReadDeny {
+        self.state.read_deny(tool_name)
+    }
+
     /// Route every call the deny list lets through to the asker.
     pub fn with_asker_for_all_tools(mut self) -> Self {
         self.ask_every_tool = true;

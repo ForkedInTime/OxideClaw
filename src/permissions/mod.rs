@@ -155,6 +155,65 @@ impl PermissionState {
         CheckResult::Ask
     }
 
+    /// The files `permissions.deny` keeps from `tool_name` (Grep, Glob)
+    /// inside a directory it searches. The per-call check only sees the
+    /// search root, so `Read(./secrets)` does not stop a project-wide Grep
+    /// from printing `secrets/prod.yml`; the tool excludes these instead.
+    pub fn read_deny(&self, tool_name: &str) -> ReadDeny {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = inner
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let real_cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        let home = dirs::home_dir().unwrap_or_default();
+        let real_home = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+        let mut globs: Vec<String> = Vec::new();
+        for rule in &inner.deny_list {
+            let Some((rule_tool, rest)) = rule.split_once('(') else {
+                continue;
+            };
+            if !rule_covers(rule_tool, tool_name) || !rule_is_supported(rule) {
+                continue;
+            }
+            let inner_rule = rest.strip_suffix(')').unwrap_or(rest);
+            for c in [cwd.as_path(), real_cwd.as_path()] {
+                for h in [home.as_path(), real_home.as_path()] {
+                    let anchor = |base: &str| -> String {
+                        let p = match base
+                            .strip_prefix('~')
+                            .filter(|r| r.is_empty() || r.starts_with('/'))
+                        {
+                            Some(rest) => format!("{}{rest}", h.display()),
+                            None => c.join(base).to_string_lossy().into_owned(),
+                        };
+                        glob::Pattern::escape(&normalize_lexically(&p))
+                    };
+                    if let Some(prefix) = inner_rule.strip_prefix("prefix:") {
+                        globs.push(format!("{}*", anchor(prefix)));
+                    } else if let Some(base) = inner_rule.strip_suffix(":*") {
+                        globs.push(anchor(base).trim_end_matches('/').to_string());
+                    } else {
+                        globs.extend(
+                            glob_rule_patterns(inner_rule, c, h, true)
+                                .into_iter()
+                                .map(|p| p.as_str().to_string()),
+                        );
+                    }
+                }
+            }
+        }
+        globs.sort();
+        globs.dedup();
+        ReadDeny {
+            patterns: globs
+                .iter()
+                .filter_map(|g| glob::Pattern::new(g).ok())
+                .collect(),
+        }
+    }
+
     /// Record an "always allow" decision for a tool.
     pub fn record_always_allow(&self, tool_name: &str) {
         self.inner
@@ -164,6 +223,43 @@ impl PermissionState {
             .insert(tool_name.to_string());
     }
 }
+
+/// Absolute globs from the user's deny rules that a directory search must
+/// skip (see [`PermissionState::read_deny`]). A pattern covers a path when
+/// it matches the path or one of its parent directories.
+#[derive(Debug, Clone, Default)]
+pub struct ReadDeny {
+    patterns: Vec<glob::Pattern>,
+}
+
+impl ReadDeny {
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// The globs, absolute and `/`-separated.
+    pub fn patterns(&self) -> impl Iterator<Item = &str> {
+        self.patterns.iter().map(|p| p.as_str())
+    }
+
+    /// Whether `path`, or the file it really reaches, is denied.
+    pub fn denies(&self, path: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let lexical = normalize_lexically(&path.to_string_lossy());
+        let real = normalize_lexically(
+            &crate::tools::resolve_for_sensitivity_check(path).to_string_lossy(),
+        );
+        self.patterns
+            .iter()
+            .any(|p| glob_covers(p, &lexical) || glob_covers(p, &real))
+    }
+}
+
+/// Paths compare case-insensitively where the filesystem does; exposed so a
+/// tool translating [`ReadDeny`] globs for another matcher (rg) agrees.
+pub const PATH_RULES_FOLD_CASE: bool = FOLD_CASE;
 
 /// How one rule relates to one tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
