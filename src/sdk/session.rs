@@ -410,6 +410,15 @@ impl SdkSession {
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
+        // The host's policy and approval see only tool names, so the user's
+        // `permissions.deny` rules are checked here as well. This gate is for
+        // top-level calls only: ctx.permission_gate stays None so Agent
+        // children keep the stricter headless gate instead of inheriting a
+        // bypass.
+        let gate = crate::permissions::PermissionGate::bypass_with_deny(
+            &self.config.permissions_deny,
+            &self.config.cwd,
+        );
 
         let mut results = Vec::new();
 
@@ -454,6 +463,15 @@ impl SdkSession {
                     });
                     continue;
                 }
+            }
+            if let crate::permissions::GateOutcome::Denied(reason) = gate.decide(name, input).await
+            {
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: vec![ToolResultContent::text(reason)],
+                    is_error: Some(true),
+                });
+                continue;
             }
 
             let decision = self.policy_engine.evaluate(name);
@@ -962,5 +980,133 @@ mod hook_tests {
             .await
             .unwrap();
         assert!(!log.exists(), "disableAllHooks must skip hooks");
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::tools::Tool;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Stands in for Bash so a test can see whether it ran without
+    /// executing anything.
+    struct FakeBash(AtomicUsize);
+    #[async_trait]
+    impl Tool for FakeBash {
+        fn name(&self) -> &str {
+            "Bash"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::success("ran"))
+        }
+    }
+
+    fn session(cfg: Config) -> (SdkSession, Arc<FakeBash>) {
+        let bash = Arc::new(FakeBash(AtomicUsize::new(0)));
+        let (ntx, _nrx) = mpsc::unbounded_channel();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let policy = Policy {
+            allow: vec!["Bash".into()],
+            ..Policy::default()
+        };
+        let s = SdkSession::new(
+            cfg,
+            vec![bash.clone()],
+            policy,
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        (s, bash)
+    }
+
+    fn cfg(dir: &std::path::Path) -> Config {
+        Config {
+            api_key: "sk-ant-test".into(),
+            cwd: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    fn call(command: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+        }]
+    }
+
+    fn is_error(r: &[ContentBlock]) -> bool {
+        matches!(
+            &r[0],
+            ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            }
+        )
+    }
+
+    /// The host's policy allowing Bash must not waive the user's own
+    /// `permissions.deny` rules.
+    #[tokio::test]
+    async fn a_settings_deny_rule_beats_a_host_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.permissions_deny = vec!["Bash(git push:*)".into()];
+        let (mut s, bash) = session(c);
+
+        let r = s
+            .execute_tools_with_approval(&call("git push origin main"))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{r:?}");
+        assert_eq!(bash.0.load(Ordering::SeqCst), 0, "denied call must not run");
+
+        let r = s.execute_tools_with_approval(&call("ls")).await.unwrap();
+        assert!(!is_error(&r), "{r:?}");
+        assert_eq!(bash.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hooks_can_block_and_post_tool_hooks_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("post-ran");
+        let mut c = cfg(dir.path());
+        c.hooks = Some(crate::settings::HooksConfig {
+            pre_tool_use: vec![crate::settings::HookEntry {
+                matcher: "Bash".into(),
+                command: "case \"$TOOL_INPUT\" in *rm*) exit 2;; esac".into(),
+            }],
+            post_tool_use: vec![crate::settings::HookEntry {
+                matcher: "Bash".into(),
+                command: format!("touch '{}'", marker.display()),
+            }],
+            ..Default::default()
+        });
+        let (mut s, bash) = session(c);
+
+        let r = s
+            .execute_tools_with_approval(&call("rm -rf x"))
+            .await
+            .unwrap();
+        assert!(is_error(&r), "{r:?}");
+        assert_eq!(bash.0.load(Ordering::SeqCst), 0, "hook-blocked call ran");
+        assert!(!marker.exists());
+
+        let r = s.execute_tools_with_approval(&call("ls")).await.unwrap();
+        assert!(!is_error(&r), "{r:?}");
+        assert!(marker.exists(), "postToolUse hook did not run");
     }
 }
