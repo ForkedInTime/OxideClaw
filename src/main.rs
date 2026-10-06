@@ -1132,9 +1132,8 @@ async fn main() -> Result<()> {
         }
         let prompt = match &config.hooks {
             Some(h) if !config.disable_all_hooks => {
-                let r =
-                    crate::hooks::run_user_prompt_hooks(h, &prompt, "print-mode", &config.cwd)
-                        .await;
+                let r = crate::hooks::run_user_prompt_hooks(h, &prompt, "print-mode", &config.cwd)
+                    .await;
                 if !r.should_continue {
                     anyhow::bail!(
                         "Prompt not sent — blocked by a userPromptSubmit hook: {}",
