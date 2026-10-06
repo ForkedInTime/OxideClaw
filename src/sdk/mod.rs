@@ -539,12 +539,15 @@ impl SdkServer {
 /// This avoids importing `crate::session` which has TUI dependencies not
 /// available in the library crate.
 async fn list_sessions(limit: Option<usize>) -> Result<Vec<SessionInfo>> {
-    let dir = Config::sessions_dir();
+    list_sessions_in(&Config::sessions_dir(), limit).await
+}
+
+async fn list_sessions_in(dir: &std::path::Path, limit: Option<usize>) -> Result<Vec<SessionInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut entries = tokio::fs::read_dir(&dir).await?;
+    let mut entries = tokio::fs::read_dir(dir).await?;
     let mut sessions: Vec<(u64, SessionInfo)> = Vec::new();
 
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -579,8 +582,16 @@ async fn list_sessions(limit: Option<usize>) -> Result<Vec<SessionInfo>> {
             Err(_) => continue,
         };
 
+        // Same order as the TUI's Session::list: last activity, not
+        // creation, so a session worked on today is not buried.
+        let modified = tokio::fs::metadata(dir.join(format!("{id}.jsonl")))
+            .await
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
         sessions.push((
-            meta.created_at,
+            meta.created_at.max(modified),
             SessionInfo {
                 id,
                 name: meta.name,
@@ -590,7 +601,7 @@ async fn list_sessions(limit: Option<usize>) -> Result<Vec<SessionInfo>> {
         ));
     }
 
-    // Sort by created_at descending (most recent first)
+    // Most recently active first
     sessions.sort_by_key(|e| std::cmp::Reverse(e.0));
 
     let limit = limit.unwrap_or(50);
@@ -771,5 +782,40 @@ mod browse_tests {
             }
             other => panic!("expected browse/completed, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::list_sessions_in;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn sessions_are_listed_by_last_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for (id, created) in [("old-but-active", 1_000u64), ("newer", 2_000)] {
+            std::fs::write(
+                d.join(format!("{id}.meta")),
+                serde_json::json!({"id": id, "name": id, "created_at": created}).to_string(),
+            )
+            .unwrap();
+        }
+        let jsonl = d.join("old-but-active.jsonl");
+        std::fs::write(&jsonl, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&jsonl)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(3_000))
+            .unwrap();
+
+        let ids: Vec<String> = list_sessions_in(d, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["old-but-active", "newer"]);
     }
 }

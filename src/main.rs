@@ -1160,11 +1160,7 @@ async fn main() -> Result<()> {
     } else if let Some(id) = cli.session {
         Some(id)
     } else if cli.resume || cli.continue_session {
-        // Find most recent session ID
-        match session::Session::list().await {
-            Ok(list) if !list.is_empty() => Some(list[0].id.clone()),
-            _ => None,
-        }
+        session::Session::most_recent().await
     } else {
         None
     };

@@ -197,15 +197,18 @@ impl Session {
         parse_message_lines(id, &content)
     }
 
-    /// List all saved sessions, newest first.
+    /// List all saved sessions, most recently active first.
     /// Backfills empty previews from session messages (for older sessions).
     pub async fn list() -> Result<Vec<SessionMeta>> {
-        let dir = crate::config::Config::sessions_dir();
+        Self::list_in(&crate::config::Config::sessions_dir()).await
+    }
+
+    async fn list_in(dir: &std::path::Path) -> Result<Vec<SessionMeta>> {
         if !dir.exists() {
             return Ok(Vec::new());
         }
 
-        let mut entries = fs::read_dir(&dir).await?;
+        let mut entries = fs::read_dir(dir).await?;
         let mut sessions: Vec<(u64, SessionMeta)> = Vec::new();
 
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -216,24 +219,60 @@ impl Session {
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
-                if !id.is_empty()
-                    && let Ok(mut meta) = SessionMeta::load(&id).await
-                {
-                    // Backfill empty preview from session messages
-                    if meta.preview.is_empty()
-                        && let Ok(msgs) = Self::load_messages(&id).await
-                        && let Some(preview) = first_user_preview(&msgs)
-                    {
-                        meta.preview = preview;
-                        let _ = meta.save().await;
-                    }
-                    sessions.push((meta.created_at, meta));
+                let Some(mut meta) = fs::read_to_string(&path)
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<SessionMeta>(&s).ok())
+                else {
+                    continue;
+                };
+                if id.is_empty() {
+                    continue;
                 }
+                let jsonl = dir.join(format!("{id}.jsonl"));
+                // Backfill empty preview from session messages
+                if meta.preview.is_empty()
+                    && let Ok(content) = fs::read_to_string(&jsonl).await
+                    && let Ok(msgs) = parse_message_lines(&id, &content)
+                    && let Some(preview) = first_user_preview(&msgs)
+                {
+                    meta.preview = preview;
+                    if let Ok(body) = serde_json::to_string(&meta) {
+                        let _ = atomic_write(&path, body.as_bytes()).await;
+                    }
+                }
+                // created_at never changes, so ordering by it alone put a
+                // session worked on today below one merely opened later.
+                let modified = fs::metadata(&jsonl)
+                    .await
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                sessions.push((meta.created_at.max(modified), meta));
             }
         }
 
         sessions.sort_by_key(|e| std::cmp::Reverse(e.0));
         Ok(sessions.into_iter().map(|(_, m)| m).collect())
+    }
+
+    /// The session `--continue` / `--resume` reopens: the most recently
+    /// active one that has messages. Every launch writes a `.meta` before
+    /// the first prompt, so a launch-and-quit leaves an empty session that
+    /// would otherwise win.
+    pub async fn most_recent() -> Option<String> {
+        Self::most_recent_in(&crate::config::Config::sessions_dir()).await
+    }
+
+    async fn most_recent_in(dir: &std::path::Path) -> Option<String> {
+        for meta in Self::list_in(dir).await.ok()? {
+            let jsonl = dir.join(format!("{}.jsonl", meta.id));
+            if fs::metadata(&jsonl).await.is_ok_and(|m| m.len() > 0) {
+                return Some(meta.id);
+            }
+        }
+        None
     }
 
     /// Delete a session (both .jsonl and .meta).
@@ -911,5 +950,77 @@ mod durability_tests {
         let c = std::fs::read_to_string(&p).unwrap();
         std::fs::write(&p, c.replace('\n', "\n\n")).unwrap();
         assert_eq!(parse(d.path(), "s").unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod continue_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn meta(dir: &std::path::Path, id: &str, created_at: u64) {
+        let m = SessionMeta {
+            id: id.into(),
+            name: id.into(),
+            created_at,
+            preview: String::new(),
+            tags: Vec::new(),
+            auto_commits: Vec::new(),
+            undo_position: 0,
+            base_commit: None,
+        };
+        std::fs::write(
+            dir.join(format!("{id}.meta")),
+            serde_json::to_string(&m).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn jsonl(dir: &std::path::Path, id: &str, modified: u64) {
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}\n",
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(modified))
+            .unwrap();
+    }
+
+    /// `-c` took the newest-created session: after "work in A, quit; open
+    /// and quit B" it reopened the empty B, and a session resumed and worked
+    /// on today ranked below one created later.
+    #[tokio::test]
+    async fn continue_picks_the_last_active_session_with_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        meta(d, "worked-today", 1_000);
+        jsonl(d, "worked-today", 5_000);
+        meta(d, "opened-and-quit", 6_000);
+        meta(d, "created-later", 4_000);
+        jsonl(d, "created-later", 4_000);
+
+        let order: Vec<String> = Session::list_in(d)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(order, ["opened-and-quit", "worked-today", "created-later"]);
+        assert_eq!(
+            Session::most_recent_in(d).await.as_deref(),
+            Some("worked-today")
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_with_only_empty_sessions_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        meta(dir.path(), "empty", 1_000);
+        assert_eq!(Session::most_recent_in(dir.path()).await, None);
     }
 }
