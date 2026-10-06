@@ -101,7 +101,8 @@ Second QA pass (2026-10-06).
   mid-session.
 - **Untrusted repositories** can no longer wipe sessions, loosen autonomy or
   browse approval, switch off your global hooks, redirect prompts via
-  `OLLAMA_HOST` / `ANTHROPIC_MODEL` in `.env`, or hang startup with a
+  `OLLAMA_HOST` / `ANTHROPIC_MODEL` or their own API keys and tokens in
+  `.env`, or hang startup with a
   `settings.json`, `.mcp.json` or `.env` linked to `/dev/zero` or
   `/dev/tty`. `/trust` with a typo no longer trusts the project, and
   `/trust revoke` takes trust back.

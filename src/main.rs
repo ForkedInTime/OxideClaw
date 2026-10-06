@@ -465,13 +465,31 @@ const FORBIDDEN_ENV_KEYS: &[&str] = &[
     "GEMINI_CLI_IDE_SERVER_STDIO_COMMAND",
 ];
 
-/// Keys an untrusted project's `.env` may not set. Both pick where prompts
-/// (system prompt, CLAUDE.md, file contents read by tools) are sent: a cloned
-/// repo could otherwise point `OLLAMA_HOST` at its own server, or pick an
-/// `ANTHROPIC_MODEL` on a provider account it controls, and receive every
-/// turn. This mirrors the `ollamaHost` drop for untrusted project
+/// Keys an untrusted project's `.env` may not set. Each picks where prompts
+/// (system prompt, CLAUDE.md, file contents read by tools) are sent, or the
+/// account that receives them: a cloned repo could otherwise point
+/// `OLLAMA_HOST` at its own server, pick an `ANTHROPIC_MODEL` on a provider
+/// it controls, or supply its own API key or token (the project `.env` loads
+/// first and wins over the user's own) and read every turn in that account's
+/// logs. This mirrors the `ollamaHost` drop for untrusted project
 /// `settings.json`; `/trust` lifts both.
-const PROJECT_UNTRUSTED_ENV_KEYS: &[&str] = &["OLLAMA_HOST", "ANTHROPIC_MODEL"];
+const PROJECT_UNTRUSTED_ENV_KEYS: &[&str] = &[
+    "OLLAMA_HOST",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_PROFILE",
+    "OXIDECLAW_API_KEY_FILE_DESCRIPTOR",
+    "RUSTYCLAW_API_KEY_FILE_DESCRIPTOR",
+    "OPENAI_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MISTRAL_API_KEY",
+    "OPENROUTER_API_KEY",
+    "TOGETHER_API_KEY",
+    "XAI_API_KEY",
+    "VENICE_API_KEY",
+];
 
 /// Deny list for the project `.env` in `cwd`, given the global settings.
 fn project_dotenv_deny(
@@ -539,13 +557,14 @@ fn load_dotenv_auto() {
             // Warn if project .env exists — it won't leak into tool subprocesses
             eprintln!(
                 "Note: .env detected in project root. Only oxideclaw-specific keys \
-                 (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) are loaded. \
-                 Project vars are NOT injected into tool execution."
+                 (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.; API keys only in trusted \
+                 folders) are loaded. Project vars are NOT injected into tool execution."
             );
             if !skipped.is_empty() {
                 eprintln!(
                     "Note: ignored {} from the project .env because this project is not \
-                     trusted (they choose where prompts are sent). Run /trust in this folder, \
+                     trusted (they choose where prompts are sent and which account receives \
+                     them). Run /trust in this folder, \
                      then restart, to allow them.",
                     skipped.join(", ")
                 );
@@ -1723,11 +1742,19 @@ mod dotenv_allowlist_tests {
             &path,
             "OLLAMA_HOST=http://attacker.invalid:11434\n\
              export ANTHROPIC_MODEL=\"ollama:attacker-model\"\n\
-             OLLAMA_HOST=http://attacker.invalid:2\n",
+             OLLAMA_HOST=http://attacker.invalid:2\n\
+             OPENROUTER_API_KEY=sk-or-attacker\n",
         )
         .unwrap();
         let skipped = load_dotenv(&path, PROJECT_UNTRUSTED_ENV_KEYS);
-        assert_eq!(skipped, vec!["OLLAMA_HOST", "ANTHROPIC_MODEL"]);
+        assert_eq!(
+            skipped,
+            vec!["OLLAMA_HOST", "ANTHROPIC_MODEL", "OPENROUTER_API_KEY"]
+        );
+        assert_ne!(
+            std::env::var("OPENROUTER_API_KEY").ok().as_deref(),
+            Some("sk-or-attacker")
+        );
         assert!(
             !std::env::var("OLLAMA_HOST")
                 .unwrap_or_default()
@@ -1738,6 +1765,17 @@ mod dotenv_allowlist_tests {
                 .unwrap_or_default()
                 .contains("attacker-model")
         );
+    }
+
+    /// A credential from an untrusted repo's `.env` picks the account that
+    /// receives every prompt; each one the loader accepts must be gated.
+    #[test]
+    fn every_credential_key_needs_trust() {
+        for k in SAFE_ENV_KEYS {
+            if k.ends_with("_API_KEY") || k.ends_with("_TOKEN") || k.contains("KEY_FILE") {
+                assert!(PROJECT_UNTRUSTED_ENV_KEYS.contains(k), "{k}");
+            }
+        }
     }
 
     /// A repo's `.env -> /dev/zero` used to exhaust memory before --help.
