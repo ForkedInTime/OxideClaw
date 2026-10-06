@@ -137,6 +137,11 @@ impl Tool for BrowserNavigateTool {
         // (up to timeout_ms) does not hold the session lock.
         let client = clone_client(&self.session).await?;
         let (title, status) = browser::actions::navigate(&client, url, self.timeout_ms).await?;
+        // Chrome follows redirects itself; record where the page actually
+        // landed, which the approval gate's URL patterns match against.
+        let final_url = browser::actions::current_url(&client)
+            .await
+            .unwrap_or_else(|| url.to_string());
         let dialogs = dialog_trailer(&self.session).await;
 
         // Snapshot afterwards. This also uses the client, not the session,
@@ -145,7 +150,7 @@ impl Tool for BrowserNavigateTool {
             Ok((tree, refs, names)) => {
                 // Brief re-lock to publish the post-navigation state.
                 let mut session = self.session.lock().await;
-                session.current_url = url.to_string();
+                session.current_url = final_url.clone();
                 session.current_title = title.clone();
                 session.set_refs_with_names(refs, names);
                 session.last_page_text = tree.clone();
@@ -155,14 +160,14 @@ impl Tool for BrowserNavigateTool {
                 // Snapshot failed (e.g. page still settling). Still publish
                 // the navigation result so the model sees we made progress.
                 let mut session = self.session.lock().await;
-                session.current_url = url.to_string();
+                session.current_url = final_url.clone();
                 session.current_title = title.clone();
                 format!("(snapshot unavailable: {e})")
             }
         };
 
         Ok(ToolOutput::success(format!(
-            "Navigated to: {url}\nTitle: {title}\nStatus: {status}{dialogs}\n\nAccessibility snapshot:\n{tree}"
+            "Navigated to: {final_url}\nTitle: {title}\nStatus: {status}{dialogs}\n\nAccessibility snapshot:\n{tree}"
         )))
     }
 }
@@ -192,10 +197,16 @@ impl Tool for BrowserSnapshotTool {
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let client = clone_client(&self.session).await?;
         let (tree, refs, names) = browser::snapshot::take_snapshot(&client).await?;
+        // A redirect or JS navigation may have moved the page since the last
+        // tool recorded its URL.
+        let live_url = browser::actions::current_url(&client).await;
         {
             let mut s = self.session.lock().await;
             s.set_refs_with_names(refs, names);
             s.last_page_text = tree.clone();
+            if let Some(u) = live_url {
+                s.current_url = u;
+            }
         }
         Ok(ToolOutput::success(tree))
     }
@@ -479,6 +490,11 @@ impl Tool for BrowserWaitTool {
         // lock for the full timeout window.
         let client = clone_client(&self.session).await?;
         let result = browser::actions::wait_for(&client, selector, timeout_ms).await?;
+        // Waiting is how the model rides out a redirect chain; record where
+        // it ended up.
+        if let Some(u) = browser::actions::current_url(&client).await {
+            self.session.lock().await.current_url = u;
+        }
         Ok(ToolOutput::success(result))
     }
 }

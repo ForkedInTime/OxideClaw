@@ -302,6 +302,40 @@ impl ApprovalGateMiddleware {
     pub fn is_user_denied(&self) -> bool {
         self.user_denied.load(Ordering::SeqCst)
     }
+
+    /// The page's URL as Chrome sees it now. The cached value is what the
+    /// last tool recorded, but Chrome follows redirects on its own: an OAuth
+    /// "Sign in" link lands on /oauth/authorize while the cache still holds
+    /// the app's URL, so URL patterns never matched the consent page.
+    async fn live_url(&self) -> String {
+        let client = match &self.browser_session {
+            // Clone the client out: the tool about to run re-locks the session.
+            Some(s) => s.lock().await.client().ok().cloned(),
+            None => None,
+        };
+        let live = match client {
+            // CdpClient::send waits up to 30s; a hung page must not stall
+            // every gated action, so fall back to the cache instead.
+            Some(c) => tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::browser::actions::current_url(&c),
+            )
+            .await
+            .ok()
+            .flatten(),
+            None => None,
+        };
+        match live {
+            Some(u) => {
+                if let Some(s) = &self.browser_session {
+                    s.lock().await.current_url = u.clone();
+                }
+                *self.current_url.lock().await = u.clone();
+                u
+            }
+            None => self.current_url.lock().await.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -326,7 +360,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
             return MiddlewareVerdict::Allow;
         }
 
-        let url = self.current_url.lock().await.clone();
+        let url = self.live_url().await;
         // `ref_or_selector` is the element identifier, with refs normalized to
         // "@eN": the tools also accept a bare "eN", and the raw spelling would
         // skip name resolution below (so "Delete account" never matched) and
@@ -674,5 +708,81 @@ mod price_signal_tests {
             drop(mw);
             assert_eq!(host.await.unwrap(), 1, "{tool} on bare ref must prompt");
         }
+    }
+
+    /// Minimal CDP endpoint: answers every command, and reports `href` as
+    /// the page location (what Chrome shows after following a redirect).
+    async fn fake_cdp(href: &'static str) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let cmd: serde_json::Value = serde_json::from_str(&t).unwrap();
+                let result = if cmd["method"] == "Runtime.evaluate" {
+                    json!({"result": {"type": "string", "value": href}})
+                } else {
+                    json!({})
+                };
+                let reply = json!({"id": cmd["id"], "result": result}).to_string();
+                if ws.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// browser_navigate recorded the requested URL, so after a redirect to
+    /// an OAuth consent page the URL patterns matched the stale app URL and
+    /// a click on "Authorize octocat" (no button pattern) went through.
+    #[tokio::test]
+    async fn url_patterns_see_the_page_after_a_redirect() {
+        let consent = "https://github.com/login/oauth/authorize?client_id=x";
+        let session = Arc::new(tokio::sync::Mutex::new(
+            crate::browser::BrowserSession::default(),
+        ));
+        {
+            let mut s = session.lock().await;
+            s.connect(&fake_cdp(consent).await).await.unwrap();
+            s.current_url = "https://app.example/login".into();
+            s.set_refs_with_names(
+                std::collections::HashMap::from([("@e1".to_string(), 1i64)]),
+                std::collections::HashMap::from([(
+                    "@e1".to_string(),
+                    "Authorize octocat".to_string(),
+                )]),
+            );
+        }
+        let shared = Arc::new(tokio::sync::Mutex::new(
+            "https://app.example/login".to_string(),
+        ));
+        let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+        let mw = ApprovalGateMiddleware::new(
+            ApprovalGate::default(),
+            BrowsePolicy::Pattern,
+            shared.clone(),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            false,
+        )
+        .with_browser_session(Some(session.clone()));
+        let host = tokio::spawn(async move {
+            let mut n = 0;
+            while let Some(p) = rx.recv().await {
+                n += 1;
+                let _ = p.reply.send(true);
+            }
+            n
+        });
+        mw.before_tool("browser_click", &json!({"ref": "@e1"}))
+            .await;
+        drop(mw);
+        assert_eq!(host.await.unwrap(), 1, "the consent URL must prompt");
+        assert_eq!(*shared.lock().await, consent);
+        assert_eq!(session.lock().await.current_url, consent);
     }
 }
