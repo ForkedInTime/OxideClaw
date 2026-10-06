@@ -595,8 +595,62 @@ fn load_dotenv_auto() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Exit status owed to a SIGINT/SIGTERM that ended -p, --headless or acp.
+static SIGNAL_EXIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+/// Runs `fut` to completion, or returns None once SIGINT/SIGTERM arrives.
+/// Bash/PowerShell tools and hooks run in their own process groups, so the
+/// terminal's Ctrl-C never reaches them, and dying on the default signal
+/// action skips the destructors that kill them: they ran on as orphans.
+/// Catching the signal lets `main` drop every task before exiting.
+async fn until_signal<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Registered before `fut` is first polled, so no tool can start
+        // while the default action is still in place.
+        let (Ok(mut int), Ok(mut term)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            return Some(fut.await);
+        };
+        let code = tokio::select! {
+            out = fut => return Some(out),
+            _ = int.recv() => 130,
+            _ = term.recv() => 143,
+        };
+        let _ = SIGNAL_EXIT.set(code);
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            out = fut => Some(out),
+            _ = tokio::signal::ctrl_c() => {
+                let _ = SIGNAL_EXIT.set(130);
+                None
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run());
+    if let Some(&code) = SIGNAL_EXIT.get() {
+        // Shutdown drops every task (SDK/ACP sessions included), so the
+        // guards on tool and hook processes kill them. The timeout covers a
+        // blocking stdin read that would otherwise hold the exit until input.
+        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        std::process::exit(code);
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     // Respect NO_COLOR (https://no-color.org/) and dumb terminals so piped
     // output / CI logs / `less` don't get ANSI escape codes.
     if std::env::var_os("NO_COLOR").is_some()
@@ -1071,14 +1125,24 @@ async fn main() -> Result<()> {
     // `oxideclaw acp`: Agent Client Protocol over stdio
     if matches!(cli.command, Some(Commands::Acp)) {
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        crate::acp::AcpServer::run(config, stdin, tokio::io::stdout()).await?;
+        if let Some(r) = until_signal(crate::acp::AcpServer::run(
+            config,
+            stdin,
+            tokio::io::stdout(),
+        ))
+        .await
+        {
+            r?;
+        }
         return Ok(());
     }
 
     // --headless mode: long-running SDK server
     if cli.headless {
         let transport = crate::sdk::transport::stdio::StdioTransport::new();
-        crate::sdk::SdkServer::run(config, transport).await?;
+        if let Some(r) = until_signal(crate::sdk::SdkServer::run(config, transport)).await {
+            r?;
+        }
         return Ok(());
     }
 
@@ -1205,7 +1269,10 @@ async fn main() -> Result<()> {
             }
             _ => prompt,
         };
-        engine.query(prompt).await?;
+        match until_signal(engine.query(prompt)).await {
+            Some(r) => r?,
+            None => return Ok(()),
+        }
         // Overwrite, not append: compaction may have rewritten the history.
         if let Some(s) = resumed
             && !config.no_session_persistence
