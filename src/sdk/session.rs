@@ -72,6 +72,10 @@ pub struct SdkSession {
     policy_engine: Arc<PolicyEngine>,
     capabilities: Capabilities,
     tools_used_this_turn: Vec<String>,
+    /// A skill loaded this turn with `disableSkillShellExecution` set: shell
+    /// tools are refused until the turn ends. On the session because each
+    /// tool round builds a new gate.
+    skill_shell_blocked: bool,
     tools_executed_count: u32,
     read_cache: ReadCache,
     notif_tx: mpsc::UnboundedSender<SdkNotification>,
@@ -127,6 +131,7 @@ impl SdkSession {
             policy_engine: Arc::new(PolicyEngine::new(policy, interactive)),
             capabilities,
             tools_used_this_turn: Vec::new(),
+            skill_shell_blocked: false,
             tools_executed_count: 0,
             read_cache: new_read_cache(),
             notif_tx,
@@ -158,6 +163,7 @@ impl SdkSession {
 
         // 1. Reset per-turn state
         self.tools_used_this_turn.clear();
+        self.skill_shell_blocked = false;
 
         // 2. Retrieve RAG context (silently ignore errors). It goes in the
         // user turn: `system` must stay byte-identical for the whole
@@ -461,7 +467,7 @@ impl SdkSession {
         ctx.budget_remaining_usd = self.cost_tracker.remaining();
         // The host's policy and approval see only tool names, so the user's
         // `permissions.deny` rules are checked here as well.
-        let gate = crate::permissions::PermissionGate::bypass_with_deny(
+        let mut gate = crate::permissions::PermissionGate::bypass_with_deny(
             &self.config.permissions_deny,
             &self.config.cwd,
         );
@@ -484,6 +490,13 @@ impl SdkSession {
             )
             .with_asker_for_all_tools(),
         );
+        if self.skill_shell_blocked {
+            gate = gate.with_skill_shell_blocked();
+            ctx.permission_gate = ctx
+                .permission_gate
+                .take()
+                .map(|g| g.with_skill_shell_blocked());
+        }
 
         let mut results = Vec::new();
 
@@ -656,6 +669,22 @@ impl SdkSession {
                 self.child_tokens.1 += u.output_tokens;
             }
             ctx.budget_remaining_usd = self.cost_tracker.remaining();
+
+            // Same rule as the TUI and `-p`: once a skill is loaded with
+            // disableSkillShellExecution set, no shell for the rest of the
+            // turn, including later calls in this round and Agent children.
+            if name == "Skill"
+                && !output.is_error
+                && self.config.disable_skill_shell_execution
+                && !self.skill_shell_blocked
+            {
+                self.skill_shell_blocked = true;
+                gate = gate.with_skill_shell_blocked();
+                ctx.permission_gate = ctx
+                    .permission_gate
+                    .take()
+                    .map(|g| g.with_skill_shell_blocked());
+            }
 
             let duration_ms = tool_start.elapsed().as_millis() as u64;
             let success = !output.is_error;
@@ -1180,6 +1209,63 @@ mod guard_tests {
                 ..
             }
         )
+    }
+
+    struct FakeSkill;
+    #[async_trait]
+    impl Tool for FakeSkill {
+        fn name(&self) -> &str {
+            "Skill"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+            Ok(ToolOutput::success("skill loaded"))
+        }
+    }
+
+    /// disableSkillShellExecution was wired into the TUI and `-p` only: a
+    /// skill loaded in a --headless or ACP session could still run Bash.
+    #[tokio::test]
+    async fn a_skill_turn_refuses_shell_in_sdk_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.disable_skill_shell_execution = true;
+        let (mut s, bash) = session(c);
+        s.tools.push(Arc::new(FakeSkill));
+        s.policy_engine = Arc::new(PolicyEngine::new(
+            Policy {
+                allow: vec!["Bash".into(), "Skill".into()],
+                ..Policy::default()
+            },
+            false,
+        ));
+        let calls = vec![
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Skill".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+        ];
+        let r = s.execute_tools_with_approval(&calls).await.unwrap();
+        assert!(is_error(&r[1..]), "{r:?}");
+        // Still blocked in a later round of the same turn.
+        let r = s.execute_tools_with_approval(&call("ls")).await.unwrap();
+        assert!(is_error(&r), "{r:?}");
+        assert_eq!(
+            bash.0.load(Ordering::SeqCst),
+            0,
+            "shell ran in a skill turn"
+        );
     }
 
     /// The host's policy allowing Bash must not waive the user's own
