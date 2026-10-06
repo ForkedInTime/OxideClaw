@@ -140,11 +140,13 @@ pub fn strict_check(cmd: &str) -> Option<String> {
     ];
     for (pattern, desc) in patterns {
         // Patterns are compared lowercased (the `chmod -R` ones never matched
-        // lowercased input). One aimed at `/` must hit `/` itself, not any
-        // absolute path: a bare substring blocked `rm -rf /tmp/build`.
+        // lowercased input). One aimed at root (` /`) must hit `/` itself, not
+        // any absolute path: a bare substring blocked `rm -rf /tmp/build`.
+        // Prefix patterns like `of=/dev/` still match as substrings, since
+        // every real target has a device name after the slash.
         let pattern = pattern.to_lowercase();
         let hit = low.match_indices(&pattern).any(|(at, m)| {
-            !pattern.ends_with('/')
+            !pattern.ends_with(" /")
                 || low[at + m.len()..]
                     .chars()
                     .next()
@@ -209,16 +211,16 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
 
 // ── firejail wrapper ──────────────────────────────────────────────────────────
 
-pub fn firejail_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
-    let cwd_quoted = shell_quote(&cwd.display().to_string());
+// firejail has no `--chdir` (it rejects unknown options and exits 1); the
+// jail inherits the caller's cwd, which bash.rs sets with `current_dir`.
+pub fn firejail_wrap(command: &str, _cwd: &std::path::Path, allow_network: bool) -> String {
     // `--net=none` is firejail's equivalent of bwrap's `--unshare-net`. Without
     // it, firejail mode silently ignored `sandbox_allow_network` and always had
     // full egress, so the same setting meant different things in the two modes.
     let net_flag = if allow_network { "" } else { "--net=none " };
     format!(
-        "firejail --quiet --private-tmp --noroot {net_flag}--chdir={cwd} -- /bin/sh -c {cmd}",
+        "firejail --quiet --private-tmp --noroot {net_flag}-- /bin/sh -c {cmd}",
         net_flag = net_flag,
-        cwd = cwd_quoted,
         cmd = shell_quote(command),
     )
 }
@@ -498,6 +500,9 @@ mod tests {
         assert!(strict_check("rm -rf / --no-preserve-root").is_some());
         assert!(strict_check("sudo rm -rf /*").is_some());
         assert!(strict_check("chmod -R 777 /").is_some());
+        assert!(strict_check("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(strict_check("dd if=/dev/urandom of=/dev/nvme0n1 bs=1M").is_some());
+        assert!(strict_check("chmod -R 777 /srv/x").is_none());
         assert!(strict_check("rm -rf /tmp/build").is_none());
         assert!(strict_check("rm -rf /home/u/proj/target && ls").is_none());
         assert!(
@@ -525,8 +530,12 @@ mod tests {
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
         let wrapped = firejail_wrap("echo 'pwn'", Path::new("/tmp/a b"), true);
         assert!(
-            wrapped.contains(r#"'/tmp/a b'"#),
-            "cwd must stay quoted: {wrapped}"
+            wrapped.contains(r#"'echo '\''pwn'\'''"#),
+            "command must stay quoted: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("--chdir"),
+            "firejail has no --chdir option: {wrapped}"
         );
     }
 
