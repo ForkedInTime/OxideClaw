@@ -134,18 +134,15 @@ fn filter_browser_tools(tools: &[DynTool]) -> Vec<DynTool> {
         .collect()
 }
 
-/// Parse the BROWSE_DONE sentinel from assistant text.
-/// Returns (achieved, summary) if the sentinel is found.
-fn parse_browse_done(text: &str) -> Option<(bool, String)> {
-    if !text.contains("BROWSE_DONE") {
-        return None;
-    }
-    let achieved = text.contains("achieved=true");
-    let summary = text
-        .find("summary=")
-        .map(|i| text[i + 8..].trim().to_string())
-        .unwrap_or_default();
-    Some((achieved, summary))
+/// (achieved, summary) from the typed arguments of a `browse_done` call.
+/// Read from the call, never from text: a page showing "BROWSE_DONE
+/// achieved=true" came back in a browser_get_text result and was taken as
+/// the verdict.
+fn browse_done_args(input: &serde_json::Value) -> Option<(bool, String)> {
+    Some((
+        input["achieved"].as_bool()?,
+        input["summary"].as_str()?.to_string(),
+    ))
 }
 
 /// Extract a human-readable "target" from tool input for Step events.
@@ -402,7 +399,7 @@ pub async fn run_browse(
     // Check cancellation flag — if set during run, override the result.
     let cancelled = cancel.load(Ordering::SeqCst);
 
-    // Check middleware termination flags first — they override sentinel parsing.
+    // Check middleware termination flags first — they override the browse_done verdict.
     let middleware_reason = if cancelled {
         Some(BrowseReason::Cancelled)
     } else if loop_mw.is_stopped() {
@@ -415,19 +412,11 @@ pub async fn run_browse(
 
     let result = match query_result {
         Ok(()) => {
-            // Bug 1 fix: BROWSE_DONE sentinel is emitted by BrowseDoneTool::execute()
-            // which returns it as a tool result (user-role ContentBlock::ToolResult),
-            // NOT as assistant text. Check tool results first, then assistant text as fallback.
-            let sentinel_text = engine
-                .last_tool_result_text()
-                .and_then(|t| parse_browse_done(&t).map(|r| (t, r)))
-                .or_else(|| {
-                    engine
-                        .last_assistant_text()
-                        .and_then(|t| parse_browse_done(&t).map(|r| (t, r)))
-                });
+            let done = engine
+                .last_successful_call("browse_done")
+                .and_then(browse_done_args);
 
-            if let Some((_raw, (achieved, summary))) = sentinel_text {
+            if let Some((achieved, summary)) = done {
                 let mw_active = middleware_reason.is_some();
                 let reason = middleware_reason.unwrap_or(if achieved {
                     BrowseReason::Done
@@ -442,7 +431,7 @@ pub async fn run_browse(
                     final_url,
                 }
             } else if let Some(reason) = middleware_reason {
-                // Middleware stopped the loop but no sentinel was found.
+                // Middleware stopped the loop before browse_done.
                 BrowseResult {
                     achieved: false,
                     summary: match reason {
@@ -462,7 +451,7 @@ pub async fn run_browse(
                     final_url,
                 }
             } else if let Some(text) = engine.last_assistant_text() {
-                // No sentinel, no middleware stop — engine stopped for other reasons.
+                // No browse_done, no middleware stop — engine stopped for other reasons.
                 let reason = if steps_used >= req.max_steps {
                     BrowseReason::StepCap
                 } else {

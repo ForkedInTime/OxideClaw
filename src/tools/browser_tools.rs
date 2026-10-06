@@ -542,8 +542,9 @@ impl Tool for BrowserConsoleTool {
 
 // ── browse_done ──────────────────────────────────────────────────────────────
 
-/// Sentinel tool the model calls to signal the end of an autonomous `/browse`
-/// run. Returns a `BROWSE_DONE` string the orchestrator parses to exit the loop.
+/// Tool the model calls to end an autonomous `/browse` run. The browse engine
+/// stops after a successful call and reports the call's own `achieved` and
+/// `summary` arguments; the returned text is only an acknowledgement.
 pub struct BrowseDoneTool;
 
 impl BrowseDoneTool {

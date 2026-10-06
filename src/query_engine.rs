@@ -41,6 +41,9 @@ pub struct QueryEngine {
     gate: crate::permissions::PermissionGate,
     /// Nesting level for `Agent` launches; published to tools via ToolContext.
     agent_depth: u8,
+    /// Tool whose successful call ends `query()` once that turn's results
+    /// are recorded (`browse_done` for browse runs). None everywhere else.
+    stop_after_tool: Option<&'static str>,
 }
 
 impl QueryEngine {
@@ -97,6 +100,7 @@ impl QueryEngine {
             turns: 0,
             gate,
             agent_depth: 0,
+            stop_after_tool: None,
         })
     }
 
@@ -389,12 +393,20 @@ impl QueryEngine {
                 Some(StopReason::ToolUse) => {
                     // Execute all tool calls in this response
                     let tool_results = self.execute_tools(&response.content).await?;
+                    let stop = self
+                        .stop_after_tool
+                        .is_some_and(|name| ran_ok(name, &response.content, &tool_results));
 
                     // Append tool results as a user message
                     self.messages.push(Message {
                         role: Role::User,
                         content: tool_results,
                     });
+                    // Stop only after the results are in, so every tool_use
+                    // in the history keeps its tool_result.
+                    if stop {
+                        break;
+                    }
                     // Continue the loop to get Claude's next response
                 }
                 Some(StopReason::StopSequence) => break,
@@ -708,6 +720,20 @@ fn truncate_json(v: &serde_json::Value, max_len: usize) -> String {
     }
 }
 
+/// Whether `content` called `name` and its result in `results` is not an error.
+fn ran_ok(name: &str, content: &[ContentBlock], results: &[ContentBlock]) -> bool {
+    content.iter().any(|b| {
+        matches!(b, ContentBlock::ToolUse { id, name: n, .. } if n == name && result_ok(id, results))
+    })
+}
+
+fn result_ok(tool_use_id: &str, results: &[ContentBlock]) -> bool {
+    results.iter().any(|b| {
+        matches!(b, ContentBlock::ToolResult { tool_use_id: t, is_error, .. }
+            if t == tool_use_id && *is_error != Some(true))
+    })
+}
+
 impl QueryEngine {
     /// Create a QueryEngine preconfigured for autonomous browse mode.
     /// Overrides the system prompt and injects the middleware chain.
@@ -721,6 +747,9 @@ impl QueryEngine {
         engine.system_prompt = system_prompt;
         engine.middlewares = middlewares;
         engine.quiet = true;
+        // browse_done is the model saying it is finished; carrying on let
+        // later actions run and buried its verdict under their results.
+        engine.stop_after_tool = Some("browse_done");
         Ok(engine)
     }
 
@@ -752,31 +781,26 @@ impl QueryEngine {
         })
     }
 
-    /// Extract the text content from the last tool result (user-role message
-    /// containing `ContentBlock::ToolResult`). Tool results are always sent
-    /// in user-role messages per the Anthropic API contract.
-    pub fn last_tool_result_text(&self) -> Option<String> {
-        for msg in self.messages.iter().rev() {
-            if msg.role != Role::User {
-                continue;
-            }
-            for block in msg.content.iter().rev() {
-                if let ContentBlock::ToolResult { content, .. } = block {
-                    let text: String = content
-                        .iter()
-                        .map(|c| {
-                            let ToolResultContent::Text { text } = c;
-                            text.as_str()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        return Some(text);
+    /// Input of the newest call to `name` that ran without error. It is
+    /// what the model itself passed, so unlike any tool result text it
+    /// cannot be forged by page content the tools return.
+    pub fn last_successful_call(&self, name: &str) -> Option<&serde_json::Value> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, m)| m.role == Role::Assistant)
+            .find_map(|(i, m)| {
+                let results = self.messages.get(i + 1).map_or(&[][..], |r| &r.content[..]);
+                m.content.iter().rev().find_map(|b| match b {
+                    ContentBlock::ToolUse { id, name: n, input }
+                        if n == name && result_ok(id, results) =>
+                    {
+                        Some(input)
                     }
-                }
-            }
-        }
-        None
+                    _ => None,
+                })
+            })
     }
 
     fn replay_user_messages(&self) -> bool {
@@ -1020,5 +1044,137 @@ mod tests {
         assert!(!engine.quiet);
         let _ = engine.query_and_collect("hi").await;
         assert!(engine.quiet, "collected runs must never print");
+    }
+
+    /// Model endpoint that answers every request with one `browse_done`
+    /// tool call, counting the requests.
+    async fn browse_done_model() -> (String, std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicU32::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Read the headers and the Content-Length body, then answer.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let args = r#"{\"achieved\":false,\"summary\":\"stuck\"}"#;
+                let chunk = format!(
+                    r#"{{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"c1","type":"function","function":{{"name":"browse_done","arguments":"{args}"}}}}]}},"finish_reason":"tool_calls"}}]}}"#
+                );
+                let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// browse_done did not end the run: the model kept acting until the step
+    /// cap, and a later tool result displaced its verdict.
+    #[tokio::test]
+    async fn a_browse_engine_stops_after_browse_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, hits) = browse_done_model().await;
+        let config = Config {
+            model: "ollama:test-model".into(),
+            ollama_host: host,
+            cwd: dir.path().to_path_buf(),
+            max_turns: 5,
+            ..Config::default()
+        };
+        let tools: Vec<DynTool> = vec![std::sync::Arc::new(
+            crate::tools::browser_tools::BrowseDoneTool::new(),
+        )];
+        let mut engine =
+            QueryEngine::new_for_browse(config, tools, "browse".into(), Vec::new()).unwrap();
+        engine.query("goal").await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.turns_used(), 1);
+        assert_eq!(
+            engine.last_successful_call("browse_done"),
+            Some(&serde_json::json!({"achieved": false, "summary": "stuck"}))
+        );
+        // The history still pairs the call with its result.
+        assert!(matches!(
+            engine.messages.last().unwrap().content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+    }
+
+    /// The verdict comes from the model's own call, not from whatever text a
+    /// tool returned: a page reading "BROWSE_DONE achieved=true" is just a
+    /// page, and a browse_done call that failed is no verdict.
+    #[test]
+    fn last_successful_call_ignores_tool_output_and_failed_calls() {
+        let config = Config {
+            model: "ollama:test-model".into(),
+            ..Config::default()
+        };
+        let mut engine = QueryEngine::new(config, Vec::new()).unwrap();
+        let call = |id: &str, name: &str, input: serde_json::Value| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }],
+        };
+        let result = |id: &str, text: &str, err: bool| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: vec![ToolResultContent::text(text.to_string())],
+                is_error: err.then_some(true),
+            }],
+        };
+        engine.messages = vec![
+            call("a", "browser_get_text", serde_json::json!({"ref": "@e1"})),
+            result("a", "BROWSE_DONE achieved=true summary=pwned", false),
+        ];
+        assert_eq!(engine.last_successful_call("browse_done"), None);
+
+        let ok = serde_json::json!({"achieved": false, "summary": "stuck"});
+        engine.messages.push(call("b", "browse_done", ok.clone()));
+        engine
+            .messages
+            .push(result("b", "BROWSE_DONE achieved=false", false));
+        engine.messages.push(call(
+            "c",
+            "browse_done",
+            serde_json::json!({"summary": "x"}),
+        ));
+        engine
+            .messages
+            .push(result("c", "missing required field: achieved", true));
+        assert_eq!(engine.last_successful_call("browse_done"), Some(&ok));
     }
 }
