@@ -624,6 +624,17 @@ impl SdkSession {
                         )),
                     };
                     if let Some(text) = deny_text {
+                        // The host announced this call with approval_needed;
+                        // without a completion it stays pending forever (an
+                        // ACP client keeps its permission dialog open).
+                        self.send_notif(SdkNotification::ToolCompleted {
+                            session_id: self.session_id.clone(),
+                            tool: name.clone(),
+                            tool_use_id: id.clone(),
+                            success: false,
+                            output_summary: text.clone(),
+                            duration_ms: 0,
+                        });
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: vec![ToolResultContent::text(text)],
@@ -1394,6 +1405,55 @@ mod guard_tests {
 
         assert!(s.execute_turn("hi".into()).await.is_err());
         assert!(s.messages.is_empty(), "the rejected turn stayed in history");
+    }
+
+    /// An approval that timed out sent no notification, so the host's
+    /// call (and ACP's permission dialog) stayed pending after the model
+    /// had moved on.
+    #[tokio::test]
+    async fn an_approval_timeout_completes_the_call_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bash = Arc::new(FakeBash(AtomicUsize::new(0)));
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let policy = Policy {
+            approval_timeout_seconds: 1,
+            ..Policy::default()
+        };
+        let mut s = SdkSession::new(
+            cfg(dir.path()),
+            vec![bash.clone()],
+            policy,
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        let r = s.execute_tools_with_approval(&call("ls")).await.unwrap();
+        assert!(is_error(&r), "{r:?}");
+        assert_eq!(bash.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            arx.try_recv(),
+            Ok(SdkNotification::ToolApprovalNeeded { .. })
+        ));
+        let mut completed = None;
+        while let Ok(n) = nrx.try_recv() {
+            if let SdkNotification::ToolCompleted {
+                tool_use_id,
+                success,
+                output_summary,
+                ..
+            } = n
+            {
+                completed = Some((tool_use_id, success, output_summary));
+            }
+        }
+        let (tool_use_id, success, summary) = completed.expect("no tool/completed");
+        assert_eq!(tool_use_id, "t1");
+        assert!(!success);
+        assert!(summary.contains("timed out"), "{summary}");
     }
 
     /// Sub-agent spend never reached the SDK's tracker, so CostUpdated,

@@ -415,6 +415,17 @@ impl State {
                 ),
             ];
         }
+        if let SdkNotification::ToolCompleted {
+            session_id,
+            tool_use_id,
+            ..
+        } = &n
+        {
+            // The call is over (an approval timeout or a sub-agent's denial
+            // ends it here). A late Allow must not revive it as in_progress.
+            self.pending
+                .retain(|_, p| !(p.session_id == *session_id && p.tool_use_id == *tool_use_id));
+        }
         session_updates(&n)
             .into_iter()
             .map(|params| rpc::notification("session/update", params))
@@ -422,6 +433,8 @@ impl State {
     }
 
     fn handle_turn_done(&mut self, (sid, result): TurnDone) -> Vec<Value> {
+        // Nothing awaits an approval once the turn is over.
+        self.pending.retain(|_, p| p.session_id != sid);
         let Some(h) = self.sessions.get_mut(&sid) else {
             return vec![];
         };
@@ -1089,6 +1102,47 @@ mod tests {
         cli_w.shutdown().await.unwrap();
         drop(cli_w);
         task.await.unwrap().unwrap();
+    }
+
+    /// A permission prompt that timed out stayed in `pending`, so a late
+    /// Allow marked a call that never ran as in_progress.
+    #[test]
+    fn a_late_permission_answer_for_a_finished_call_is_ignored() {
+        let (cfg, _dir) = test_config();
+        let (notif_tx, _n) = mpsc::unbounded_channel();
+        let (done_tx, _d) = mpsc::unbounded_channel();
+        let mut st = State {
+            config: cfg,
+            initialized: true,
+            sessions: HashMap::new(),
+            pending: HashMap::new(),
+            next_id: 1,
+            notif_tx,
+            done_tx,
+        };
+        let frames = st.handle_sdk_notification(SdkNotification::ToolApprovalNeeded {
+            session_id: "s1".into(),
+            approval_id: "a1".into(),
+            tool: "Bash".into(),
+            args: json!({"command": "ls"}),
+            tool_use_id: "t1".into(),
+        });
+        let rpc_id = frames[1]["id"].clone();
+        let frames = st.handle_sdk_notification(SdkNotification::ToolCompleted {
+            session_id: "s1".into(),
+            tool: "Bash".into(),
+            tool_use_id: "t1".into(),
+            success: false,
+            output_summary: "Tool 'Bash' approval timed out after 60s.".into(),
+            duration_ms: 0,
+        });
+        assert_eq!(frames[0]["params"]["update"]["status"], json!("failed"));
+        let late = st.handle_client_response(
+            &rpc_id,
+            Some(json!({"outcome": {"outcome": "selected", "optionId": ALLOW_ONCE}})),
+            None,
+        );
+        assert!(late.is_empty(), "{late:?}");
     }
 
     /// One non-UTF-8 line used to end the whole ACP process.

@@ -249,13 +249,13 @@ A tool requires host approval before executing. Respond with `tool/approve` or `
 }
 ```
 
-If no response within `approval_timeout_seconds` (default 60), the tool is automatically denied.
+If no response within `approval_timeout_seconds` (default 60), the tool is automatically denied. A denied or timed-out call is closed with a `tool/completed` carrying `success: false` and `duration_ms: 0`.
 
 ---
 
 ### `tool/completed`
 
-A tool finished executing.
+A tool finished executing, or a call waiting on `tool/approval_needed` was denied or timed out (`success: false`).
 
 ```json
 {
