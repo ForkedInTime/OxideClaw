@@ -1231,8 +1231,7 @@ pub(crate) mod scripted_api_tests {
 
         e.query("second question").await.unwrap();
 
-        let body: serde_json::Value =
-            serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
         let sent: Vec<&str> = body["messages"]
             .as_array()
             .unwrap()

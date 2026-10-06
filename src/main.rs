@@ -1345,7 +1345,9 @@ fn parse_mcp_config_arg(
         None => json,
     };
     let serde_json::Value::Object(map) = json else {
-        return Err("expected a JSON object of servers, e.g. {\"name\":{\"command\":\"...\"}}".into());
+        return Err(
+            "expected a JSON object of servers, e.g. {\"name\":{\"command\":\"...\"}}".into(),
+        );
     };
     map.into_iter()
         .map(|(name, val)| {
@@ -1830,8 +1832,8 @@ mod cli_parse_tests {
     #[test]
     fn mcp_config_json_with_spaces_is_one_value() {
         let json = r#"{"fs": {"command": "npx", "args": ["-y", "server fs"]}}"#;
-        let cli = Cli::try_parse_from(["oxideclaw", "--mcp-config", json, "--mcp-config", "{}"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["oxideclaw", "--mcp-config", json, "--mcp-config", "{}"]).unwrap();
         assert_eq!(cli.mcp_config, vec![json, "{}"]);
         let servers = super::parse_mcp_config_arg(json).unwrap();
         assert_eq!(servers.len(), 1);
@@ -1846,8 +1848,11 @@ mod cli_parse_tests {
     fn mcp_config_reads_files_and_reports_bad_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        std::fs::write(&path, r#"{"mcpServers": {"web": {"url": "https://x.test/mcp"}}}"#)
-            .unwrap();
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {"web": {"url": "https://x.test/mcp"}}}"#,
+        )
+        .unwrap();
         let servers = super::parse_mcp_config_arg(path.to_str().unwrap()).unwrap();
         assert_eq!(servers[0].0, "web");
 
@@ -1875,10 +1880,8 @@ mod settings_arg_tests {
 
     #[test]
     fn settings_come_from_a_file_or_inline_json_with_every_key() {
-        let s = parse_settings_arg(
-            r#"{"permissions": {"deny": ["Bash(rm:*)"]}, "effort": "low"}"#,
-        )
-        .unwrap();
+        let s = parse_settings_arg(r#"{"permissions": {"deny": ["Bash(rm:*)"]}, "effort": "low"}"#)
+            .unwrap();
         assert_eq!(s.permissions.deny, vec!["Bash(rm:*)"]);
         assert_eq!(s.effort.as_deref(), Some("low"));
 
@@ -1916,8 +1919,7 @@ mod mcp_add_tests {
     fn stdio_is_unchanged_and_bad_input_is_refused() {
         let args = vec!["-y".to_string(), "pkg".to_string()];
         let env = vec!["TOKEN=a=b".to_string()];
-        let McpServerConfig::Stdio(s) = mcp_add_config("stdio", "npx", &args, &env).unwrap()
-        else {
+        let McpServerConfig::Stdio(s) = mcp_add_config("stdio", "npx", &args, &env).unwrap() else {
             panic!("expected stdio");
         };
         assert_eq!(s.command, "npx");
