@@ -92,6 +92,14 @@ impl QueryEngine {
         client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
             eprintln!("{}", n.message().yellow());
         }));
+        // With a distinct --fallback-model, `query` switches models on the
+        // first overload; a backoff before that would only delay it.
+        client.set_retry_overloaded(
+            config
+                .fallback_model
+                .as_ref()
+                .is_none_or(|fb| *fb == config.model),
+        );
         let system_prompt = config.build_system_prompt();
         let gate = crate::permissions::PermissionGate::headless(&config);
         let (child_usage_tx, child_usage_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -718,6 +726,9 @@ impl QueryEngine {
                 tracing::warn!("{}", n.message());
             },
         ));
+        // No fallback-model path here, so the client must ride out an
+        // overload itself.
+        self.client.set_retry_overloaded(true);
         self.messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text {

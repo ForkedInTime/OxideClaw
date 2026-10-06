@@ -134,6 +134,9 @@ pub struct ClaudeClient {
     /// Optional sink for retry notices, so a backoff sleep is visible rather
     /// than looking like a hang. Set by the TUI and the headless runner.
     retry_notifier: Option<retry::RetryNotifier>,
+    /// Retry an overloaded API (HTTP 529, or an `overloaded_error` event
+    /// before any text). Off only where a fallback model takes over instead.
+    retry_overloaded: bool,
 }
 
 impl ClaudeClient {
@@ -183,6 +186,7 @@ impl ClaudeClient {
             base_url: ANTHROPIC_API_BASE.to_string(),
             credential_betas,
             retry_notifier: None,
+            retry_overloaded: true,
         })
     }
 
@@ -248,6 +252,7 @@ impl ClaudeClient {
                     builder
                 },
                 self.retry_notifier.as_ref(),
+                self.retry_overloaded,
                 context,
             )
         };
@@ -267,6 +272,11 @@ impl ClaudeClient {
     /// invisible and a rate-limited turn looks like a hang.
     pub fn set_retry_notifier(&mut self, n: retry::RetryNotifier) {
         self.retry_notifier = Some(n);
+    }
+
+    /// See [`ClaudeClient::retry_overloaded`].
+    pub fn set_retry_overloaded(&mut self, on: bool) {
+        self.retry_overloaded = on;
     }
 
     /// Merge the request's betas with any the credential requires.
@@ -322,10 +332,56 @@ impl ClaudeClient {
         let url = format!("{}/v1/messages", self.base_url);
         debug!("POST {url} stream=true model={}", request.model);
 
+        // An overload often arrives as an `overloaded_error` event right after
+        // the 200 rather than as a 529. Until a text delta has gone out the
+        // request can be re-sent exactly like a 529; after that, never.
+        let start = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            let mut emitted = false;
+            let res = self
+                .stream_once(&url, &request, &mut on_text, &mut emitted)
+                .await;
+            let e = match res {
+                Err(e) if self.retry_overloaded && !emitted && is_stream_overloaded(&e) => e,
+                other => return other,
+            };
+            let jitter: f64 = rand::random::<f64>();
+            match retry::decide(attempt, true, None, start.elapsed(), jitter) {
+                retry::RetryDecision::Retry(delay) => {
+                    let notice = retry::RetryNotice {
+                        attempt,
+                        max_attempts: retry::MAX_ATTEMPTS,
+                        delay,
+                        reason: retry::describe_status(529),
+                    };
+                    warn!("Streaming API request failed: {}", notice.message());
+                    if let Some(n) = &self.retry_notifier {
+                        n(&notice);
+                    }
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                retry::RetryDecision::GiveUp(why) => {
+                    return Err(anyhow!("{e:#}{}", why.describe()));
+                }
+            }
+        }
+    }
+
+    /// One request/stream round of [`ClaudeClient::messages_stream`].
+    /// `emitted` turns true once any text has been handed to `on_text`.
+    async fn stream_once(
+        &self,
+        url: &str,
+        request: &MessagesRequest,
+        on_text: &mut impl FnMut(&str),
+        emitted: &mut bool,
+    ) -> Result<StreamedResponse> {
         // Retrying is safe here and only here: nothing has been handed to
         // `on_text` yet, so a retry cannot duplicate text the user has seen.
         let resp = self
-            .send(&url, &request, "Streaming API request failed")
+            .send(url, request, "Streaming API request failed")
             .await?;
 
         let status = resp.status();
@@ -383,6 +439,7 @@ impl ClaudeClient {
                 },
                 StreamEvent::ContentBlockDelta { index, delta } => match delta {
                     ContentDelta::Text { text } => {
+                        *emitted = true;
                         on_text(&text);
                         text_blocks.entry(index).or_default().push_str(&text);
                     }
@@ -451,6 +508,11 @@ impl ClaudeClient {
 
         Ok(result)
     }
+}
+
+/// The `Stream error ...` that an `overloaded_error` SSE event becomes.
+fn is_stream_overloaded(e: &anyhow::Error) -> bool {
+    e.to_string().starts_with("Stream error overloaded_error")
 }
 
 /// Normalize streamed tool input: when the API emits an array/object field as
@@ -713,6 +775,14 @@ impl ApiBackend {
             Self::Ollama(c) => c.tools_disabled(),
             Self::OpenAiCompat(c) => c.tools_disabled(),
             Self::Anthropic(_) => false,
+        }
+    }
+
+    /// See [`ClaudeClient::set_retry_overloaded`]. Only Anthropic overloads
+    /// with a 529.
+    pub fn set_retry_overloaded(&mut self, on: bool) {
+        if let Self::Anthropic(c) = self {
+            c.set_retry_overloaded(on);
         }
     }
 

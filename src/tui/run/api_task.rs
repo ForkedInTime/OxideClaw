@@ -375,10 +375,10 @@ pub(super) async fn run_api_task(task: ApiTask) {
             session_id: Some(session_id.to_string()),
         };
 
-        // Transient *pre-stream* failures (429, 5xx, connection refused) are
-        // retried inside the API client, which honours `retry-after` and backs
-        // off exponentially. What is left here is recovery the client cannot
-        // do: compacting an over-long prompt, and switching models on 529.
+        // Transient *pre-stream* failures (429, 5xx, Anthropic overloads,
+        // connection refused) are retried inside the API client, which
+        // honours `retry-after` and backs off exponentially. What is left here
+        // is recovery the client cannot do: compacting an over-long prompt.
         //
         // Nothing may be retried once a chunk has reached the transcript.
         // `AppEvent::TextChunk` appends to `app.streaming` and that buffer is
@@ -419,12 +419,15 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // 429 and 5xx are deliberately absent: the client already
                     // retried those with proper backoff, and repeating them
                     // here would multiply into 15 attempts while ignoring the
-                    // server's `retry-after`. 529 stays because the client
-                    // leaves it alone for the model-switch path, and the
-                    // connection cases stay for a drop on the very first event.
-                    let is_retryable = err_str.contains("529")
-                        || err_str.contains("overloaded")
-                        || err_str.contains("Overloaded")
+                    // server's `retry-after`. The Anthropic client retries an
+                    // overload (529 or a pre-text overloaded_error) the same
+                    // way, so only other backends' overloads are retried here.
+                    // The connection cases stay for a drop on the first event.
+                    let overloaded = !matches!(client, crate::api::ApiBackend::Anthropic(_))
+                        && (err_str.contains("529")
+                            || err_str.contains("overloaded")
+                            || err_str.contains("Overloaded"));
+                    let is_retryable = overloaded
                         || err_str.contains("connection")
                         || err_str.contains("reset by peer");
 

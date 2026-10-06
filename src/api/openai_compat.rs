@@ -876,6 +876,7 @@ impl OpenAiCompatClient {
         let resp = super::retry::send_with_retry(
             || build(&oai_request),
             self.retry_notifier.as_ref(),
+            false,
             &format!("{} request failed", self.provider_name),
         )
         .await?;
@@ -900,6 +901,7 @@ impl OpenAiCompatClient {
                 super::retry::send_with_retry(
                     || build(&oai_request),
                     self.retry_notifier.as_ref(),
+                    false,
                     &format!("{} request failed", self.provider_name),
                 )
                 .await?

@@ -8,9 +8,10 @@
 //!
 //! Two deliberate scope limits:
 //!
-//!   * **529 is not retried here.** It is owned by the fallback-model fast
-//!     path in `query_engine`, which switches to a cheaper model immediately.
-//!     Sleeping 30s before doing that would be strictly worse.
+//!   * **529 is retried only when the caller asks** (`retry_overloaded`).
+//!     The Anthropic client does unless `--fallback-model` is set: then the
+//!     fallback path in `query_engine` switches models immediately, and
+//!     sleeping 30s before doing that would be strictly worse.
 //!   * **Retries happen only before any bytes are streamed.** Every caller
 //!     retries at the send-and-check-status step, so a retry can never
 //!     duplicate text the user has already seen.
@@ -68,7 +69,7 @@ pub type RetryNotifier = Arc<dyn Fn(&RetryNotice) + Send + Sync>;
 
 /// Statuses worth retrying.
 ///
-/// 529 is excluded on purpose — see the module docs. 4xx other than 408/429
+/// 529 is opt-in per call — see the module docs. 4xx other than 408/429
 /// are caller errors: retrying a 400 just burns the same tokens again, and
 /// retrying a 401 hammers an auth failure.
 pub fn is_retryable_status(status: u16) -> bool {
@@ -198,6 +199,7 @@ pub fn describe_status(status: u16) -> String {
     match status {
         429 => "Rate limited by the API".to_string(),
         408 => "Request timed out".to_string(),
+        529 => "API overloaded (529)".to_string(),
         500 | 502 | 503 | 504 => format!("API server error ({status})"),
         _ => format!("API error ({status})"),
     }
@@ -224,7 +226,8 @@ pub fn may_retry_stream(
 /// Crucially this returns the `Response` even when the status is an error, so
 /// every existing caller-side branch still works — the OpenAI-compat
 /// "model does not support tools" 400 sniff and the 529 fallback detection
-/// both depend on seeing the real response.
+/// both depend on seeing the real response. `retry_overloaded` adds 529 to
+/// the retried statuses.
 ///
 /// `make` rebuilds the request from scratch each attempt; `RequestBuilder` is
 /// consumed by `send()` and `try_clone` returns `None` for streamed bodies, so
@@ -232,6 +235,7 @@ pub fn may_retry_stream(
 pub async fn send_with_retry<F>(
     make: F,
     notifier: Option<&RetryNotifier>,
+    retry_overloaded: bool,
     context: &str,
 ) -> anyhow::Result<reqwest::Response>
 where
@@ -250,7 +254,7 @@ where
                     return Ok(result.unwrap());
                 }
                 (
-                    is_retryable_status(status),
+                    is_retryable_status(status) || (retry_overloaded && status == 529),
                     parse_retry_after(resp.headers()),
                     describe_status(status),
                 )
@@ -321,8 +325,8 @@ mod tests {
         for s in [408, 429, 500, 502, 503, 504] {
             assert!(is_retryable_status(s), "{s} should retry");
         }
-        // 529 belongs to the fallback-model path — retrying it here would
-        // delay the model switch that already handles it.
+        // 529 is opt-in per call (`retry_overloaded`) so the fallback-model
+        // path can switch models without waiting out a backoff first.
         for s in [200, 400, 401, 403, 404, 413, 422, 529] {
             assert!(!is_retryable_status(s), "{s} should not retry");
         }
@@ -518,7 +522,9 @@ mod tests {
     #[tokio::test]
     async fn a_429_is_retried_and_then_succeeds() {
         let (url, hits) = scripted_server(vec![RATE_LIMITED, OK]).await;
-        let resp = send_with_retry(|| post(&url), None, "test").await.unwrap();
+        let resp = send_with_retry(|| post(&url), None, false, "test")
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "should have retried once");
     }
@@ -526,7 +532,9 @@ mod tests {
     #[tokio::test]
     async fn a_400_is_not_retried() {
         let (url, hits) = scripted_server(vec![BAD_REQUEST]).await;
-        let resp = send_with_retry(|| post(&url), None, "test").await.unwrap();
+        let resp = send_with_retry(|| post(&url), None, false, "test")
+            .await
+            .unwrap();
         // The response is handed back untouched so callers keep their own
         // error handling — notably the OpenAI-compat "no tools" 400 sniff.
         assert_eq!(resp.status(), 400);
@@ -536,7 +544,9 @@ mod tests {
     #[tokio::test]
     async fn a_permanent_429_stops_at_the_attempt_cap() {
         let (url, hits) = scripted_server(vec![RATE_LIMITED]).await;
-        let resp = send_with_retry(|| post(&url), None, "test").await.unwrap();
+        let resp = send_with_retry(|| post(&url), None, false, "test")
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 429);
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -554,7 +564,7 @@ mod tests {
         let notifier: RetryNotifier =
             Arc::new(move |n: &RetryNotice| sink.lock().unwrap().push(n.message()));
 
-        let resp = send_with_retry(|| post(&url), Some(&notifier), "test")
+        let resp = send_with_retry(|| post(&url), Some(&notifier), false, "test")
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -580,7 +590,9 @@ mod tests {
                             content-length: 0\r\nconnection: close\r\n\r\n";
         let (url, hits) = scripted_server(vec![SLOW, OK]).await;
         let start = std::time::Instant::now();
-        let resp = send_with_retry(|| post(&url), None, "test").await.unwrap();
+        let resp = send_with_retry(|| post(&url), None, false, "test")
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert_eq!(resp.status(), 200);
@@ -601,7 +613,7 @@ mod tests {
         let notifier: RetryNotifier =
             Arc::new(move |n: &RetryNotice| sink.lock().unwrap().push(n.reason.clone()));
 
-        let _ = send_with_retry(|| post(&url), Some(&notifier), "test").await;
+        let _ = send_with_retry(|| post(&url), Some(&notifier), false, "test").await;
         let msgs = seen.lock().unwrap();
         assert!(
             msgs.last().unwrap().contains("gave up after"),
@@ -654,6 +666,90 @@ mod tests {
         );
     }
 
+    const OVERLOADED: &str =
+        "HTTP/1.1 529 Overloaded\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    fn sse_response(events: &[&str]) -> &'static str {
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    const OVERLOADED_EVENT: &str =
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+
+    #[tokio::test]
+    async fn a_529_is_retried_only_when_asked() {
+        let (url, hits) = scripted_server(vec![OVERLOADED, OK]).await;
+        let resp = send_with_retry(|| post(&url), None, true, "test")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let (url, hits) = scripted_server(vec![OVERLOADED, OK]).await;
+        let resp = send_with_retry(|| post(&url), None, false, "test")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 529);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// -p, SDK, ACP, sub-agents and compaction have no retry loop of their
+    /// own: one 529 failed the whole prompt unless --fallback-model was set.
+    #[tokio::test]
+    async fn streaming_client_retries_a_529_unless_a_fallback_takes_over() {
+        let (url, hits) = scripted_server(vec![OVERLOADED, OK_SSE]).await;
+        let res = test_client(&url)
+            .messages_stream(empty_request(), |_| {})
+            .await;
+        assert!(res.is_ok(), "should have recovered: {:?}", res.err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let (url, hits) = scripted_server(vec![OVERLOADED, OK_SSE]).await;
+        let mut client = test_client(&url);
+        client.set_retry_overloaded(false);
+        let err = client
+            .messages_stream(empty_request(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("529"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// An overload delivered as an SSE `overloaded_error` right after the 200
+    /// is retried like a 529 while no text has been shown, and never after.
+    #[tokio::test]
+    async fn a_pre_text_overloaded_event_is_retried_but_not_after_text() {
+        let overloaded = sse_response(&[OVERLOADED_EVENT]);
+        let (url, hits) = scripted_server(vec![overloaded, OK_SSE]).await;
+        let res = test_client(&url)
+            .messages_stream(empty_request(), |_| {})
+            .await;
+        assert!(res.is_ok(), "should have recovered: {:?}", res.err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let after_text = sse_response(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            OVERLOADED_EVENT,
+        ]);
+        let (url, hits) = scripted_server(vec![after_text, OK_SSE]).await;
+        let mut seen = String::new();
+        let res = test_client(&url)
+            .messages_stream(empty_request(), |t| seen.push_str(t))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(seen, "hi", "text must not be replayed");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
     /// The non-streaming path is used by SDK/headless callers.
     #[tokio::test]
     async fn non_streaming_client_retries_a_429() {
@@ -704,7 +800,7 @@ mod tests {
                             content-length: 0\r\nconnection: close\r\n\r\n";
         let (url, hits) = scripted_server(vec![SLOW]).await;
         let handle = tokio::spawn(async move {
-            let _ = send_with_retry(|| post(&url), None, "test").await;
+            let _ = send_with_retry(|| post(&url), None, false, "test").await;
         });
 
         // Wait for the first attempt to land rather than assuming a fixed
