@@ -247,16 +247,24 @@ impl SdkSession {
             let tool_defs: Vec<ToolDefinition> =
                 self.tools.iter().map(|t| t.definition()).collect();
 
+            let max_tokens = self.config.max_tokens_for(&self.config.model);
+            let mut request_system = system.clone();
+            let (thinking, output_config, betas) = crate::api::thinking::request_knobs(
+                &self.config,
+                &self.config.model,
+                max_tokens,
+                &mut request_system,
+            );
             let request = MessagesRequest {
                 model: self.config.model.clone(),
-                max_tokens: self.config.max_tokens_for(&self.config.model),
-                system: SystemContent::Plain(system.clone()),
+                max_tokens,
+                system: SystemContent::Plain(request_system),
                 messages: self.messages.clone(),
                 tools: tool_defs,
                 stream: None,
-                thinking: None,
-                output_config: None,
-                betas: self.config.extra_betas.clone(),
+                thinking,
+                output_config,
+                betas,
                 session_id: Some(self.session_id.clone()),
             };
 
@@ -1405,6 +1413,33 @@ mod guard_tests {
 
         assert!(s.execute_turn("hi".into()).await.is_err());
         assert!(s.messages.is_empty(), "the rejected turn stayed in history");
+    }
+
+    /// The SDK sidecar and ACP sent `thinking: None, output_config: None`
+    /// whatever --thinking / --effort and settings.json said.
+    #[tokio::test]
+    async fn requests_carry_the_configured_thinking_and_effort() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let (url, seen) = serve(vec![sse(
+            &[serde_json::json!({"type":"text","text":"ok"})],
+            "end_turn",
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.model = "claude-opus-5".into();
+        c.effort = Some("high".into());
+        c.thinking_budget_tokens = Some(0);
+        let (mut s, _) = session(c);
+        let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        client.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(client);
+
+        s.execute_turn("hi".into()).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));
+        assert_eq!(body["output_config"]["effort"], "high");
     }
 
     /// An approval that timed out sent no notification, so the host's

@@ -309,18 +309,14 @@ pub(super) async fn run_api_task(task: ApiTask) {
 
         let max_tokens = config.max_tokens_for(&config.model);
 
-        // Effort: a real parameter on models that have one, a prompt nudge elsewhere.
+        // Effort, thinking and betas; the effort nudge lands in system_text.
         let mut system_text = system_prompt.clone();
-        let output_config =
-            match crate::api::thinking::effort_for(&config.model, config.effort.as_deref()) {
-                Some(crate::api::thinking::EffortWire::Param(oc)) => Some(oc),
-                Some(crate::api::thinking::EffortWire::Prompt(nudge)) => {
-                    system_text.push_str("\n\n");
-                    system_text.push_str(&nudge);
-                    None
-                }
-                None => None,
-            };
+        let (thinking_cfg, output_config, betas) = crate::api::thinking::request_knobs(
+            &config,
+            &config.model,
+            max_tokens,
+            &mut system_text,
+        );
 
         // Build system content — wrap in blocks for prompt caching if enabled
         let system_content = if config.prompt_cache {
@@ -332,23 +328,6 @@ pub(super) async fn run_api_task(task: ApiTask) {
         } else {
             crate::api::types::SystemContent::Plain(system_text)
         };
-
-        // Extended thinking: adaptive on Claude 4.6+/5, budget_tokens on older
-        // models, nothing on non-Claude backends (see api::thinking).
-        let thinking_cfg = crate::api::thinking::thinking_for(
-            &config.model,
-            config.thinking_budget_tokens,
-            max_tokens,
-            config.effort.as_deref(),
-            config.show_thinking_summaries,
-        );
-        let mut betas = crate::api::thinking::thinking_betas(thinking_cfg.as_ref());
-        // Append extra betas from CLI --betas flag
-        for b in &config.extra_betas {
-            if !betas.contains(b) {
-                betas.push(b.clone());
-            }
-        }
 
         // Tool result budgeting — truncate oversized ToolResult payloads
         // to prevent context overflow (mirrors apiMicrocompact truncation).

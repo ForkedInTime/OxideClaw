@@ -257,6 +257,44 @@ pub fn effort_for(model: &str, effort: Option<&str>) -> Option<EffortWire> {
     Some(EffortWire::Prompt(effort_prompt(&level).to_string()))
 }
 
+/// The `thinking`, `output_config` and beta fields of one request to
+/// `model`, from --thinking / --max-thinking-tokens / --effort / --betas and
+/// settings.json. Every request builder (TUI, -p, sub-agents, SDK, ACP)
+/// goes through here; the non-TUI ones used to drop all of it. A model with
+/// no effort parameter gets the nudge appended to `system`, so build that
+/// from the same base on every request: a `system` that changes mid-
+/// conversation invalidates replayed thinking signatures.
+pub fn request_knobs(
+    config: &crate::config::Config,
+    model: &str,
+    max_tokens: u32,
+    system: &mut String,
+) -> (Option<ThinkingConfig>, Option<OutputConfig>, Vec<String>) {
+    let output_config = match effort_for(model, config.effort.as_deref()) {
+        Some(EffortWire::Param(oc)) => Some(oc),
+        Some(EffortWire::Prompt(nudge)) => {
+            system.push_str("\n\n");
+            system.push_str(&nudge);
+            None
+        }
+        None => None,
+    };
+    let thinking = thinking_for(
+        model,
+        config.thinking_budget_tokens,
+        max_tokens,
+        config.effort.as_deref(),
+        config.show_thinking_summaries,
+    );
+    let mut betas = thinking_betas(thinking.as_ref());
+    for b in &config.extra_betas {
+        if !betas.contains(b) {
+            betas.push(b.clone());
+        }
+    }
+    (thinking, output_config, betas)
+}
+
 /// Prompt-level substitute for models without `output_config.effort`.
 pub fn effort_prompt(level: &str) -> &'static str {
     match level {
@@ -629,6 +667,39 @@ mod tests {
         assert_eq!(effort_for("claude-sonnet-5", None), None);
         assert_eq!(effort_for("claude-sonnet-5", Some("ultra")), None);
         assert_eq!(effort_for("claude-sonnet-5", Some("")), None);
+    }
+
+    #[test]
+    fn request_knobs_route_effort_and_merge_betas() {
+        let config = crate::config::Config {
+            effort: Some("medium".into()),
+            thinking_budget_tokens: Some(2048),
+            extra_betas: vec!["custom-beta".into(), INTERLEAVED_THINKING_BETA.into()],
+            ..Default::default()
+        };
+        let mut system = "base".to_string();
+        let (thinking, output, betas) =
+            request_knobs(&config, "claude-haiku-4-5", 16_000, &mut system);
+        assert_eq!(
+            thinking,
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: 2048
+            })
+        );
+        assert_eq!(output, None);
+        assert_eq!(system, format!("base\n\n{}", effort_prompt("medium")));
+        assert_eq!(betas, [INTERLEAVED_THINKING_BETA, "custom-beta"]);
+
+        let mut system = "base".to_string();
+        let (thinking, output, betas) =
+            request_knobs(&config, "claude-opus-5", 16_000, &mut system);
+        assert_eq!(
+            thinking,
+            Some(ThinkingConfig::Adaptive { summarized: false })
+        );
+        assert_eq!(output.unwrap().effort, "medium");
+        assert_eq!(system, "base");
+        assert_eq!(betas, ["custom-beta", INTERLEAVED_THINKING_BETA]);
     }
 
     #[test]

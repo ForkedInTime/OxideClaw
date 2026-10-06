@@ -179,6 +179,27 @@ impl QueryEngine {
         self.include_hook_events = enabled;
     }
 
+    /// The next request to `model` with the conversation so far, carrying
+    /// the configured thinking, effort and betas.
+    fn request_for(&self, model: &str, tools: Vec<ToolDefinition>) -> MessagesRequest {
+        let max_tokens = self.config.max_tokens_for(model);
+        let mut system = self.system_prompt.clone();
+        let (thinking, output_config, betas) =
+            crate::api::thinking::request_knobs(&self.config, model, max_tokens, &mut system);
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens,
+            system: crate::api::types::SystemContent::Plain(system),
+            messages: self.messages.clone(),
+            tools,
+            stream: None,
+            thinking,
+            output_config,
+            betas,
+            session_id: self.session_id.clone(),
+        }
+    }
+
     /// Add a user message and run the agentic loop until stop_reason == EndTurn.
     /// Mirrors the main query() function in query.ts.
     pub async fn query(&mut self, user_input: impl Into<String>) -> Result<()> {
@@ -231,18 +252,7 @@ impl QueryEngine {
             let tool_defs: Vec<ToolDefinition> =
                 self.tools.iter().map(|t| t.definition()).collect();
 
-            let request = MessagesRequest {
-                model: self.config.model.clone(),
-                max_tokens: self.config.max_tokens_for(&self.config.model),
-                system: crate::api::types::SystemContent::Plain(self.system_prompt.clone()),
-                messages: self.messages.clone(),
-                tools: tool_defs,
-                stream: None,
-                thinking: None,
-                output_config: None,
-                betas: self.config.extra_betas.clone(),
-                session_id: self.session_id.clone(),
-            };
+            let request = self.request_for(&self.config.model, tool_defs);
 
             // Call the API with streaming, printing text as it arrives
             let mut full_text = String::new();
@@ -280,8 +290,10 @@ impl QueryEngine {
                                     format!("Model overloaded — retrying with {fb}").yellow()
                                 );
                                 full_text.clear();
-                                let mut fb_req = request.clone();
-                                fb_req.model = fb.clone();
+                                // Thinking shape, effort and max_tokens are
+                                // per model: Opus 5 settings can be a 400 on
+                                // an older fallback.
+                                let fb_req = self.request_for(fb, request.tools.clone());
                                 self.client.messages_stream(fb_req, |chunk| {
                                     if self.stream_json_output {
                                         if include_partial {
@@ -773,18 +785,7 @@ impl QueryEngine {
             let tool_defs: Vec<ToolDefinition> =
                 self.tools.iter().map(|t| t.definition()).collect();
 
-            let request = MessagesRequest {
-                model: self.config.model.clone(),
-                max_tokens: self.config.max_tokens_for(&self.config.model),
-                system: crate::api::types::SystemContent::Plain(self.system_prompt.clone()),
-                messages: self.messages.clone(),
-                tools: tool_defs,
-                stream: None,
-                thinking: None,
-                output_config: None,
-                betas: vec![],
-                session_id: self.session_id.clone(),
-            };
+            let request = self.request_for(&self.config.model, tool_defs);
 
             let mut turn_text = String::new();
             let response = self
@@ -1136,6 +1137,64 @@ pub(crate) mod scripted_api_tests {
         .unwrap();
         let ctx = QueryEngine::retrieve_rag_context(dir.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
+
+    /// -p, `oxideclaw spawn` and Agent sub-agents sent `thinking: None,
+    /// output_config: None` whatever --thinking / --effort said.
+    #[tokio::test]
+    async fn headless_requests_carry_the_configured_thinking_and_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = || {
+            sse(
+                &[serde_json::json!({"type":"text","text":"ok"})],
+                "end_turn",
+            )
+        };
+        let (url, seen) = serve(vec![reply(), reply()]).await;
+        let engine = |model: &str, effort: &str, budget: u32| {
+            let config = Config {
+                model: model.into(),
+                api_key: "sk-ant-test".into(),
+                cwd: dir.path().to_path_buf(),
+                effort: Some(effort.into()),
+                thinking_budget_tokens: Some(budget),
+                ..Config::default()
+            };
+            let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+            e.quiet = true;
+            let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+            c.set_base_url_for_test(url.clone());
+            e.client = ApiBackend::Anthropic(c);
+            e
+        };
+
+        engine("claude-opus-5", "low", 0).query("hi").await.unwrap();
+        engine("claude-haiku-4-5", "medium", 2048)
+            .query_and_collect("hi")
+            .await
+            .unwrap();
+
+        let bodies: Vec<serde_json::Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(
+            bodies[0]["thinking"],
+            serde_json::json!({"type":"disabled"})
+        );
+        assert_eq!(bodies[0]["output_config"]["effort"], "low");
+        assert_eq!(
+            bodies[1]["thinking"],
+            serde_json::json!({"type":"enabled","budget_tokens":2048})
+        );
+        assert!(bodies[1].get("output_config").is_none());
+        let system = bodies[1]["system"].as_str().unwrap();
+        assert!(
+            system.ends_with(crate::api::thinking::effort_prompt("medium")),
+            "no effort nudge for a model without the parameter"
+        );
     }
 
     /// /browse runs on `query()`, which kept its spend to itself, and the
