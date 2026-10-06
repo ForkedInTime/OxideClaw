@@ -155,7 +155,7 @@ pub fn rejects_disabled_thinking(model: &str) -> bool {
 fn disabled_needs_low_effort(model: &str) -> bool {
     let model = canonical(model);
     family_of(&model).is_some_and(|(_, f)| f == "opus")
-        && model_version(&model).is_some_and(|v| v >= (5, 0) && v < (5, 5))
+        && model_version(&model).is_some_and(|v| ((5, 0)..(5, 5)).contains(&v))
 }
 
 /// `output_config.effort` support tracks adaptive thinking exactly.

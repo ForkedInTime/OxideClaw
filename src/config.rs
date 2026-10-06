@@ -2382,9 +2382,8 @@ mod max_tokens_default_tests {
     /// 8096 left a thinking turn too little room for a large Write.
     #[test]
     fn unset_max_tokens_follows_the_model() {
+        // Default: no maxTokens, no per-model overrides.
         let mut cfg = Config::default();
-        cfg.max_tokens = None;
-        cfg.max_tokens_by_model.clear();
         for m in [
             "claude-sonnet-5",
             "sonnet",
