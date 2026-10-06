@@ -101,7 +101,8 @@ impl Tool for AgentTool {
         }
 
         if let Some(desc) = &input.description {
-            eprintln!("[Agent: {}]", desc);
+            // Not eprintln!: the TUI owns the terminal in raw mode.
+            tracing::info!("[Agent: {}]", desc);
         }
 
         // Build config for sub-agent, potentially with restricted tools.

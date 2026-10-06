@@ -542,7 +542,7 @@ impl QueryEngine {
                     mw.after_tool(name, &output_text).await;
                 }
 
-                if output.is_error && !self.stream_json_output {
+                if output.is_error && !self.stream_json_output && !self.quiet {
                     eprintln!(
                         "{} {}",
                         "Error:".red().bold(),
@@ -586,6 +586,15 @@ impl QueryEngine {
         &mut self,
         user_input: &str,
     ) -> Result<crate::tools::ToolOutput> {
+        // Both callers (Agent tool, /spawn) run inside a frontend that owns
+        // stdout/stderr: the TUI's raw-mode viewport, SDK NDJSON, ACP
+        // JSON-RPC or `-p --output-format json`. Any print here corrupts it.
+        self.quiet = true;
+        self.client.set_retry_notifier(std::sync::Arc::new(
+            |n: &crate::api::retry::RetryNotice| {
+                tracing::warn!("{}", n.message());
+            },
+        ));
         self.messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -990,5 +999,26 @@ mod permission_wiring_tests {
         }];
         e.execute_tools(&call).await.unwrap();
         assert_eq!(*probe.0.lock().unwrap(), Some((2, true)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sub-agents used to println! "Tool: ..." for every child tool call
+    /// straight into the TUI / SDK / ACP stdout stream.
+    #[tokio::test]
+    async fn query_and_collect_silences_the_engine() {
+        let config = Config {
+            model: "ollama:test-model".into(),
+            // Nothing listens here: the request fails fast, no retries.
+            ollama_host: "http://127.0.0.1:1".into(),
+            ..Config::default()
+        };
+        let mut engine = QueryEngine::new(config, Vec::new()).unwrap();
+        assert!(!engine.quiet);
+        let _ = engine.query_and_collect("hi").await;
+        assert!(engine.quiet, "collected runs must never print");
     }
 }
