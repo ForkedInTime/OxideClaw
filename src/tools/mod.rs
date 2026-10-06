@@ -236,10 +236,26 @@ impl ToolOutput {
 /// Protected directories that Write/Edit tools must never modify.
 pub const PROTECTED_DIRS: &[&str] = &[".git", ".husky"];
 
+/// Is any component of `path` `name`, ignoring ASCII case? macOS and
+/// Windows filesystems are case-insensitive: `.GIT/config` is `.git/config`.
+fn has_component_ignore_case(path: &std::path::Path, name: &str) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(name))
+    })
+}
+
 /// Returns Some(error ToolOutput) if `path` is inside a protected directory.
+/// The resolved path is checked too: a repo can commit `gl -> .git`, and a
+/// write to `gl/config` adding `core.fsmonitor` runs code on the next git
+/// command.
 pub fn check_protected_path(path: &std::path::Path) -> Option<ToolOutput> {
+    let resolved = resolve_for_sensitivity_check(path);
     for &protected in PROTECTED_DIRS {
-        if path.components().any(|c| c.as_os_str() == protected) {
+        if has_component_ignore_case(path, protected)
+            || has_component_ignore_case(&resolved, protected)
+        {
             return Some(ToolOutput::error(format!(
                 "Modifying files inside '{}' directories is not allowed.",
                 protected
@@ -396,20 +412,27 @@ pub fn denied_read_globs() -> Vec<String> {
 /// That needs no unusual privileges: a repository can simply *ship* a symlink
 /// called `README.md`, and asking the agent to read it exfiltrates the target.
 ///
-/// Falls back to the parent directory for paths that do not exist yet (a fresh
-/// write), which also catches a symlinked parent, and to the input unchanged
-/// when nothing can be resolved — a check on the literal path is never worse
-/// than the old behaviour.
+/// For paths that do not exist yet (a fresh write) the nearest existing
+/// ancestor is resolved and the rest re-attached, so `link/newdir/x` is seen
+/// through `link` even though Write has yet to create `newdir`. Falls back to
+/// the input unchanged when nothing can be resolved — a check on the literal
+/// path is never worse than the old behaviour.
 pub fn resolve_for_sensitivity_check(path: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(cur) {
+            real.extend(missing.iter().rev());
+            return real;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(real_parent) = std::fs::canonicalize(parent)
-    {
-        return real_parent.join(name);
-    }
-    path.to_path_buf()
 }
 
 /// [`check_sensitive_path`] applied to both the supplied path and its symlink
@@ -484,12 +507,10 @@ pub fn check_sensitive_path(path: &std::path::Path, op: SensitiveOp) -> Option<T
     }
 
     // Paths inside secrets directories anywhere in the ancestor chain.
-    for comp in path.components() {
-        let s = comp.as_os_str();
-        if SECRET_DIR_COMPONENTS.iter().any(|d| s == *d) {
+    for d in SECRET_DIR_COMPONENTS {
+        if has_component_ignore_case(path, d) {
             return Some(ToolOutput::error(format!(
-                "Refusing to modify files inside '{}'. This directory is on the hard deny-list.",
-                s.to_string_lossy()
+                "Refusing to modify files inside '{d}'. This directory is on the hard deny-list."
             )));
         }
     }
@@ -742,6 +763,63 @@ mod sensitive_path_tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    /// A repo-shipped `gl -> .git` let Write reach `.git/config`
+    /// (`core.fsmonitor` runs on the next git command) and create files in a
+    /// new directory under `.git`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_a_symlink_into_git_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]\n").unwrap();
+        std::os::unix::fs::symlink(".git", dir.path().join("gl")).unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        for target in ["gl/config", "gl/newdir/x"] {
+            assert!(
+                check_protected_path(&dir.path().join(target)).is_some(),
+                "{target}"
+            );
+            let out = file_write::FileWriteTool
+                .execute(
+                    serde_json::json!({"file_path": target, "content": "pwned"}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(out.is_error, "{target}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/config")).unwrap(),
+            "[core]\n"
+        );
+        assert!(!dir.path().join(".git/newdir").exists());
+        assert!(check_protected_path(&dir.path().join("src/main.rs")).is_none());
+    }
+
+    #[test]
+    fn protected_and_secret_dirs_match_any_case() {
+        assert!(check_protected_path(&p("/proj/.GIT/hooks/pre-commit")).is_some());
+        assert!(check_protected_path(&p("/proj/.Husky/pre-push")).is_some());
+        assert!(
+            check_sensitive_path(&p("/home/u/.SSH/authorized_keys"), SensitiveOp::Write).is_some()
+        );
+        assert!(check_protected_path(&p("/proj/.github/workflows/ci.yml")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_sees_through_a_symlink_above_missing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(real.join("target")).unwrap();
+        std::os::unix::fs::symlink(real.join("target"), real.join("link")).unwrap();
+        assert_eq!(
+            resolve_for_sensitivity_check(&real.join("link/a/b")),
+            real.join("target/a/b")
+        );
     }
 
     #[test]

@@ -193,6 +193,9 @@ impl Tool for NotebookEditTool {
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
         // Same deny-list as Write/Edit: a notebook under ~/.ssh is still ~/.ssh.
+        if let Some(err) = super::check_protected_path(&path) {
+            return Ok(err);
+        }
         if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Write) {
             return Ok(err);
         }
