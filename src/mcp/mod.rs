@@ -153,16 +153,28 @@ fn sanitize_name(s: &str) -> String {
 /// characters or a duplicate name, so every MCP tool must fit and be unique.
 /// Long or colliding names keep a readable prefix plus a hash of the original.
 fn fit_tool_name(name: String, used: &mut std::collections::HashSet<String>) -> String {
+    use sha2::{Digest, Sha256};
     const MAX: usize = 64;
-    let fitted = if name.len() <= MAX && !used.contains(&name) {
-        name
-    } else {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(name.as_bytes());
-        let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-        let keep = name.len().min(MAX - hash.len() - 1);
-        format!("{}_{hash}", &name[..keep])
-    };
+    if name.len() <= MAX && !used.contains(&name) {
+        used.insert(name.clone());
+        return name;
+    }
+    // Every collision on the same sanitized name hashes the same input, so
+    // the third one would repeat the second's suffix: salt until it is free.
+    // Attempt 0 is unsalted so existing names stay put.
+    let keep = name.len().min(MAX - 8 - 1);
+    let fitted = (0u32..)
+        .map(|n| {
+            let digest = if n == 0 {
+                Sha256::digest(name.as_bytes())
+            } else {
+                Sha256::digest(format!("{name}#{n}").as_bytes())
+            };
+            let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            format!("{}_{hash}", &name[..keep])
+        })
+        .find(|candidate| !used.contains(candidate))
+        .expect("an unused suffix exists");
     used.insert(fitted.clone());
     fitted
 }
@@ -180,6 +192,22 @@ mod description_tests {
         assert_eq!(b, "mcp__s__t");
         assert_ne!(b, c, "duplicates get a distinct name");
         assert_eq!(super::sanitize_name("café.list"), "caf__list");
+    }
+
+    /// `get.user`, `get/user` and `get user` all sanitize to `get_user`; the
+    /// second and third got the same hashed name and every request was a 400.
+    #[test]
+    fn any_number_of_colliding_names_stay_unique() {
+        let mut used = std::collections::HashSet::new();
+        let long = format!("mcp__srv__{}", "z".repeat(80));
+        let mut names = Vec::new();
+        for _ in 0..5 {
+            names.push(super::fit_tool_name("mcp__s__get_user".into(), &mut used));
+            names.push(super::fit_tool_name(long.clone(), &mut used));
+        }
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        assert!(names.iter().all(|n| n.len() <= 64), "{names:?}");
     }
 
     use super::*;
