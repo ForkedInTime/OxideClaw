@@ -167,8 +167,17 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 /// Wrap a shell command string in a bubblewrap sandbox.
 /// The sandbox:
 ///   - Mounts /usr, /lib, /lib64, /bin, /sbin as read-only
-///   - Binds the current working directory as read-write
-///   - Binds /tmp as read-write (tmpfs)
+///   - Mounts the parts of /etc that ordinary tools resolve through, read-only:
+///     /etc/alternatives (Debian/Ubuntu route awk, cc, java... through it),
+///     /etc/ssl + /etc/pki (Fedora/RHEL keep the CA bundle under pki), the
+///     dynamic-linker cache, and the name-service/timezone files
+///   - Mounts per-user toolchains (~/.cargo/bin, ~/.rustup, ~/.local/bin,
+///     ~/.nvm) read-only so PATH entries pointing at them still resolve. The
+///     rest of $HOME stays hidden; ~/.cargo itself is not bound because it
+///     holds registry credentials.
+///   - Mounts a fresh tmpfs on /tmp, then binds the current working directory
+///     read-write on top. bwrap applies mounts in argument order, so the cwd
+///     bind must come last or a project under /tmp would be buried by the tmpfs
 ///   - Uses --unshare-net to block network (configurable)
 ///   - Uses --unshare-pid for process isolation
 ///   - Uses --new-session to detach from the controlling terminal. Without it
@@ -179,8 +188,28 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 ///     control, so bwrap's own guard is the right place to rely on.
 ///   - Uses --die-with-parent so cleanup is automatic
 pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
+    bwrap_wrap_with_home(command, cwd, allow_network, dirs::home_dir().as_deref())
+}
+
+fn bwrap_wrap_with_home(
+    command: &str,
+    cwd: &std::path::Path,
+    allow_network: bool,
+    home: Option<&std::path::Path>,
+) -> String {
     let cwd_quoted = shell_quote(&cwd.display().to_string());
     let net_flag = if allow_network { "" } else { "--unshare-net " };
+    let home_binds: String = home
+        .map(|h| {
+            [".cargo/bin", ".rustup", ".local/bin", ".nvm"]
+                .iter()
+                .map(|d| {
+                    let p = shell_quote(&h.join(d).display().to_string());
+                    format!("--ro-bind-try {p} {p} ")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     format!(
         "bwrap \
@@ -190,11 +219,20 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
          --ro-bind-try /lib32 /lib32 \
          --ro-bind /bin /bin \
          --ro-bind /sbin /sbin \
+         --ro-bind-try /etc/alternatives /etc/alternatives \
          --ro-bind-try /etc/ssl /etc/ssl \
+         --ro-bind-try /etc/pki /etc/pki \
+         --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
+         --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
          --ro-bind-try /etc/resolv.conf /etc/resolv.conf \
+         --ro-bind-try /etc/hosts /etc/hosts \
+         --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
+         --ro-bind-try /etc/localtime /etc/localtime \
          --ro-bind-try /etc/passwd /etc/passwd \
-         --bind {cwd} {cwd} \
+         --ro-bind-try /etc/group /etc/group \
          --tmpfs /tmp \
+         {home_binds}\
+         --bind {cwd} {cwd} \
          --proc /proc \
          --dev /dev \
          --chdir {cwd} \
@@ -204,6 +242,7 @@ pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> 
          --die-with-parent \
          -- /bin/sh -c {shell_quoted}",
         cwd = cwd_quoted,
+        home_binds = home_binds,
         net_flag = net_flag,
         shell_quoted = shell_quote(command),
     )
@@ -438,6 +477,58 @@ mod tests {
         let fj = firejail_wrap("echo hi", Path::new("/tmp"), false);
         assert!(bw.contains("--unshare-net"));
         assert!(fj.contains("--net=none"));
+    }
+
+    /// bwrap applies mounts in argument order. The cwd bind used to come
+    /// before `--tmpfs /tmp`, so a project under /tmp was buried by the tmpfs
+    /// and every sandboxed command died with "Can't chdir".
+    #[test]
+    fn bwrap_binds_cwd_after_tmp_tmpfs() {
+        let cmd = bwrap_wrap_with_home(
+            "ls",
+            Path::new("/tmp/proj"),
+            true,
+            Some(Path::new("/tmp/home")),
+        );
+        let tmpfs = cmd.find("--tmpfs /tmp ").expect("tmpfs on /tmp");
+        let bind = cmd
+            .find("--bind '/tmp/proj' '/tmp/proj'")
+            .expect("cwd bind");
+        assert!(tmpfs < bind, "cwd bind must follow the /tmp tmpfs: {cmd}");
+        let home = cmd
+            .find("--ro-bind-try '/tmp/home/.cargo/bin'")
+            .expect("toolchain bind");
+        assert!(
+            tmpfs < home && home < bind,
+            "a $HOME under /tmp must not be hidden, and cwd must win: {cmd}"
+        );
+    }
+
+    /// Debian routes awk/cc/java through /etc/alternatives and Fedora keeps the
+    /// CA bundle under /etc/pki; without them common commands and TLS fail.
+    #[test]
+    fn bwrap_exposes_alternatives_pki_and_user_toolchains() {
+        let cmd = bwrap_wrap_with_home(
+            "awk 1",
+            Path::new("/work"),
+            true,
+            Some(Path::new("/home/o'neil")),
+        );
+        for needed in [
+            "--ro-bind-try /etc/alternatives /etc/alternatives",
+            "--ro-bind-try /etc/pki /etc/pki",
+            "--ro-bind-try /etc/ld.so.cache /etc/ld.so.cache",
+            "--ro-bind-try '/home/o'\\''neil/.rustup' '/home/o'\\''neil/.rustup'",
+            "--ro-bind-try '/home/o'\\''neil/.cargo/bin'",
+        ] {
+            assert!(cmd.contains(needed), "missing `{needed}` in: {cmd}");
+        }
+        assert!(
+            !cmd.contains("neil/.cargo' "),
+            "~/.cargo holds registry credentials and must stay hidden: {cmd}"
+        );
+        let no_home = bwrap_wrap_with_home("true", Path::new("/work"), true, None);
+        assert!(!no_home.contains(".rustup"));
     }
 
     // ── Honesty about what `strict` actually does ────────────────────────────

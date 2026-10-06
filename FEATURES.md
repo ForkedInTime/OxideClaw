@@ -399,7 +399,7 @@ OxideClaw supports multiple sandbox backends for tool isolation:
 
 | Backend | Description |
 |---------|-------------|
-| `bwrap` | bubblewrap — lightweight Linux sandboxing |
+| `bwrap` | bubblewrap — lightweight Linux sandboxing. System dirs and per-user toolchains (`~/.cargo/bin`, `~/.rustup`, `~/.local/bin`, `~/.nvm`) are read-only, the rest of `$HOME` is hidden, `/tmp` is private |
 | `firejail` | Firejail — security sandbox with profiles |
 | `strict` | Best-effort denylist of catastrophic command literals — NOT isolation; no filesystem or network restriction (the only option on macOS/Windows) |
 
