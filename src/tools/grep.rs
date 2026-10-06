@@ -161,8 +161,8 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
 
     // Same read deny-list the fallback backend and FileRead enforce. rg opens
     // files itself, so exclusions have to be declared rather than checked.
-    for g in super::denied_read_globs() {
-        args.push("--glob".into());
+    for (flag, g) in super::denied_read_globs() {
+        args.push(flag.into());
         args.push(g);
     }
 

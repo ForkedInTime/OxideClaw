@@ -35,6 +35,10 @@ fn text(o: &oxideclaw::tools::ToolOutput) -> String {
         .join("")
 }
 
+/// Held while the fallback test empties PATH, and by tests that need `rg`:
+/// otherwise they silently run the fallback backend and prove nothing about rg.
+static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Secrets outside the project, a project dir, and links pointing out of it.
 fn fixture() -> (TempDir, PathBuf) {
     let td = TempDir::new().unwrap();
@@ -174,6 +178,33 @@ async fn grep_does_not_return_private_key_contents() {
     );
 }
 
+/// Read refuses `CERT.PEM` (suffixes are matched case-insensitively), but the
+/// rg exclusion globs were case-sensitive, so Grep printed upper-case key files.
+#[tokio::test]
+async fn grep_deny_list_ignores_key_suffix_case() {
+    let (_td, proj) = fixture();
+    for name in ["CERT.PEM", "server.Key", "STORE.PFX"] {
+        std::fs::write(proj.join(name), "CASESECRET\n").unwrap();
+    }
+    std::fs::write(proj.join("ok.txt"), "CASESECRET\n").unwrap();
+
+    let _path = PATH_LOCK.lock().await;
+    let ctx = ToolContext::new(proj);
+    let out = GrepTool
+        .execute(
+            json!({"pattern": "CASESECRET", "output_mode": "content"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let body = text(&out);
+
+    for name in ["CERT.PEM", "server.Key", "STORE.PFX"] {
+        assert!(!body.contains(name), "{name} must not be searched: {body}");
+    }
+    assert!(body.contains("ok.txt"), "{body}");
+}
+
 /// The same, forced down the non-ripgrep path.
 #[tokio::test]
 async fn grep_fallback_backend_also_honours_the_deny_list() {
@@ -183,9 +214,10 @@ async fn grep_fallback_backend_also_honours_the_deny_list() {
 
     // An empty PATH removes `rg`, so the pure-Rust backend runs.
     let ctx = ToolContext::new(proj);
+    let _path = PATH_LOCK.lock().await;
     let prev = std::env::var_os("PATH");
-    // SAFETY: restored below; this test does not run concurrently with other
-    // PATH users in this binary.
+    // SAFETY: restored below; PATH_LOCK keeps the other PATH users in this
+    // binary out while it is empty.
     unsafe { std::env::set_var("PATH", "") };
     let out = GrepTool
         .execute(

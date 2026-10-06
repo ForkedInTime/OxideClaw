@@ -424,12 +424,21 @@ pub fn crlf_fallback(content: &str, old: &str, new: &str) -> Option<(String, Str
 /// The Grep tool has two backends — a `ripgrep` subprocess and a pure-Rust
 /// fallback — and both must honour the same rules. The fallback can check each
 /// file as it opens it; `rg` opens files itself, so it has to be told up front.
-pub fn denied_read_globs() -> Vec<String> {
-    let mut g: Vec<String> = PRIVATE_KEY_NAMES
+///
+/// Each entry is `(rg flag, glob)`. [`check_sensitive_path`] matches names
+/// exactly but suffixes case-insensitively, so the suffix globs go out as
+/// `--iglob`: with plain `--glob`, `server.KEY` or `CERT.PEM` were printed by
+/// Grep while Read refused them.
+pub fn denied_read_globs() -> Vec<(&'static str, String)> {
+    let mut g: Vec<(&'static str, String)> = PRIVATE_KEY_NAMES
         .iter()
-        .map(|n| format!("!**/{n}"))
+        .map(|n| ("--glob", format!("!**/{n}")))
         .collect();
-    g.extend(PRIVATE_KEY_SUFFIXES.iter().map(|s| format!("!**/*{s}")));
+    g.extend(
+        PRIVATE_KEY_SUFFIXES
+            .iter()
+            .map(|s| ("--iglob", format!("!**/*{s}"))),
+    );
     g
 }
 
