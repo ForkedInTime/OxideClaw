@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write    # needed to create GitHub Releases and upload assets
+  actions: write     # needed to dispatch docker.yml after the release
 
 jobs:
   build:
@@ -209,3 +210,8 @@ jobs:
             --title "OxideClaw $TAG" \
             --generate-notes \
             release/*
+          # A release made with GITHUB_TOKEN triggers no workflows, so start
+          # the image build explicitly; the Dockerfile downloads the musl
+          # asset, which exists only from this point on.
+          gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" \
+            -f version="${TAG#v}"
