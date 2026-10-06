@@ -124,6 +124,13 @@ async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option
         match result {
             Ok(Ok(output)) if output.status.success() => {
                 let raw = String::from_utf8_lossy(&output.stdout);
+                // A refused or failed navigation still exits 0 and dumps
+                // Chromium's own error page; that is no answer, and every
+                // installed browser would hit the same wall. The guarded
+                // fetch reports the real reason instead.
+                if is_chromium_error_page(&raw) {
+                    return None;
+                }
                 let stripped = strip_html(raw.as_ref(), max_chars);
                 if !stripped.trim().is_empty() {
                     return Some(stripped);
@@ -133,6 +140,11 @@ async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option
         }
     }
     None
+}
+
+/// Chromium's net-error interstitial (`chrome-error://chromewebdata/`).
+fn is_chromium_error_page(dom: &str) -> bool {
+    dom.contains("id=\"main-frame-error\"") && dom.contains("neterror")
 }
 
 fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &str) -> Vec<String> {
@@ -264,6 +276,19 @@ mod tests {
         assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
         assert!(args.contains(&"--user-data-dir=/p".to_string()));
         assert_eq!(args.last().unwrap(), "https://e.example/");
+    }
+
+    /// A navigation the proxy refused used to come back as success, with
+    /// "This site can't be reached" as the page text.
+    #[test]
+    fn chromium_error_pages_are_not_page_content() {
+        let interstitial = r#"<html dir="ltr" lang="en"><body class="neterror" id="t">
+            <div id="main-frame-error" class="interstitial-wrapper"><h1>This site can't be reached</h1>
+            <div class="error-code">ERR_TUNNEL_CONNECTION_FAILED</div></div></body></html>"#;
+        assert!(is_chromium_error_page(interstitial));
+        assert!(!is_chromium_error_page(
+            "<html><body><p>neterror is a word here</p></body></html>"
+        ));
     }
 
     /// `chromium --dump-dom file:///etc/passwd` would happily print the
