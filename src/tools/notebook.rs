@@ -19,6 +19,9 @@ struct Notebook {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Cell {
+    // Cell ids only exist from nbformat 4.5 on; older schemas forbid the key,
+    // so an absent id must stay absent rather than round-trip as `"id": null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     cell_type: String,
     source: CellSource,
@@ -57,6 +60,58 @@ impl CellSource {
             lines
         };
         CellSource::Lines(lines)
+    }
+}
+
+impl Notebook {
+    /// nbformat 4.0-4.4 cells have no `id` and the schema rejects one.
+    fn supports_cell_ids(&self) -> bool {
+        let major = self
+            .extra
+            .get("nbformat")
+            .and_then(Value::as_u64)
+            .unwrap_or(4);
+        let minor = self
+            .extra
+            .get("nbformat_minor")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        major > 4 || minor >= 5
+    }
+}
+
+/// Label NotebookRead shows for a cell, and which NotebookEdit accepts back.
+/// Id-less cells (nbformat < 4.5) get a positional `cell-N`.
+fn cell_label(cell: &Cell, index: usize) -> String {
+    cell.id
+        .clone()
+        .unwrap_or_else(|| format!("cell-{}", index + 1))
+}
+
+/// Resolve the target cell. A real id always wins; `cell-N` and `cell_number`
+/// are 1-based positions so notebooks without ids stay editable.
+fn target_index(cells: &[Cell], cell_id: Option<&str>, cell_number: Option<u64>) -> Result<usize> {
+    let position = |n: u64| -> Result<usize> {
+        match usize::try_from(n) {
+            Ok(n) if (1..=cells.len()).contains(&n) => Ok(n - 1),
+            _ => Err(anyhow!(
+                "Cell number {n} is out of range (notebook has {} cells)",
+                cells.len()
+            )),
+        }
+    };
+    if let Some(id) = cell_id {
+        if let Some(i) = cells.iter().position(|c| c.id.as_deref() == Some(id)) {
+            return Ok(i);
+        }
+        if let Some(n) = id.strip_prefix("cell-").and_then(|n| n.parse::<u64>().ok()) {
+            return position(n);
+        }
+        return Err(anyhow!("Cell not found: {id}"));
+    }
+    match cell_number {
+        Some(n) => position(n),
+        None => Err(anyhow!("cell_id or cell_number is required")),
     }
 }
 
@@ -110,7 +165,7 @@ impl Tool for NotebookReadTool {
 
         let mut out = String::new();
         for (i, cell) in notebook.cells.iter().enumerate() {
-            let id = cell.id.as_deref().unwrap_or("(no id)");
+            let id = cell_label(cell, i);
             let source = cell.source.to_string();
             out.push_str(&format!(
                 "Cell {} [{}] id={}\n{}\n\n",
@@ -134,8 +189,10 @@ impl Tool for NotebookReadTool {
 #[derive(Deserialize)]
 struct EditInput {
     notebook_path: String,
-    /// Cell id to target (for replace/delete). Required for replace and delete.
+    /// Cell id to target, as NotebookRead prints it.
     cell_id: Option<String>,
+    /// 1-based cell position, the `N` in NotebookRead's "Cell N".
+    cell_number: Option<u64>,
     /// New source content (for replace/insert).
     new_source: Option<String>,
     /// Cell type for insert: "code" or "markdown" (default "code")
@@ -152,7 +209,9 @@ impl Tool for NotebookEditTool {
 
     fn description(&self) -> &str {
         "Edit a Jupyter notebook cell. Supports replace, insert_before, insert_after, and delete. \
-        Use NotebookRead first to get cell ids."
+        Use NotebookRead first to get cell ids; target a cell by cell_id (cells without an id \
+        are listed as cell-N) or by its 1-based cell_number. Inserting into an empty notebook \
+        needs no target."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -165,7 +224,12 @@ impl Tool for NotebookEditTool {
                 },
                 "cell_id": {
                     "type": "string",
-                    "description": "ID of the target cell (required for replace, insert_before, insert_after, delete)"
+                    "description": "ID of the target cell as shown by NotebookRead (cells without an id are shown as cell-N)"
+                },
+                "cell_number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based position of the target cell; alternative to cell_id"
                 },
                 "new_source": {
                     "type": "string",
@@ -209,39 +273,35 @@ impl Tool for NotebookEditTool {
 
         match input.edit_mode.as_str() {
             "replace" => {
-                let cell_id = input
-                    .cell_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("cell_id is required for replace"))?;
                 let new_source = input
                     .new_source
                     .as_deref()
                     .ok_or_else(|| anyhow!("new_source is required for replace"))?;
-
-                let cell = notebook
-                    .cells
-                    .iter_mut()
-                    .find(|c| c.id.as_deref() == Some(cell_id))
-                    .ok_or_else(|| anyhow!("Cell not found: {cell_id}"))?;
-
-                cell.source = CellSource::from_text(new_source);
+                let idx =
+                    target_index(&notebook.cells, input.cell_id.as_deref(), input.cell_number)?;
+                notebook.cells[idx].source = CellSource::from_text(new_source);
             }
             "insert_before" | "insert_after" => {
-                let cell_id = input
-                    .cell_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("cell_id is required for insert"))?;
                 let new_source = input
                     .new_source
                     .as_deref()
                     .ok_or_else(|| anyhow!("new_source is required for insert"))?;
                 let cell_type = input.cell_type.as_deref().unwrap_or("code").to_string();
 
-                let idx = notebook
-                    .cells
-                    .iter()
-                    .position(|c| c.id.as_deref() == Some(cell_id))
-                    .ok_or_else(|| anyhow!("Cell not found: {cell_id}"))?;
+                // An empty notebook has nothing to anchor on; its first cell
+                // would otherwise be impossible to create.
+                let untargeted = input.cell_id.is_none() && input.cell_number.is_none();
+                let insert_at = if untargeted && notebook.cells.is_empty() {
+                    0
+                } else {
+                    let idx =
+                        target_index(&notebook.cells, input.cell_id.as_deref(), input.cell_number)?;
+                    if input.edit_mode == "insert_before" {
+                        idx
+                    } else {
+                        idx + 1
+                    }
+                };
 
                 // nbformat v4 requires `metadata` on every cell and `outputs` +
                 // `execution_count` on code cells; without them Jupyter refuses
@@ -253,31 +313,18 @@ impl Tool for NotebookEditTool {
                     extra.insert("execution_count".to_string(), Value::Null);
                 }
                 let new_cell = Cell {
-                    id: Some(uuid::Uuid::new_v4().to_string().chars().take(8).collect()),
+                    id: notebook
+                        .supports_cell_ids()
+                        .then(|| uuid::Uuid::new_v4().to_string().chars().take(8).collect()),
                     cell_type,
                     source: CellSource::from_text(new_source),
                     extra,
                 };
-
-                let insert_at = if input.edit_mode == "insert_before" {
-                    idx
-                } else {
-                    idx + 1
-                };
                 notebook.cells.insert(insert_at, new_cell);
             }
             "delete" => {
-                let cell_id = input
-                    .cell_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("cell_id is required for delete"))?;
-
-                let idx = notebook
-                    .cells
-                    .iter()
-                    .position(|c| c.id.as_deref() == Some(cell_id))
-                    .ok_or_else(|| anyhow!("Cell not found: {cell_id}"))?;
-
+                let idx =
+                    target_index(&notebook.cells, input.cell_id.as_deref(), input.cell_number)?;
                 notebook.cells.remove(idx);
             }
             other => return Ok(ToolOutput::error(format!("Unknown edit_mode: {other}"))),
@@ -305,6 +352,11 @@ mod tests {
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
         ToolContext::new(dir.to_path_buf())
+    }
+
+    fn text(out: &ToolOutput) -> &str {
+        let crate::api::types::ToolResultContent::Text { text } = &out.content[0];
+        text
     }
 
     /// `"~"` alone used to slice `p[2..]` on a 1-byte string and panic.
@@ -401,5 +453,76 @@ mod tests {
         assert_eq!(code["metadata"], json!({}));
         assert_eq!(code["outputs"], json!([]));
         assert!(code.get("execution_count").is_some_and(Value::is_null));
+    }
+
+    /// nbformat < 4.5 cells have no id. Every edit used to fail with "Cell not
+    /// found", and a write would have emitted schema-invalid `"id": null`.
+    #[tokio::test]
+    async fn cells_without_ids_are_editable_and_stay_id_less() {
+        const OLD: &str = r##"{"cells":[{"cell_type":"code","source":["a = 1\n"],"metadata":{},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":["# b"],"metadata":{}}],"nbformat":4,"nbformat_minor":4,"metadata":{}}"##;
+        let dir = tempfile::tempdir().unwrap();
+        let nb = dir.path().join("old.ipynb");
+        std::fs::write(&nb, OLD).unwrap();
+        let c = ctx(dir.path());
+
+        let listing = NotebookReadTool
+            .execute(json!({"notebook_path": "old.ipynb"}), &c)
+            .await
+            .unwrap();
+        assert!(text(&listing).contains("id=cell-1"), "{}", text(&listing));
+        assert!(text(&listing).contains("id=cell-2"), "{}", text(&listing));
+
+        for edit in [
+            json!({"edit_mode": "replace", "cell_id": "cell-1", "new_source": "a = 2"}),
+            json!({"edit_mode": "insert_after", "cell_number": 2, "new_source": "c = 3"}),
+            json!({"edit_mode": "delete", "cell_id": "cell-2"}),
+        ] {
+            let mut input = edit.clone();
+            input["notebook_path"] = json!("old.ipynb");
+            let out = NotebookEditTool.execute(input, &c).await.unwrap();
+            assert!(!out.is_error, "{edit}: {}", text(&out));
+        }
+
+        let text = std::fs::read_to_string(&nb).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let cells = v["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0]["source"], json!(["a = 2"]));
+        assert_eq!(cells[1]["source"], json!(["c = 3"]));
+        assert!(
+            cells.iter().all(|c| c.get("id").is_none()),
+            "a 4.4 notebook must not gain id keys: {text}"
+        );
+
+        let out = NotebookEditTool
+            .execute(
+                json!({"notebook_path": "old.ipynb", "edit_mode": "delete", "cell_number": 9}),
+                &c,
+            )
+            .await;
+        assert!(out.is_err(), "out-of-range cell_number must be rejected");
+    }
+
+    #[tokio::test]
+    async fn the_first_cell_can_be_inserted_into_an_empty_notebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb = dir.path().join("e.ipynb");
+        std::fs::write(
+            &nb,
+            r#"{"cells":[],"nbformat":4,"nbformat_minor":5,"metadata":{}}"#,
+        )
+        .unwrap();
+        let out = NotebookEditTool
+            .execute(
+                json!({"notebook_path": "e.ipynb", "edit_mode": "insert_after", "new_source": "x"}),
+                &ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", text(&out));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&nb).unwrap()).unwrap();
+        let cells = v["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert!(cells[0]["id"].is_string(), "4.5 cells get an id");
     }
 }
