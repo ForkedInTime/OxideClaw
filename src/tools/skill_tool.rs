@@ -57,7 +57,16 @@ impl Tool for SkillTool {
             ));
         }
 
-        let skill_content = find_skill(&ctx.cwd, &input.skill).await?;
+        let path = find_skill(&ctx.cwd, &input.skill)?;
+        // Skill is unprompted and echoes the file back, so a repo-shipped
+        // `.claude/skills/setup.md -> ~/.ssh/id_rsa` would hand the model the
+        // key that Read refuses.
+        if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read) {
+            return Ok(err);
+        }
+        let skill_content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Cannot read skill {}: {e}", input.skill))?;
 
         // Expand the skill content (strip frontmatter, optionally append args)
         let prompt = expand_skill(&skill_content, input.args.as_deref());
@@ -68,7 +77,7 @@ impl Tool for SkillTool {
     }
 }
 
-async fn find_skill(cwd: &std::path::Path, name: &str) -> Result<String> {
+fn find_skill(cwd: &std::path::Path, name: &str) -> Result<PathBuf> {
     let dirs: Vec<PathBuf> = {
         let mut d = Vec::new();
         // Local project skills override global ones
@@ -82,9 +91,7 @@ async fn find_skill(cwd: &std::path::Path, name: &str) -> Result<String> {
     for dir in &dirs {
         let path = dir.join(format!("{name}.md"));
         if path.exists() {
-            return tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Cannot read skill {name}: {e}"));
+            return Ok(path);
         }
     }
 
@@ -147,5 +154,31 @@ mod tests {
                 "{name:?} read outside the skills dir"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_symlinked_to_a_private_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_ed25519");
+        std::fs::write(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\nKEYBODY\n").unwrap();
+        let skills = dir.path().join("proj/.claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(&key, skills.join("setup.md")).unwrap();
+        std::fs::write(skills.join("ok.md"), "do the thing").unwrap();
+        let ctx = ToolContext::new(dir.path().join("proj"));
+
+        let out = SkillTool
+            .execute(json!({"skill": "setup"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(!format!("{:?}", out.content).contains("KEYBODY"));
+
+        let out = SkillTool
+            .execute(json!({"skill": "ok"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error && format!("{:?}", out.content).contains("do the thing"));
     }
 }

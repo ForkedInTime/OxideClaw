@@ -262,7 +262,14 @@ pub async fn load_skills() -> HashMap<String, Skill> {
         if let Ok(mut entries) = fs::read_dir(&dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
+                // Same deny-list as Read: a skill file that links to key
+                // material must not become a prompt.
                 if path.extension().and_then(|e| e.to_str()) == Some("md")
+                    && crate::tools::check_sensitive_path_resolved(
+                        &path,
+                        crate::tools::SensitiveOp::Read,
+                    )
+                    .is_none()
                     && let Ok(content) = fs::read_to_string(&path).await
                 {
                     let fallback = path

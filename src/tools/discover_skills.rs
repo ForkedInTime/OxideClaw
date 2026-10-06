@@ -52,11 +52,16 @@ impl Tool for DiscoverSkillsTool {
                     }
 
                     // Read first non-empty, non-frontmatter line as description
-                    let desc = if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        extract_description(&content)
-                    } else {
-                        String::new()
-                    };
+                    // (never from a link to key material).
+                    let desc =
+                        if super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read)
+                            .is_none()
+                            && let Ok(content) = tokio::fs::read_to_string(&path).await
+                        {
+                            extract_description(&content)
+                        } else {
+                            String::new()
+                        };
 
                     // Avoid duplicates (local overrides global)
                     if !skills.iter().any(|(n, _)| n == &name) {
