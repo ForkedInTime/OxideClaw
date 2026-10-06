@@ -645,11 +645,7 @@ impl Config {
         let old = std::mem::take(self);
         macro_rules! unless_overridden {
             ($f:ident) => {
-                if old.$f == launch.$f {
-                    new.$f
-                } else {
-                    old.$f
-                }
+                if old.$f == launch.$f { new.$f } else { old.$f }
             };
         }
         *self = Config {
@@ -846,7 +842,8 @@ impl Config {
             self.spinner_style = style;
         }
         self.sandbox_allow_network = settings.sandbox_allow_network.unwrap_or(true);
-        self.disable_skill_shell_execution = settings.disable_skill_shell_execution.unwrap_or(false);
+        self.disable_skill_shell_execution =
+            settings.disable_skill_shell_execution.unwrap_or(false);
 
         // Smart model router settings
         self.router_enabled = settings.router_enabled.unwrap_or(false);
@@ -2343,7 +2340,11 @@ mod retarget_cwd_tests {
         cfg.retarget_cwd(b.path().to_path_buf());
 
         assert_eq!(cfg.cwd, b.path());
-        assert!(cfg.claudemd.contains("BRAVO-INSTRUCTIONS"), "{}", cfg.claudemd);
+        assert!(
+            cfg.claudemd.contains("BRAVO-INSTRUCTIONS"),
+            "{}",
+            cfg.claudemd
+        );
         assert!(!cfg.claudemd.contains("ALPHA-INSTRUCTIONS"));
         assert_eq!(cfg.model, "bravo-model");
         assert_eq!(cfg.max_tokens, 2222);
