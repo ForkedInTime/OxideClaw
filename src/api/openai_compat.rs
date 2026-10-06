@@ -17,7 +17,8 @@
 ///
 /// Provider API keys come from environment variables:
 ///   GROQ_API_KEY, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, etc.
-///   OPENAI_API_KEY is the fallback for any provider without a specific key.
+///   OPENAI_API_KEY is used only by `oai:` and `openai-compat:`; named
+///   third-party providers require their own key variable.
 ///   OPENAI_BASE_URL overrides the base URL for the generic `openai-compat:` prefix.
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
@@ -579,6 +580,17 @@ pub struct OpenAiCompatClient {
     retry_notifier: Option<super::retry::RetryNotifier>,
 }
 
+/// The bearer token for `provider`, read only from its own key variable.
+/// There is deliberately no fallback to OPENAI_API_KEY: that would hand the
+/// user's OpenAI key to Groq, DeepSeek, OpenRouter, etc. whenever their own
+/// variable is unset. Local providers (LM Studio) have no key variable.
+fn provider_api_key(provider: &ProviderDef, env: impl Fn(&str) -> Option<String>) -> String {
+    if provider.key_env.is_empty() {
+        return String::new();
+    }
+    env(provider.key_env).unwrap_or_default()
+}
+
 impl OpenAiCompatClient {
     /// Create a client for a specific provider prefix + model string.
     /// Resolves base_url from the provider registry and API key from env vars.
@@ -603,15 +615,7 @@ impl OpenAiCompatClient {
             provider.base_url.to_string()
         };
 
-        // Resolve API key: provider-specific env var → OPENAI_API_KEY fallback → empty
-        let api_key = if provider.key_env.is_empty() {
-            // Local providers (LM Studio) don't need a key
-            String::new()
-        } else {
-            std::env::var(provider.key_env)
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                .unwrap_or_default()
-        };
+        let api_key = provider_api_key(provider, |k| std::env::var(k).ok());
 
         // Warn if cloud provider has no key (local providers are fine without)
         if api_key.is_empty()
@@ -620,7 +624,7 @@ impl OpenAiCompatClient {
             && !base_url.starts_with("http://127.0.0.1")
         {
             return Err(anyhow!(
-                "{}: no API key found.\n  Set {} or OPENAI_API_KEY in your environment.\n  \
+                "{}: no API key found.\n  Set {} in your environment.\n  \
                  Example: export {}=your-key-here",
                 provider.name,
                 provider.key_env,
@@ -835,5 +839,49 @@ mod reasoning_echo_tests {
         let msgs = assistant(vec![ContentBlock::Text { text: "hi".into() }]);
         let v = assistant_json(&msgs, true);
         assert!(v.get("reasoning_content").is_none(), "{v}");
+    }
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    use super::*;
+
+    fn provider(prefix: &str) -> &'static ProviderDef {
+        PROVIDERS.iter().find(|p| p.prefix == prefix).unwrap()
+    }
+
+    /// Only OPENAI_API_KEY is set, as for most users with an OpenAI account.
+    fn only_openai(k: &str) -> Option<String> {
+        (k == "OPENAI_API_KEY").then(|| "sk-openai-secret".to_string())
+    }
+
+    #[test]
+    fn openai_key_is_never_sent_to_third_party_providers() {
+        for p in PROVIDERS {
+            if p.key_env.is_empty() || p.key_env == "OPENAI_API_KEY" {
+                continue;
+            }
+            assert_eq!(
+                provider_api_key(p, only_openai),
+                "",
+                "{} got the OpenAI key",
+                p.prefix
+            );
+        }
+        let env = |k: &str| (k == "GROQ_API_KEY").then(|| "gsk-groq".to_string());
+        assert_eq!(provider_api_key(provider("groq"), env), "gsk-groq");
+    }
+
+    #[test]
+    fn openai_key_still_serves_openai_and_generic_endpoints() {
+        assert_eq!(
+            provider_api_key(provider("oai"), only_openai),
+            "sk-openai-secret"
+        );
+        assert_eq!(
+            provider_api_key(provider("openai-compat"), only_openai),
+            "sk-openai-secret"
+        );
+        assert_eq!(provider_api_key(provider("lmstudio"), only_openai), "");
     }
 }
