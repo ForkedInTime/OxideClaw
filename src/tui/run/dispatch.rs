@@ -1598,27 +1598,37 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::MemoryForget(query) => {
             let cwd = config.cwd.clone();
             match crate::memory::MemoryStore::open(&cwd) {
-                Ok(store) => match store.search(&query, 20) {
-                    Ok(matches) if matches.is_empty() => {
-                        app.entries
-                            .push(ChatEntry::system(format!("No memories matched '{query}'.")));
-                    }
-                    Ok(matches) => {
-                        let count = matches.len();
-                        let mut errs = 0usize;
-                        for m in &matches {
-                            if store.forget(&m.key).is_err() {
-                                errs += 1;
+                Ok(store) => match store.forget_matching(&query) {
+                    Ok(removed) if removed.is_empty() => {
+                        let mut msg = format!("No memories matched every word of '{query}'.");
+                        // Near misses, so the user can forget one by its key.
+                        if let Ok(near) = store.search(&query, 5)
+                            && !near.is_empty()
+                        {
+                            msg.push_str(" Closest (/forget <key>):");
+                            for m in near {
+                                msg.push_str(&format!(
+                                    "\n  [{}] {} ({})",
+                                    m.category, m.value, m.key
+                                ));
                             }
                         }
-                        let ok = count - errs;
-                        app.entries.push(ChatEntry::system(format!(
-                            "Forgot {ok} memory entries matching '{query}'."
-                        )));
+                        app.entries.push(ChatEntry::system(msg));
+                    }
+                    Ok(removed) => {
+                        let mut msg = format!(
+                            "Forgot {} memor{}:",
+                            removed.len(),
+                            if removed.len() == 1 { "y" } else { "ies" }
+                        );
+                        for m in removed {
+                            msg.push_str(&format!("\n  [{}] {} ({})", m.category, m.value, m.key));
+                        }
+                        app.entries.push(ChatEntry::system(msg));
                     }
                     Err(e) => app
                         .entries
-                        .push(ChatEntry::system(format!("Memory search error: {e}"))),
+                        .push(ChatEntry::system(format!("Memory forget error: {e}"))),
                 },
                 Err(e) => app
                     .entries

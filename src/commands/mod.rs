@@ -478,7 +478,9 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         }
         "forget" => {
             if args.is_empty() {
-                CommandAction::Message("Usage: /forget <query matching memories to remove>".into())
+                CommandAction::Message(
+                    "Usage: /forget <key | words every memory to remove contains>".into(),
+                )
             } else {
                 CommandAction::MemoryForget(args.to_string())
             }

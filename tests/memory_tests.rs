@@ -178,6 +178,71 @@ fn test_forget_nonexistent_key_is_ok() {
     store.forget("nonexistent_key_xyz").unwrap();
 }
 
+fn seed_unrelated(store: &MemoryStore) {
+    store
+        .add("auth", "We use JWT for auth", Category::Decision, "user")
+        .unwrap();
+    store
+        .add(
+            "db",
+            "The database is Postgres 16",
+            Category::Decision,
+            "user",
+        )
+        .unwrap();
+    store
+        .add(
+            "style",
+            "Prefer tabs over spaces in the frontend",
+            Category::Preference,
+            "user",
+        )
+        .unwrap();
+}
+
+/// `/forget the JWT decision` used to delete every FTS hit of
+/// "the"* OR "JWT"* OR "decision"*: all three unrelated memories.
+#[test]
+fn test_forget_matching_needs_every_word() {
+    let (_tmp, store) = make_store();
+    seed_unrelated(&store);
+
+    assert!(
+        store
+            .forget_matching("the JWT decision")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.count().unwrap(), 3);
+
+    // "auth" must not take a prefix match on "author"/"authentication".
+    store
+        .add(
+            "a2",
+            "authentication goes via SSO",
+            Category::Context,
+            "user",
+        )
+        .unwrap();
+    let removed = store.forget_matching("JWT auth").unwrap();
+    assert_eq!(
+        removed.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
+        ["auth"]
+    );
+    assert_eq!(store.count().unwrap(), 3);
+}
+
+#[test]
+fn test_forget_matching_exact_key_wins() {
+    let (_tmp, store) = make_store();
+    seed_unrelated(&store);
+    let removed = store.forget_matching("  db ").unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].key, "db");
+    assert_eq!(store.count().unwrap(), 2);
+    assert!(store.forget_matching("  ").unwrap().is_empty());
+}
+
 // ── clear_all ─────────────────────────────────────────────────────────────────
 
 #[test]

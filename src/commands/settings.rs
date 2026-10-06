@@ -244,7 +244,9 @@ pub(super) fn cmd_memory_dispatch(args: &str, ctx: &CommandContext) -> CommandAc
         }
         "forget" => {
             if rest.is_empty() {
-                CommandAction::Message("Usage: /memory forget <query>".into())
+                CommandAction::Message(
+                    "Usage: /memory forget <key | words every memory to remove contains>".into(),
+                )
             } else {
                 CommandAction::MemoryForget(rest.to_string())
             }

@@ -254,6 +254,35 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Remove what `/forget <query>` names: the memory whose key is exactly
+    /// `query`, else every memory containing each word of `query` as a whole
+    /// word. Returns the removed entries. `search` ORs prefix terms, which
+    /// suits recall but made a forget of "the JWT decision" delete every
+    /// note containing "the…" or "decision…".
+    pub fn forget_matching(&self, query: &str) -> Result<Vec<Memory>> {
+        let query = query.trim();
+        let all = self.list(None)?;
+        let hits: Vec<Memory> = match all.iter().find(|m| m.key == query) {
+            Some(exact) => vec![exact.clone()],
+            None => {
+                let wanted = words(query);
+                if wanted.is_empty() {
+                    return Ok(Vec::new());
+                }
+                all.into_iter()
+                    .filter(|m| {
+                        let have = words(&format!("{} {}", m.key, m.value));
+                        wanted.iter().all(|w| have.contains(w))
+                    })
+                    .collect()
+            }
+        };
+        for m in &hits {
+            self.forget(&m.key)?;
+        }
+        Ok(hits)
+    }
+
     /// Delete all memories. Rebuilds the FTS index.
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute_batch(
@@ -394,6 +423,15 @@ fn sanitize_key(key: &str) -> String {
     key.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .take(64)
+        .collect()
+}
+
+/// Lowercased alphanumeric words; `_` splits too, so generated keys
+/// (`we_use_jwt_for_1a2b3c4d`) yield their words.
+fn words(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
         .collect()
 }
 
