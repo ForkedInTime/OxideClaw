@@ -395,28 +395,45 @@ pub fn cuda_available() -> bool {
 
 // ── XTTS v2 server lifecycle ─────────────────────────────────────────────────
 
-/// Find the xtts-server.py script bundled with OxideClaw.
-fn xtts_server_script() -> Option<PathBuf> {
-    // Check relative to the running binary
-    if let Ok(exe) = std::env::current_exe() {
-        let exe_dir = exe.parent()?;
-        // release binary: target/release/oxideclaw → ../../scripts/
-        for candidate in &[
-            exe_dir.join("../../scripts/xtts-server.py"),
-            exe_dir.join("../scripts/xtts-server.py"),
-            exe_dir.join("scripts/xtts-server.py"),
-        ] {
-            if candidate.exists() {
-                return candidate.canonicalize().ok();
-            }
-        }
+/// The XTTS v2 server, compiled into the binary. It used to be looked up on
+/// disk, and the only lookup that matched an installed binary was
+/// `./scripts/xtts-server.py` in the current directory, so `/voice speak on`
+/// inside a cloned repo ran whatever that repo shipped under that name.
+const XTTS_SERVER_PY: &str = include_str!("voice/xtts_server.py");
+
+/// Materialise the embedded server script into `dir` and return its path.
+/// `dir` is private to the user (0700) and holds nothing else, because Python
+/// puts the script's directory on `sys.path[0]`; a shared directory would let
+/// a planted `numpy.py` next to it run instead.
+fn install_xtts_server_script(dir: &std::path::Path) -> Result<PathBuf> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        // An older or hand-made directory keeps its mode under `create`.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    // Check relative to CWD
-    let cwd_script = PathBuf::from("scripts/xtts-server.py");
-    if cwd_script.exists() {
-        return cwd_script.canonicalize().ok();
+    #[cfg(not(unix))]
+    builder.create(dir)?;
+
+    let script = dir.join("xtts-server.py");
+    if std::fs::read_to_string(&script).ok().as_deref() == Some(XTTS_SERVER_PY) {
+        return Ok(script);
     }
-    None
+    // Write-then-rename so a concurrent OxideClaw never runs a half-written file.
+    let tmp = dir.join(format!(".xtts-server.py.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, XTTS_SERVER_PY)?;
+    std::fs::rename(&tmp, &script)?;
+    Ok(script)
+}
+
+/// Path of the XTTS v2 server script, refreshed from the copy embedded in
+/// this binary.
+fn xtts_server_script() -> Result<PathBuf> {
+    install_xtts_server_script(&crate::config::Config::data_dir().join("xtts"))
 }
 
 /// Find the Python interpreter inside the TTS uv tool venv.
@@ -448,9 +465,8 @@ pub async fn ensure_xtts_server() -> Result<u16> {
         return Ok(XTTS_SERVER_PORT);
     }
 
-    let script = xtts_server_script().ok_or_else(|| {
-        anyhow!("xtts-server.py not found. Rebuild OxideClaw or check scripts/ dir.")
-    })?;
+    let script = xtts_server_script()
+        .map_err(|e| anyhow!("Could not write the XTTS v2 server script: {e}"))?;
     let python = tts_python()
         .ok_or_else(|| anyhow!("No Python for TTS venv. Run: uv tool install TTS --python 3.11"))?;
 
@@ -1372,5 +1388,37 @@ mod scratch_and_body_tests {
         let v: serde_json::Value = serde_json::from_str(&with_clone).unwrap();
         assert_eq!(v["speaker_wav"].as_str(), Some("/tmp/me \"x\".wav"));
         assert!(v.get("speaker").is_none());
+    }
+}
+
+#[cfg(test)]
+mod xtts_server_script_tests {
+    use super::{XTTS_SERVER_PY, install_xtts_server_script};
+
+    #[test]
+    fn server_script_comes_from_the_binary_not_the_project() {
+        let project = tempfile::tempdir().unwrap();
+        let planted = project.path().join("scripts");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("xtts-server.py"), "import os; os.system('id')").unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let dir = data.path().join("xtts");
+        let script = install_xtts_server_script(&dir).unwrap();
+        assert!(script.starts_with(&dir), "{script:?}");
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), XTTS_SERVER_PY);
+        assert!(XTTS_SERVER_PY.contains("xtts_v2"));
+
+        // A tampered copy is replaced on the next start.
+        std::fs::write(&script, "print('stale')").unwrap();
+        install_xtts_server_script(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), XTTS_SERVER_PY);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 }

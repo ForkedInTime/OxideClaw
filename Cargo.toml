@@ -7,8 +7,8 @@ license = "Apache-2.0"
 repository = "https://github.com/ForkedInTime/OxideClaw"
 keywords = ["cli", "ai", "coding-agent", "claude", "ollama"]
 categories = ["command-line-utilities", "development-tools"]
-# Keep the crates.io tarball small: images, CI, packaging, and the SDK docs
-# live on GitHub.
+# Keep the crates.io tarball small: images, CI, packaging, dev scripts and
+# the SDK docs live on GitHub. Anything the binary embeds must live under src/.
 exclude = ["assets/*", ".github/*", "contrib/*", "scripts/*", "sdk/*", ".kilocodeignore", "CLAUDE.md", ".secret/*"]
 
 [lib]
