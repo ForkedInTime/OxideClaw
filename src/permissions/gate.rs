@@ -10,8 +10,8 @@
 //! have needed one.
 
 use super::{
-    CheckResult, PermissionDecision, PermissionState, check_compound_command, describe_tool_call,
-    is_command_tool,
+    CheckResult, PermissionDecision, PermissionState, blocked_entry_matches,
+    check_compound_command, describe_tool_call, is_command_tool,
 };
 use std::sync::Arc;
 
@@ -98,7 +98,11 @@ impl PermissionGate {
     }
 
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
-        if self.blocked.iter().any(|b| b == tool_name) {
+        if self
+            .blocked
+            .iter()
+            .any(|b| blocked_entry_matches(b, tool_name))
+        {
             return GateOutcome::Denied(format!(
                 "{tool_name} is blocked in plan mode. Use ExitPlanMode when the plan is approved."
             ));
@@ -330,6 +334,64 @@ mod tests {
         );
         assert_eq!(
             g.decide("Read", &json!({"file_path": "a"})).await,
+            GateOutcome::Allowed
+        );
+    }
+
+    /// MCP tools fell through as "not sensitive", so a server's write_file
+    /// or start_process ran with no prompt, plan mode included.
+    #[tokio::test]
+    async fn mcp_tools_prompt_and_honour_server_wide_rules() {
+        let write = "mcp__fs__write_file";
+        let asker = Scripted::new(vec![Some(PermissionDecision::Deny)]);
+        let g = gate(&[], Some(asker.clone()));
+        assert!(matches!(
+            g.decide(write, &json!({"path": "a"})).await,
+            GateOutcome::Denied(_)
+        ));
+        assert_eq!(asker.asked().len(), 1, "an MCP call must prompt");
+        assert!(matches!(
+            gate(&[], None).decide(write, &json!({})).await,
+            GateOutcome::Denied(_)
+        ));
+
+        for rule in ["mcp__fs", "mcp__fs__*", "MCP__*", write] {
+            assert_eq!(
+                gate(&[rule], None).decide(write, &json!({})).await,
+                GateOutcome::Allowed,
+                "{rule}"
+            );
+        }
+        for rule in ["mcp__f", "mcp__fsx", "mcp__other__*", "mcp__fs__read"] {
+            assert!(
+                matches!(
+                    gate(&[rule], None).decide(write, &json!({})).await,
+                    GateOutcome::Denied(_)
+                ),
+                "{rule} must not allow {write}"
+            );
+        }
+
+        let deny = PermissionGate::bypass_with_deny(&["mcp__fs".into()], std::path::Path::new("/"));
+        assert!(matches!(
+            deny.decide(write, &json!({})).await,
+            GateOutcome::Denied(_)
+        ));
+        assert_eq!(
+            deny.decide("mcp__github__get_issue", &json!({})).await,
+            GateOutcome::Allowed
+        );
+
+        let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+        let plan = gate(&["mcp__*"], Some(asker.clone())).with_blocked_tools(&["Write", "mcp__*"]);
+        let out = plan.decide(write, &json!({})).await;
+        assert!(
+            matches!(out, GateOutcome::Denied(ref m) if m.contains("plan mode")),
+            "{out:?}"
+        );
+        assert!(asker.asked().is_empty());
+        assert_eq!(
+            plan.decide("Read", &json!({"file_path": "a"})).await,
             GateOutcome::Allowed
         );
     }

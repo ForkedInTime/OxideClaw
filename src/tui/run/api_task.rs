@@ -9,7 +9,8 @@ pub(super) const MAX_TOOL_ITERATIONS: u32 = 50;
 
 /// Destructive tools blocked when plan mode is active. PowerShell runs
 /// commands like Bash; Agent spawns a sub-agent with its own (unblocked)
-/// tools; the browser actions click and type on live sites.
+/// tools; the browser actions click and type on live sites; MCP tools can
+/// do anything their server does and do not say whether they write.
 pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "Bash",
     "PowerShell",
@@ -23,6 +24,7 @@ pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "browser_click",
     "browser_fill",
     "browser_press_key",
+    "mcp__*",
 ];
 
 /// Owned bundle handed to `run_api_task` when a user turn kicks off a new
@@ -477,7 +479,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         }
 
                         // Plan mode: block destructive tools
-                        if effective_plan_mode && PLAN_MODE_BLOCKED_TOOLS.contains(&name.as_str()) {
+                        if effective_plan_mode
+                            && PLAN_MODE_BLOCKED_TOOLS
+                                .iter()
+                                .any(|b| crate::permissions::blocked_entry_matches(b, name))
+                        {
                             let msg = format!(
                                 "Tool '{}' is blocked in plan mode. \
                                  Use /plan to exit plan mode first.",

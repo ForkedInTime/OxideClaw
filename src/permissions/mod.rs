@@ -129,7 +129,9 @@ impl PermissionState {
             return CheckResult::Allow;
         }
 
-        if !SENSITIVE_TOOLS.contains(&tool_name) {
+        // MCP tools are arbitrary third-party code (write_file, push_files,
+        // start_process...), so they prompt like Bash unless a rule allows them.
+        if !SENSITIVE_TOOLS.contains(&tool_name) && !tool_name.starts_with("mcp__") {
             return CheckResult::Allow;
         }
 
@@ -241,7 +243,7 @@ fn rule_matches(
     deny: bool,
 ) -> RuleMatch {
     let Some((rule_tool, rest)) = rule.split_once('(') else {
-        return RuleMatch::from_bool(rule.eq_ignore_ascii_case(tool_name));
+        return RuleMatch::from_bool(name_rule_matches(rule, tool_name));
     };
     if !rule_covers(rule_tool, tool_name) {
         return RuleMatch::NoMatch;
@@ -335,6 +337,36 @@ fn rule_matches(
             .iter()
             .any(|pat| glob_covers(pat, &path)),
     )
+}
+
+/// A bare tool-name rule. MCP tools are named `mcp__<server>__<tool>`, so
+/// `mcp__github` and `mcp__github__*` cover every tool of that server and
+/// `mcp__*` every MCP tool; otherwise one "always allow" per tool would be
+/// the only way to trust a server, and a server-wide deny would not exist.
+fn name_rule_matches(rule: &str, tool_name: &str) -> bool {
+    if rule.eq_ignore_ascii_case(tool_name) {
+        return true;
+    }
+    let (rule, name) = (rule.to_ascii_lowercase(), tool_name.to_ascii_lowercase());
+    let Some(server) = rule.strip_prefix("mcp__") else {
+        return false;
+    };
+    if !name.starts_with("mcp__") {
+        return false;
+    }
+    match rule.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => !server.contains("__") && name.starts_with(&format!("{rule}__")),
+    }
+}
+
+/// Whether a plan-mode block-list entry covers `tool_name`; a trailing `*`
+/// blocks a whole family (`mcp__*`).
+pub fn blocked_entry_matches(entry: &str, tool_name: &str) -> bool {
+    match entry.strip_suffix('*') {
+        Some(prefix) => tool_name.starts_with(prefix),
+        None => entry == tool_name,
+    }
 }
 
 /// The absolute glob(s) a gitignore-style path rule stands for.
