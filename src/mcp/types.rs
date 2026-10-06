@@ -127,19 +127,12 @@ fn default_schema() -> serde_json::Value {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpCallResult {
+    /// Raw content items (text, resource, resource_link, image, audio, ...);
+    /// kept as JSON so one odd item cannot fail the whole result.
     #[serde(default)]
-    pub content: Vec<McpContentItem>,
+    pub content: Vec<serde_json::Value>,
     #[serde(rename = "isError", default)]
     pub is_error: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // fields populated by MCP tool result deserialization
-pub struct McpContentItem {
-    #[serde(rename = "type")]
-    pub content_type: String,
-    #[serde(default)]
-    pub text: String,
 }
 
 // ── MCP resource (from resources/list) ───────────────────────────────────────

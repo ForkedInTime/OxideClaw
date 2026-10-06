@@ -569,7 +569,7 @@ impl McpClient {
             .and_then(|c| c.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .map(render_resource)
                     .collect::<Vec<_>>()
                     .join("\n")
             })
@@ -599,11 +599,12 @@ impl McpClient {
         let text = call_result
             .content
             .iter()
-            .map(|c| c.text.as_str())
+            .map(render_content_item)
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Fall back to raw JSON if content array was empty
+        // Fall back to raw JSON if nothing in the content array rendered
         let mut output = if text.is_empty() {
             serde_json::to_string_pretty(&result).unwrap_or_default()
         } else {
@@ -626,6 +627,42 @@ impl McpClient {
         } else {
             Ok(output)
         }
+    }
+}
+
+/// One `resources/read` content, or the `resource` of an embedded-resource
+/// item: its text, or a placeholder for a blob. Tool output is text-only, so
+/// base64 would only burn context.
+fn render_resource(res: &Value) -> String {
+    if let Some(text) = res.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+    let field = |k: &str| res.get(k).and_then(Value::as_str);
+    format!(
+        "[binary resource {} ({}, {} bytes base64 omitted)]",
+        field("uri").unwrap_or("?"),
+        field("mimeType").unwrap_or("unknown type"),
+        field("blob").map_or(0, str::len)
+    )
+}
+
+/// Text for one tool-result content item. Servers such as github-mcp-server
+/// return a file as an embedded `resource`; reading only `text` dropped it.
+fn render_content_item(item: &Value) -> String {
+    let field = |k: &str| item.get(k).and_then(Value::as_str);
+    match field("type") {
+        Some("text") => field("text").unwrap_or_default().to_string(),
+        Some("resource") => item
+            .get("resource")
+            .map(render_resource)
+            .unwrap_or_default(),
+        Some("resource_link") => format!("[resource link: {}]", field("uri").unwrap_or("?")),
+        Some(kind @ ("image" | "audio")) => format!(
+            "[{kind} {}, {} bytes base64 omitted]",
+            field("mimeType").unwrap_or("unknown type"),
+            field("data").map_or(0, str::len)
+        ),
+        _ => item.to_string(),
     }
 }
 
@@ -989,5 +1026,51 @@ mod hardening_tests {
         let t = HttpTransport::new(&base, &HashMap::new()).unwrap();
         let err = t.call(1, "tools/list", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    /// github-mcp-server's get_file_contents returns [status text, embedded
+    /// resource]; only the status line used to reach the model.
+    #[tokio::test]
+    async fn embedded_resource_text_reaches_the_model() {
+        let github = client(json!({ "content": [
+                { "type": "text", "text": "successfully downloaded text file" },
+                { "type": "resource", "resource": {
+                    "uri": "repo://o/r/contents/src/lib.rs",
+                    "mimeType": "text/x-rust",
+                    "text": "pub fn answer() -> u32 { 42 }"
+                } }
+            ] }));
+        let out = github
+            .call_tool("get_file_contents", json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("successfully downloaded"), "{out}");
+        assert!(out.contains("pub fn answer() -> u32 { 42 }"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn binary_content_becomes_a_placeholder_not_base64() {
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";
+        let tool = client(json!({ "content": [
+                { "type": "image", "mimeType": "image/png", "data": b64 },
+                { "type": "resource", "resource": {
+                    "uri": "file:///shot.png", "mimeType": "image/png", "blob": b64
+                } },
+                { "type": "resource_link", "uri": "file:///big.log", "name": "big.log" }
+            ] }));
+        let out = tool.call_tool("screenshot", json!({})).await.unwrap();
+        assert!(!out.contains(b64), "{out}");
+        assert!(out.contains("[image image/png"), "{out}");
+        assert!(out.contains("[binary resource file:///shot.png"), "{out}");
+        assert!(out.contains("[resource link: file:///big.log]"), "{out}");
+
+        let resource = client(json!({ "contents": [
+                { "uri": "file:///shot.png", "mimeType": "image/png", "blob": b64 }
+            ] }));
+        let out = resource.read_resource("file:///shot.png").await.unwrap();
+        assert!(
+            out.starts_with("[binary resource file:///shot.png (image/png"),
+            "{out}"
+        );
     }
 }
