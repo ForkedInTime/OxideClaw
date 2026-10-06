@@ -164,7 +164,7 @@ Push-to-talk speech input (Whisper). TTS responses in any voice, including a clo
 
 ### ♻️ &nbsp; Auto-fix loop
 
-Every `Write`/`Edit` kicks off a lint + test cycle. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — OxideClaw fixes forward.
+Every `Write`/`Edit` kicks off a lint + test cycle, using the project's own runner (clippy, ESLint, ruff, `go vet`; `cargo test`, `npm test`, pytest, `go test`) when it is installed, or your `lintCommand`/`testCommand`. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — OxideClaw fixes forward.
 
 ### ↩️ &nbsp; `/undo` and `/redo` on shadow refs
 

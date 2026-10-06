@@ -140,6 +140,93 @@ pub fn detect_lint_command(cwd: &Path, override_cmd: &Option<String>) -> Option<
     None
 }
 
+/// An auto-detected command if it can actually run in `cwd`, else `None`.
+/// Project files say which runner a project uses, not that it is installed:
+/// a Python repo without ruff, a Rust toolchain without clippy, or npm's
+/// default `"test": "echo \"Error: no test specified\" && exit 1"` would
+/// otherwise fail every check and send the model chasing an error it cannot
+/// fix. `path` is the PATH to search (a parameter so tests do not depend on
+/// the machine's).
+fn runnable_detected(cwd: &Path, cmd: String, path: Option<&std::ffi::OsStr>) -> Option<String> {
+    let program = cmd.split_whitespace().next()?.to_string();
+    // A project virtualenv is where Python tools usually live, and it is
+    // often not activated in the shell oxideclaw was started from.
+    if matches!(program.as_str(), "ruff" | "pytest")
+        && is_executable(&cwd.join(".venv/bin").join(&program))
+    {
+        return Some(format!(".venv/bin/{cmd}"));
+    }
+    let resolved = find_on_path(&program, path)?;
+    if cmd.starts_with("cargo clippy") {
+        // `cargo clippy` without the clippy component exits 101.
+        let ok = Command::new(&resolved)
+            .args(["clippy", "--version"])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return None;
+        }
+    }
+    if cmd.starts_with("npx --no-install eslint") && !eslint_configured(cwd) {
+        return None;
+    }
+    if cmd == "npm test" && !has_real_npm_test_script(cwd) {
+        return None;
+    }
+    Some(cmd)
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    p.is_file() || p.with_extension("exe").is_file()
+}
+
+fn find_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(program))
+        .find(|p| is_executable(p))
+}
+
+fn eslint_configured(cwd: &Path) -> bool {
+    const CONFIGS: [&str; 12] = [
+        "eslint.config.js",
+        "eslint.config.mjs",
+        "eslint.config.cjs",
+        "eslint.config.ts",
+        "eslint.config.mts",
+        "eslint.config.cts",
+        ".eslintrc",
+        ".eslintrc.js",
+        ".eslintrc.cjs",
+        ".eslintrc.json",
+        ".eslintrc.yml",
+        ".eslintrc.yaml",
+    ];
+    let has_config = CONFIGS.iter().any(|f| cwd.join(f).is_file())
+        || read_package_json(cwd).is_some_and(|v| v.get("eslintConfig").is_some());
+    has_config && cwd.join("node_modules/.bin/eslint").exists()
+}
+
+fn has_real_npm_test_script(cwd: &Path) -> bool {
+    read_package_json(cwd)
+        .and_then(|v| v["scripts"]["test"].as_str().map(str::to_owned))
+        .is_some_and(|s| !s.trim().is_empty() && !s.contains("no test specified"))
+}
+
+fn read_package_json(cwd: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(cwd.join("package.json")).ok()?).ok()
+}
+
 // ── Trigger logic ─────────────────────────────────────────────────────────────
 
 /// Check if the auto-fix loop should trigger right now.
@@ -461,8 +548,20 @@ pub fn run_auto_fix_check(
         return AutoFixAction::Continue { status: None };
     }
 
-    let lint_cmd = detect_lint_command(cwd, &config.lint_command);
-    let test_cmd = detect_test_command(cwd, &config.test_command);
+    // Overrides run as given, so a script the model broke still fails. An
+    // auto-detected runner that is not installed here is skipped instead:
+    // `sh: ruff: not found` is not something the model can fix by editing.
+    let path = std::env::var_os("PATH");
+    let lint_cmd = match &config.lint_command {
+        Some(cmd) => Some(cmd.clone()),
+        None => detect_lint_command(cwd, &None)
+            .and_then(|cmd| runnable_detected(cwd, cmd, path.as_deref())),
+    };
+    let test_cmd = match &config.test_command {
+        Some(cmd) => Some(cmd.clone()),
+        None => detect_test_command(cwd, &None)
+            .and_then(|cmd| runnable_detected(cwd, cmd, path.as_deref())),
+    };
 
     if lint_cmd.is_none() && test_cmd.is_none() {
         return AutoFixAction::Continue { status: None };
@@ -527,6 +626,128 @@ pub fn run_auto_fix_check(
 
 #[cfg(test)]
 mod tests {
+    // ── Auto-detected runners must be runnable ───────────────────────────────
+
+    #[cfg(unix)]
+    fn fake_bin(dir: &std::path::Path, name: &str, exit: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_repo_without_ruff_or_pytest_has_no_runner() {
+        let proj = tempfile::tempdir().unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("pyproject.toml"), "[project]\n").unwrap();
+        let path = empty_path.path().as_os_str();
+        for cmd in ["ruff check .", "pytest"] {
+            assert_eq!(
+                super::runnable_detected(proj.path(), cmd.into(), Some(path)),
+                None
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_venv_tools_are_used_when_present() {
+        let proj = tempfile::tempdir().unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join(".venv/bin")).unwrap();
+        fake_bin(&proj.path().join(".venv/bin"), "ruff", 0);
+        assert_eq!(
+            super::runnable_detected(
+                proj.path(),
+                "ruff check .".into(),
+                Some(empty_path.path().as_os_str())
+            ),
+            Some(".venv/bin/ruff check .".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_without_clippy_skips_lint_but_keeps_tests() {
+        let proj = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        fake_bin(bin.path(), "cargo", 101); // `cargo clippy --version` fails
+        let path = Some(bin.path().as_os_str());
+        let lint = "cargo clippy --all-targets -- -D warnings";
+        assert_eq!(
+            super::runnable_detected(proj.path(), lint.into(), path),
+            None
+        );
+        assert_eq!(
+            super::runnable_detected(proj.path(), "cargo test".into(), path),
+            Some("cargo test".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_default_test_stub_and_unconfigured_eslint_are_skipped() {
+        let proj = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        fake_bin(bin.path(), "npm", 0);
+        fake_bin(bin.path(), "npx", 0);
+        let path = Some(bin.path().as_os_str());
+        std::fs::write(
+            proj.path().join("package.json"),
+            r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::runnable_detected(proj.path(), "npm test".into(), path),
+            None
+        );
+        let eslint = "npx --no-install eslint .";
+        assert_eq!(
+            super::runnable_detected(proj.path(), eslint.into(), path),
+            None
+        );
+
+        std::fs::write(
+            proj.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(proj.path().join("eslint.config.js"), "export default [];").unwrap();
+        std::fs::create_dir_all(proj.path().join("node_modules/.bin")).unwrap();
+        fake_bin(&proj.path().join("node_modules/.bin"), "eslint", 0);
+        assert_eq!(
+            super::runnable_detected(proj.path(), "npm test".into(), path),
+            Some("npm test".to_string())
+        );
+        assert_eq!(
+            super::runnable_detected(proj.path(), eslint.into(), path),
+            Some(eslint.to_string())
+        );
+    }
+
+    /// An explicit override is never second-guessed: if the model deletes
+    /// the script it names, that is a failure to report, not a skip.
+    #[cfg(unix)]
+    #[test]
+    fn missing_override_command_still_fails() {
+        let proj = tempfile::tempdir().unwrap();
+        let cfg = super::AutoFixConfig {
+            enabled: true,
+            trigger: super::AutoFixTrigger::Always,
+            lint_command: Some("./scripts/check.sh".into()),
+            test_command: None,
+            max_retries: 3,
+            timeout_secs: 10,
+        };
+        let action = super::run_auto_fix_check(proj.path(), &cfg, "auto-edit", 0);
+        assert!(
+            matches!(action, super::AutoFixAction::Retry { .. }),
+            "{action:?}"
+        );
+    }
+
     /// More output than a pipe buffer used to deadlock until the timeout.
     #[cfg(unix)]
     #[test]
