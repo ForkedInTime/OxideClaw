@@ -233,13 +233,11 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
         .output()
         .map(|o| o.status.success() || o.status.code() == Some(1))
         .unwrap_or(false);
-    let openai_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("WHISPER_API_KEY"))
-        .is_ok();
+    let stt_key = crate::voice::voice_api_key_source();
     if whisper_ok {
         checks.push("✓ whisper (offline STT transcription)".into());
-    } else if openai_key {
-        checks.push("✓ OPENAI_API_KEY set (cloud Whisper transcription)".into());
+    } else if let Some((var, _)) = stt_key {
+        checks.push(format!("✓ {var} set (cloud Whisper transcription)"));
     } else {
         checks.push("  ✗ No speech-to-text — for /voice input:".into());
         match distro {

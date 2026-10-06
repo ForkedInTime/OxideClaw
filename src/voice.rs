@@ -4,7 +4,7 @@
 /// Transcription: tries in priority order:
 ///   1. Local `whisper` CLI (OpenAI whisper or whisper.cpp)
 ///   2. OpenAI-compatible /v1/audio/transcriptions API endpoint
-///      (reads OPENAI_API_KEY or WHISPER_API_KEY from env)
+///      (reads WHISPER_API_KEY, else OPENAI_API_KEY, from env)
 ///
 /// Usage:
 ///   /voice          — show status + setup instructions
@@ -43,10 +43,21 @@ pub fn local_whisper_available() -> bool {
     which("whisper") || which("whisper-cpp") || which("whisper.cpp")
 }
 
+/// The transcription API key and the variable it came from. The
+/// voice-specific WHISPER_API_KEY wins: OPENAI_API_KEY used to, so a custom
+/// `voiceApiUrl` was sent the user's OpenAI key instead of its own.
+pub fn voice_api_key_source() -> Option<(&'static str, String)> {
+    pick_voice_api_key(|name| std::env::var(name).ok())
+}
+
+fn pick_voice_api_key(get: impl Fn(&str) -> Option<String>) -> Option<(&'static str, String)> {
+    ["WHISPER_API_KEY", "OPENAI_API_KEY"]
+        .into_iter()
+        .find_map(|name| get(name).filter(|v| !v.is_empty()).map(|v| (name, v)))
+}
+
 pub fn voice_api_key() -> Option<String> {
-    std::env::var("OPENAI_API_KEY")
-        .ok()
-        .or_else(|| std::env::var("WHISPER_API_KEY").ok())
+    voice_api_key_source().map(|(_, key)| key)
 }
 
 fn which(cmd: &str) -> bool {
@@ -185,7 +196,7 @@ pub async fn transcribe(api_url: Option<&str>, api_key: Option<&str>) -> Result<
         .ok_or_else(|| {
             anyhow!(
                 "No transcription available.\n\
-             Set OPENAI_API_KEY or WHISPER_API_KEY env var,\n\
+             Set WHISPER_API_KEY or OPENAI_API_KEY env var,\n\
              or install whisper: pip install openai-whisper"
             )
         })?;
@@ -958,8 +969,10 @@ pub async fn speak_browse_milestone(milestone: BrowseMilestone, text: &str) {
 
 /// Listen for a voice approve/deny reply during an approval prompt.
 /// Returns true if the user said "confirm"/"yes"/"approve"/"ok", false otherwise.
-/// Times out after `timeout_secs`, returning false on timeout.
-pub async fn await_voice_approval(timeout_secs: u64) -> bool {
+/// Times out after `timeout_secs`, returning false on timeout. `api_url` is
+/// the user's `voiceApiUrl`: without it the reply always went to OpenAI, with
+/// whatever key was meant for the custom endpoint.
+pub async fn await_voice_approval(timeout_secs: u64, api_url: Option<&str>) -> bool {
     // Requires a recorder to be available; return deny if none found.
     let backend = match find_recorder() {
         Some(b) => b,
@@ -992,8 +1005,11 @@ pub async fn await_voice_approval(timeout_secs: u64) -> bool {
     let _ = record_task.await;
 
     // Transcribe with a 30s timeout and check for affirmative keywords.
-    let transcribe_result =
-        tokio::time::timeout(std::time::Duration::from_secs(30), transcribe(None, None)).await;
+    let transcribe_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        transcribe(api_url, None),
+    )
+    .await;
     let transcript = match transcribe_result {
         Ok(Ok(text)) => text,
         _ => return false, // timeout or transcription error = deny
@@ -1641,5 +1657,37 @@ mod xtts_probe_tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod voice_api_key_tests {
+    use super::pick_voice_api_key;
+
+    fn env(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// With both set, the OpenAI key used to go to the custom voiceApiUrl.
+    #[test]
+    fn whisper_key_outranks_the_openai_key() {
+        let both = env(&[
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("WHISPER_API_KEY", "gsk-whisper"),
+        ]);
+        assert_eq!(
+            pick_voice_api_key(both),
+            Some(("WHISPER_API_KEY", "gsk-whisper".to_string()))
+        );
+        let openai_only = env(&[("OPENAI_API_KEY", "sk-openai"), ("WHISPER_API_KEY", "")]);
+        assert_eq!(
+            pick_voice_api_key(openai_only),
+            Some(("OPENAI_API_KEY", "sk-openai".to_string()))
+        );
+        assert_eq!(pick_voice_api_key(env(&[])), None);
     }
 }

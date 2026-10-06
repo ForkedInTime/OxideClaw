@@ -261,6 +261,8 @@ pub struct ApprovalGateMiddleware {
     user_denied: AtomicBool,
     /// When true, also listen for a spoken "yes/approve" alongside the keyboard reply.
     voice: bool,
+    /// The user's `voiceApiUrl`, for transcribing that spoken reply.
+    voice_api_url: Option<String>,
     /// Optional handle to the live browser session — used to resolve an @eN
     /// ref to its real button label so button-text patterns (e.g. "buy now")
     /// can actually match. None in tests where no browser is attached.
@@ -289,9 +291,16 @@ impl ApprovalGateMiddleware {
             denial_counts: Mutex::new(HashMap::new()),
             user_denied: AtomicBool::new(false),
             voice,
+            voice_api_url: None,
             browser_session: None,
             sensitive_fill_pending: AtomicBool::new(false),
         }
+    }
+
+    /// Transcribe spoken approvals at the user's `voiceApiUrl`.
+    pub fn with_voice_api_url(mut self, url: Option<String>) -> Self {
+        self.voice_api_url = url;
+        self
     }
 
     /// Attach a browser session so the gate can resolve @eN refs to button
@@ -485,7 +494,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                             Ok(Ok(b)) => Some(b),
                             _ => None,
                         },
-                        voice_yes = crate::voice::await_voice_approval(60) => {
+                        voice_yes = crate::voice::await_voice_approval(60, self.voice_api_url.as_deref()) => {
                             if voice_yes { Some(true) } else { None }
                         }
                     }

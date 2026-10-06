@@ -256,6 +256,7 @@ pub async fn run_browse(
             step_counter.clone(),
             req.voice,
         )
+        .with_voice_api_url(config.voice_api_url.clone())
         .with_browser_session(browser_session.clone()),
     );
 
