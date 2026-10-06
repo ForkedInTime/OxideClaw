@@ -1307,21 +1307,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.overlay = Some(Overlay::new("plugins", text));
         }
         CommandAction::PluginRemove(name) => {
-            let settings_path = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("settings.json");
+            // Where /plugin install registered it: the loader's config dir.
+            let settings_path = crate::config::Config::claude_dir().join("settings.json");
             let mut removed = false;
             if let Ok(content) = std::fs::read_to_string(&settings_path)
                 && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content)
             {
-                if let Some(obj) = json["mcpServers"].as_object_mut() {
+                // get_mut, not IndexMut: a `[]` root would panic (and abort).
+                if let Some(obj) = json.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
                     removed = obj.remove(&name).is_some();
                 }
                 if removed {
-                    let _ = std::fs::write(
+                    let _ = crate::config::write_json_atomic(
                         &settings_path,
-                        serde_json::to_string_pretty(&json).unwrap_or_default(),
+                        &serde_json::to_string_pretty(&json).unwrap_or_default(),
                     );
                 }
             }
@@ -1333,13 +1332,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if let Ok(content) = std::fs::read_to_string(&plugins_path)
                 && let Ok(mut plugins) = serde_json::from_str::<serde_json::Value>(&content)
             {
-                if let Some(obj) = plugins.as_object_mut() {
-                    obj.remove(&name);
+                if let Some(obj) = plugins.as_object_mut()
+                    && obj.remove(&name).is_some()
+                {
+                    let _ = crate::config::write_json_atomic(
+                        &plugins_path,
+                        &serde_json::to_string_pretty(&plugins).unwrap_or_default(),
+                    );
                 }
-                let _ = std::fs::write(
-                    &plugins_path,
-                    serde_json::to_string_pretty(&plugins).unwrap_or_default(),
-                );
             }
             let msg = if removed {
                 format!(
