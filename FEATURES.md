@@ -428,7 +428,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 |---------|--------|---------|-------------|
 | `model` | any model name | `claude-sonnet-5` | Default model |
 | `showThinkingSummaries` | `true` / `false` | `false` | Show model reasoning |
-| `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables (ignored on Fable, Opus 5.5 and Sonnet 5.5, where the API does not allow thinking to be turned off). CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
+| `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables (ignored on Fable, Opus 5.5 and Sonnet 5.5, where the API does not allow thinking to be turned off, and on Opus 5 at `max` effort, where it only allows it at `high` or below). CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
 | `effort` | `low` / `medium` / `high` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5; older and non-Claude models get a prompt nudge. Set with `/effort` |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |

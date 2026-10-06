@@ -138,19 +138,41 @@ pub fn rejects_disabled_thinking(model: &str) -> bool {
     (family == "opus" || family == "sonnet") && model_version(&model).is_some_and(|v| v >= (5, 5))
 }
 
+/// Opus 5 accepts `{"type":"disabled"}` only at effort `high` or below; at
+/// `xhigh`/`max` the same request is a 400.
+fn disabled_needs_low_effort(model: &str) -> bool {
+    let model = canonical(model);
+    family_of(&model).is_some_and(|(_, f)| f == "opus")
+        && model_version(&model).is_some_and(|v| v >= (5, 0) && v < (5, 5))
+}
+
 /// `output_config.effort` support tracks adaptive thinking exactly.
 pub fn supports_effort(model: &str) -> bool {
     supports_adaptive_thinking(model)
 }
 
 /// The `thinking` field for `model` given the user's budget setting.
-/// `None` budget = leave the API default. `Some(0)` = off.
-pub fn thinking_for(model: &str, budget: Option<u32>, max_tokens: u32) -> Option<ThinkingConfig> {
+/// `None` budget = leave the API default. `Some(0)` = off. `effort` is the
+/// configured effort level, which decides whether "off" is legal on Opus 5.
+pub fn thinking_for(
+    model: &str,
+    budget: Option<u32>,
+    max_tokens: u32,
+    effort: Option<&str>,
+) -> Option<ThinkingConfig> {
     let budget = budget?;
     let model = canonical(model);
     family_of(&model)?;
     let adaptive = supports_adaptive_thinking(&model);
     if budget == 0 {
+        // Opus 5 at xhigh/max: omitting the field (adaptive) is the only
+        // request the API accepts, so effort wins over "off".
+        let high_effort = effort
+            .map(|e| e.trim().to_ascii_lowercase())
+            .is_some_and(|e| e == "max" || e == "xhigh");
+        if high_effort && disabled_needs_low_effort(&model) {
+            return None;
+        }
         return (adaptive && !rejects_disabled_thinking(&model))
             .then_some(ThinkingConfig::Disabled);
     }
@@ -304,11 +326,11 @@ mod tests {
     #[test]
     fn claude_5_gets_adaptive_never_budget_tokens() {
         assert_eq!(
-            thinking_for("claude-sonnet-5", Some(10_000), 64_000),
+            thinking_for("claude-sonnet-5", Some(10_000), 64_000, None),
             Some(ThinkingConfig::Adaptive)
         );
         assert_eq!(
-            thinking_for("claude-opus-5", Some(100), 64_000),
+            thinking_for("claude-opus-5", Some(100), 64_000, None),
             Some(ThinkingConfig::Adaptive)
         );
     }
@@ -316,7 +338,7 @@ mod tests {
     #[test]
     fn haiku_keeps_the_budget_form() {
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(10_000), 64_000),
+            thinking_for("claude-haiku-4-5", Some(10_000), 64_000, None),
             Some(ThinkingConfig::Enabled {
                 budget_tokens: 10_000
             })
@@ -326,28 +348,34 @@ mod tests {
     #[test]
     fn budget_is_clamped_to_the_api_minimum_and_below_max_tokens() {
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(100), 64_000),
+            thinking_for("claude-haiku-4-5", Some(100), 64_000, None),
             Some(ThinkingConfig::Enabled {
                 budget_tokens: MIN_BUDGET_TOKENS
             })
         );
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(10_000), 4_096),
+            thinking_for("claude-haiku-4-5", Some(10_000), 4_096, None),
             Some(ThinkingConfig::Enabled {
                 budget_tokens: 4_095
             })
         );
         // max_tokens too small for any legal budget: omit rather than 400.
-        assert_eq!(thinking_for("claude-haiku-4-5", Some(10_000), 1_000), None);
+        assert_eq!(
+            thinking_for("claude-haiku-4-5", Some(10_000), 1_000, None),
+            None
+        );
     }
 
     #[test]
     fn zero_budget_disables_explicitly_on_adaptive_models_and_omits_elsewhere() {
         assert_eq!(
-            thinking_for("claude-sonnet-5", Some(0), 64_000),
+            thinking_for("claude-sonnet-5", Some(0), 64_000, None),
             Some(ThinkingConfig::Disabled)
         );
-        assert_eq!(thinking_for("claude-haiku-4-5", Some(0), 64_000), None);
+        assert_eq!(
+            thinking_for("claude-haiku-4-5", Some(0), 64_000, None),
+            None
+        );
     }
 
     #[test]
@@ -360,25 +388,50 @@ mod tests {
             "claude-sonnet-5-5",
             "fable",
         ] {
-            assert_eq!(thinking_for(m, Some(0), 64_000), None, "{m}");
+            assert_eq!(thinking_for(m, Some(0), 64_000, None), None, "{m}");
             assert_eq!(
-                thinking_for(m, Some(4_096), 64_000),
+                thinking_for(m, Some(4_096), 64_000, None),
                 Some(ThinkingConfig::Adaptive),
                 "{m}"
             );
         }
         assert_eq!(
-            thinking_for("claude-opus-5", Some(0), 64_000),
+            thinking_for("claude-opus-5", Some(0), 64_000, None),
             Some(ThinkingConfig::Disabled)
         );
     }
 
+    /// Opus 5 rejects `disabled` at xhigh/max effort with a 400.
+    #[test]
+    fn opus_5_keeps_thinking_on_when_effort_is_above_high() {
+        for m in ["claude-opus-5", "opus"] {
+            for e in ["max", "xhigh", " MAX "] {
+                assert_eq!(thinking_for(m, Some(0), 64_000, Some(e)), None, "{m} {e}");
+            }
+            for e in ["low", "medium", "high"] {
+                assert_eq!(
+                    thinking_for(m, Some(0), 64_000, Some(e)),
+                    Some(ThinkingConfig::Disabled),
+                    "{m} {e}"
+                );
+            }
+        }
+        // Sonnet 5 and Opus 4.x accept disabled at any effort.
+        for m in ["claude-sonnet-5", "claude-opus-4-8"] {
+            assert_eq!(
+                thinking_for(m, Some(0), 64_000, Some("max")),
+                Some(ThinkingConfig::Disabled),
+                "{m}"
+            );
+        }
+    }
+
     #[test]
     fn unset_budget_and_non_claude_models_send_nothing() {
-        assert_eq!(thinking_for("claude-sonnet-5", None, 64_000), None);
-        assert_eq!(thinking_for("llama3.2", Some(4_096), 64_000), None);
+        assert_eq!(thinking_for("claude-sonnet-5", None, 64_000, None), None);
+        assert_eq!(thinking_for("llama3.2", Some(4_096), 64_000, None), None);
         assert_eq!(
-            thinking_for("groq:llama-3.3-70b", Some(4_096), 64_000),
+            thinking_for("groq:llama-3.3-70b", Some(4_096), 64_000, None),
             None
         );
     }
@@ -473,7 +526,7 @@ mod tests {
         let key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
         let client = ClaudeClient::new(key).unwrap();
         for model in ["claude-sonnet-5", "claude-haiku-4-5", "claude-sonnet-4-6"] {
-            let thinking = thinking_for(model, Some(2048), 4096);
+            let thinking = thinking_for(model, Some(2048), 4096, None);
             let betas = thinking_betas(thinking.as_ref());
             let mut system = String::from("Reply with one word.");
             let output_config = match effort_for(model, Some("low")) {
