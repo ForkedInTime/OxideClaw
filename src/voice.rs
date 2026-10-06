@@ -1561,6 +1561,15 @@ mod xtts_server_script_tests {
             assert_eq!(mode, 0o700);
         }
     }
+
+    /// XTTS v2 synthesises at 24 kHz; a hard-coded 22,050 Hz header made
+    /// every server reply play ~8% slow and 1.5 semitones low.
+    #[test]
+    fn server_wav_header_uses_the_model_sample_rate() {
+        assert!(!XTTS_SERVER_PY.contains("22050"));
+        assert!(XTTS_SERVER_PY.contains("\"output_sample_rate\""));
+        assert!(XTTS_SERVER_PY.contains("wav_bytes(samples, SAMPLE_RATE)"));
+    }
 }
 
 #[cfg(all(test, unix))]

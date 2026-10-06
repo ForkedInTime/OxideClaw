@@ -33,13 +33,16 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 5002
 
 print(f"Loading XTTS v2 model (gpu={USE_GPU})...", flush=True)
 model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=USE_GPU)
+# model.tts() returns raw samples at the model's own rate (24 kHz for XTTS v2);
+# a header with any other rate makes players speed up or slow down the voice.
+SAMPLE_RATE = getattr(getattr(model, "synthesizer", None), "output_sample_rate", None) or 24000
 # Requests are threaded so /health answers while a reply is synthesising;
 # the model itself is not thread-safe.
 MODEL_LOCK = threading.Lock()
 print(f"Model loaded. Listening on 127.0.0.1:{PORT}", flush=True)
 
 
-def wav_bytes(samples, sample_rate=22050):
+def wav_bytes(samples, sample_rate):
     """Convert float32 samples to WAV bytes."""
     buf = io.BytesIO()
     pcm = (np.array(samples) * 32767).clip(-32768, 32767).astype(np.int16)
@@ -88,7 +91,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     samples = model.tts(text=text, speaker=speaker, language=language)
 
-            audio = wav_bytes(samples)
+            audio = wav_bytes(samples, SAMPLE_RATE)
 
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
