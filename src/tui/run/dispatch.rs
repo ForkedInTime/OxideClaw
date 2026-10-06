@@ -394,52 +394,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
         }
         CommandAction::ResumeSession(id_or_prefix) => {
-            // Resolve prefix to full ID if necessary
-            let full_id = if id_or_prefix.len() == 36 {
-                // Looks like a full UUID — use directly
-                Some(id_or_prefix.clone())
-            } else {
-                // Prefix match
-                match Session::list().await {
-                    Ok(list) => {
-                        let matched: Vec<_> = list
-                            .iter()
-                            .filter(|m| m.id.starts_with(&id_or_prefix) || m.name == id_or_prefix)
-                            .collect();
-                        match matched.len() {
-                            0 => {
-                                app.overlay = Some(Overlay::new(
-                                    "error",
-                                    format!(
-                                        "No session matching '{id_or_prefix}'. Try /session list"
-                                    ),
-                                ));
-                                None
-                            }
-                            1 => Some(matched[0].id.clone()),
-                            _ => {
-                                let ids: Vec<_> = matched
-                                    .iter()
-                                    .map(|m| format!("  {} — {}", short_id(&m.id, 12), m.name))
-                                    .collect();
-                                app.overlay = Some(Overlay::new(
-                                    "resume",
-                                    format!(
-                                        "Multiple sessions match '{id_or_prefix}':\n{}\nBe more specific.",
-                                        ids.join("\n")
-                                    ),
-                                ));
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        app.overlay = Some(Overlay::new(
-                            "error",
-                            format!("Could not list sessions: {e}"),
-                        ));
-                        None
-                    }
+            let full_id = match Session::resolve(&id_or_prefix).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    app.overlay = Some(Overlay::new("error", format!("{e}. Try /session list")));
+                    None
                 }
             };
 

@@ -286,6 +286,10 @@ pub struct Config {
     /// When resuming, assign a new session UUID instead of reusing the original.
     pub fork_session: bool,
 
+    /// `--session-id` naming a session that does not exist yet: the TUI
+    /// creates its new session under this ID instead of a random one.
+    pub new_session_id: Option<String>,
+
     /// Custom agent definitions JSON (--agents flag).
     pub custom_agents: Option<serde_json::Value>,
 
@@ -466,6 +470,7 @@ impl Default for Config {
             json_schema: None,
             replay_user_messages: false,
             fork_session: false,
+            new_session_id: None,
             custom_agents: None,
             output_style: None,
             output_style_prompt: None,
@@ -733,6 +738,7 @@ impl Config {
             json_schema: old.json_schema,
             replay_user_messages: old.replay_user_messages,
             fork_session: old.fork_session,
+            new_session_id: old.new_session_id,
             custom_agents: old.custom_agents,
             file_snapshot_dir: old.file_snapshot_dir,
             watch_debounce_ms: old.watch_debounce_ms,

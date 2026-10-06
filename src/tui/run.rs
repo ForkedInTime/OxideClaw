@@ -560,7 +560,10 @@ async fn run_loop(
             }
         }
         None => {
-            let s = Session::new().await?;
+            let s = match config.new_session_id.clone() {
+                Some(id) => Session::new_with_id(id).await?,
+                None => Session::new().await?,
+            };
             app.session_name = s.meta.name.clone();
             s
         }

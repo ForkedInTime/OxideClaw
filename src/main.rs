@@ -128,7 +128,7 @@ struct Cli {
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
 
-    /// Resume a specific session by ID prefix
+    /// Resume a specific session by ID, unique ID prefix, or name
     #[arg(long)]
     session: Option<String>,
 
@@ -192,7 +192,8 @@ struct Cli {
     #[arg(long)]
     no_session_persistence: bool,
 
-    /// Use a specific session ID for the conversation (must be a valid UUID)
+    /// Use a specific session ID for the conversation (must be a valid UUID):
+    /// resumes it if it exists, otherwise starts a new session with that ID
     #[arg(long)]
     session_id: Option<String>,
 
@@ -1174,11 +1175,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve resume session ID (--session-id takes priority as an explicit UUID)
-    let resume_id = if let Some(id) = cli.session_id {
-        Some(id)
-    } else if let Some(id) = cli.session {
-        Some(id)
+    // --session-id takes priority: resume that exact session if it exists,
+    // otherwise start a new one under that ID. --session also takes the short
+    // IDs and names the picker shows; an unknown one is an error rather than a
+    // silently fresh session.
+    let resume_id = if let Some(raw) = cli.session_id {
+        let id = uuid::Uuid::parse_str(raw.trim())
+            .map_err(|e| anyhow::anyhow!("--session-id must be a valid UUID: {e}"))?
+            .to_string();
+        if session::Session::exists(&id) {
+            Some(id)
+        } else {
+            config.new_session_id = Some(id);
+            None
+        }
+    } else if let Some(q) = cli.session {
+        Some(
+            session::Session::resolve(&q)
+                .await
+                .map_err(|e| anyhow::anyhow!("--session: {e}"))?,
+        )
     } else if cli.resume || cli.continue_session {
         session::Session::most_recent().await
     } else {

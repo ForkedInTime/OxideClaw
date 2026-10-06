@@ -72,7 +72,12 @@ impl Session {
 
     /// Create a new empty session with a human-readable default name.
     pub async fn new() -> Result<Self> {
-        let id = Uuid::new_v4().to_string();
+        Self::new_with_id(Uuid::new_v4().to_string()).await
+    }
+
+    /// A new empty session under a caller-chosen ID (`--session-id`). The
+    /// caller validates it as a UUID, which also keeps it a plain file name.
+    pub async fn new_with_id(id: String) -> Result<Self> {
         fs::create_dir_all(crate::config::Config::sessions_dir()).await?;
         let meta = SessionMeta {
             id: id.clone(),
@@ -109,6 +114,45 @@ impl Session {
                 base_commit: None,
             },
             path,
+        }
+    }
+
+    /// Is there a saved session with exactly this ID?
+    pub fn exists(id: &str) -> bool {
+        SessionMeta::path_for(id).exists()
+    }
+
+    /// Resolve what a user typed to a saved session's ID: the full ID, a
+    /// unique ID prefix (the short IDs the picker and banner show), or an
+    /// exact session name.
+    pub async fn resolve(query: &str) -> Result<String> {
+        Self::resolve_in(&crate::config::Config::sessions_dir(), query).await
+    }
+
+    async fn resolve_in(dir: &std::path::Path, query: &str) -> Result<String> {
+        let q = query.trim();
+        anyhow::ensure!(!q.is_empty(), "No session ID or name given");
+        let list = Self::list_in(dir).await?;
+        if let Some(m) = list.iter().find(|m| m.id == q) {
+            return Ok(m.id.clone());
+        }
+        let matched: Vec<_> = list
+            .iter()
+            .filter(|m| m.id.starts_with(q) || m.name == q)
+            .collect();
+        match matched.as_slice() {
+            [] => anyhow::bail!("No saved session matches '{q}'"),
+            [m] => Ok(m.id.clone()),
+            many => {
+                let ids: Vec<_> = many
+                    .iter()
+                    .map(|m| format!("  {} — {}", m.id, m.name))
+                    .collect();
+                anyhow::bail!(
+                    "Multiple sessions match '{q}':\n{}\nBe more specific.",
+                    ids.join("\n")
+                )
+            }
         }
     }
 
@@ -1132,5 +1176,55 @@ mod continue_tests {
         let dir = tempfile::tempdir().unwrap();
         meta(dir.path(), "empty", 1_000);
         assert_eq!(Session::most_recent_in(dir.path()).await, None);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    async fn write_meta(dir: &std::path::Path, id: &str, name: &str) {
+        let meta = SessionMeta {
+            id: id.into(),
+            name: name.into(),
+            created_at: 0,
+            preview: "p".into(),
+            tags: Vec::new(),
+            auto_commits: Vec::new(),
+            undo_position: 0,
+            base_commit: None,
+        };
+        let body = serde_json::to_string(&meta).unwrap();
+        atomic_write(&dir.join(format!("{id}.meta")), body.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// `--session <short id>` read `<short id>.meta` verbatim, failed, and
+    /// dropped the user into a fresh session. It now resolves like /resume.
+    #[tokio::test]
+    async fn short_ids_and_names_resolve_and_misses_are_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let a = "3f2a9c1e-0000-4000-8000-000000000001";
+        let b = "3f2a9c1e-0000-4000-8000-000000000002";
+        let c = "77aa0000-0000-4000-8000-000000000003";
+        write_meta(d.path(), a, "alpha").await;
+        write_meta(d.path(), b, "beta").await;
+        write_meta(d.path(), c, "gamma").await;
+
+        let r = |q: &'static str| Session::resolve_in(d.path(), q);
+        assert_eq!(r(a).await.unwrap(), a);
+        assert_eq!(r("77aa0000").await.unwrap(), c);
+        assert_eq!(r("beta").await.unwrap(), b);
+        let many = r("3f2a9c1e").await.unwrap_err().to_string();
+        assert!(many.contains("Multiple") && many.contains(a) && many.contains(b));
+        assert!(
+            r("deadbeef")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("No saved session")
+        );
+        assert!(r("  ").await.is_err());
     }
 }
