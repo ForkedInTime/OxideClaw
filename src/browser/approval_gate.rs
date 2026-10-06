@@ -252,6 +252,53 @@ fn gate_trip_phrase(tool_name: &str) -> String {
     format!("Approval needed to {action}. Please answer.")
 }
 
+/// How long an approval prompt waits for an answer.
+const APPROVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// One voice recording. Short, so a spoken yes is acted on seconds after it
+/// is said rather than after the whole prompt window plus transcription.
+const VOICE_LISTEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The answer to a voice-mode prompt: a key until `deadline`, or a spoken yes
+/// heard in back-to-back `listen` windows opened before `deadline`.
+/// `listen(window)` is `None` when it cannot record at all, else whether it
+/// heard an approval. Voice only approves; silence, a "no" or a failed
+/// transcription leaves the keyboard to decide. A window opened before the
+/// deadline may finish transcribing after it, and a key still answers then.
+async fn await_key_or_voice<F, Fut>(
+    mut rx: oneshot::Receiver<bool>,
+    deadline: tokio::time::Instant,
+    mut listen: F,
+) -> Option<bool>
+where
+    F: FnMut(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    let voice = async {
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            match listen(left.min(VOICE_LISTEN_WINDOW)).await {
+                Some(true) => return true,
+                Some(false) => {}
+                None => return false,
+            }
+        }
+    };
+    let heard_yes = tokio::select! {
+        kb = &mut rx => return kb.ok(),
+        heard = voice => heard,
+    };
+    if heard_yes {
+        return Some(true);
+    }
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(b)) => Some(b),
+        _ => None,
+    }
+}
+
 /// Source of [`ApprovalPrompt::id`]: never repeats in this process.
 static PROMPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -510,11 +557,8 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                         reason: "approval channel closed".to_string(),
                     };
                 }
-                use tokio::time::{Duration, timeout};
                 // If voice is on, announce the gate, then race the keyboard reply
-                // against a voice-approval listener. Whichever resolves first wins.
-                // Voice only contributes an Approve vote (false/timeout is ignored
-                // unless no keyboard reply arrives either).
+                // against a voice-approval listener (see `await_key_or_voice`).
                 let approved_opt: Option<bool> = if self.voice {
                     let mut rx = rx;
                     // The announcement must finish before the mic opens, or the
@@ -530,22 +574,29 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                     };
                     match early {
                         Some(kb) => kb,
-                        None => tokio::select! {
-                            kb = timeout(Duration::from_secs(60), rx) => match kb {
-                                Ok(Ok(b)) => Some(b),
-                                _ => None,
-                            },
-                            voice_yes = crate::voice::await_voice_approval(
-                                60,
-                                self.voice_api_url.as_deref(),
-                                &phrase,
-                            ) => {
-                                if voice_yes { Some(true) } else { None }
-                            }
-                        },
+                        // One 60 s recording raced a 60 s keyboard timeout,
+                        // which always expired before the transcription
+                        // finished, and a missing recorder denied at once.
+                        None => {
+                            let deadline = tokio::time::Instant::now() + APPROVAL_WINDOW;
+                            let api_url = self.voice_api_url.as_deref();
+                            let phrase = phrase.as_str();
+                            await_key_or_voice(rx, deadline, |window| async move {
+                                crate::voice::find_recorder()?;
+                                Some(
+                                    crate::voice::await_voice_approval(
+                                        window.as_secs().max(1),
+                                        api_url,
+                                        phrase,
+                                    )
+                                    .await,
+                                )
+                            })
+                            .await
+                        }
                     }
                 } else {
-                    match timeout(Duration::from_secs(60), rx).await {
+                    match tokio::time::timeout(APPROVAL_WINDOW, rx).await {
                         Ok(Ok(b)) => Some(b),
                         _ => None,
                     }
@@ -1028,5 +1079,107 @@ mod price_signal_tests {
         assert!(mw.is_user_denied(), "second denial must end the session");
         drop(mw);
         assert_eq!(host.await.unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod voice_reply_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// Records for `window`, then spends `transcribe` turning it into text.
+    async fn record(window: Duration, transcribe: Duration) {
+        tokio::time::sleep(window + transcribe).await;
+    }
+
+    /// A yes spoken late in the prompt is transcribed after the 60 s
+    /// keyboard timeout; that timeout used to win and deny.
+    #[tokio::test(start_paused = true)]
+    async fn a_spoken_yes_late_in_the_window_approves() {
+        let (_tx, rx) = oneshot::channel();
+        let start = Instant::now();
+        let deadline = start + APPROVAL_WINDOW;
+        let answer = await_key_or_voice(rx, deadline, |window| async move {
+            let opened = start.elapsed();
+            record(window, Duration::from_secs(20)).await;
+            Some(opened >= Duration::from_secs(45))
+        })
+        .await;
+        assert_eq!(answer, Some(true));
+        assert!(start.elapsed() > APPROVAL_WINDOW, "{:?}", start.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_spoken_yes_is_acted_on_within_one_short_window() {
+        let (_tx, rx) = oneshot::channel();
+        let start = Instant::now();
+        let answer = await_key_or_voice(rx, start + APPROVAL_WINDOW, |window| async move {
+            record(window, Duration::from_secs(2)).await;
+            Some(true)
+        })
+        .await;
+        assert_eq!(answer, Some(true));
+        assert_eq!(
+            start.elapsed(),
+            VOICE_LISTEN_WINDOW + Duration::from_secs(2)
+        );
+    }
+
+    /// With no recorder the voice side gave up at once and that denied the
+    /// action before the user could press a key.
+    #[tokio::test(start_paused = true)]
+    async fn no_recorder_leaves_the_keyboard_to_answer() {
+        for reply in [true, false] {
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let _ = tx.send(reply);
+            });
+            let answer =
+                await_key_or_voice(rx, Instant::now() + APPROVAL_WINDOW, |_| async { None }).await;
+            assert_eq!(answer, Some(reply));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_answers_while_the_mic_is_listening() {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = tx.send(false);
+        });
+        let start = Instant::now();
+        let answer = await_key_or_voice(rx, start + APPROVAL_WINDOW, |window| async move {
+            record(window, Duration::from_secs(3)).await;
+            Some(false)
+        })
+        .await;
+        assert_eq!(answer, Some(false));
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_times_out_and_opens_no_window_after_the_deadline() {
+        let (_tx, rx) = oneshot::channel::<bool>();
+        let start = Instant::now();
+        let deadline = start + APPROVAL_WINDOW;
+        let late = AtomicUsize::new(0);
+        let answer = await_key_or_voice(rx, deadline, |window| {
+            if Instant::now() + window > deadline {
+                late.fetch_add(1, Ordering::SeqCst);
+            }
+            async move {
+                record(window, Duration::from_secs(1)).await;
+                Some(false)
+            }
+        })
+        .await;
+        assert_eq!(answer, None);
+        assert_eq!(late.load(Ordering::SeqCst), 0);
+        // The last window closes at the deadline; its transcription is the
+        // only wait past it.
+        assert_eq!(start.elapsed(), APPROVAL_WINDOW + Duration::from_secs(1));
     }
 }
