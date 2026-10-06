@@ -896,7 +896,7 @@ fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
 }
 
 #[cfg(test)]
-mod rag_placement_tests {
+mod scripted_api_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1024,6 +1024,41 @@ mod rag_placement_tests {
                 .contains("validate_session_token"),
             "{user}"
         );
+    }
+
+    /// Sub-agent engines printed "Tool: name(args)" for every call to the
+    /// process stdout, which in ACP/SDK/`-p --output-format json` mode is
+    /// the protocol stream. query_and_collect must leave the engine quiet.
+    #[tokio::test]
+    async fn sub_agent_runs_are_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, seen) = serve(vec![
+            sse(
+                &[serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})],
+                "tool_use",
+            ),
+            sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        assert!(!e.quiet);
+
+        let out = e.query_and_collect("look around").await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(seen.lock().unwrap().len(), 2, "the tool turn must have run");
+        assert!(e.quiet, "a sub-agent engine must not print to stdout");
     }
 }
 
