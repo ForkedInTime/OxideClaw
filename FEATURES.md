@@ -359,7 +359,7 @@ User-defined shell commands that run at lifecycle events. Configure them under `
 |-------|------|-------------|
 | `preToolUse` | Before a tool runs. Exit 2 blocks it. | `TOOL_NAME`, `TOOL_INPUT` |
 | `postToolUse` | After a tool completes | `TOOL_NAME`, `TOOL_RESULT` |
-| `userPromptSubmit` | When you send a message. Stdout is appended as context. | `CLAUDE_MESSAGE` |
+| `userPromptSubmit` | When you send a message in the TUI. Stdout is appended as context; exit 2 (or `{"continue": false}`) stops the prompt before it is sent and puts it back in the input box. | `CLAUDE_MESSAGE` |
 | `notification` | When the model sends a text response | `CLAUDE_MESSAGE` |
 | `stop` | When the session ends | — |
 | `sessionStart` | When a session begins | — |

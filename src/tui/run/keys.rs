@@ -570,6 +570,51 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
+
+            // btw note and image are only taken once the prompt is allowed, so
+            // a hook that stops the turn leaves them in place for the retry.
+            let final_text = match app.btw_note.as_deref() {
+                Some(note) => format!("(btw: {note})\n\n{input}"),
+                None => input,
+            };
+            // UserPromptSubmit hooks: stdout adds context, exit 2 or
+            // `continue: false` stops the prompt before it reaches the model.
+            let mut hook_system_message = None;
+            let final_text = match &config.hooks {
+                Some(hook_cfg) if !config.disable_all_hooks => {
+                    let r = hooks::run_user_prompt_hooks(
+                        hook_cfg,
+                        &final_text,
+                        &session.id,
+                        &config.cwd,
+                    )
+                    .await;
+                    if !r.should_continue {
+                        app.entries.pop();
+                        app.finish_loading();
+                        app.input = raw.chars().collect();
+                        app.cursor = app.input.len();
+                        app.entries.push(ChatEntry::error(format!(
+                            "Prompt not sent — blocked by a userPromptSubmit hook: {}",
+                            r.stop_reason.unwrap_or_default()
+                        )));
+                        app.scroll_to_bottom();
+                        return Ok(());
+                    }
+                    hook_system_message = r.system_message;
+                    match r.additional_context {
+                        Some(extra_ctx) => format!(
+                            "{final_text}\n\n<additional_context>{extra_ctx}</additional_context>"
+                        ),
+                        None => final_text,
+                    }
+                }
+                _ => final_text,
+            };
+            if let Some(msg) = hook_system_message {
+                app.entries.push(ChatEntry::system(msg));
+            }
+            app.btw_note = None;
             begin_agent_turn(session, config).await;
 
             // Build message content — text + optional image attachment
@@ -585,35 +630,6 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     }
                 }
             }
-            // Prepend btw_note if set
-            let final_text = if let Some(note) = app.btw_note.take() {
-                format!("(btw: {note})\n\n{input}")
-            } else {
-                input
-            };
-            // UserPromptSubmit hooks — can inject additional context
-            let final_text = if let Some(hook_cfg) = &config.hooks {
-                if !config.disable_all_hooks {
-                    if let Some(extra_ctx) = hooks::run_user_prompt_hooks(
-                        hook_cfg,
-                        &final_text,
-                        &session.id,
-                        &config.cwd,
-                    )
-                    .await
-                    {
-                        format!(
-                            "{final_text}\n\n<additional_context>{extra_ctx}</additional_context>"
-                        )
-                    } else {
-                        final_text
-                    }
-                } else {
-                    final_text
-                }
-            } else {
-                final_text
-            };
             user_content.push(ContentBlock::Text {
                 text: final_text.clone(),
             });

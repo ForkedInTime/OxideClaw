@@ -153,21 +153,29 @@ impl SdkSession {
         // 2. Retrieve RAG context (silently ignore errors)
         let rag_context = self.retrieve_rag_context(&prompt);
 
-        // UserPromptSubmit hooks may add context, as in the TUI.
+        // UserPromptSubmit hooks may add context or stop the prompt, as in the TUI.
         let prompt = match self.hooks() {
-            Some(h) => match crate::hooks::run_user_prompt_hooks(
-                h,
-                &prompt,
-                &self.session_id,
-                &self.config.cwd,
-            )
-            .await
-            {
-                Some(extra) => {
-                    format!("{prompt}\n\n<additional_context>{extra}</additional_context>")
+            Some(h) => {
+                let r = crate::hooks::run_user_prompt_hooks(
+                    h,
+                    &prompt,
+                    &self.session_id,
+                    &self.config.cwd,
+                )
+                .await;
+                if !r.should_continue {
+                    anyhow::bail!(
+                        "Prompt not sent — blocked by a userPromptSubmit hook: {}",
+                        r.stop_reason.unwrap_or_default()
+                    );
                 }
-                None => prompt,
-            },
+                match r.additional_context {
+                    Some(extra) => {
+                        format!("{prompt}\n\n<additional_context>{extra}</additional_context>")
+                    }
+                    None => prompt,
+                }
+            }
             None => prompt,
         };
 

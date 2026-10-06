@@ -153,13 +153,16 @@ pub async fn run_post_tool_hooks(
     }
 }
 
-/// Run all UserPromptSubmit hooks. Returns any additional_context to prepend.
+/// Run all UserPromptSubmit hooks. The first hook that stops the prompt (exit
+/// 2 or `continue: false`) wins and the caller must not send it; otherwise
+/// every hook's context is joined and the last system message is kept.
 pub async fn run_user_prompt_hooks(
     hooks: &HooksConfig,
     prompt: &str,
     session_id: &str,
     cwd: &std::path::Path,
-) -> Option<String> {
+) -> HookResult {
+    let mut result = HookResult::allow();
     let mut additional: Vec<String> = Vec::new();
     for hook in &hooks.user_prompt_submit {
         let r = execute_hook(
@@ -175,15 +178,20 @@ pub async fn run_user_prompt_hooks(
             },
         )
         .await;
+        if !r.should_continue {
+            return r;
+        }
         if let Some(ctx) = r.additional_context {
             additional.push(ctx);
         }
+        if r.system_message.is_some() {
+            result.system_message = r.system_message;
+        }
     }
-    if additional.is_empty() {
-        None
-    } else {
-        Some(additional.join("\n"))
+    if !additional.is_empty() {
+        result.additional_context = Some(additional.join("\n"));
     }
+    result
 }
 
 /// Run Stop hooks when the session ends.
@@ -554,6 +562,16 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
         };
     }
 
+    // Plain stdout from a prompt hook is documented as extra context for the
+    // model. Other events keep ignoring it.
+    if env.event == "UserPromptSubmit" && !trimmed.is_empty() {
+        return HookResult {
+            should_continue: true,
+            additional_context: Some(trimmed.to_string()),
+            ..Default::default()
+        };
+    }
+
     HookResult::allow()
 }
 
@@ -828,5 +846,51 @@ mod tests {
         assert!(capped.contains("truncated"));
         // Round-trips as valid UTF-8 (would have panicked on a bad slice).
         assert!(!capped.is_empty());
+    }
+
+    // ── userPromptSubmit ─────────────────────────────────────────────────────
+
+    fn cfg_prompt(commands: &[&str]) -> HooksConfig {
+        HooksConfig {
+            user_prompt_submit: commands.iter().map(|c| entry(c)).collect(),
+            ..Default::default()
+        }
+    }
+
+    async fn prompt_hooks(commands: &[&str]) -> HookResult {
+        let dir = tempfile::tempdir().unwrap();
+        run_user_prompt_hooks(&cfg_prompt(commands), "hello", "sess", dir.path()).await
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_plain_stdout_becomes_context() {
+        let r = prompt_hooks(&["echo feature/login", "echo '  second  '"]).await;
+        assert!(r.should_continue);
+        assert_eq!(
+            r.additional_context.as_deref(),
+            Some("feature/login\nsecond")
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_exit_2_stops_the_prompt() {
+        let r = prompt_hooks(&["echo context", "echo 'contains a secret'; exit 2"]).await;
+        assert!(!r.should_continue, "exit 2 must stop the prompt");
+        assert_eq!(r.stop_reason.as_deref(), Some("contains a secret"));
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_continue_false_stops_the_prompt() {
+        let r = prompt_hooks(&[r#"echo '{"continue":false,"stopReason":"frozen"}'"#]).await;
+        assert!(!r.should_continue);
+        assert_eq!(r.stop_reason.as_deref(), Some("frozen"));
+    }
+
+    #[tokio::test]
+    async fn plain_stdout_is_still_ignored_for_tool_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = run_pre_tool_hooks(&cfg_pre("echo hi"), "Bash", "{}", "sess", dir.path()).await;
+        assert!(r.should_continue);
+        assert!(r.additional_context.is_none());
     }
 }
