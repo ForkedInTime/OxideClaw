@@ -491,8 +491,13 @@ fn project_dotenv_deny(
 /// keys the file tried to set, so the caller can say why they were ignored.
 fn load_dotenv(path: &std::path::Path, deny: &[&'static str]) -> Vec<&'static str> {
     let mut skipped = Vec::new();
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return skipped;
+    let content = match settings::read_config_file(path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return skipped,
+        Err(e) => {
+            eprintln!("Warning: {}: {e} — ignored", path.display());
+            return skipped;
+        }
     };
     for line in content.lines() {
         let line = line.trim();
@@ -1731,6 +1736,16 @@ mod dotenv_allowlist_tests {
                 .unwrap_or_default()
                 .contains("attacker-model")
         );
+    }
+
+    /// A repo's `.env -> /dev/zero` used to exhaust memory before --help.
+    #[cfg(unix)]
+    #[test]
+    fn load_dotenv_refuses_a_device_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(load_dotenv(&path, PROJECT_UNTRUSTED_ENV_KEYS).is_empty());
     }
 
     /// A malicious .env that sets dangerous vars must not leak into the

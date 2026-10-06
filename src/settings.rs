@@ -382,6 +382,38 @@ pub struct PermissionsConfig {
     pub deny: Vec<String>,
 }
 
+/// Largest settings / .mcp.json / .env / output-style file read. Real ones
+/// are a few KB.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Read a config file a cloned repo may ship; `Ok(None)` if it does not
+/// exist. Symlinks are followed (dotfile managers, shared monorepo config),
+/// but the target must be a regular file of at most `MAX_CONFIG_BYTES`: a
+/// repo committing `.claude/settings.json -> /dev/zero` would otherwise grow
+/// a String until OOM, and `-> /dev/tty` or a FIFO would hang startup. The
+/// type is checked before opening because opening a FIFO already blocks.
+pub fn read_config_file(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let md = match std::fs::metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !md.is_file() {
+        return Err("not a regular file".into());
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut buf))
+        .map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!("larger than {} KiB", MAX_CONFIG_BYTES / 1024));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| "not valid UTF-8".into())
+}
+
 /// User-facing text for `Settings::load_errors`.
 pub fn load_errors_notice(errors: &[String]) -> String {
     format!(
@@ -604,12 +636,14 @@ impl Settings {
     /// Returns a Settings with only mcp_servers populated.
     fn load_mcp_json(path: &Path) -> Self {
         let mut s = Self::default();
-        let json = match std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|c| {
-                serde_json::from_str::<serde_json::Value>(c.strip_prefix('\u{feff}').unwrap_or(&c))
-                    .map_err(|e| e.to_string())
-            }) {
+        let text = match read_config_file(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => return s,
+            Err(e) => return Self::load_failed(path, e),
+        };
+        let json = match serde_json::from_str::<serde_json::Value>(
+            text.strip_prefix('\u{feff}').unwrap_or(&text),
+        ) {
             Ok(json) => json,
             Err(e) => return Self::load_failed(path, e),
         };
@@ -655,9 +689,9 @@ impl Settings {
     /// shell-injection vector on shared hosts. The warning is emitted via
     /// `tracing::warn` so it shows up in the log file without corrupting TUI.
     fn from_file(path: &Path) -> Self {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+        let text = match read_config_file(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => return Self::default(),
             Err(e) => return Self::load_failed(path, e),
         };
         // Windows editors save a BOM, which serde_json rejects.
@@ -1241,6 +1275,45 @@ mod load_error_tests {
         assert_eq!(s.model.as_deref(), Some("opus"));
         assert!(s.load_errors.is_empty(), "{:?}", s.load_errors);
         assert!(load(None, None).load_errors.is_empty());
+    }
+
+    /// A cloned repo shipping its settings as a link to /dev/zero used to
+    /// exhaust memory at startup (and a link to /dev/tty to hang it).
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_link_to_a_device_is_refused_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", repo.path().join(".claude/settings.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", repo.path().join(".mcp.json")).unwrap();
+        let s = Settings::load_in(home.path(), repo.path());
+        assert_eq!(s.load_errors.len(), 1, "{:?}", s.load_errors);
+        assert!(s.load_errors[0].contains("not a regular file"));
+        assert!(read_config_file(Path::new("/dev/zero")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_link_to_a_regular_file_is_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("shared.json"), r#"{"model": "opus"}"#).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join("shared.json"),
+            home.path().join("settings.json"),
+        )
+        .unwrap();
+        let s = Settings::load_in(home.path(), repo.path());
+        assert_eq!(s.model.as_deref(), Some("opus"));
+        assert!(s.load_errors.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_settings_file_is_refused() {
+        let s = load(Some(&" ".repeat(MAX_CONFIG_BYTES as usize + 1)), None);
+        assert_eq!(s.load_errors.len(), 1, "{:?}", s.load_errors);
+        assert!(s.load_errors[0].contains("larger than"));
     }
 
     #[test]

@@ -18,7 +18,8 @@ impl OutputStyleDef {
     /// Try to load an OutputStyleDef from a markdown file.
     /// The file stem becomes the style name if no `name:` frontmatter is present.
     fn from_markdown_file(path: &Path) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
+        // Project styles come from the repo: same /dev/zero, FIFO risk.
+        let content = crate::settings::read_config_file(path).ok()??;
         let stem = path.file_stem()?.to_string_lossy().to_string();
 
         // Simple YAML frontmatter parser (--- ... ---)
