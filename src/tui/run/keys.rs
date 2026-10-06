@@ -95,12 +95,14 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     if let Some(target_pos) =
                         target_pos.filter(|&p| p != session.meta.undo_position)
                     {
-                        match oxideclaw::autocommit::restore_to(
-                            &config.cwd,
-                            &session.id,
-                            &session.meta.auto_commits,
+                        match oxideclaw::autocommit::restore_to_blocking(
+                            config.cwd.clone(),
+                            session.id.clone(),
+                            session.meta.auto_commits.clone(),
                             target_pos,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(report) => {
                                 session.meta.undo_position = target_pos;
                                 if let Err(e) = session.save_meta().await {
@@ -132,12 +134,14 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     if let Some(target_pos) =
                         target_pos.filter(|&p| p != session.meta.undo_position)
                     {
-                        match oxideclaw::autocommit::restore_to(
-                            &config.cwd,
-                            &session.id,
-                            &session.meta.auto_commits,
+                        match oxideclaw::autocommit::restore_to_blocking(
+                            config.cwd.clone(),
+                            session.id.clone(),
+                            session.meta.auto_commits.clone(),
                             target_pos,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(report) => {
                                 session.meta.undo_position = target_pos;
                                 if let Err(e) = session.save_meta().await {

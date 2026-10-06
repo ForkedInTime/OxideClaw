@@ -2060,12 +2060,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 match n {
                     Some(k) => {
                         let new_pos = session.meta.undo_position.saturating_sub(k as usize);
-                        match oxideclaw::autocommit::restore_to(
-                            &config.cwd,
-                            &session.id,
-                            &session.meta.auto_commits,
+                        match oxideclaw::autocommit::restore_to_blocking(
+                            config.cwd.clone(),
+                            session.id.clone(),
+                            session.meta.auto_commits.clone(),
                             new_pos,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(report) => {
                                 session.meta.undo_position = new_pos;
                                 if let Err(e) = session.save_meta().await {
@@ -2152,12 +2154,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     Some(k) => {
                         let new_pos = (session.meta.undo_position + k as usize)
                             .min(session.meta.auto_commits.len());
-                        match oxideclaw::autocommit::restore_to(
-                            &config.cwd,
-                            &session.id,
-                            &session.meta.auto_commits,
+                        match oxideclaw::autocommit::restore_to_blocking(
+                            config.cwd.clone(),
+                            session.id.clone(),
+                            session.meta.auto_commits.clone(),
                             new_pos,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(report) => {
                                 session.meta.undo_position = new_pos;
                                 if let Err(e) = session.save_meta().await {

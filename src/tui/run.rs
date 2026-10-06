@@ -1135,16 +1135,40 @@ async fn run_loop(
                                         }
                                     })
                                     .unwrap_or_default();
-                                match oxideclaw::autocommit::snapshot_turn_raw(
-                                    &config.cwd,
-                                    &config.auto_commit.message_prefix,
-                                    &session.id,
-                                    &prompt,
-                                    turn_index,
-                                    &mut session.meta.auto_commits,
-                                    &mut session.meta.undo_position,
-                                    session.meta.base_commit.as_deref(),
-                                ) {
+                                // Off the runtime: staging runs git over the whole
+                                // work tree. The chain goes in as a copy, so a
+                                // panicking task cannot lose it.
+                                let (cwd, prefix, id) = (
+                                    config.cwd.clone(),
+                                    config.auto_commit.message_prefix.clone(),
+                                    session.id.clone(),
+                                );
+                                let base = session.meta.base_commit.clone();
+                                let mut commits = session.meta.auto_commits.clone();
+                                let mut position = session.meta.undo_position;
+                                let snapshot = tokio::task::spawn_blocking(move || {
+                                    let out = oxideclaw::autocommit::snapshot_turn_raw(
+                                        &cwd,
+                                        &prefix,
+                                        &id,
+                                        &prompt,
+                                        turn_index,
+                                        &mut commits,
+                                        &mut position,
+                                        base.as_deref(),
+                                    );
+                                    (out, commits, position)
+                                })
+                                .await;
+                                let outcome = match snapshot {
+                                    Ok((out, commits, position)) => {
+                                        session.meta.auto_commits = commits;
+                                        session.meta.undo_position = position;
+                                        out
+                                    }
+                                    Err(e) => Err(anyhow::anyhow!("snapshot task failed: {e}")),
+                                };
+                                match outcome {
                                     Ok(oxideclaw::autocommit::SnapshotOutcome::Committed { sha, files }) => {
                                         tracing::info!(
                                             "autoCommit: turn {turn_index} committed ({files} files, sha={})",

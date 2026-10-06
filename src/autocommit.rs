@@ -295,6 +295,50 @@ fn count_tree_files(cwd: &Path, tree: &str) -> u32 {
     }
 }
 
+/// `git` on the temp index at `temp_index`. It may start as a copy of the
+/// user's index (see [`seed_index`]), whose split-index, untracked-cache and
+/// sparse-index state must not be reused or written back next to `.git/index`.
+fn temp_index_cmd(cwd: &Path, temp_index: &Path) -> Command {
+    let mut cmd = git_cmd(cwd);
+    cmd.env("GIT_INDEX_FILE", temp_index).args([
+        "-c",
+        "core.splitIndex=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "index.sparse=false",
+    ]);
+    cmd
+}
+
+/// Fill `temp_index` with `tree`, keeping the stat data of the user's real
+/// index for every entry whose blob already matches (`read-tree -m` with one
+/// tree does exactly that). A plain `read-tree` zeroes stat data, so `add -A`
+/// re-read and re-hashed (through any clean filter) every tracked file on
+/// every turn, freezing the TUI for seconds in large repos.
+fn seed_index(cwd: &Path, tree: &str, temp_index: &Path) -> anyhow::Result<()> {
+    let warm = git_output(git_cmd(cwd).args(["rev-parse", "--git-path", "index"]))
+        .is_ok_and(|real| std::fs::copy(cwd.join(real), temp_index).is_ok())
+        && temp_index_cmd(cwd, temp_index)
+            .args(["read-tree", "-m", tree])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    if warm {
+        return Ok(());
+    }
+    // No index yet, or one mid-merge (`read-tree -m` refuses unmerged entries).
+    let _ = std::fs::remove_file(temp_index);
+    let s = temp_index_cmd(cwd, temp_index)
+        .args(["read-tree", tree])
+        .status()?;
+    if !s.success() {
+        anyhow::bail!("git read-tree {tree} failed");
+    }
+    Ok(())
+}
+
 /// Stage the whole working tree into the temp index at `temp_index`, seeded
 /// from `seed_tree`, and return the resulting tree SHA. The user's real index
 /// is never touched.
@@ -308,16 +352,9 @@ fn stage_worktree(
     // it, which makes empty-turn detection accurate even when the user's real
     // index has other staging.
     if let Some(tree) = seed_tree {
-        let s = git_cmd(cwd)
-            .env("GIT_INDEX_FILE", temp_index)
-            .args(["read-tree", tree])
-            .status()?;
-        if !s.success() {
-            anyhow::bail!("git read-tree {tree} failed");
-        }
+        seed_index(cwd, tree, temp_index)?;
     }
-    let add_status = git_cmd(cwd)
-        .env("GIT_INDEX_FILE", temp_index)
+    let add_status = temp_index_cmd(cwd, temp_index)
         // Whole tree from any subdirectory, minus OxideClaw's own SQLite
         // index/memory store: snapshotting it stored a binary blob per turn,
         // and /undo overwrote the live database (rolling back memories).
@@ -332,11 +369,7 @@ fn stage_worktree(
     if !add_status.success() {
         anyhow::bail!("git add -A failed");
     }
-    git_output(
-        git_cmd(cwd)
-            .env("GIT_INDEX_FILE", temp_index)
-            .args(["write-tree"]),
-    )
+    git_output(temp_index_cmd(cwd, temp_index).args(["write-tree"]))
 }
 
 /// `git commit-tree` with OxideClaw as author, so shadow commits never carry
@@ -643,7 +676,32 @@ pub fn restore_to(
         .collect();
 
     let recovery = recovery_ref(session_id);
-    let saved_edits = save_unrecorded_worktree(cwd, &recovery, auto_commits)?;
+    let (saved_edits, live_tree) = save_unrecorded_worktree(cwd, &recovery, auto_commits)?;
+
+    // Write only what differs from the live tree. `checkout-index -a` on a
+    // fresh index rewrote every file (bumping every mtime, so builds redid
+    // everything) and wrote out paths a sparse checkout had left out. Paths
+    // absent from the target are skipped (`d`): orphans stay on disk.
+    let changed = git_cmd(cwd)
+        .args([
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=d",
+            &live_tree,
+            &tree_sha,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !changed.status.success() {
+        anyhow::bail!(
+            "git diff-tree failed: {}",
+            String::from_utf8_lossy(&changed.stderr)
+        );
+    }
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
@@ -666,12 +724,24 @@ pub fn restore_to(
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
     let prefix = format!("{}/", toplevel.display());
-    let checkout_status = git_cmd(&toplevel)
-        .env("GIT_INDEX_FILE", &temp_index)
-        .args(["checkout-index", "-a", "-f", "--prefix", &prefix])
-        .status()?;
-    if !checkout_status.success() {
-        anyhow::bail!("git checkout-index --prefix={prefix} failed");
+    if !changed.stdout.is_empty() {
+        use std::io::Write;
+        let mut child = git_cmd(&toplevel)
+            .env("GIT_INDEX_FILE", &temp_index)
+            .args(["checkout-index", "-f", "-z", "--stdin", "--prefix", &prefix])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        // Dropping stdin closes it, so checkout-index sees EOF.
+        let written = child
+            .stdin
+            .take()
+            .map(|mut w| w.write_all(&changed.stdout))
+            .transpose();
+        let checkout_status = child.wait()?;
+        written?;
+        if !checkout_status.success() {
+            anyhow::bail!("git checkout-index --prefix={prefix} failed");
+        }
     }
 
     Ok(RestoreReport {
@@ -682,16 +752,32 @@ pub fn restore_to(
     })
 }
 
+/// [`restore_to`] on a blocking thread. It stages the whole work tree through
+/// git subprocesses, which must not stall the async runtime the TUI runs on.
+pub async fn restore_to_blocking(
+    cwd: PathBuf,
+    session_id: String,
+    auto_commits: Vec<String>,
+    target_position: usize,
+) -> anyhow::Result<RestoreReport> {
+    tokio::task::spawn_blocking(move || {
+        restore_to(&cwd, &session_id, &auto_commits, target_position)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("restore task failed: {e}"))?
+}
+
 /// Before `restore_to` overwrites the working tree, commit it under the
 /// session's `recovery` ref unless some snapshot already holds exactly this tree.
 /// Edits made after the last turn (or uncommitted work a legacy session base
 /// never captured) were otherwise overwritten with no way back. Errors abort
 /// the restore: better no undo than an undo that destroys work.
+/// Also returns the live tree it staged, which `restore_to` diffs against.
 fn save_unrecorded_worktree(
     cwd: &Path,
     recovery: &str,
     auto_commits: &[String],
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, String)> {
     let head = resolve_head(cwd);
     let latest = auto_commits.last().cloned().or_else(|| head.clone());
     let latest_tree = latest.as_deref().and_then(|c| tree_of_commit(cwd, c));
@@ -717,7 +803,7 @@ fn save_unrecorded_worktree(
         known.push(EMPTY_TREE.to_string());
     }
     if known.contains(&live_tree) {
-        return Ok(None);
+        return Ok((None, live_tree));
     }
 
     let previous = git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", recovery])).ok();
@@ -742,7 +828,7 @@ fn save_unrecorded_worktree(
     if !status.success() {
         anyhow::bail!("could not save un-snapshotted edits to {recovery}; nothing was restored");
     }
-    Ok(Some(sha))
+    Ok((Some(sha), live_tree))
 }
 
 // ── Prune pipeline ────────────────────────────────────────────────────────────
@@ -1962,10 +2048,25 @@ mod resume_and_restore_tests {
     use super::git_detection_tests::init_test_repo;
     use super::snapshot_tests::write_file;
     use super::*;
+    use std::time::{Duration, SystemTime};
 
     fn git(repo: &Path, args: &[&str]) {
         let s = git_cmd(repo).args(args).status().unwrap();
         assert!(s.success(), "git {args:?}");
+    }
+
+    fn age(repo: &Path, rel: &str) -> SystemTime {
+        let when = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.join(rel))
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        std::fs::metadata(repo.join(rel))
+            .unwrap()
+            .modified()
+            .unwrap()
     }
 
     fn turn(repo: &Path, commits: &mut Vec<String>, pos: &mut usize, n: u32) -> SnapshotOutcome {
@@ -2005,5 +2106,110 @@ mod resume_and_restore_tests {
             git_output(git_cmd(td.path()).args(["rev-parse", &format!("{}^", commits[1])]))
                 .unwrap();
         assert_eq!(parent, commits[0], "the chain must stay linked");
+    }
+
+    /// /undo rewrote every tracked file, so every mtime moved and build
+    /// tools rebuilt the whole project.
+    #[test]
+    fn restore_leaves_unchanged_files_untouched() {
+        let td = init_test_repo();
+        write_file(td.path(), "a.txt", "v1\n");
+        write_file(td.path(), "b.txt", "same\n");
+        git(td.path(), &["add", "-A"]);
+        git(td.path(), &["commit", "-q", "-m", "base"]);
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        write_file(td.path(), "a.txt", "v2\n");
+        turn(td.path(), &mut commits, &mut pos, 1);
+        let before = age(td.path(), "b.txt");
+
+        restore_to(td.path(), "s", &commits, 0).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("a.txt")).unwrap(),
+            "v1\n"
+        );
+        let after = std::fs::metadata(td.path().join("b.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "an unchanged file was rewritten");
+    }
+
+    /// Paths a sparse checkout leaves out stay out after /undo.
+    #[test]
+    fn restore_does_not_materialize_sparse_excluded_paths() {
+        let td = init_test_repo();
+        write_file(td.path(), "src/s1", "v1\n");
+        write_file(td.path(), "other/f1", "out of cone\n");
+        git(td.path(), &["add", "-A"]);
+        git(td.path(), &["commit", "-q", "-m", "base"]);
+        git(td.path(), &["sparse-checkout", "set", "src"]);
+        assert!(!td.path().join("other").exists());
+        pin_filters(td.path()).unwrap();
+
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        write_file(td.path(), "src/s1", "v2\n");
+        turn(td.path(), &mut commits, &mut pos, 1);
+        restore_to(td.path(), "s", &commits, 0).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("src/s1")).unwrap(),
+            "v1\n"
+        );
+        assert!(
+            !td.path().join("other/f1").exists(),
+            "out-of-cone path written"
+        );
+        // The snapshot still holds it, so nothing is lost.
+        let files = list_tree_files(td.path(), &tree_of_commit(td.path(), &commits[0]).unwrap());
+        assert!(files.contains(&"other/f1".to_string()), "{files:?}");
+    }
+
+    /// A snapshot re-hashed every tracked file through the clean filter
+    /// (seconds per turn in large or LFS repos); only changed files should be.
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_only_rehash_changed_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = init_test_repo();
+        let logdir = tempfile::TempDir::new().unwrap();
+        let log = logdir.path().join("cleaned");
+        let filter = logdir.path().join("count.sh");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\necho x >> '{}'\ncat\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            td.path(),
+            &[
+                "config",
+                "filter.count.clean",
+                &filter.display().to_string(),
+            ],
+        );
+        write_file(td.path(), ".gitattributes", "*.txt filter=count\n");
+        for i in 0..20 {
+            let f = format!("f{i}.txt");
+            write_file(td.path(), &f, &format!("{i}\n"));
+            // Older than the index git writes next, so no entry is racy.
+            age(td.path(), &f);
+        }
+        git(td.path(), &["add", "-A"]);
+        git(td.path(), &["commit", "-q", "-m", "base"]);
+        pin_filters(td.path()).unwrap();
+        let _ = std::fs::remove_file(&log);
+
+        write_file(td.path(), "f0.txt", "changed\n");
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        let out = turn(td.path(), &mut commits, &mut pos, 1);
+        assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
+        let runs = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            runs <= 2,
+            "clean filter ran {runs} times for one changed file"
+        );
     }
 }
