@@ -87,6 +87,28 @@ pub(super) fn detect_package_manager() -> (&'static str, &'static str) {
     }
 }
 
+const MARKETPLACE_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `git clone` for a marketplace plugin that can never ask for input. A
+/// typo'd, private or renamed repo makes GitHub answer 401, and git then
+/// prompts for a username on /dev/tty, which is the TUI's terminal: the
+/// prompt was drawn over the UI, it read the keys the user typed, and the
+/// spinner ran forever. Credential helpers still work; only the prompt goes.
+fn marketplace_clone_cmd(url: &str, dir: &std::path::Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["clone", "--depth", "1", url])
+        .arg(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // An insteadOf rewrite to ssh would prompt for a passphrase or host key
+    // on the same tty; keep any ssh command the user configured themselves.
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    }
+    cmd
+}
+
 pub(super) async fn plugin_install_task(
     spec: String,
     tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
@@ -121,11 +143,18 @@ pub(super) async fn plugin_install_task(
                 let _ = tokio::fs::remove_dir_all(&clone_dir).await;
             }
             let url = format!("https://github.com/{}.git", raw_spec);
-            let output = tokio::process::Command::new("git")
-                .args(["clone", "--depth", "1", &url, &clone_dir.to_string_lossy()])
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("git clone failed: {e}"))?;
+            let output = tokio::time::timeout(
+                MARKETPLACE_CLONE_TIMEOUT,
+                marketplace_clone_cmd(&url, &clone_dir).output(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "git clone timed out after {}s",
+                    MARKETPLACE_CLONE_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|e| anyhow::anyhow!("git clone failed: {e}"))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!("git clone failed:\n{}", stderr.trim());
@@ -320,5 +349,31 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(json["permissions"]["deny"][0], "Bash(rm:*)");
         assert_eq!(json["mcpServers"]["p"]["command"], "x");
+    }
+}
+
+#[cfg(test)]
+mod marketplace_clone_tests {
+    use super::*;
+
+    /// A clone that needs credentials must fail fast instead of prompting on
+    /// the TUI's terminal: GIT_TERMINAL_PROMPT=0 is what turns git's
+    /// "Username for 'https://github.com':" into an immediate error.
+    #[test]
+    fn marketplace_clone_never_prompts_on_the_terminal() {
+        let cmd = marketplace_clone_cmd(
+            "https://github.com/x/y.git",
+            std::path::Path::new("/nonexistent/y"),
+        );
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("GIT_TERMINAL_PROMPT"),
+            Some(std::ffi::OsStr::new("0"))
+        )));
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(
+            args[..4],
+            ["clone", "--depth", "1", "https://github.com/x/y.git"]
+        );
     }
 }
