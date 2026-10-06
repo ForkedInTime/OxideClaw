@@ -539,7 +539,13 @@ fn load_dotenv(path: &std::path::Path, deny: &[&'static str]) -> Vec<&'static st
                 }
                 continue;
             }
-            if !key.is_empty() && SAFE_ENV_KEYS.contains(&key) && std::env::var(key).is_err() {
+            // A blank value would claim the key and keep a later .env (say
+            // ~/.env behind a project's `ANTHROPIC_API_KEY=`) from filling it.
+            if !key.is_empty()
+                && !val.is_empty()
+                && SAFE_ENV_KEYS.contains(&key)
+                && std::env::var(key).is_err()
+            {
                 // SAFETY: single-threaded at this point — called before tokio runtime starts
                 unsafe {
                     std::env::set_var(key, val);
@@ -2050,6 +2056,53 @@ mod dotenv_allowlist_tests {
             load_dotenv(&path, PROJECT_UNTRUSTED_ENV_KEYS),
             vec!["OLLAMA_HOST"]
         );
+    }
+
+    /// A blank `KEY=` in the first .env set the key to "", so the real
+    /// value in a later .env (e.g. ~/.env) was skipped and auth found none.
+    #[test]
+    fn load_dotenv_blank_value_does_not_shadow_a_later_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.env");
+        let home = dir.path().join("home.env");
+        std::fs::write(&project, "XAI_API_KEY=\nXAI_API_KEY=\"\"\n").unwrap();
+        std::fs::write(&home, "XAI_API_KEY=xai-real\n").unwrap();
+        let snap = std::env::var("XAI_API_KEY").ok();
+        unsafe { std::env::remove_var("XAI_API_KEY") };
+
+        load_dotenv(&project, &[]);
+        load_dotenv(&home, &[]);
+        let got = std::env::var("XAI_API_KEY").ok();
+
+        unsafe {
+            match snap {
+                Some(v) => std::env::set_var("XAI_API_KEY", v),
+                None => std::env::remove_var("XAI_API_KEY"),
+            }
+        }
+        assert_eq!(got.as_deref(), Some("xai-real"));
+    }
+
+    /// Windows PowerShell 5.1 writes a BOM; the first key used to carry it
+    /// and fail the allowlist without a word.
+    #[test]
+    fn load_dotenv_strips_a_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "\u{feff}VENICE_API_KEY=venice-key\r\n").unwrap();
+        let snap = std::env::var("VENICE_API_KEY").ok();
+        unsafe { std::env::remove_var("VENICE_API_KEY") };
+
+        load_dotenv(&path, &[]);
+        let got = std::env::var("VENICE_API_KEY").ok();
+
+        unsafe {
+            match snap {
+                Some(v) => std::env::set_var("VENICE_API_KEY", v),
+                None => std::env::remove_var("VENICE_API_KEY"),
+            }
+        }
+        assert_eq!(got.as_deref(), Some("venice-key"));
     }
 
     /// A credential from an untrusted repo's `.env` picks the account that
