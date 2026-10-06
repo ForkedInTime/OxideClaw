@@ -324,7 +324,30 @@ pub(crate) fn translate_messages(
                     }
                 }
 
-                if !text_blocks.is_empty() {
+                // `/image` attachments go as OpenAI content parts. A model
+                // without vision answers 400, and the TUI then drops the
+                // image so it is not re-sent every turn.
+                let image_parts: Vec<serde_json::Value> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Image { source } => {
+                            let url = match source {
+                                ImageSource::Base64 { media_type, data } => {
+                                    format!("data:{media_type};base64,{data}")
+                                }
+                                ImageSource::Url { url } => url.clone(),
+                            };
+                            Some(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": { "url": url },
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                if !text_blocks.is_empty() || !image_parts.is_empty() {
                     let text = text_blocks
                         .iter()
                         .filter_map(|b| {
@@ -336,9 +359,19 @@ pub(crate) fn translate_messages(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let content = if image_parts.is_empty() {
+                        serde_json::Value::String(text)
+                    } else {
+                        let mut parts = Vec::with_capacity(image_parts.len() + 1);
+                        if !text.is_empty() {
+                            parts.push(serde_json::json!({ "type": "text", "text": text }));
+                        }
+                        parts.extend(image_parts);
+                        serde_json::Value::Array(parts)
+                    };
                     out.push(OaiMessage {
                         role: "user".into(),
-                        content: Some(serde_json::Value::String(text)),
+                        content: Some(content),
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
@@ -1157,5 +1190,53 @@ mod stream_error_tests {
         .await
         .unwrap();
         assert_eq!(r.content, vec![ContentBlock::Text { text: "hi".into() }]);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn user_images_become_image_url_parts() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this?".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/a.jpg".into(),
+                    },
+                },
+            ],
+        }];
+        let out = translate_messages("", &msgs, false);
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(
+            v["content"],
+            serde_json::json!([
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn text_only_user_messages_stay_plain_strings() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        }];
+        let v = serde_json::to_value(&translate_messages("", &msgs, false)[0]).unwrap();
+        assert_eq!(v["content"], "hi");
     }
 }
