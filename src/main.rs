@@ -416,7 +416,9 @@ const SAFE_ENV_KEYS: &[&str] = &[
     // Verbose logging toggle — no exec side-effects
     "OXIDECLAW_VERBOSE",
     "RUSTYCLAW_VERBOSE",
-    // Ollama host — read-only redirect risk, but legitimate common use case
+    // Ollama host: whoever runs it is the model, so it sees every prompt and
+    // drives tool calls. A project .env may set it (and ANTHROPIC_MODEL) only
+    // once the folder is trusted; see PROJECT_UNTRUSTED_ENV_KEYS.
     "OLLAMA_HOST",
     // OpenAI-compat provider keys
     "OPENAI_API_KEY",
@@ -525,7 +527,7 @@ fn load_dotenv_auto() {
             // Warn if project .env exists — it won't leak into tool subprocesses
             eprintln!(
                 "Note: .env detected in project root. Only oxideclaw-specific keys \
-                 (ANTHROPIC_API_KEY, OLLAMA_HOST, etc.) are loaded. \
+                 (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) are loaded. \
                  Project vars are NOT injected into tool execution."
             );
             if !skipped.is_empty() {

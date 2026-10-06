@@ -2160,7 +2160,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 ) {
                     Ok(()) => format!(
                         "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
-                         servers will be honoured — run /reload (or restart) to apply."
+                         servers will be honoured — run /reload (or restart) to apply. \
+                         OLLAMA_HOST / ANTHROPIC_MODEL from its .env apply after a restart."
                     ),
                     Err(e) => format!("Could not save trust: {e}"),
                 }
