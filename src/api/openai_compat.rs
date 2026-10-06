@@ -266,12 +266,22 @@ pub(crate) struct OaiUsage {
 /// `reasoning_content`. DeepSeek thinking models return 400 on a tool-call
 /// follow-up without it; other providers reject the unknown field, so it is
 /// per provider rather than always on (history survives `/model` switches).
+///
+/// `mistral_tool_ids` rewrites tool-call ids through [`mistral_tool_id`].
 pub(crate) fn translate_messages(
     system: &str,
     messages: &[Message],
     echo_reasoning: bool,
+    mistral_tool_ids: bool,
 ) -> Vec<OaiMessage> {
     let mut out = Vec::with_capacity(messages.len() + 1);
+    let tool_id = |id: &str| {
+        if mistral_tool_ids {
+            mistral_tool_id(id)
+        } else {
+            id.to_string()
+        }
+    };
 
     if !system.is_empty() {
         out.push(OaiMessage {
@@ -318,7 +328,7 @@ pub(crate) fn translate_messages(
                             role: "tool".into(),
                             content: Some(serde_json::Value::String(text)),
                             tool_calls: None,
-                            tool_call_id: Some(tool_use_id.clone()),
+                            tool_call_id: Some(tool_id(tool_use_id)),
                             reasoning_content: None,
                         });
                     }
@@ -389,7 +399,7 @@ pub(crate) fn translate_messages(
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse { id, name, input } => {
                             tool_calls.push(OaiToolCall {
-                                id: id.clone(),
+                                id: tool_id(id),
                                 call_type: "function".into(),
                                 function: OaiFunction {
                                     name: name.clone(),
@@ -445,6 +455,31 @@ pub(crate) fn translate_messages(
     }
 
     out
+}
+
+/// Mistral rejects (400) any tool-call id that is not exactly 9 ASCII
+/// alphanumerics, and a history from Claude (`toolu_…`) or another provider
+/// (`call_…`) carries longer ones after a `/model` switch or resume. The
+/// mapping is a pure function of the id, so each assistant tool call and its
+/// tool result still pair up; stored history keeps the original ids.
+fn mistral_tool_id(id: &str) -> String {
+    if id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return id.to_string();
+    }
+    // FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    (0..9)
+        .map(|_| {
+            let c = BASE62[(h % 62) as usize] as char;
+            h /= 62;
+            c
+        })
+        .collect()
 }
 
 /// Translate Anthropic `ToolDefinition`s to OpenAI tool format.
@@ -669,6 +704,8 @@ pub struct OpenAiCompatClient {
     tools_notice_sent: Arc<AtomicBool>,
     /// See [`translate_messages`]: only DeepSeek wants reasoning echoed back.
     echo_reasoning: bool,
+    /// See [`mistral_tool_id`].
+    mistral_tool_ids: bool,
     /// See `ClaudeClient::retry_notifier`. Rate limiting is far more common on
     /// these providers than on Anthropic — Groq and OpenRouter throttle hard.
     retry_notifier: Option<super::retry::RetryNotifier>,
@@ -750,6 +787,7 @@ impl OpenAiCompatClient {
             no_tools: Arc::new(AtomicBool::new(false)),
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
             echo_reasoning: provider.prefix == "deepseek",
+            mistral_tool_ids: provider.prefix == "mistral",
         })
     }
 
@@ -794,7 +832,12 @@ impl OpenAiCompatClient {
             system_str.clone()
         };
 
-        let oai_messages = translate_messages(&system, &request.messages, self.echo_reasoning);
+        let oai_messages = translate_messages(
+            &system,
+            &request.messages,
+            self.echo_reasoning,
+            self.mistral_tool_ids,
+        );
         let oai_tools = if no_tools {
             vec![]
         } else {
@@ -846,8 +889,12 @@ impl OpenAiCompatClient {
                 self.no_tools.store(true, Ordering::Relaxed);
                 debug!("Model does not support tools — disabling for this session");
                 let patched_system = patch_system_no_tools(&system_str);
-                oai_request.messages =
-                    translate_messages(&patched_system, &request.messages, self.echo_reasoning);
+                oai_request.messages = translate_messages(
+                    &patched_system,
+                    &request.messages,
+                    self.echo_reasoning,
+                    self.mistral_tool_ids,
+                );
                 oai_request.tools = vec![];
 
                 super::retry::send_with_retry(
@@ -907,7 +954,7 @@ mod reasoning_echo_tests {
     }
 
     fn assistant_json(msgs: &[Message], echo: bool) -> serde_json::Value {
-        let out = translate_messages("", msgs, echo);
+        let out = translate_messages("", msgs, echo, false);
         serde_json::to_value(&out[1]).unwrap()
     }
 
@@ -1058,6 +1105,7 @@ mod max_tokens_tests {
             no_tools: Arc::new(AtomicBool::new(false)),
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
             echo_reasoning: false,
+            mistral_tool_ids: false,
             retry_notifier: None,
         }
     }
@@ -1218,7 +1266,7 @@ mod image_tests {
                 },
             ],
         }];
-        let out = translate_messages("", &msgs, false);
+        let out = translate_messages("", &msgs, false, false);
         let v = serde_json::to_value(&out[0]).unwrap();
         assert_eq!(
             v["content"],
@@ -1236,7 +1284,68 @@ mod image_tests {
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
         }];
-        let v = serde_json::to_value(&translate_messages("", &msgs, false)[0]).unwrap();
+        let v = serde_json::to_value(&translate_messages("", &msgs, false, false)[0]).unwrap();
         assert_eq!(v["content"], "hi");
+    }
+}
+
+#[cfg(test)]
+mod mistral_tool_id_tests {
+    use super::*;
+
+    fn history(id: &str) -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: id.into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: vec![ToolResultContent::Text { text: "ok".into() }],
+                    is_error: None,
+                }],
+            },
+        ]
+    }
+
+    fn ids(msgs: &[Message], mistral: bool) -> (String, String) {
+        let out = translate_messages("", msgs, false, mistral);
+        let call = serde_json::to_value(&out[1]).unwrap()["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let result = out[2].tool_call_id.clone().unwrap();
+        (call, result)
+    }
+
+    #[test]
+    fn foreign_ids_are_rewritten_to_nine_alphanumerics_and_stay_paired() {
+        for id in ["toolu_01A09q90qw90lq917835lq9", "call_abc123", "c1"] {
+            let (call, result) = ids(&history(id), true);
+            assert_eq!(call.len(), 9, "{call}");
+            assert!(call.bytes().all(|b| b.is_ascii_alphanumeric()), "{call}");
+            assert_eq!(call, result, "tool result must still match its call");
+        }
+        assert_ne!(mistral_tool_id("call_a"), mistral_tool_id("call_b"));
+    }
+
+    #[test]
+    fn mistral_ids_and_other_providers_are_untouched() {
+        assert_eq!(ids(&history("aB3dE6gH9"), true).0, "aB3dE6gH9");
+        let (call, result) = ids(&history("toolu_01xyz"), false);
+        assert_eq!(
+            (call.as_str(), result.as_str()),
+            ("toolu_01xyz", "toolu_01xyz")
+        );
     }
 }

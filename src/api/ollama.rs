@@ -135,7 +135,7 @@ impl OllamaClient {
             system_str.clone()
         };
 
-        let oai_messages = translate_messages(&system, &request.messages, false);
+        let oai_messages = translate_messages(&system, &request.messages, false, false);
         let oai_tools = if no_tools {
             vec![]
         } else {
@@ -172,7 +172,7 @@ impl OllamaClient {
                 debug!("Model does not support tools — disabling tools for this session");
                 let patched_system = patch_system_no_tools(&system_str);
                 oai_request.messages =
-                    translate_messages(&patched_system, &request.messages, false);
+                    translate_messages(&patched_system, &request.messages, false, false);
                 oai_request.tools = vec![];
                 self.client
                     .post(&url)
