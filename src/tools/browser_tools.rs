@@ -294,14 +294,15 @@ impl Tool for BrowserFillTool {
     }
     fn description(&self) -> &str {
         "Fill a text input / textarea / contenteditable element identified by an @eN ref. \
-         Clears the existing value first."
+         Clears the existing value first. On a <select> (combobox/listbox), chooses the \
+         option whose value or visible text matches `value`."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "ref":   { "type": "string", "description": "Element ref from the last snapshot" },
-                "value": { "type": "string", "description": "Text to type into the element" }
+                "value": { "type": "string", "description": "Text to type into the element, or the option to choose in a <select>" }
             },
             "required": ["ref", "value"]
         })

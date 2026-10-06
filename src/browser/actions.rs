@@ -248,10 +248,12 @@ pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<St
         )
         .await;
 
-    // Get element center coordinates
+    // Get element center coordinates. An element with no layout box (an
+    // <option> of a closed <select>) errors here; the JS fallback handles it.
     let box_model = client
         .send("DOM.getBoxModel", json!({"backendNodeId": node_id}))
-        .await?;
+        .await
+        .unwrap_or_default();
     let content = &box_model["model"]["content"];
     if let Some(coords) = content.as_array()
         && coords.len() >= 4
@@ -283,14 +285,47 @@ pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<St
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
-                "functionDeclaration": "function() { this.click(); }",
+                // Clicking an <option> does not select it; selecting it does.
+                "functionDeclaration": "function() {
+                    const sel = this.tagName === 'OPTION' ? this.closest('select') : null;
+                    if (!sel) { this.click(); return; }
+                    this.selected = true;
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                }",
             }),
         )
         .await?;
     Ok(format!("Clicked {element_ref} (JS fallback)"))
 }
 
-/// Fill a text input by @ref.
+/// Runs on the target element before any text is typed. A `<select>` gets
+/// the option whose value or visible text matches: clearing it the way a
+/// text field is cleared deselected every option, and `Input.insertText`
+/// cannot type into it, so the fill reported success on an emptied select.
+/// Inputs that take no text are refused rather than reported filled.
+const FILL_PREPARE_JS: &str = r#"function(v) {
+  if (this.tagName === 'SELECT') {
+    const opts = Array.from(this.options);
+    const want = v.trim().toLowerCase();
+    const opt = opts.find(o => o.value === v)
+      || opts.find(o => o.text.trim().toLowerCase() === want);
+    if (!opt) return { status: 'nomatch', options: opts.slice(0, 30).map(o => o.text.trim()) };
+    opt.selected = true;
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+    return { status: 'selected', text: opt.text.trim() };
+  }
+  if (this.tagName === 'INPUT' && ['checkbox', 'radio', 'file', 'submit', 'button', 'image',
+      'reset', 'range', 'color'].includes(this.type)) {
+    return { status: 'unsupported', type: this.type };
+  }
+  if ('value' in this) this.value = '';
+  else if (this.isContentEditable) this.textContent = '';
+  return { status: 'cleared' };
+}"#;
+
+/// Fill a text input by @ref, or choose a `<select>` option by value or text.
 pub async fn fill(session: &mut BrowserSession, element_ref: &str, value: &str) -> Result<String> {
     let node_id = session.resolve_ref(element_ref)?;
     let client = session.client()?;
@@ -300,23 +335,50 @@ pub async fn fill(session: &mut BrowserSession, element_ref: &str, value: &str) 
         .send("DOM.focus", json!({"backendNodeId": node_id}))
         .await?;
 
-    // Clear existing value by calling .value = '' on the resolved element directly
-    // (not on document.activeElement, which could be anything after focus changes).
+    // Prepare the resolved element directly (not document.activeElement,
+    // which could be anything after focus changes).
     let resolved = client
         .send("DOM.resolveNode", json!({"backendNodeId": node_id}))
         .await?;
     if let Some(object_id) = resolved["object"]["objectId"].as_str() {
-        let _ = client
+        let prepared = client
             .send(
                 "Runtime.callFunctionOn",
                 json!({
                     "objectId": object_id,
-                    "functionDeclaration":
-                        "function() { if ('value' in this) this.value = ''; \
-                                      else if (this.isContentEditable) this.textContent = ''; }",
+                    "functionDeclaration": FILL_PREPARE_JS,
+                    "arguments": [{ "value": value }],
+                    "returnByValue": true,
                 }),
             )
-            .await;
+            .await
+            .map(|r| r["result"]["value"].clone())
+            .unwrap_or_default();
+        match prepared["status"].as_str() {
+            Some("selected") => {
+                let text = prepared["text"].as_str().unwrap_or("");
+                return Ok(format!("Selected \"{text}\" in {element_ref}"));
+            }
+            Some("nomatch") => {
+                let options: Vec<&str> = prepared["options"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|o| o.as_str()).collect())
+                    .unwrap_or_default();
+                bail!(
+                    "{element_ref} is a <select> with no option matching that value; \
+                     its options are: {}",
+                    options.join(" | ")
+                );
+            }
+            Some("unsupported") => {
+                let kind = prepared["type"].as_str().unwrap_or("");
+                bail!(
+                    "{element_ref} is an <input type={kind}>, which takes no text; \
+                     use browser_click instead"
+                );
+            }
+            _ => {}
+        }
     }
 
     // Type the value (handles input events correctly)
@@ -671,6 +733,7 @@ mod landed_url_tests {
 mod cdp_request_tests {
     use super::*;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -834,5 +897,102 @@ mod cdp_request_tests {
         assert_eq!(events[2]["type"], "keyDown");
         assert_eq!(events[2]["text"], "x");
         assert_eq!(events[2]["windowsVirtualKeyCode"], 88);
+    }
+
+    async fn session_on(reply: fn(&str, &Value) -> Value) -> (BrowserSession, Log) {
+        let (ws, log) = scripted_cdp(reply).await;
+        let mut session = BrowserSession::default();
+        session.connect(&ws).await.unwrap();
+        session.set_refs(HashMap::from([("@e1".to_string(), 7)]));
+        (session, log)
+    }
+
+    fn element(method: &str, prepared: Value) -> Value {
+        match method {
+            "DOM.resolveNode" => json!({"object": {"objectId": "obj-7"}}),
+            "Runtime.callFunctionOn" => json!({"result": {"type": "object", "value": prepared}}),
+            _ => json!({}),
+        }
+    }
+
+    /// Filling a <select> cleared its selection, typed nothing, and
+    /// reported "Filled".
+    #[tokio::test]
+    async fn filling_a_select_chooses_the_option_instead_of_typing() {
+        fn reply(method: &str, _: &Value) -> Value {
+            element(method, json!({"status": "selected", "text": "Canada"}))
+        }
+        let (mut session, log) = session_on(reply).await;
+        let out = fill(&mut session, "@e1", "canada").await.unwrap();
+        assert_eq!(out, "Selected \"Canada\" in @e1");
+        assert!(sent(&log, "Input.insertText").is_empty());
+        let call = sent(&log, "Runtime.callFunctionOn").remove(0);
+        assert_eq!(call["arguments"][0]["value"], "canada");
+        assert_eq!(call["returnByValue"], true);
+        assert!(
+            call["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("SELECT")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_select_with_no_matching_option_is_an_error() {
+        fn reply(method: &str, _: &Value) -> Value {
+            element(
+                method,
+                json!({"status": "nomatch", "options": ["Canada", "Mexico"]}),
+            )
+        }
+        let (mut session, log) = session_on(reply).await;
+        let err = fill(&mut session, "@e1", "Narnia").await.unwrap_err();
+        assert!(err.to_string().contains("Canada | Mexico"), "{err}");
+        assert!(sent(&log, "Input.insertText").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_checkbox_is_not_reported_filled() {
+        fn reply(method: &str, _: &Value) -> Value {
+            element(method, json!({"status": "unsupported", "type": "checkbox"}))
+        }
+        let (mut session, log) = session_on(reply).await;
+        let err = fill(&mut session, "@e1", "yes").await.unwrap_err();
+        assert!(err.to_string().contains("browser_click"), "{err}");
+        assert!(sent(&log, "Input.insertText").is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_fields_are_still_typed_into() {
+        fn reply(method: &str, _: &Value) -> Value {
+            element(method, json!({"status": "cleared"}))
+        }
+        let (mut session, log) = session_on(reply).await;
+        let out = fill(&mut session, "@e1", "hello").await.unwrap();
+        assert_eq!(out, "Filled @e1 (5 chars)");
+        assert_eq!(sent(&log, "Input.insertText")[0]["text"], "hello");
+    }
+
+    /// An <option> of a closed <select> has no layout box; the error from
+    /// DOM.getBoxModel aborted the click before the JS fallback.
+    #[tokio::test]
+    async fn an_element_without_a_box_falls_back_to_a_js_click() {
+        fn reply(method: &str, _: &Value) -> Value {
+            match method {
+                "DOM.resolveNode" => json!({"object": {"objectId": "obj-7"}}),
+                "DOM.getBoxModel" => {
+                    json!({"error": {"code": -32000, "message": "Could not compute box model."}})
+                }
+                _ => json!({}),
+            }
+        }
+        let (mut session, log) = session_on(reply).await;
+        let out = click(&mut session, "@e1").await.unwrap();
+        assert!(out.contains("JS fallback"), "{out}");
+        let calls = sent(&log, "Runtime.callFunctionOn");
+        let js = calls.last().unwrap()["functionDeclaration"]
+            .as_str()
+            .unwrap();
+        assert!(js.contains("OPTION") && js.contains("change"), "{js}");
     }
 }
