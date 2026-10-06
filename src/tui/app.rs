@@ -501,6 +501,12 @@ pub struct PendingPermission {
     pub tool_name: String,
     pub description: String,
     pub reply: oneshot::Sender<PermissionDecision>,
+    /// First wrapped row of the description shown when it is taller than
+    /// the popup; render clamps it.
+    pub scroll: u16,
+    /// Set by render once every row of the description has been on screen.
+    /// y/a are ignored until then so nobody approves a tail they never saw.
+    pub fully_shown: bool,
 }
 
 // ── AskUser dialog ────────────────────────────────────────────────────────────
@@ -1401,6 +1407,8 @@ impl App {
                     tool_name,
                     description,
                     reply,
+                    scroll: 0,
+                    fully_shown: false,
                 });
             }
             AppEvent::AskUser { question, reply } => {

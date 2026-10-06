@@ -243,14 +243,21 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     }
 
     // Permission dialog takes priority
-    if app.pending_permission.is_some() {
+    if let Some(perm) = &mut app.pending_permission {
+        // y/a only once render has shown every row of the command; until
+        // then the arrows scroll the dialog and n/Esc still deny.
+        let shown = perm.fully_shown;
         match key.code {
-            Char('y') | Char('Y') => {
+            KeyCode::Up => perm.scroll = perm.scroll.saturating_sub(1),
+            KeyCode::Down => perm.scroll = perm.scroll.saturating_add(1),
+            KeyCode::PageUp => perm.scroll = perm.scroll.saturating_sub(10),
+            KeyCode::PageDown => perm.scroll = perm.scroll.saturating_add(10),
+            Char('y') | Char('Y') if shown => {
                 if let Some(p) = app.pending_permission.take() {
                     let _ = p.reply.send(PermissionDecision::Allow);
                 }
             }
-            Char('a') | Char('A') => {
+            Char('a') | Char('A') if shown => {
                 if let Some(p) = app.pending_permission.take() {
                     perm_state.record_always_allow(&p.tool_name);
                     let _ = p.reply.send(PermissionDecision::AlwaysAllow);
