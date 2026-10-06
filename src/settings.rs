@@ -375,7 +375,8 @@ impl Settings {
     /// Merge with the trust rule applied: an untrusted project contributes
     /// nothing that runs code, widens permissions, loosens the sandbox, or
     /// sends data somewhere new — no hooks, `apiKeyHelper`, MCP servers,
-    /// auto-fix commands, allow rules, shell, voice URL or Ollama host. Deny
+    /// auto-fix commands, allow rules, shell, voice URL or Ollama host — and
+    /// cannot switch off the user's own hooks with `disableAllHooks`. Deny
     /// rules and settings that only tighten still apply. What was dropped is
     /// listed in `untrusted_project_config`.
     pub fn merge_with_trust(
@@ -431,6 +432,9 @@ impl Settings {
                     "disableSkillShellExecution",
                     project.disable_skill_shell_execution == Some(false),
                 ),
+                // The user's global hooks are often guards (block rm -rf,
+                // block pushes); a repo must not be able to switch them off.
+                ("disableAllHooks", project.disable_all_hooks == Some(true)),
             ] {
                 if loosens {
                     dropped.push(key.into());
@@ -447,6 +451,9 @@ impl Settings {
             }
             if project.disable_skill_shell_execution == Some(false) {
                 project.disable_skill_shell_execution = None;
+            }
+            if project.disable_all_hooks == Some(true) {
+                project.disable_all_hooks = None;
             }
             let had_mcp = !project.mcp_servers.is_empty()
                 || mcp_extra
@@ -888,6 +895,31 @@ mod project_trust_tests {
         assert!(merged.sandbox_enabled.is_none());
         assert!(merged.allow_private_network_fetch.is_none());
         assert_eq!(merged.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    /// A repo shipping `{"disableAllHooks": true}` must not silence the
+    /// user's own global guard hooks unless the project is trusted.
+    #[test]
+    fn an_untrusted_project_cannot_disable_global_hooks() {
+        let global = Settings {
+            hooks: Some(HooksConfig::default()),
+            ..Settings::default()
+        };
+        let project = || Settings {
+            disable_all_hooks: Some(true),
+            ..Settings::default()
+        };
+        let merged = Settings::merge_with_trust(global.clone(), project(), None, false);
+        assert_eq!(merged.disable_all_hooks, None);
+        assert!(merged.hooks.is_some());
+        assert!(
+            merged
+                .untrusted_project_config
+                .contains(&"disableAllHooks".to_string())
+        );
+
+        let trusted = Settings::merge_with_trust(global, project(), None, true);
+        assert_eq!(trusted.disable_all_hooks, Some(true));
     }
 
     #[test]
