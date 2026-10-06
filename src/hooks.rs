@@ -364,6 +364,31 @@ fn cap_env_value(v: &str) -> String {
     format!("{}…[truncated by oxideclaw]", &v[..cut])
 }
 
+/// The JSON object written to a hook's stdin, with every value uncapped.
+/// Field names follow Claude Code's hook input so existing hooks port over.
+fn hook_stdin_payload(env: &HookEnvVars<'_>) -> String {
+    let mut obj = serde_json::json!({
+        "hook_event_name": env.event,
+        "session_id": env.session_id,
+        "cwd": env.cwd.to_string_lossy(),
+    });
+    if let Some(name) = env.tool_name {
+        obj["tool_name"] = name.into();
+    }
+    if let Some(inp) = env.tool_input {
+        // Callers pass the serialized tool input; hand it back as an object
+        // so `jq .tool_input.command` works.
+        obj["tool_input"] = serde_json::from_str(inp).unwrap_or_else(|_| inp.into());
+    }
+    if let Some(res) = env.tool_result {
+        obj["tool_response"] = res.into();
+    }
+    if let Some(msg) = env.prompt {
+        obj["prompt"] = msg.into();
+    }
+    obj.to_string()
+}
+
 /// Read a pipe to EOF, keeping at most `cap` bytes.
 ///
 /// Draining past the cap matters: if we stopped reading, the hook would block
@@ -433,20 +458,26 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     if let Some(name) = env.tool_name {
         cmd.env("TOOL_NAME", name);
     }
-    if let Some(inp) = env.tool_input {
-        cmd.env("TOOL_INPUT", cap_env_value(inp));
+    // A capped value hides its tail, which is exactly where a padded command
+    // puts the dangerous part. `<VAR>_TRUNCATED=1` lets an env-only guard fail
+    // closed; the full value is always on stdin.
+    for (var, value) in [
+        ("TOOL_INPUT", env.tool_input),
+        ("TOOL_RESULT", env.tool_result),
+        ("CLAUDE_MESSAGE", env.prompt),
+    ] {
+        if let Some(v) = value {
+            cmd.env(var, cap_env_value(v));
+            if v.len() > MAX_HOOK_ENV_BYTES {
+                cmd.env(format!("{var}_TRUNCATED"), "1");
+            }
+        }
     }
-    if let Some(res) = env.tool_result {
-        cmd.env("TOOL_RESULT", cap_env_value(res));
-    }
-    if let Some(msg) = env.prompt {
-        cmd.env("CLAUDE_MESSAGE", cap_env_value(msg));
-    }
+    let payload = hook_stdin_payload(&env);
 
-    // Capture stdout and stderr. stdin is /dev/null: inherited stdin would let
-    // a hook that reads input compete with the TUI for the user's keystrokes
-    // and hang until the timeout.
-    cmd.stdin(std::process::Stdio::null());
+    // stdin is a pipe carrying the payload rather than inherited: a hook that
+    // reads input must never compete with the TUI for the user's keystrokes.
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
@@ -469,14 +500,30 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     let Some(mut child_stderr) = child.stderr.take() else {
         return hook_unevaluable(env.event, hook, "produced no stderr pipe");
     };
+    let Some(mut child_stdin) = child.stdin.take() else {
+        return hook_unevaluable(env.event, hook, "produced no stdin pipe");
+    };
 
-    // Read both pipes concurrently. Draining one to EOF before starting the
-    // other deadlocks if the hook fills the second pipe first.
+    // Feed stdin and read both output pipes concurrently. Doing any of them
+    // to completion first deadlocks once the hook fills a pipe we are not
+    // servicing yet.
     let collect = async {
-        let (out, err) = tokio::join!(
+        let feed = async move {
+            use tokio::io::AsyncWriteExt;
+            let r = child_stdin.write_all(payload.as_bytes()).await;
+            // Dropping `child_stdin` here sends EOF. A hook that exits without
+            // reading stdin closes the pipe, which is fine.
+            match r {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                r => r,
+            }
+        };
+        let (fed, out, err) = tokio::join!(
+            feed,
             read_capped(&mut child_stdout, MAX_HOOK_OUTPUT_BYTES),
             read_capped(&mut child_stderr, MAX_HOOK_OUTPUT_BYTES),
         );
+        fed?;
         let status = child.wait().await?;
         Ok::<_, std::io::Error>((status, out?, err?))
     };
@@ -868,6 +915,67 @@ mod tests {
             !reason.contains(&format!("len={}", huge.len())),
             "value should have been truncated before spawn: {reason}"
         );
+    }
+
+    /// The env copy keeps only the first 64 KiB, so a guard grepping
+    /// `$TOOL_INPUT` never saw a command padded past that. stdin carries all
+    /// of it, and the env says when it was cut.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guard_reading_stdin_sees_the_tail_of_a_padded_input() {
+        let padded = serde_json::json!({
+            "command": format!("# {}\nrm -rf ~", "x".repeat(200 * 1024)),
+        })
+        .to_string();
+        let r = run_pre_tool_hooks(
+            &cfg_pre("grep -q 'rm -rf' && { echo \"cut=$TOOL_INPUT_TRUNCATED\"; exit 2; }; exit 0"),
+            "Bash",
+            &padded,
+            "sess",
+            std::path::Path::new("."),
+        )
+        .await;
+        assert!(!r.should_continue, "the guard must see the tail on stdin");
+        assert_eq!(r.stop_reason.as_deref(), Some("cut=1"));
+
+        let r = run_pre_tool_hooks(
+            &cfg_pre("echo \"[$TOOL_INPUT_TRUNCATED]\"; exit 2"),
+            "Bash",
+            "{}",
+            "sess",
+            std::path::Path::new("."),
+        )
+        .await;
+        assert_eq!(
+            r.stop_reason.as_deref(),
+            Some("[]"),
+            "small inputs are not marked"
+        );
+    }
+
+    #[test]
+    fn stdin_payload_carries_full_values_as_json() {
+        let big = "y".repeat(MAX_HOOK_ENV_BYTES * 2);
+        let input = serde_json::json!({ "command": big }).to_string();
+        let payload = hook_stdin_payload(&HookEnvVars {
+            event: "PreToolUse",
+            tool_name: Some("Bash"),
+            tool_input: Some(&input),
+            tool_result: None,
+            prompt: None,
+            session_id: "sess",
+            cwd: std::path::Path::new("/w"),
+        });
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["hook_event_name"], "PreToolUse");
+        assert_eq!(v["tool_name"], "Bash");
+        assert_eq!(v["session_id"], "sess");
+        assert_eq!(v["cwd"], "/w");
+        assert_eq!(
+            v["tool_input"]["command"].as_str().unwrap().len(),
+            big.len()
+        );
+        assert!(v.get("tool_response").is_none());
     }
 
     #[test]
