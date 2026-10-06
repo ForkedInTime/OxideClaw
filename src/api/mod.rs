@@ -23,23 +23,61 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 8096;
 
-/// Maximum time to wait for the *next* SSE event before declaring the stream dead.
+/// Maximum time to wait for the *next* bytes of an SSE response before declaring
+/// the stream dead.
 ///
-/// This is deliberately an inter-event budget, not a whole-request timeout: a
+/// This is deliberately an inter-chunk budget, not a whole-request timeout: a
 /// legitimate response can stream for many minutes, so `.timeout()` on the request
 /// would truncate valid work. But a healthy connection always delivers *something* —
-/// a content delta, a `ping`, or a keepalive — well inside this window.
+/// a content delta, a `ping`, or a keepalive comment — well inside this window.
 ///
 /// Without this bound, a silently dropped TCP connection (NAT idle reaper, laptop
 /// sleep, VPN drop) leaves the read future pending forever: the UI hangs with no
 /// error and no recovery short of killing the process.
 pub(crate) const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Await the next event from an SSE stream, bounded by [`SSE_IDLE_TIMEOUT`].
+/// Bound the gap between body chunks by [`SSE_IDLE_TIMEOUT`]; on expiry yield
+/// one `TimedOut` error and end.
+///
+/// The timer runs on bytes, not parsed events: the SSE parser swallows comment
+/// lines without yielding anything, so OpenRouter's `: OPENROUTER PROCESSING`
+/// keepalives during a long silent reasoning phase never reset an event-level
+/// timer, and the healthy request was aborted as stalled and re-sent.
+pub(crate) fn idle_bounded<S, B, E>(
+    stream: S,
+) -> impl futures_util::Stream<Item = std::result::Result<B, std::io::Error>> + Unpin
+where
+    S: futures_util::Stream<Item = std::result::Result<B, E>>,
+    E: std::fmt::Display,
+{
+    Box::pin(futures_util::stream::unfold(
+        Some(Box::pin(stream)),
+        |state| async move {
+            let mut stream = state?;
+            match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "SSE stream stalled: no data received for {}s — the connection \
+                             was likely dropped upstream. Retry the request.",
+                            SSE_IDLE_TIMEOUT.as_secs()
+                        ),
+                    )),
+                    None,
+                )),
+                Ok(None) => None,
+                Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(stream))),
+                Ok(Some(Err(e))) => Some((Err(std::io::Error::other(e.to_string())), Some(stream))),
+            }
+        },
+    ))
+}
+
+/// Await the next event from an SSE stream built on [`idle_bounded`] bytes.
 ///
 /// Returns `Ok(None)` on clean end-of-stream. Shared by the Anthropic backend and
-/// the OpenAI-compatible backend (which also serves Ollama), so every streaming path
-/// gets the same stall detection.
+/// the OpenAI-compatible backend (which also serves Ollama).
 pub(crate) async fn next_sse_event<S, E>(
     stream: &mut S,
 ) -> Result<Option<eventsource_stream::Event>>
@@ -47,15 +85,10 @@ where
     S: futures_util::Stream<Item = std::result::Result<eventsource_stream::Event, E>> + Unpin,
     E: std::fmt::Display,
 {
-    match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
-        Err(_) => Err(anyhow!(
-            "SSE stream stalled: no data received for {}s — the connection was likely \
-             dropped upstream. Retry the request.",
-            SSE_IDLE_TIMEOUT.as_secs()
-        )),
-        Ok(None) => Ok(None),
-        Ok(Some(Ok(event))) => Ok(Some(event)),
-        Ok(Some(Err(e))) => Err(anyhow!("SSE stream error: {e}")),
+    match stream.next().await {
+        None => Ok(None),
+        Some(Ok(event)) => Ok(Some(event)),
+        Some(Err(e)) => Err(anyhow!("SSE stream error: {e}")),
     }
 }
 
@@ -301,7 +334,7 @@ impl ClaudeClient {
             return Err(anyhow!("API stream error {status}: {body}"));
         }
 
-        let mut stream = resp.bytes_stream().eventsource();
+        let mut stream = idle_bounded(resp.bytes_stream()).eventsource();
 
         // Tool schemas by name, so string arguments are only re-parsed where
         // the schema asks for an array or object.
@@ -942,7 +975,8 @@ mod sse_idle_tests {
     /// Before the idle-timeout guard this hung the caller forever.
     #[tokio::test(start_paused = true)]
     async fn stalled_stream_errors_instead_of_hanging_forever() {
-        let mut stream = futures_util::stream::pending::<Result<Event, Infallible>>();
+        let bytes = futures_util::stream::pending::<Result<Vec<u8>, Infallible>>();
+        let mut stream = idle_bounded(bytes).eventsource();
 
         let err = next_sse_event(&mut stream)
             .await
@@ -964,15 +998,40 @@ mod sse_idle_tests {
     #[tokio::test(start_paused = true)]
     async fn quiet_period_within_budget_is_not_treated_as_a_stall() {
         let quiet = SSE_IDLE_TIMEOUT - std::time::Duration::from_secs(1);
-        let mut stream = Box::pin(futures_util::stream::once(async move {
+        let bytes = futures_util::stream::once(async move {
             tokio::time::sleep(quiet).await;
-            Ok::<_, Infallible>(event("late but valid"))
-        }));
+            Ok::<_, Infallible>(b"data: late but valid\n\n".to_vec())
+        });
+        let mut stream = idle_bounded(bytes).eventsource();
 
         let got = next_sse_event(&mut stream)
             .await
             .expect("must not time out");
         assert_eq!(got.map(|e| e.data).as_deref(), Some("late but valid"));
+    }
+
+    /// OpenRouter sends only `: OPENROUTER PROCESSING` comments while a
+    /// reasoning model thinks. The parser yields no event for a comment, so
+    /// an event-level timer fired after 120 s of healthy keepalives.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_comments_reset_the_idle_timer() {
+        let gap = SSE_IDLE_TIMEOUT / 2;
+        let bytes = futures_util::stream::unfold(0u32, move |i| async move {
+            tokio::time::sleep(gap).await;
+            let chunk: &[u8] = match i {
+                0..=5 => b": OPENROUTER PROCESSING\n\n",
+                6 => b"data: answer\n\n",
+                _ => return None,
+            };
+            Some((Ok::<_, Infallible>(chunk.to_vec()), i + 1))
+        });
+        let mut stream = idle_bounded(bytes).eventsource();
+
+        let got = next_sse_event(&mut stream)
+            .await
+            .expect("keepalives must keep the stream alive");
+        assert_eq!(got.map(|e| e.data).as_deref(), Some("answer"));
+        assert!(next_sse_event(&mut stream).await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1003,9 +1062,10 @@ mod sse_idle_tests {
     /// timeout wrapper.
     #[tokio::test(start_paused = true)]
     async fn transport_error_is_propagated() {
-        let mut stream = Box::pin(futures_util::stream::once(async {
-            Err::<Event, _>(std::io::Error::other("connection reset"))
-        }));
+        let bytes = futures_util::stream::once(async {
+            Err::<Vec<u8>, _>(std::io::Error::other("connection reset"))
+        });
+        let mut stream = idle_bounded(bytes).eventsource();
 
         let err = next_sse_event(&mut stream).await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "{err}");
