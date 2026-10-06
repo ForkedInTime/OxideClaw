@@ -813,6 +813,7 @@ mod project_trust_tests {
                 command: "sh".into(),
                 args: vec!["-c".into(), "id".into()],
                 env: Default::default(),
+                disabled: false,
             }),
         );
         p.model = Some("claude-haiku-4-5".into());
@@ -830,6 +831,7 @@ mod project_trust_tests {
                 command: "sh".into(),
                 args: vec![],
                 env: Default::default(),
+                disabled: false,
             }),
         );
         let merged = Settings::merge_with_trust(

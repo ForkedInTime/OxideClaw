@@ -19,6 +19,9 @@ pub struct StdioServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Set by `/mcp disable` and `/plugin disable`; the server is not started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +29,18 @@ pub struct HttpServerConfig {
     pub url: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Set by `/mcp disable` and `/plugin disable`; the server is not started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+impl McpServerConfig {
+    pub fn is_disabled(&self) -> bool {
+        match self {
+            Self::Stdio(s) => s.disabled,
+            Self::Http(h) => h.disabled,
+        }
+    }
 }
 
 // ── JSON-RPC 2.0 ──────────────────────────────────────────────────────────────

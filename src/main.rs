@@ -1265,7 +1265,12 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                         }
                         crate::mcp::types::McpServerConfig::Http(h) => format!("http: {}", h.url),
                     };
-                    println!("  {name}  ({kind})");
+                    let state = if cfg.is_disabled() {
+                        "  [disabled]"
+                    } else {
+                        ""
+                    };
+                    println!("  {name}  ({kind}){state}");
                 }
             }
         }
@@ -1322,6 +1327,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                     command: command.clone(),
                     args: args.clone(),
                     env: env_map,
+                    disabled: false,
                 });
             mcp_write_server(name, cfg, scope, &config)?;
             println!("Added MCP server '{name}' (scope: {scope})");

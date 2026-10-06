@@ -211,6 +211,7 @@ impl State {
                                     command: command.to_string(),
                                     args,
                                     env,
+                                    disabled: false,
                                 },
                             ),
                         );

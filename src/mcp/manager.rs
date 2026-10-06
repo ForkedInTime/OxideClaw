@@ -55,6 +55,12 @@ impl McpManager {
         // Stable order so tool registration is deterministic across runs.
         let mut entries: Vec<(String, McpServerConfig)> = all.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.retain(|(name, cfg)| {
+            if cfg.is_disabled() {
+                tracing::info!("MCP '{}': disabled in settings — skipped", name);
+            }
+            !cfg.is_disabled()
+        });
 
         let handles: Vec<_> = entries
             .into_iter()
@@ -135,6 +141,7 @@ mod startup_tests {
                 command: "sh".into(),
                 args: vec!["-c".into(), "sleep 30".into()],
                 env: Default::default(),
+                disabled: false,
             }),
         )
     }
@@ -153,6 +160,7 @@ cat >/dev/null"#;
                 command: "sh".into(),
                 args: vec!["-c".into(), script.into()],
                 env: Default::default(),
+                disabled: false,
             }),
         )
     }
@@ -172,6 +180,35 @@ cat >/dev/null"#;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"mcp__fake__ping"), "{names:?}");
         assert!(names.contains(&"Read"), "built-ins must still be there");
+    }
+
+    /// `/mcp disable` and `/plugin disable` write `"disabled": true` into the
+    /// server's settings entry; that server must not be launched.
+    #[tokio::test]
+    async fn disabled_servers_are_not_started() {
+        let (_, on) = fake_server("on");
+        let mut off = serde_json::to_value(&on).unwrap();
+        assert!(
+            off.get("disabled").is_none(),
+            "false must not be written out"
+        );
+        off["disabled"] = serde_json::json!(true);
+        let off: McpServerConfig = serde_json::from_value(off).unwrap();
+        assert!(off.is_disabled());
+
+        let extra: std::collections::HashMap<_, _> =
+            [("on".to_string(), on), ("off".to_string(), off)]
+                .into_iter()
+                .collect();
+        let m = McpManager::start_with_extra_timeout(
+            &Settings::default(),
+            &extra,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        let started: Vec<&str> = m.clients.iter().map(|c| c.server_name.as_str()).collect();
+        assert_eq!(started, ["on"]);
+        assert!(m.failed.is_empty(), "{:?}", m.failed);
     }
 
     /// Three servers that never answer must cost one timeout, not three, and
