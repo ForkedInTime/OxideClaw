@@ -248,10 +248,13 @@ pub async fn run_tui(
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        // Harmless on terminals that never took the flags.
+        // Separate command: on Windows the pop always errors, and execute!
+        // stops at the first error, which would skip the rest.
+        if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             io::stdout(),
-            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             crossterm::cursor::Show
