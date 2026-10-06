@@ -11,7 +11,9 @@ pub mod transport;
 
 pub use protocol::*;
 
-use crate::browser::browse_loop::{BrowsePolicy, BrowseProgress, BrowseRequest, run_browse};
+use crate::browser::browse_loop::{
+    BrowsePolicy, BrowseProgress, BrowseReason, BrowseRequest, BrowseResult, run_browse,
+};
 use crate::config::Config;
 use anyhow::Result;
 use session::SdkSession;
@@ -20,10 +22,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use transport::Transport;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The approval gate a browse run is blocked on, keyed by browse session id:
+/// `(step, reply)`. A run waits on at most one prompt at a time.
+type PendingBrowse = Arc<std::sync::Mutex<HashMap<String, (u32, oneshot::Sender<bool>)>>>;
 
 /// Headless SDK server — reads NDJSON requests, writes NDJSON responses.
 pub struct SdkServer;
@@ -62,6 +68,8 @@ impl SdkServer {
         // Track active session count (shared with spawned tasks)
         let active_sessions = Arc::new(AtomicUsize::new(0));
 
+        let pending_browse: PendingBrowse = Arc::default();
+
         loop {
             tokio::select! {
                 req = transport.read_request() => {
@@ -74,6 +82,7 @@ impl SdkServer {
                                 &notif_tx,
                                 &approval_out_tx,
                                 &mut approval_ins,
+                                &pending_browse,
                                 &active_sessions,
                                 start_time,
                             ).await?;
@@ -105,6 +114,7 @@ impl SdkServer {
         notif_tx: &mpsc::UnboundedSender<SdkNotification>,
         approval_out_tx: &mpsc::UnboundedSender<SdkNotification>,
         approval_ins: &mut HashMap<String, mpsc::UnboundedSender<(String, Option<String>)>>,
+        pending_browse: &PendingBrowse,
         active_sessions: &Arc<AtomicUsize>,
         start_time: Instant,
     ) -> Result<()> {
@@ -404,8 +414,16 @@ impl SdkServer {
                 // Forward ApprovalPrompt events as BrowseApprovalNeeded notifications
                 let appr_notif_tx = approval_out_tx.clone();
                 let appr_sid = session_id.clone();
+                let appr_pending = Arc::clone(pending_browse);
                 tokio::spawn(async move {
                     while let Some(prompt) = approval_rx.recv().await {
+                        // Park the reply before the host can see the prompt, so
+                        // an instant browse/approval_reply always finds it. A
+                        // stale entry (the gate timed out) is simply replaced.
+                        appr_pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(appr_sid.clone(), (prompt.step, prompt.reply));
                         let notif = SdkNotification::BrowseApprovalNeeded {
                             session_id: appr_sid.clone(),
                             step: prompt.step,
@@ -415,9 +433,6 @@ impl SdkServer {
                             reason: prompt.reason,
                         };
                         let _ = appr_notif_tx.send(notif);
-                        // Note: prompt.reply is dropped here — the gate will treat
-                        // an unreceived reply as a deny in Phase A. Phase B will
-                        // wire BrowseApprovalReply to fulfill this oneshot.
                     }
                 });
 
@@ -430,13 +445,15 @@ impl SdkServer {
                 };
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let session_counter = Arc::clone(active_sessions);
+                let run_notif_tx = notif_tx.clone();
+                let run_pending = Arc::clone(pending_browse);
                 tokio::spawn(async move {
                     let channels = crate::browser::browse_loop::BrowseChannels {
                         progress_tx,
                         approval_tx,
                         cancel,
                     };
-                    let _ = run_browse(
+                    let outcome = run_browse(
                         browse_req,
                         &cfg,
                         all_tools_list,
@@ -445,6 +462,25 @@ impl SdkServer {
                         channels,
                     )
                     .await;
+                    // run_browse only reports Completed itself on the Ok path;
+                    // without this a setup failure (e.g. no credential) left
+                    // the host waiting forever after browse/started.
+                    if let Err(e) = outcome {
+                        let _ = run_notif_tx.send(SdkNotification::BrowseCompleted {
+                            session_id: session_id.clone(),
+                            result: BrowseResult {
+                                achieved: false,
+                                summary: format!("Browse agent error: {e:#}"),
+                                reason: BrowseReason::Bailed,
+                                steps_used: 0,
+                                final_url: None,
+                            },
+                        });
+                    }
+                    run_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&session_id);
                     session_counter.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -464,9 +500,32 @@ impl SdkServer {
                     .await?;
             }
 
-            // BrowseApprovalReply has no request id — it's a fire-and-forget host reply.
-            SdkRequest::BrowseApprovalReply { .. } => {
-                // Phase B: route to the waiting browse session's approval channel.
+            // BrowseApprovalReply has no request id — it's a fire-and-forget
+            // host reply, so a mismatch can only be logged, not answered.
+            SdkRequest::BrowseApprovalReply {
+                session_id,
+                step,
+                approved,
+            } => {
+                let mut pending = pending_browse.lock().unwrap_or_else(|e| e.into_inner());
+                match pending.remove(&session_id) {
+                    Some((want, reply)) if want == step => {
+                        if reply.send(approved).is_err() {
+                            eprintln!(
+                                "[sdk] browse/approval_reply for {session_id} step {step} arrived after the gate timed out"
+                            );
+                        }
+                    }
+                    Some((want, reply)) => {
+                        eprintln!(
+                            "[sdk] browse/approval_reply for {session_id} names step {step}, but step {want} is waiting; ignored"
+                        );
+                        pending.insert(session_id, (want, reply));
+                    }
+                    None => eprintln!(
+                        "[sdk] browse/approval_reply for {session_id}: no approval is pending"
+                    ),
+                }
             }
         }
 
@@ -572,5 +631,145 @@ mod cwd_tests {
         );
         let err = validate_session_cwd(Some("/definitely/not/here".into())).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod browse_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// Records responses; notifications go through the server's channels.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<SdkResponse>>);
+
+    #[async_trait]
+    impl Transport for Recorder {
+        async fn read_request(&mut self) -> Result<Option<SdkRequest>> {
+            Ok(None)
+        }
+        async fn send_response(&self, response: SdkResponse) -> Result<()> {
+            self.0.lock().unwrap().push(response);
+            Ok(())
+        }
+        async fn send_notification(&self, _: SdkNotification) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Harness {
+        transport: Recorder,
+        notif_tx: mpsc::UnboundedSender<SdkNotification>,
+        notif_rx: mpsc::UnboundedReceiver<SdkNotification>,
+        approval_out_tx: mpsc::UnboundedSender<SdkNotification>,
+        approval_ins: HashMap<String, mpsc::UnboundedSender<(String, Option<String>)>>,
+        pending: PendingBrowse,
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (notif_tx, notif_rx) = mpsc::unbounded_channel();
+            let (approval_out_tx, _) = mpsc::unbounded_channel();
+            Self {
+                transport: Recorder::default(),
+                notif_tx,
+                notif_rx,
+                approval_out_tx,
+                approval_ins: HashMap::new(),
+                pending: Arc::default(),
+                active: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        async fn handle(&mut self, cfg: &Config, req: SdkRequest) {
+            SdkServer::handle_request(
+                req,
+                cfg,
+                &mut self.transport,
+                &self.notif_tx,
+                &self.approval_out_tx,
+                &mut self.approval_ins,
+                &self.pending,
+                &self.active,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    fn reply(session_id: &str, step: u32, approved: bool) -> SdkRequest {
+        SdkRequest::BrowseApprovalReply {
+            session_id: session_id.into(),
+            step,
+            approved,
+        }
+    }
+
+    /// The reply used to be dropped on the floor, so every gated browse
+    /// action timed out into a deny no matter what the host answered.
+    #[tokio::test]
+    async fn approval_reply_reaches_the_waiting_gate_only_for_its_step() {
+        let mut h = Harness::new();
+        let cfg = Config::default();
+        let (tx, mut rx) = oneshot::channel();
+        h.pending.lock().unwrap().insert("browse-1".into(), (3, tx));
+
+        // Wrong step and unknown session: ignored, prompt still waiting.
+        h.handle(&cfg, reply("browse-1", 2, true)).await;
+        h.handle(&cfg, reply("browse-9", 3, true)).await;
+        assert!(rx.try_recv().is_err());
+        assert!(h.pending.lock().unwrap().contains_key("browse-1"));
+
+        h.handle(&cfg, reply("browse-1", 3, true)).await;
+        assert_eq!(rx.await, Ok(true));
+        assert!(h.pending.lock().unwrap().is_empty());
+        assert!(
+            h.transport.0.lock().unwrap().is_empty(),
+            "replies have no id"
+        );
+    }
+
+    /// A run that fails before the loop starts (here: no credential) must
+    /// still end with browse/completed instead of leaving the host hanging.
+    #[tokio::test]
+    async fn a_browse_setup_error_is_reported_as_completed() {
+        let mut h = Harness::new();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            api_key: String::new(),
+            model: "claude-sonnet-4-5".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        h.handle(
+            &cfg,
+            SdkRequest::BrowseStart {
+                id: "1".into(),
+                goal: "open example.com".into(),
+                policy: BrowsePolicy::Pattern,
+                max_steps: Some(3),
+                yolo_ack: false,
+            },
+        )
+        .await;
+        let sid = match h.transport.0.lock().unwrap().first() {
+            Some(SdkResponse::BrowseStarted { session_id, .. }) => session_id.clone(),
+            other => panic!("expected browse/started, got {other:?}"),
+        };
+        let notif = tokio::time::timeout(std::time::Duration::from_secs(10), h.notif_rx.recv())
+            .await
+            .expect("no browse/completed")
+            .unwrap();
+        match notif {
+            SdkNotification::BrowseCompleted { session_id, result } => {
+                assert_eq!(session_id, sid);
+                assert!(!result.achieved);
+                assert_eq!(result.reason, BrowseReason::Bailed);
+                assert!(result.summary.contains("credential"), "{}", result.summary);
+            }
+            other => panic!("expected browse/completed, got {other:?}"),
+        }
     }
 }

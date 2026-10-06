@@ -176,6 +176,34 @@ The reason is passed back to the model so it can adapt its approach.
 
 ---
 
+### `browse/start`
+
+Run the autonomous browser agent toward a goal. `policy` is `pattern` (default: only actions matching the approval patterns ask), `ask` (every non-read-only action asks) or `yolo` (no approvals; requires `"yolo_ack": true`). `max_steps` defaults to `browseMaxSteps`.
+
+```json
+{"id": "6", "type": "browse/start", "goal": "Find the latest release notes on example.com", "policy": "pattern", "max_steps": 30}
+```
+
+**Response:**
+
+```json
+{"type": "browse/started", "id": "6", "session_id": "browse-1712345678901"}
+```
+
+Progress then streams as `browse/progress`, `browse/approval_needed` and exactly one `browse/completed` per run, including runs that fail before the first step.
+
+---
+
+### `browse/approval_reply`
+
+Answer a `browse/approval_needed` prompt. It has no `id` and gets no response. `session_id` and `step` must match the pending prompt; anything else is logged to stderr and ignored. An unanswered prompt is denied after 60 seconds.
+
+```json
+{"type": "browse/approval_reply", "session_id": "browse-1712345678901", "step": 4, "approved": true}
+```
+
+---
+
 ## Notifications
 
 Notifications are streamed from the server during turn execution. They have `session_id` but no `id`.
@@ -335,6 +363,48 @@ Something went wrong during the turn.
 ```
 
 Error codes: `budget_exceeded`, `max_turns_exceeded`, `turn_error`, `internal_error`.
+
+---
+
+### `browse/progress`
+
+A browser action the agent took.
+
+```json
+{"type": "browse/progress", "session_id": "browse-1712345678901", "step": 3, "action": "browser_click", "target": "Releases"}
+```
+
+---
+
+### `browse/approval_needed`
+
+The approval gate is holding an action. Answer with `browse/approval_reply`.
+
+```json
+{
+  "type": "browse/approval_needed",
+  "session_id": "browse-1712345678901",
+  "step": 4,
+  "tool_name": "browser_click",
+  "target_text": "Delete repository",
+  "url": "https://example.com/settings",
+  "reason": "destructive action"
+}
+```
+
+---
+
+### `browse/completed`
+
+The run ended. `reason` is one of `done`, `bailed`, `step_cap`, `stagnation`, `budget`, `browser_crashed`, `user_denied`, `cancelled`. A run that fails to start (for example, no credential) reports `achieved: false`, `reason: "bailed"` and the error in `summary`.
+
+```json
+{
+  "type": "browse/completed",
+  "session_id": "browse-1712345678901",
+  "result": {"achieved": true, "summary": "Release notes for v2.1 ...", "reason": "done", "steps_used": 6, "final_url": "https://example.com/releases"}
+}
+```
 
 ---
 

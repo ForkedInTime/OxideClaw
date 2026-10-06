@@ -83,6 +83,8 @@ Your App                    OxideClaw
 | `rag/search` | Search the codebase index | `rag/search` |
 | `tool/approve` | Approve a pending tool execution | *(routed to session)* |
 | `tool/deny` | Deny a pending tool execution | *(routed to session)* |
+| `browse/start` | Run the browser agent toward a goal | `browse/started` + streaming |
+| `browse/approval_reply` | Answer a `browse/approval_needed` prompt | *(routed to the run, no response)* |
 
 ### Notification Types (streamed during a turn)
 
@@ -99,6 +101,9 @@ Your App                    OxideClaw
 | `progress/updated` | Estimated progress through the task |
 | `turn/completed` | Turn finished — final response, total cost, duration |
 | `error` | Something went wrong |
+| `browse/progress` | Browser agent took an action |
+| `browse/approval_needed` | Browser action needs host approval |
+| `browse/completed` | Browser run ended (always sent, also on startup failure) |
 
 Full protocol reference: [protocol.md](protocol.md)
 
