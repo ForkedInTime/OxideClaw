@@ -459,10 +459,11 @@ pub fn denied_read_globs() -> Vec<(&'static str, String)> {
 /// existing ancestor and replays the rest lexically. Checking only the parent
 /// was bypassable: in `link/newdir/../authorized_keys` the parent cannot be
 /// canonicalized (`newdir` does not exist yet), so the literal path was checked
-/// while `create_dir_all` + rename landed in the link's target. Replaying is
-/// exact: components past the deepest existing ancestor cannot be symlinks, and
-/// a `..` among them pops into a prefix that is already symlink-free. Falls back
-/// to the input unchanged only when no ancestor resolves.
+/// while `create_dir_all` + rename landed in the link's target. The replay
+/// re-resolves after every component that exists: a `..` after a missing
+/// directory pops back into an existing one, and the next component may be a
+/// symlink (`missing/../gl/config` with `gl -> .git`). Falls back to the input
+/// unchanged only when no ancestor resolves.
 pub fn resolve_for_sensitivity_check(path: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     if let Ok(real) = std::fs::canonicalize(path) {
@@ -477,7 +478,14 @@ pub fn resolve_for_sensitivity_check(path: &std::path::Path) -> std::path::PathB
         };
         for c in rest.components() {
             match c {
-                Component::Normal(n) => real.push(n),
+                Component::Normal(n) => {
+                    real.push(n);
+                    if real.symlink_metadata().is_ok()
+                        && let Ok(r) = std::fs::canonicalize(&real)
+                    {
+                        real = r;
+                    }
+                }
                 Component::ParentDir => {
                     real.pop();
                 }
@@ -867,6 +875,31 @@ mod sensitive_path_tests {
         );
         assert!(!dir.path().join(".git/newdir").exists());
         assert!(check_protected_path(&dir.path().join("src/main.rs")).is_none());
+    }
+
+    /// `missing/../gl/config`: canonicalize fails up to the project root and
+    /// a purely lexical replay gave `gl/config`, hiding that `gl -> .git`.
+    #[cfg(unix)]
+    #[test]
+    fn dotdot_after_a_missing_dir_still_resolves_a_later_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        std::os::unix::fs::symlink(".git", root.join("gl")).unwrap();
+        let sneaky = root.join("missing/../gl/config");
+        assert_eq!(
+            resolve_for_sensitivity_check(&sneaky),
+            root.join(".git/config")
+        );
+        assert!(check_protected_path(&sneaky).is_some());
+
+        std::fs::create_dir(root.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(root.join(".ssh"), root.join("keys")).unwrap();
+        let sneaky = root.join("missing/../keys/authorized_keys");
+        assert!(check_sensitive_path_resolved(&sneaky, SensitiveOp::Write).is_some());
+
+        assert!(check_protected_path(&root.join("missing/../src/main.rs")).is_none());
     }
 
     #[test]
