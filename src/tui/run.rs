@@ -31,6 +31,46 @@ fn short_id(id: &str, n: usize) -> &str {
     }
 }
 
+/// A user message that starts an exchange: typed text, not a tool result.
+/// /rewind cuts at these; resume counts them to realign the turn counter.
+fn is_prompt(m: &Message) -> bool {
+    m.role == Role::User
+        && m.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { .. }))
+        && !m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+}
+
+/// Turn counter for a session just resumed. `turn-N` snapshot dirs outlive
+/// the process, so a counter restarted at 0 sent the next turn into a
+/// previous run's `turn-1`, where `snapshot_file` keeps the stale copy and
+/// /rewind then reverted files to it. The result sits above every existing
+/// dir, and at least at the prompt count because turns without edits leave
+/// no dir and /rewind n must still line up with the last n prompts.
+fn resume_turn_counter(snap_base: &std::path::Path, messages: &[Message]) -> usize {
+    let max_dir = std::fs::read_dir(snap_base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_prefix("turn-")?
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    max_dir.max(messages.iter().filter(|m| is_prompt(m)).count())
+}
+
+fn session_snapshot_base(session_id: &str) -> std::path::PathBuf {
+    Config::sessions_dir().join(session_id).join("snapshots")
+}
+
 /// Puts a permission prompt in front of the user through the TUI event
 /// loop. A dropped reply (TUI shutdown, panic, SIGHUP) is `None`, which the
 /// gate treats as Deny — the "close terminal = auto-approve" class.
@@ -363,6 +403,7 @@ async fn run_loop(
                     )));
                     app.session_name = s.meta.name.clone();
                     app.scroll_to_bottom();
+                    turn_counter = resume_turn_counter(&session_snapshot_base(&s.id), &messages);
                     s
                 }
                 Err(e) => {
@@ -592,6 +633,8 @@ async fn run_loop(
                     let resume_name = new_session.meta.name.clone();
                     let resume_count = saved_count;
                     app.session_name = resume_name.clone();
+                    turn_counter =
+                        resume_turn_counter(&session_snapshot_base(&new_session.id), &messages);
                     session = new_session;
                     app.overlay = Some(Overlay::new(
                         "resume",
@@ -1279,5 +1322,50 @@ mod short_id_tests {
             "日本語のセッション"[..24].to_string()
         );
         assert_eq!(short_id("", 8), "");
+    }
+}
+
+#[cfg(test)]
+mod resume_turn_counter_tests {
+    use super::*;
+
+    fn user_text(t: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    /// Run 1 left turn-1..turn-3 behind; the resumed run must start above
+    /// them, or its first turn reuses turn-1 and /rewind restores run 1's
+    /// pre-edit copies over everything done since.
+    #[test]
+    fn resumed_turns_never_reuse_a_previous_runs_snapshot_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in [1, 3] {
+            std::fs::create_dir_all(tmp.path().join(format!("turn-{n}"))).unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("not-a-turn")).unwrap();
+        let msgs = vec![user_text("a")];
+        assert_eq!(resume_turn_counter(tmp.path(), &msgs), 3);
+    }
+
+    /// Turns that edited nothing leave no dir; the counter still tracks the
+    /// prompt count so /rewind n restores the snapshots of the last n turns.
+    #[test]
+    fn prompt_count_wins_when_turns_left_no_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("turn-1")).unwrap();
+        let tool_result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t".into(),
+                content: vec![],
+                is_error: None,
+            }],
+        };
+        let msgs = vec![user_text("a"), tool_result, user_text("b"), user_text("c")];
+        assert_eq!(resume_turn_counter(tmp.path(), &msgs), 3);
+        assert_eq!(resume_turn_counter(&tmp.path().join("missing"), &[]), 0);
     }
 }

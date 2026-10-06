@@ -622,12 +622,13 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 
             // Set snapshot directory for this turn (file history checkpointing)
             *turn_counter += 1;
-            config.file_snapshot_dir = Some(
-                crate::config::Config::sessions_dir()
-                    .join(&session.id)
-                    .join("snapshots")
-                    .join(format!("turn-{}", *turn_counter)),
-            );
+            let snap_dir =
+                session_snapshot_base(&session.id).join(format!("turn-{}", *turn_counter));
+            // snapshot_file keeps the first copy it finds, so leftovers from
+            // an earlier run or a partly failed /rewind would stand in for
+            // this turn's pre-edit state and /rewind would restore them.
+            let _ = std::fs::remove_dir_all(&snap_dir);
+            config.file_snapshot_dir = Some(snap_dir);
 
             // Background incremental re-index: pick up any files changed since last index.
             // Fire-and-forget — doesn't block the user's message from being sent.

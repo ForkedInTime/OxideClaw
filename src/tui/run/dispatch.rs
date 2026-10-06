@@ -80,6 +80,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 && let Ok(fresh) = Session::new().await
             {
                 *session = fresh;
+                // Turn numbers restart only with a new id; the old one keeps
+                // its snapshot dirs for when it is resumed.
+                *turn_counter = 0;
             }
             *saved_count = 0;
             app.clear();
@@ -279,16 +282,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // An exchange is everything from one user prompt on: with tools
             // that is many messages, so cut at the n-th last prompt rather
             // than n*2 messages (which left a tool_use without its result).
-            let is_prompt = |m: &Message| {
-                m.role == Role::User
-                    && m.content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::Text { .. }))
-                    && !m
-                        .content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-            };
             let prompts: Vec<usize> = messages
                 .iter()
                 .enumerate()
@@ -318,9 +311,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 // earliest rewound edit. A turn's snapshots are deleted only
                 // once all of them were restored.
                 let restore_start = (*turn_counter).saturating_sub(n) + 1;
-                let snap_base = crate::config::Config::sessions_dir()
-                    .join(&session.id)
-                    .join("snapshots");
+                let snap_base = session_snapshot_base(&session.id);
                 let mut restored_files: Vec<String> = Vec::new();
                 let mut failed: Vec<String> = Vec::new();
                 for turn in restore_start..=*turn_counter {
@@ -435,6 +426,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let resume_name = new_session.meta.name.clone();
                         let resume_count = *saved_count;
                         app.session_name = resume_name.clone();
+                        *turn_counter =
+                            resume_turn_counter(&session_snapshot_base(&new_session.id), messages);
                         *session = new_session;
                         app.overlay = Some(Overlay::new(
                             "resume",
