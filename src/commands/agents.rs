@@ -189,36 +189,28 @@ pub(super) fn cmd_spawn(args: &str) -> CommandAction {
     }
 
     let (sub, rest) = split_first_word(args);
+    // A subcommand only when its argument looks like one: spawn ids are
+    // 8-hex-char UUID prefixes, so "review the auth module" or "list all
+    // TODOs" is a task, not a subcommand with a bogus id.
+    let is_id = !rest.is_empty() && rest.len() <= 8 && rest.chars().all(|c| c.is_ascii_hexdigit());
     match sub {
-        "list" | "ls" => CommandAction::ListSpawns,
-        "review" | "diff" => {
-            if rest.is_empty() {
-                CommandAction::Message("Usage: /spawn review <agent-id>".into())
-            } else {
-                CommandAction::ReviewSpawn(rest.to_string())
-            }
+        "list" | "ls" if rest.is_empty() => CommandAction::ListSpawns,
+        "review" | "diff" if rest.is_empty() => {
+            CommandAction::Message("Usage: /spawn review <agent-id>".into())
         }
-        "merge" => {
-            if rest.is_empty() {
-                CommandAction::Message("Usage: /spawn merge <agent-id>".into())
-            } else {
-                CommandAction::MergeSpawn(rest.to_string())
-            }
+        "review" | "diff" if is_id => CommandAction::ReviewSpawn(rest.to_string()),
+        "merge" if rest.is_empty() => {
+            CommandAction::Message("Usage: /spawn merge <agent-id>".into())
         }
-        "kill" | "cancel" => {
-            if rest.is_empty() {
-                CommandAction::Message("Usage: /spawn kill <agent-id>".into())
-            } else {
-                CommandAction::KillSpawn(rest.to_string())
-            }
+        "merge" if is_id => CommandAction::MergeSpawn(rest.to_string()),
+        "kill" | "cancel" if rest.is_empty() => {
+            CommandAction::Message("Usage: /spawn kill <agent-id>".into())
         }
-        "discard" | "drop" => {
-            if rest.is_empty() {
-                CommandAction::Message("Usage: /spawn discard <agent-id>".into())
-            } else {
-                CommandAction::DiscardSpawn(rest.to_string())
-            }
+        "kill" | "cancel" if is_id => CommandAction::KillSpawn(rest.to_string()),
+        "discard" | "drop" if rest.is_empty() => {
+            CommandAction::Message("Usage: /spawn discard <agent-id>".into())
         }
+        "discard" | "drop" if is_id => CommandAction::DiscardSpawn(rest.to_string()),
         // Everything else is the task description
         _ => CommandAction::SpawnAgent(args.to_string()),
     }
@@ -245,4 +237,51 @@ pub(super) fn cmd_ultraplan(args: &str) -> CommandAction {
          Be specific and actionable. Use TodoWrite to record the plan."
     };
     CommandAction::SendPrompt(prompt.into())
+}
+
+#[cfg(test)]
+mod spawn_parse_tests {
+    use super::{CommandAction, cmd_spawn};
+
+    /// Tasks that start with a subcommand word used to be parsed as that
+    /// subcommand with the rest of the sentence as an agent id.
+    #[test]
+    fn tasks_starting_with_a_subcommand_word_are_spawned() {
+        for task in [
+            "review the auth module",
+            "list all TODOs in src",
+            "merge the two config parsers",
+            "kill dead code in utils",
+            "discard unused imports",
+            "drop the legacy API",
+        ] {
+            match cmd_spawn(task) {
+                CommandAction::SpawnAgent(t) => assert_eq!(t, task),
+                _ => panic!("{task:?} was not spawned as a task"),
+            }
+        }
+    }
+
+    #[test]
+    fn subcommands_with_an_id_still_dispatch() {
+        assert!(matches!(cmd_spawn("list"), CommandAction::ListSpawns));
+        assert!(matches!(cmd_spawn("ls"), CommandAction::ListSpawns));
+        assert!(
+            matches!(cmd_spawn("review 3fa85f64"), CommandAction::ReviewSpawn(id) if id == "3fa85f64")
+        );
+        assert!(matches!(cmd_spawn("diff 3fa8"), CommandAction::ReviewSpawn(id) if id == "3fa8"));
+        assert!(matches!(
+            cmd_spawn("merge 3fa85f64"),
+            CommandAction::MergeSpawn(_)
+        ));
+        assert!(matches!(
+            cmd_spawn("kill 3fa85f64"),
+            CommandAction::KillSpawn(_)
+        ));
+        assert!(matches!(
+            cmd_spawn("discard 3fa85f64"),
+            CommandAction::DiscardSpawn(_)
+        ));
+        assert!(matches!(cmd_spawn("merge"), CommandAction::Message(_)));
+    }
 }
