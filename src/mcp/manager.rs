@@ -119,11 +119,30 @@ impl McpManager {
         cfg: &McpServerConfig,
         cwd: &std::path::Path,
     ) -> anyhow::Result<McpClient> {
+        // Expanded here, not at load, so `/mcp list` and anything that
+        // writes the config back keep the placeholders, not the secrets.
+        let lookup = |k: &str| std::env::var(k).ok();
+        let x = |v: &str| expand_vars(v, &lookup);
         match cfg {
             McpServerConfig::Stdio(s) => {
-                McpClient::connect_stdio(name, &s.command, &s.args, &s.env, cwd).await
+                let command = x(&s.command)?;
+                let args = s.args.iter().map(|a| x(a)).collect::<Result<Vec<_>, _>>()?;
+                let env = s
+                    .env
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), x(v)?)))
+                    .collect::<anyhow::Result<_>>()?;
+                McpClient::connect_stdio(name, &command, &args, &env, cwd).await
             }
-            McpServerConfig::Http(h) => McpClient::connect_http(name, &h.url, &h.headers).await,
+            McpServerConfig::Http(h) => {
+                let url = x(&h.url)?;
+                let headers = h
+                    .headers
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), x(v)?)))
+                    .collect::<anyhow::Result<_>>()?;
+                McpClient::connect_http(name, &url, &headers).await
+            }
         }
     }
 
@@ -137,6 +156,97 @@ impl McpManager {
                 tool_count: c.tools.len(),
             })
             .collect()
+    }
+}
+
+/// Expand `${NAME}` and `${NAME:-default}` as Claude Code does in
+/// .mcp.json, so a shared config can name a secret without containing it.
+/// Passing the placeholder through literally replaced the real value in the
+/// server's environment, or sent `Bearer ${TOKEN}` as the credential. An
+/// unset variable with no default is an error: starting the server with an
+/// empty token only moves the failure somewhere harder to read.
+fn expand_vars(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    let is_name = |n: &str| {
+        let mut b = n.bytes();
+        b.next()
+            .is_some_and(|c| c == b'_' || c.is_ascii_alphabetic())
+            && b.all(|c| c == b'_' || c.is_ascii_alphanumeric())
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let body = &rest[start + 2..];
+        let Some(end) = body.find('}') else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let inner = &body[..end];
+        let (var, default) = match inner.split_once(":-") {
+            Some((v, d)) => (v, Some(d)),
+            None => (inner, None),
+        };
+        if !is_name(var) {
+            // Not ours (a shell `${1}` in an `sh -c` arg, say): keep it.
+            out.push_str(&rest[start..start + 2]);
+            rest = body;
+            continue;
+        }
+        match (
+            lookup(var).filter(|v| default.is_none() || !v.is_empty()),
+            default,
+        ) {
+            (Some(v), _) => out.push_str(&v),
+            (None, Some(d)) => out.push_str(d),
+            (None, None) => {
+                anyhow::bail!("environment variable {var} is not set (used as ${{{var}}})")
+            }
+        }
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_vars;
+
+    fn env(k: &str) -> Option<String> {
+        match k {
+            "TOKEN" => Some("s3cret".into()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn placeholders_take_the_environment_value_or_the_default() {
+        let x = |s: &str| expand_vars(s, &env).unwrap();
+        assert_eq!(x("Bearer ${TOKEN}"), "Bearer s3cret");
+        assert_eq!(x("${TOKEN}-${TOKEN}"), "s3cret-s3cret");
+        assert_eq!(
+            x("${MISSING:-http://localhost:3000}/mcp"),
+            "http://localhost:3000/mcp"
+        );
+        assert_eq!(x("${TOKEN:-unused}"), "s3cret");
+        assert_eq!(x("${EMPTY:-fallback}"), "fallback");
+        assert_eq!(x("${EMPTY}"), "");
+        assert_eq!(x("plain"), "plain");
+    }
+
+    #[test]
+    fn non_variable_braces_are_left_alone() {
+        let x = |s: &str| expand_vars(s, &env).unwrap();
+        assert_eq!(x("echo ${1} ${@}"), "echo ${1} ${@}");
+        assert_eq!(x("cost $5 and ${TOKEN"), "cost $5 and ${TOKEN");
+        assert_eq!(x("${ TOKEN}"), "${ TOKEN}");
+    }
+
+    #[test]
+    fn an_unset_variable_without_default_names_itself() {
+        let err = expand_vars("${GITHUB_TOKEN}", &env).unwrap_err();
+        assert!(err.to_string().contains("GITHUB_TOKEN"), "{err}");
     }
 }
 
@@ -220,6 +330,39 @@ cat >/dev/null"#;
         let tools = crate::mcp::tools_for_config(&cfg).await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"mcp__rel__ping"), "{names:?}");
+    }
+
+    /// `.mcp.json` placeholders reached the server literally: the tool
+    /// name below comes from an env value and an arg, both defaulted.
+    #[tokio::test]
+    async fn placeholders_are_expanded_before_the_server_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, server) = fake_server("vars");
+        let McpServerConfig::Stdio(s) = &server else {
+            unreachable!()
+        };
+        let script = s.args[1].replace(r#""name":"ping""#, r#""name":"'"$TOOL$1"'""#);
+        let unset = "OXIDECLAW_TEST_SURELY_UNSET_VAR";
+        let cfg = McpServerConfig::Stdio(StdioServerConfig {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                script,
+                "sh".into(),
+                format!("${{{unset}:-_two}}"),
+            ],
+            env: [("TOOL".to_string(), format!("${{{unset}:-one}}"))].into(),
+            disabled: false,
+        });
+        let cfg = crate::config::Config {
+            cwd: dir.path().to_path_buf(),
+            strict_mcp_config: true,
+            extra_mcp_servers: [("vars".to_string(), cfg)].into_iter().collect(),
+            ..Default::default()
+        };
+        let tools = crate::mcp::tools_for_config(&cfg).await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"mcp__vars__one_two"), "{names:?}");
     }
 
     /// ACP and `--headless` sessions take their tools from here; the CLI

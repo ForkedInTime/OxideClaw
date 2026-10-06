@@ -148,10 +148,13 @@ pub struct Settings {
     /// Example (settings.json):
     /// ```json
     /// "mcpServers": {
-    ///   "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."} },
-    ///   "remote": { "url": "http://localhost:3000/mcp" }
+    ///   "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"} },
+    ///   "remote": { "url": "${MCP_URL:-http://localhost:3000/mcp}" }
     /// }
     /// ```
+    ///
+    /// `${VAR}` and `${VAR:-default}` in command, args, env values, url and
+    /// headers are expanded from the environment when the server starts.
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
