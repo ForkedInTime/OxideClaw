@@ -839,7 +839,7 @@ impl Settings {
     }
 
     /// Merge `other` on top of `self` — `other` wins for any Some field.
-    fn merge(self, other: Self) -> Self {
+    pub(crate) fn merge(self, other: Self) -> Self {
         // MCP servers: project entries override global entries of the same name;
         // entries that only exist in global are preserved.
         let mut mcp_servers = self.mcp_servers;

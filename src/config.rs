@@ -418,6 +418,11 @@ pub struct Config {
     /// refs navigable via `/undo` and `/redo`.
     #[serde(skip)]
     pub auto_commit: crate::settings::AutoCommitConfig,
+
+    /// `--settings` contents, merged over the settings files. Kept so a
+    /// session moved to another project (`retarget_cwd`) applies them there.
+    #[serde(skip)]
+    pub flag_settings: Option<crate::settings::Settings>,
 }
 
 impl Default for Config {
@@ -512,6 +517,7 @@ impl Default for Config {
             phase_router: crate::router::PhaseRouterConfig::default(),
             auto_fix: crate::autofix::AutoFixConfig::default(),
             auto_commit: crate::settings::AutoCommitConfig::default(),
+            flag_settings: None,
         }
     }
 }
@@ -534,7 +540,27 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
+        Self::load_with(None, None)
+    }
+
+    /// `load` for project `cwd` instead of the process's (a deep link's
+    /// directory), with `--settings` merged over the settings files. Both
+    /// must be known here: everything below is derived from them, and the
+    /// credential helpers run here.
+    pub fn load_with(
+        cwd: Option<PathBuf>,
+        flag_settings: Option<crate::settings::Settings>,
+    ) -> Result<Self> {
         let mut cfg = Config::default();
+        if let Some(dir) = cwd {
+            cfg.cwd = dir;
+        }
+        // The MCP manager reads servers from the settings files itself, so
+        // these reach it the way --mcp-config servers do.
+        if let Some(flag) = &flag_settings {
+            cfg.extra_mcp_servers.extend(flag.mcp_servers.clone());
+        }
+        cfg.flag_settings = flag_settings;
 
         cfg.load_project();
 
@@ -627,10 +653,13 @@ impl Config {
         if dir == self.cwd {
             return;
         }
+        // --settings applies in every project, on top of its settings files.
+        let flag_settings = self.flag_settings.clone();
         let project = |cwd: PathBuf, bare_mode: bool| {
             let mut c = Config {
                 cwd,
                 bare_mode,
+                flag_settings: flag_settings.clone(),
                 ..Config::default()
             };
             c.load_project();
@@ -741,6 +770,7 @@ impl Config {
             watch_debounce_ms: old.watch_debounce_ms,
             watch_rate_limit_ms: old.watch_rate_limit_ms,
             watch_markers: old.watch_markers,
+            flag_settings: old.flag_settings,
         };
     }
 
@@ -750,8 +780,8 @@ impl Config {
     /// at their defaults.
     fn load_project(&mut self) {
         // ── Settings files: global (~/.claude/settings.json) → project (./.claude/settings.json)
-        // Project wins; env vars applied after (higher priority than settings files).
-        let settings = crate::settings::Settings::load(&self.cwd);
+        // → --settings. Env vars applied after (higher priority than settings).
+        let settings = self.load_settings();
         self.apply_browser_settings(&settings);
         if let Some(model) = settings.model {
             self.model = crate::commands::resolve_model_alias(&model);
@@ -971,6 +1001,15 @@ impl Config {
         // CLAUDE.md merges on top of settings.json per-phase: a user can set
         // base defaults in settings and override individual phases in CLAUDE.md.
         Self::apply_phase_routing_from_claudemd(&self.claudemd, &mut self.phase_router);
+    }
+
+    /// Settings files for `self.cwd`, with `--settings` on top.
+    fn load_settings(&self) -> crate::settings::Settings {
+        let settings = crate::settings::Settings::load(&self.cwd);
+        match &self.flag_settings {
+            Some(flag) => settings.merge(flag.clone()),
+            None => settings,
+        }
     }
 
     /// Apply browser_* fields from settings.json (blank paths become None,
@@ -2401,5 +2440,65 @@ mod max_tokens_default_tests {
         cfg.max_tokens_by_model
             .insert("claude-sonnet-5".into(), 64_000);
         assert_eq!(cfg.max_tokens_for("sonnet"), 64_000);
+    }
+}
+
+#[cfg(test)]
+mod flag_settings_retarget_tests {
+    use super::Config;
+
+    /// SDK and ACP sessions swapped only `cwd`, so a session ran in its
+    /// project with the launch directory's CLAUDE.md and without the
+    /// project's deny rules (or the ones passed with --settings).
+    #[test]
+    fn retarget_reads_the_new_projects_rules_and_the_flag_settings() {
+        let launch = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(launch.path().join("CLAUDE.md"), "launch-dir rules").unwrap();
+        std::fs::write(project.path().join("CLAUDE.md"), "project rules").unwrap();
+        std::fs::create_dir(project.path().join(".claude")).unwrap();
+        std::fs::write(
+            project.path().join(".claude").join("settings.json"),
+            r#"{"permissions": {"deny": ["Bash(curl:*)"]}}"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config {
+            model: "cli-model".into(),
+            flag_settings: Some(
+                serde_json::from_str(r#"{"permissions": {"deny": ["WebFetch"]}}"#).unwrap(),
+            ),
+            ..Config::default()
+        };
+        cfg.retarget_cwd(launch.path().to_path_buf());
+        assert!(cfg.claudemd.contains("launch-dir rules"));
+        assert!(!cfg.permissions_deny.contains(&"Bash(curl:*)".to_string()));
+
+        cfg.retarget_cwd(project.path().to_path_buf());
+        assert_eq!(cfg.cwd, project.path());
+        assert!(cfg.claudemd.contains("project rules"), "{}", cfg.claudemd);
+        assert!(!cfg.claudemd.contains("launch-dir rules"));
+        for rule in ["Bash(curl:*)", "WebFetch"] {
+            assert!(
+                cfg.permissions_deny.contains(&rule.to_string()),
+                "{rule} missing: {:?}",
+                cfg.permissions_deny
+            );
+        }
+        assert_eq!(cfg.model, "cli-model", "overrides are kept");
+    }
+
+    #[test]
+    fn retarget_keeps_bare_mode_bare() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("CLAUDE.md"), "project rules").unwrap();
+        let mut cfg = Config {
+            bare_mode: true,
+            disable_all_hooks: true,
+            ..Config::default()
+        };
+        cfg.retarget_cwd(project.path().to_path_buf());
+        assert!(cfg.disable_all_hooks);
+        assert!(cfg.claudemd.is_empty());
     }
 }

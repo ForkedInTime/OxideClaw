@@ -673,10 +673,9 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             deeplink::DeepLinkAction::OpenTui { query, cwd } => {
-                let mut config = Config::load()?;
-                if let Some(dir) = cwd {
-                    config.retarget_cwd(std::path::PathBuf::from(dir));
-                }
+                // The link's directory decides which CLAUDE.md, permission
+                // rules and hooks apply, so it goes in before they are read.
+                let config = Config::load_with(cwd.map(std::path::PathBuf::from), None)?;
                 return tui::run_tui(config, None, Some(query), None).await;
             }
         }
@@ -883,8 +882,16 @@ async fn main() -> Result<()> {
         eprintln!("warning: {w}");
     }
 
-    // Load config
-    let mut config = Config::load()?;
+    // --settings is merged over the settings files inside Config::load, so
+    // every key applies, its apiKeyHelper runs with the other credential
+    // sources, and the CLI flags below still override it.
+    let flag_settings = cli.settings.as_deref().map(|arg| {
+        parse_settings_arg(arg).unwrap_or_else(|e| {
+            eprintln!("Error: --settings: {e}");
+            std::process::exit(1);
+        })
+    });
+    let mut config = Config::load_with(None, flag_settings)?;
 
     // Apply CLI overrides (highest priority)
     if cli.verbose {
@@ -1023,37 +1030,6 @@ async fn main() -> Result<()> {
             Err(e) => {
                 eprintln!("Error parsing --agents JSON: {}", e);
                 std::process::exit(1);
-            }
-        }
-    }
-    // --settings: load extra settings from a file path or JSON string
-    if let Some(ref settings_arg) = cli.settings {
-        let extra_settings: Option<crate::settings::Settings> =
-            if std::path::Path::new(settings_arg).exists() {
-                std::fs::read_to_string(settings_arg)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-            } else {
-                serde_json::from_str(settings_arg).ok()
-            };
-        if let Some(extra) = extra_settings {
-            // Merge: extra wins over already-loaded settings
-            if let Some(m) = extra.model {
-                config.model = crate::commands::resolve_model_alias(&m);
-            }
-            if let Some(mt) = extra.max_tokens {
-                config.max_tokens = Some(mt);
-            }
-            // Config::load already ran the helpers it knew of; this one
-            // would otherwise never run.
-            if let Some(ah) = extra.api_key_helper {
-                config.api_key_helper = Some(ah);
-                if config.api_key.is_empty() {
-                    config.apply_api_key_helper();
-                }
-            }
-            for (k, v) in extra.mcp_servers {
-                config.extra_mcp_servers.insert(k, v);
             }
         }
     }
@@ -1311,6 +1287,20 @@ fn self_update_target() -> String {
     } else {
         format!("{os}-{arch}{suffix}")
     }
+}
+
+/// The `--settings` value: a settings file path or inline JSON. Unlike the
+/// settings files, a bad value is an error: it was asked for explicitly.
+fn parse_settings_arg(arg: &str) -> std::result::Result<settings::Settings, String> {
+    let text = if std::path::Path::new(arg).is_file() {
+        std::fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?
+    } else if arg.trim_start().starts_with('{') {
+        arg.to_string()
+    } else {
+        return Err(format!("{arg}: not a file or a JSON object"));
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).map_err(|e| format!("invalid settings JSON: {e}"))
 }
 
 /// One `--mcp-config` value: a file path or inline JSON, holding server
@@ -1848,6 +1838,37 @@ mod cli_parse_tests {
         assert!(super::parse_mcp_config_arg("{not json").is_err());
         assert!(super::parse_mcp_config_arg("/no/such/mcp.json").is_err());
         assert!(super::parse_mcp_config_arg("[1]").is_err());
+    }
+}
+
+#[cfg(test)]
+mod settings_arg_tests {
+    use super::parse_settings_arg;
+
+    /// A missing file or bad JSON was dropped silently, and the run went
+    /// ahead without the settings (deny rules included) it was asked for.
+    #[test]
+    fn bad_settings_values_are_errors() {
+        assert!(parse_settings_arg("/no/such/settings.json").is_err());
+        assert!(parse_settings_arg(r#"{"model": "#).is_err());
+        // Wrong type: the whole value is rejected, not just that key.
+        assert!(parse_settings_arg(r#"{"maxTokens": "8000"}"#).is_err());
+    }
+
+    #[test]
+    fn settings_come_from_a_file_or_inline_json_with_every_key() {
+        let s = parse_settings_arg(
+            r#"{"permissions": {"deny": ["Bash(rm:*)"]}, "effort": "low"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.permissions.deny, vec!["Bash(rm:*)"]);
+        assert_eq!(s.effort.as_deref(), Some("low"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        std::fs::write(&path, "\u{feff}{\"model\": \"haiku\"}").unwrap();
+        let s = parse_settings_arg(path.to_str().unwrap()).unwrap();
+        assert_eq!(s.model.as_deref(), Some("haiku"));
     }
 }
 
