@@ -482,66 +482,63 @@ pub(super) fn cmd_ctx_viz(ctx: &CommandContext) -> CommandAction {
 }
 
 pub(super) fn cmd_stats(ctx: &CommandContext) -> CommandAction {
-    // Show usage statistics from session history
-    let sessions_dir = dirs::home_dir()
-        .map(|h| h.join(".claude").join("sessions"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".claude/sessions"));
+    let dir = crate::config::Config::sessions_dir();
+    CommandAction::Message(format_stats(
+        &ctx.cost_summary,
+        count_saved_sessions(&dir),
+        &ctx.config.model,
+    ))
+}
 
-    let mut total_sessions = 0usize;
-    let mut total_tokens_in: u64 = 0;
-    let mut total_tokens_out: u64 = 0;
+// Session `.meta` files carry no token or cost totals, so summing them gave
+// 0 for every session; only the count is real. The current session comes
+// from the shared cost tracker (every call, current prices), not the
+// last-call token counts and a stale price table.
+fn format_stats(cost_summary: &str, saved_sessions: usize, model: &str) -> String {
+    format!(
+        "Usage Statistics\n\n\
+         {cost_summary}\n\n\
+         Saved sessions: {saved_sessions}\n\
+         Model: {model}"
+    )
+}
 
-    if sessions_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&sessions_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("meta") {
-                total_sessions += 1;
-                if let Ok(data) = std::fs::read_to_string(&path)
-                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                {
-                    total_tokens_in += json["tokens_in"].as_u64().unwrap_or(0);
-                    total_tokens_out += json["tokens_out"].as_u64().unwrap_or(0);
-                }
-            }
+fn count_saved_sessions(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("meta"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn stats_counts_sessions_in_the_given_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.meta", "a.jsonl", "b.meta", "notes.txt"] {
+            std::fs::write(dir.path().join(f), "{}").unwrap();
         }
+        assert_eq!(count_saved_sessions(dir.path()), 2);
+        assert_eq!(count_saved_sessions(&dir.path().join("missing")), 0);
     }
 
-    let (price_in, price_out) = {
-        let m = &ctx.config.model;
-        if m.contains("opus-4") {
-            (15.0f64, 75.0f64)
-        } else if m.contains("sonnet-4") {
-            (3.0, 15.0)
-        } else if m.contains("haiku") {
-            (0.25, 1.25)
-        } else {
-            (3.0, 15.0)
-        }
-    };
-    let cost = (total_tokens_in as f64 / 1_000_000.0 * price_in)
-        + (total_tokens_out as f64 / 1_000_000.0 * price_out);
-
-    let session_in = ctx.tokens_in;
-    let session_out = ctx.tokens_out;
-    let session_cost = (session_in as f64 / 1_000_000.0 * price_in)
-        + (session_out as f64 / 1_000_000.0 * price_out);
-
-    let lines = vec![
-        "Usage Statistics\n".to_string(),
-        "Current session:".to_string(),
-        format!("  Tokens in:  {session_in}"),
-        format!("  Tokens out: {session_out}"),
-        format!("  Est. cost:  ${session_cost:.4}"),
-        String::new(),
-        format!("All sessions ({total_sessions} total):"),
-        format!("  Tokens in:  {total_tokens_in}"),
-        format!("  Tokens out: {total_tokens_out}"),
-        format!("  Est. cost:  ${cost:.4}"),
-        String::new(),
-        format!("Model: {}", ctx.config.model),
-        format!("Pricing: ${price_in}/M in, ${price_out}/M out"),
-    ];
-    CommandAction::Message(lines.join("\n"))
+    /// /stats priced the session with its own table (Opus 4.x at $15/$75)
+    /// and printed always-zero all-session totals.
+    #[test]
+    fn stats_uses_the_cost_tracker_summary() {
+        let mut tracker = crate::cost::CostTracker::new();
+        tracker.record("claude-opus-4-6", 1_000_000, 0);
+        let summary = tracker.summary();
+        let text = format_stats(&summary, 3, "claude-opus-4-6");
+        assert!(text.contains(&summary), "{text}");
+        assert!(text.contains("Saved sessions: 3"), "{text}");
+        assert!(!text.contains("$15"), "{text}");
+        assert!(!text.contains("Tokens in:  0"), "{text}");
+    }
 }
