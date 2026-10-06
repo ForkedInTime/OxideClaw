@@ -72,7 +72,10 @@ impl SdkServer {
         let pending_browse: PendingBrowse = Arc::default();
 
         loop {
+            // Biased so an approval request never overtakes the deltas and
+            // tool events a session queued before it.
             tokio::select! {
+                biased;
                 req = transport.read_request() => {
                     match req {
                         Ok(Some(request)) => {

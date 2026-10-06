@@ -73,7 +73,11 @@ impl AcpServer {
         // loses a partly-read line whenever a notification wins.
         let mut lines = spawn_line_reader(reader, MAX_LINE_BYTES);
         loop {
+            // Biased so done_rx is polled only once notif_rx is empty: a
+            // session task queues a turn's last updates before its TurnDone,
+            // and the prompt response must follow every one of them.
             let frames = tokio::select! {
+                biased;
                 read = lines.recv() => {
                     let Some(read) = read else { break };
                     match read? {
@@ -983,6 +987,108 @@ mod tests {
         // The cancel produced nothing; initialize still answered.
         assert_eq!(out[1]["id"], json!(0));
         assert_eq!(out.len(), 2);
+    }
+
+    /// Ollama stand-in whose every reply is cut off at the token limit, so
+    /// each turn ends with an Error notification right before it returns.
+    async fn max_tokens_model() -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The session task queues a turn's last updates and then its TurnDone
+    /// on separate channels; an unbiased select answered `session/prompt`
+    /// first about half the time, so the `[max_tokens]` notice arrived after
+    /// the turn had already ended.
+    #[tokio::test]
+    async fn every_turn_update_precedes_the_prompt_response() {
+        use tokio::io::AsyncBufReadExt;
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        cfg.ollama_host = max_tokens_model().await;
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (srv_r, srv_w) = tokio::io::split(server);
+        let (cli_r, mut cli_w) = tokio::io::split(client);
+        let task = tokio::spawn(AcpServer::run(cfg, tokio::io::BufReader::new(srv_r), srv_w));
+        let mut lines = tokio::io::BufReader::new(cli_r).lines();
+        let mut next = async || -> Value {
+            let l = tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+                .await
+                .expect("no timeout")
+                .unwrap()
+                .expect("server closed");
+            serde_json::from_str(&l).unwrap()
+        };
+        cli_w
+            .write_all((init_line() + "\n").as_bytes())
+            .await
+            .unwrap();
+        let _ = next().await;
+        cli_w
+            .write_all((new_session_line(1, &dir.path().to_string_lossy()) + "\n").as_bytes())
+            .await
+            .unwrap();
+        let created = next().await;
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        for id in 2..22 {
+            let prompt = json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"hi"}]}}).to_string();
+            cli_w.write_all((prompt + "\n").as_bytes()).await.unwrap();
+            let mut saw_notice = false;
+            loop {
+                let v = next().await;
+                if v["id"] == json!(id) {
+                    assert_eq!(v["result"]["stopReason"], json!("max_tokens"), "{v}");
+                    assert!(
+                        saw_notice,
+                        "prompt {id} answered before its [max_tokens] update"
+                    );
+                    break;
+                }
+                let text = v["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or("");
+                saw_notice |= text.contains("[max_tokens]");
+            }
+        }
+        cli_w.shutdown().await.unwrap();
+        drop(cli_w);
+        task.await.unwrap().unwrap();
     }
 
     /// One non-UTF-8 line used to end the whole ACP process.
