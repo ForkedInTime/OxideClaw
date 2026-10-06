@@ -63,3 +63,235 @@ fn browser_session_default_state() {
     assert!(!session.is_connected());
     assert!(session.ref_map().is_empty());
 }
+
+// ── Fake CDP endpoint ──────────────────────────────────────────────────────
+//
+// Speaks just enough of Chrome's DevTools WebSocket protocol for the client:
+// answers every command with `{}` (or a scripted result) and records what the
+// client sent, so the tests run without a real Chrome.
+
+mod fake_cdp {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[derive(Default)]
+    pub struct Script {
+        /// Result object per method; anything else gets `{}`.
+        pub results: HashMap<&'static str, Value>,
+        /// Close the socket right after answering `Runtime.enable`.
+        pub close_after_enable: bool,
+        /// Raise this `Page.javascriptDialogOpening` event on
+        /// `Input.dispatchMouseEvent` and, like Chrome, hold that command's
+        /// reply until the client answers the dialog.
+        pub dialog_on_click: Option<Value>,
+    }
+
+    /// Serve one scripted connection per entry, in order. Returns the ws URL
+    /// and a feed of every `(method, params)` the client sent.
+    pub async fn serve(scripts: Vec<Script>) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/devtools/page/FAKE", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for script in scripts {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    run(ws, script, seen_tx).await;
+                });
+            }
+        });
+        (url, seen_rx)
+    }
+
+    async fn run(
+        mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        script: Script,
+        seen: mpsc::UnboundedSender<(String, Value)>,
+    ) {
+        let mut held_click: Option<u64> = None;
+        while let Some(Ok(msg)) = ws.next().await {
+            let Message::Text(text) = msg else { continue };
+            let cmd: Value = serde_json::from_str(&text).unwrap();
+            let id = cmd["id"].as_u64().unwrap();
+            let method = cmd["method"].as_str().unwrap().to_string();
+            let _ = seen.send((method.clone(), cmd["params"].clone()));
+
+            if method == "Input.dispatchMouseEvent"
+                && let Some(ev) = &script.dialog_on_click
+            {
+                send(&mut ws, ev.clone()).await;
+                held_click = Some(id);
+                continue;
+            }
+
+            let result = script.results.get(method.as_str()).cloned();
+            send(
+                &mut ws,
+                json!({ "id": id, "result": result.unwrap_or(json!({})) }),
+            )
+            .await;
+
+            match method.as_str() {
+                "Page.navigate" => {
+                    send(
+                        &mut ws,
+                        json!({ "method": "Page.loadEventFired", "params": {} }),
+                    )
+                    .await;
+                }
+                "Page.handleJavaScriptDialog" => {
+                    if let Some(click_id) = held_click.take() {
+                        send(&mut ws, json!({ "id": click_id, "result": {} })).await;
+                    }
+                }
+                "Runtime.enable" if script.close_after_enable => {
+                    let _ = ws.close(None).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn send(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, v: Value) {
+        ws.send(Message::Text(v.to_string().into())).await.unwrap();
+    }
+}
+
+/// Chrome ships each CDP reply as one unfragmented frame. A long page's
+/// accessibility tree is bigger than tungstenite's 16 MiB default frame cap,
+/// which used to kill the socket and leave the browser session unusable.
+#[tokio::test]
+async fn cdp_reply_larger_than_16_mib_is_received() {
+    use oxideclaw::browser::cdp::CdpClient;
+
+    let pad = "x".repeat(20 << 20);
+    let (url, _seen) = fake_cdp::serve(vec![fake_cdp::Script {
+        results: [(
+            "Accessibility.getFullAXTree",
+            json!({ "nodes": [], "pad": pad }),
+        )]
+        .into(),
+        ..Default::default()
+    }])
+    .await;
+
+    let client = CdpClient::connect(&url).await.unwrap();
+    let reply = client
+        .send("Accessibility.getFullAXTree", json!({}))
+        .await
+        .expect("oversized reply must not drop the connection");
+    assert_eq!(reply["pad"].as_str().map(str::len), Some(20 << 20));
+    assert!(client.is_alive());
+}
+
+/// A confirm() raised by a click blocks the renderer until the CDP client
+/// answers it. The session must dismiss it on its own (never confirm it) and
+/// report it so the model knows the click did not go through.
+#[tokio::test]
+async fn javascript_dialog_is_dismissed_and_reported() {
+    use oxideclaw::browser::BrowserSession;
+
+    let (url, mut seen) = fake_cdp::serve(vec![fake_cdp::Script {
+        dialog_on_click: Some(json!({
+            "method": "Page.javascriptDialogOpening",
+            "params": { "type": "confirm", "message": "Delete repo?", "url": "about:blank" }
+        })),
+        ..Default::default()
+    }])
+    .await;
+
+    let mut session = BrowserSession::default();
+    session.connect(&url).await.unwrap();
+    let client = session.client().unwrap().clone();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.send(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseReleased" }),
+        ),
+    )
+    .await
+    .expect("click stayed blocked on an unanswered dialog")
+    .unwrap();
+
+    let mut answer = None;
+    while let Ok((method, params)) = seen.try_recv() {
+        if method == "Page.handleJavaScriptDialog" {
+            answer = Some(params);
+        }
+    }
+    assert_eq!(answer, Some(json!({ "accept": false })));
+    assert_eq!(
+        session.take_dialog_messages().await,
+        vec!["[dialog:confirm] Delete repo? (auto-dismissed)".to_string()]
+    );
+    assert!(session.take_console_messages().await.is_empty());
+}
+
+/// Once the CDP socket dies the stale client must not stick around: the next
+/// browser_navigate reconnects instead of failing with "connection is closed"
+/// until the user runs /browser close.
+#[tokio::test]
+async fn navigate_reconnects_after_the_cdp_socket_dies() {
+    use oxideclaw::browser::BrowserSession;
+    use oxideclaw::tools::browser_tools::BrowserNavigateTool;
+    use oxideclaw::tools::{Tool, ToolContext};
+    use std::sync::Arc;
+
+    let (url, _seen) = fake_cdp::serve(vec![
+        fake_cdp::Script {
+            close_after_enable: true,
+            ..Default::default()
+        },
+        fake_cdp::Script {
+            results: [
+                ("Runtime.evaluate", json!({ "result": { "value": "Fake" } })),
+                ("Accessibility.getFullAXTree", json!({ "nodes": [] })),
+            ]
+            .into(),
+            ..Default::default()
+        },
+    ])
+    .await;
+
+    let session = Arc::new(tokio::sync::Mutex::new(BrowserSession::default()));
+    session.lock().await.connect(&url).await.unwrap();
+    let first = session.lock().await.client().unwrap().clone();
+    for _ in 0..100 {
+        if !first.is_alive() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !first.is_alive(),
+        "fake server should have closed the socket"
+    );
+
+    let tool = BrowserNavigateTool {
+        session: session.clone(),
+        headless: true,
+        chrome_path: None,
+        cdp_endpoint: Some(url),
+        timeout_ms: 5_000,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tool
+        .execute(
+            json!({ "url": "about:blank" }),
+            &ToolContext::new(tmp.path().to_path_buf()),
+        )
+        .await
+        .expect("navigate should reconnect over a dead CDP socket");
+    let oxideclaw::api::types::ToolResultContent::Text { text } = &out.content[0];
+    assert!(!out.is_error && text.contains("Title: Fake"), "{text}");
+    assert!(session.lock().await.client().unwrap().is_alive());
+}

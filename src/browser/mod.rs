@@ -164,11 +164,30 @@ impl BrowserSession {
 
     /// Drain and return all console messages captured since the last call.
     /// Includes both `Runtime.consoleAPICalled` events (formatted as
-    /// `[level] text`) and `Runtime.exceptionThrown` events (formatted as
-    /// `[exception] text`). The buffer is cleared on each call.
+    /// `[level] text`), `Runtime.exceptionThrown` events (formatted as
+    /// `[exception] text`) and auto-handled dialogs not yet drained by
+    /// `take_dialog_messages`. The buffer is cleared on each call.
     pub async fn take_console_messages(&self) -> Vec<String> {
         let mut buf = self.console_buf.lock().await;
         buf.drain(..).collect()
+    }
+
+    /// Drain only the auto-handled dialog lines, leaving console output for
+    /// `browser_console`. Action tools append these to their result: a
+    /// dismissed confirm() means the click did not do what the model
+    /// intended, and it would otherwise never find out.
+    pub async fn take_dialog_messages(&self) -> Vec<String> {
+        let mut buf = self.console_buf.lock().await;
+        let mut dialogs = Vec::new();
+        buf.retain(|line| {
+            if line.starts_with(DIALOG_LINE_PREFIX) {
+                dialogs.push(line.clone());
+                false
+            } else {
+                true
+            }
+        });
+        dialogs
     }
 
     /// Update ref map (called after each snapshot). Names are optional — pass
@@ -260,18 +279,31 @@ pub fn find_chrome() -> Option<PathBuf> {
 /// console + exception messages into `buf`. Bounded at `CONSOLE_BUF_CAP`;
 /// oldest entries are dropped on overflow. The returned handle is aborted
 /// on session close.
+///
+/// It also answers JavaScript dialogs. With the Page domain enabled Chrome
+/// hands alert/confirm/prompt/beforeunload to the CDP client and blocks the
+/// renderer until `Page.handleJavaScriptDialog` arrives; headless Chrome has
+/// no UI to close them, so an unanswered dialog stalls every later command
+/// on the page until it times out.
 fn spawn_console_listener(
     client: &CdpClient,
     buf: Arc<AsyncMutex<VecDeque<String>>>,
 ) -> JoinHandle<()> {
     let mut rx = client.subscribe();
+    let client = client.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    let mut dialog_accept = None;
                     let formatted = match event.method.as_str() {
                         "Runtime.consoleAPICalled" => format_console_event(&event.params),
                         "Runtime.exceptionThrown" => format_exception_event(&event.params),
+                        "Page.javascriptDialogOpening" => {
+                            let (accept, line) = dialog_response(&event.params);
+                            dialog_accept = Some(accept);
+                            Some(line)
+                        }
                         _ => continue,
                     };
                     if let Some(line) = formatted {
@@ -280,6 +312,20 @@ fn spawn_console_listener(
                             guard.pop_front();
                         }
                         guard.push_back(line);
+                    }
+                    // Logged before answering: the blocked click/navigate only
+                    // returns once the dialog closes, and its tool result
+                    // drains the dialog line, so it must already be there.
+                    if let Some(accept) = dialog_accept {
+                        let c = client.clone();
+                        tokio::spawn(async move {
+                            let _ = c
+                                .send(
+                                    "Page.handleJavaScriptDialog",
+                                    serde_json::json!({ "accept": accept }),
+                                )
+                                .await;
+                        });
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -290,6 +336,31 @@ fn spawn_console_listener(
             }
         }
     })
+}
+
+/// Prefix of the console-buffer lines that record an auto-handled dialog.
+const DIALOG_LINE_PREFIX: &str = "[dialog:";
+
+/// Decide how to answer a `Page.javascriptDialogOpening` event and describe
+/// it for the model. beforeunload is accepted because the agent itself asked
+/// to leave the page; alert/confirm/prompt are dismissed so no confirmation
+/// ("Delete this repo?") is ever silently granted.
+fn dialog_response(params: &serde_json::Value) -> (bool, String) {
+    let ty = params
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("alert");
+    let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let accept = ty == "beforeunload";
+    let outcome = if accept {
+        "auto-accepted"
+    } else {
+        "auto-dismissed"
+    };
+    (
+        accept,
+        format!("{DIALOG_LINE_PREFIX}{ty}] {message} ({outcome})"),
+    )
 }
 
 fn format_console_event(params: &serde_json::Value) -> Option<String> {
@@ -387,6 +458,22 @@ async fn poll_cdp_endpoint(port: u16) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dialogs_are_dismissed_except_beforeunload() {
+        let (accept, line) =
+            dialog_response(&json!({"type": "confirm", "message": "Delete repo?"}));
+        assert!(!accept);
+        assert_eq!(line, "[dialog:confirm] Delete repo? (auto-dismissed)");
+        assert!(!dialog_response(&json!({"type": "prompt", "message": "Name?"})).0);
+        assert!(!dialog_response(&json!({"type": "alert", "message": "hi"})).0);
+        let (accept, line) = dialog_response(&json!({"type": "beforeunload", "message": ""}));
+        assert!(
+            accept,
+            "agent-requested navigation must not hang on beforeunload"
+        );
+        assert!(line.ends_with("(auto-accepted)"));
+    }
 
     #[test]
     fn console_event_formats_string_args() {

@@ -56,6 +56,14 @@ async fn ensure_launched(
     cdp_endpoint: Option<&str>,
 ) -> Result<()> {
     let mut s = session.lock().await;
+    // A dead socket (Chrome crashed, or the connection dropped) leaves the
+    // client in place, so `is_connected` would keep reporting true and every
+    // tool would fail with "CDP connection is closed" until a manual
+    // /browser close. Tear it down so the branch below starts fresh; close()
+    // also reaps the old Chrome child and console task.
+    if s.client().is_ok_and(|c| !c.is_alive()) {
+        s.close().await;
+    }
     if !s.is_connected() {
         if let Some(endpoint) = cdp_endpoint {
             s.connect(endpoint).await?;
@@ -72,6 +80,17 @@ async fn ensure_launched(
 async fn clone_client(session: &SharedSession) -> Result<browser::cdp::CdpClient> {
     let s = session.lock().await;
     Ok(s.client()?.clone())
+}
+
+/// Result trailer listing the JavaScript dialogs the action just raised (the
+/// console listener answers them automatically), or "" when there were none.
+async fn dialog_trailer(session: &SharedSession) -> String {
+    let lines = session.lock().await.take_dialog_messages().await;
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nJavaScript dialogs:\n{}", lines.join("\n"))
+    }
 }
 
 // ── browser_navigate ────────────────────────────────────────────────────────
@@ -118,6 +137,7 @@ impl Tool for BrowserNavigateTool {
         // (up to timeout_ms) does not hold the session lock.
         let client = clone_client(&self.session).await?;
         let (title, status) = browser::actions::navigate(&client, url, self.timeout_ms).await?;
+        let dialogs = dialog_trailer(&self.session).await;
 
         // Snapshot afterwards. This also uses the client, not the session,
         // so still no session lock held.
@@ -142,7 +162,7 @@ impl Tool for BrowserNavigateTool {
         };
 
         Ok(ToolOutput::success(format!(
-            "Navigated to: {url}\nTitle: {title}\nStatus: {status}\n\nAccessibility snapshot:\n{tree}"
+            "Navigated to: {url}\nTitle: {title}\nStatus: {status}{dialogs}\n\nAccessibility snapshot:\n{tree}"
         )))
     }
 }
@@ -219,6 +239,7 @@ impl Tool for BrowserClickTool {
             let client = session.client()?.clone();
             (result, client)
         };
+        let dialogs = dialog_trailer(&self.session).await;
 
         // Auto-snapshot uses only the client — no session lock held during
         // the CDP round-trip. If the snapshot fails (e.g. page navigated
@@ -241,7 +262,7 @@ impl Tool for BrowserClickTool {
             self.session.lock().await.current_url = new_url;
         }
 
-        Ok(ToolOutput::success(format!("{result}{trailer}")))
+        Ok(ToolOutput::success(format!("{result}{dialogs}{trailer}")))
     }
 }
 
@@ -283,11 +304,12 @@ impl Tool for BrowserFillTool {
             let client = session.client()?.clone();
             (result, client)
         };
+        let dialogs = dialog_trailer(&self.session).await;
         // Fill can trigger navigation on some SPAs (e.g. submit-on-change forms).
         if let Some(new_url) = browser::actions::current_url(&client).await {
             self.session.lock().await.current_url = new_url;
         }
-        Ok(ToolOutput::success(result))
+        Ok(ToolOutput::success(format!("{result}{dialogs}")))
     }
 }
 
@@ -408,11 +430,12 @@ impl Tool for BrowserPressKeyTool {
         let key = required_str(&input, "key")?;
         let client = clone_client(&self.session).await?;
         let result = browser::actions::press_key(&client, key).await?;
+        let dialogs = dialog_trailer(&self.session).await;
         // Enter/Tab can submit a form and trigger navigation.
         if let Some(new_url) = browser::actions::current_url(&client).await {
             self.session.lock().await.current_url = new_url;
         }
-        Ok(ToolOutput::success(result))
+        Ok(ToolOutput::success(format!("{result}{dialogs}")))
     }
 }
 
@@ -473,8 +496,8 @@ impl Tool for BrowserConsoleTool {
     }
     fn description(&self) -> &str {
         "Drain and return console messages and uncaught exceptions captured \
-         since the last call. Each entry is prefixed with [level] or \
-         [exception]. The buffer is cleared after each call."
+         since the last call. Each entry is prefixed with [level], \
+         [exception] or [dialog:type]. The buffer is cleared after each call."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({

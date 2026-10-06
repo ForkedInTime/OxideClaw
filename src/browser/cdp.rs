@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 /// A CDP command to send to Chrome.
 #[derive(Debug, Clone, Serialize)]
@@ -75,7 +76,17 @@ pub struct CdpClient {
 impl CdpClient {
     /// Connect to a CDP WebSocket endpoint (e.g. ws://127.0.0.1:9222/devtools/page/xxx).
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (stream, _) = tokio_tungstenite::connect_async(ws_url)
+        // Chrome sends every CDP reply as one unfragmented frame, and on a
+        // long page Accessibility.getFullAXTree or a full-page screenshot
+        // runs well past tungstenite's 16 MiB default frame cap. Hitting
+        // that cap kills the reader loop and with it the whole session.
+        // The socket only ever talks to our own Chrome on loopback, so the
+        // limits guard nothing here; keep a generous message ceiling as a
+        // backstop against a runaway reply.
+        let config = WebSocketConfig::default()
+            .max_frame_size(None)
+            .max_message_size(Some(512 << 20));
+        let (stream, _) = tokio_tungstenite::connect_async_with_config(ws_url, Some(config), false)
             .await
             .map_err(|e| anyhow::anyhow!("CDP WebSocket connect failed: {e}"))?;
         let (writer, reader) = stream.split();
@@ -146,6 +157,12 @@ impl CdpClient {
             bail!("CDP error: {err}");
         }
         Ok(resp.result.unwrap_or(serde_json::json!({})))
+    }
+
+    /// False once the reader loop has exited (socket closed or broken).
+    /// Every later `send` fails, so the owner must reconnect.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// Subscribe to CDP events.
