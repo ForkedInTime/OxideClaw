@@ -3,6 +3,21 @@
 
 use super::*;
 
+/// Tools that run shell commands, directly or through a sub-agent that has
+/// its own Bash. `disableSkillShellExecution` removes them from skill turns.
+const SKILL_SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "Agent", "TeamCreate", "SendMessage"];
+
+/// The tool list for a `/skill` turn. A prompt note alone left Bash both
+/// advertised and executable, so with `Bash(*)` allowed or in bypass mode a
+/// skill still ran shell commands with the flag on.
+fn skill_turn_tools(tools: &[DynTool], disable_shell: bool) -> Vec<DynTool> {
+    tools
+        .iter()
+        .filter(|t| !(disable_shell && SKILL_SHELL_TOOLS.contains(&t.name())))
+        .cloned()
+        .collect()
+}
+
 /// Run one `/command` line: build the `CommandContext`, dispatch, and
 /// apply the resulting `CommandAction` to app/session state.
 pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()> {
@@ -2545,7 +2560,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     content: vec![ContentBlock::Text { text: prompt }],
                 });
                 let c2 = client.clone();
-                let tvec = tools.to_vec();
+                let tvec = skill_turn_tools(tools, config.disable_skill_shell_execution);
                 let cfg = config.clone();
                 let tx2 = tx.clone();
                 let sp = system_prompt.clone();
@@ -2575,4 +2590,28 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabling_skill_shell_execution_removes_shell_capable_tools() {
+        let all = crate::tools::all_tools_with_state(&crate::config::Config::default()).0;
+        let names = |v: &[DynTool]| v.iter().map(|t| t.name().to_string()).collect::<Vec<_>>();
+
+        let open = names(&skill_turn_tools(&all, false));
+        assert_eq!(open, names(&all), "flag off must not change the list");
+        assert!(open.iter().any(|n| n == "Bash"));
+
+        let closed = names(&skill_turn_tools(&all, true));
+        for n in ["Bash", "PowerShell", "Agent"] {
+            assert!(
+                !closed.iter().any(|c| c == n),
+                "{n} still offered: {closed:?}"
+            );
+        }
+        assert!(closed.iter().any(|n| n == "Read"), "non-shell tools stay");
+    }
 }

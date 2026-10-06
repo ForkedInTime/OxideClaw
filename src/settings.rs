@@ -224,7 +224,9 @@ pub struct Settings {
     #[serde(rename = "sandboxAllowNetwork")]
     pub sandbox_allow_network: Option<bool>,
 
-    /// When true, skills cannot execute shell commands (Bash tool blocked during skill turns).
+    /// When true, `/skill` turns run without Bash, PowerShell or the
+    /// agent-spawning tools. A skill the model loads itself via the Skill tool
+    /// runs inside an ordinary turn, where this cannot apply.
     #[serde(rename = "disableSkillShellExecution")]
     pub disable_skill_shell_execution: Option<bool>,
 
