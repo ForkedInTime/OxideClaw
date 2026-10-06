@@ -160,8 +160,12 @@ struct Cli {
     #[arg(long)]
     append_system_prompt: Option<String>,
 
-    /// Load additional MCP server configs (JSON: {"name":{"command":"...","args":[...]},...})
-    #[arg(long, value_delimiter = ' ')]
+    /// Load additional MCP server configs from a JSON file path or JSON string:
+    /// {"name":{"command":"...","args":[...]},...} or {"mcpServers":{...}}.
+    /// Repeat the flag to load several.
+    // No value_delimiter: splitting on spaces cut any JSON with a space in
+    // it into fragments that were then dropped without a word.
+    #[arg(long)]
     mcp_config: Vec<String>,
 
     /// Permission mode: default, auto, bypass
@@ -343,9 +347,9 @@ enum McpSubcommand {
     Add {
         /// Server name
         name: String,
-        /// Command to run (for stdio transport)
+        /// Command to run (stdio) or server URL (http)
         command: String,
-        /// Arguments for the command
+        /// Arguments for the command (stdio only)
         args: Vec<String>,
         /// Configuration scope: local (default; private to you, this project),
         /// project (.claude/settings.json, usually committed), or user
@@ -354,7 +358,7 @@ enum McpSubcommand {
         /// Transport type: stdio (default) or http
         #[arg(short = 't', long, default_value = "stdio")]
         transport: String,
-        /// Environment variables (KEY=VALUE)
+        /// Environment variables (KEY=VALUE, stdio only)
         #[arg(short = 'e', long)]
         env: Vec<String>,
     },
@@ -1067,17 +1071,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Inline MCP configs from --mcp-config (each is a JSON object merged into settings)
-    if !cli.mcp_config.is_empty() {
-        for json_str in &cli.mcp_config {
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(json_str) {
-                for (name, val) in map {
-                    if let Ok(cfg) =
-                        serde_json::from_value::<crate::mcp::types::McpServerConfig>(val)
-                    {
-                        config.extra_mcp_servers.insert(name, cfg);
-                    }
-                }
+    for arg in &cli.mcp_config {
+        match parse_mcp_config_arg(arg) {
+            Ok(servers) => config.extra_mcp_servers.extend(servers),
+            Err(e) => {
+                eprintln!("Error: --mcp-config: {e}");
+                std::process::exit(1);
             }
         }
     }
@@ -1314,6 +1313,41 @@ fn self_update_target() -> String {
     }
 }
 
+/// One `--mcp-config` value: a file path or inline JSON, holding server
+/// entries at the top level or under `mcpServers` (the .mcp.json shape).
+/// Any entry that is not a valid server is an error: a server the user
+/// asked for on the command line must not silently fail to start.
+fn parse_mcp_config_arg(
+    arg: &str,
+) -> std::result::Result<Vec<(String, crate::mcp::types::McpServerConfig)>, String> {
+    let text = if std::path::Path::new(arg).is_file() {
+        std::fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?
+    } else {
+        arg.to_string()
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        if text.trim_start().starts_with('{') {
+            format!("invalid JSON: {e}")
+        } else {
+            format!("{arg}: not a file or a JSON object")
+        }
+    })?;
+    let json = match json.get("mcpServers") {
+        Some(inner) => inner.clone(),
+        None => json,
+    };
+    let serde_json::Value::Object(map) = json else {
+        return Err("expected a JSON object of servers, e.g. {\"name\":{\"command\":\"...\"}}".into());
+    };
+    map.into_iter()
+        .map(|(name, val)| {
+            serde_json::from_value(val)
+                .map(|cfg| (name.clone(), cfg))
+                .map_err(|e| format!("server '{name}': {e}"))
+        })
+        .collect()
+}
+
 /// stderr notice for `Config::settings_load_errors` outside the TUI.
 fn warn_settings_load_errors(config: &Config) {
     if !config.settings_load_errors.is_empty() {
@@ -1395,25 +1429,10 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             command,
             args,
             scope,
-            transport: _,
+            transport,
             env,
         }) => {
-            let env_map: std::collections::HashMap<String, String> = env
-                .iter()
-                .filter_map(|kv| {
-                    let mut parts = kv.splitn(2, '=');
-                    let k = parts.next()?.to_string();
-                    let v = parts.next()?.to_string();
-                    Some((k, v))
-                })
-                .collect();
-            let cfg =
-                crate::mcp::types::McpServerConfig::Stdio(crate::mcp::types::StdioServerConfig {
-                    command: command.clone(),
-                    args: args.clone(),
-                    env: env_map,
-                    disabled: false,
-                });
+            let cfg = mcp_add_config(transport, command, args, env)?;
             let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::claude_dir())?;
             println!(
                 "Added MCP server '{name}' (scope: {scope}) to {}",
@@ -1506,6 +1525,51 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// The server `mcp add` writes. `target` is the command for stdio and the
+/// URL for http; an http server written as stdio would try to run its URL.
+fn mcp_add_config(
+    transport: &str,
+    target: &str,
+    args: &[String],
+    env: &[String],
+) -> Result<crate::mcp::types::McpServerConfig> {
+    use crate::mcp::types::{HttpServerConfig, McpServerConfig, StdioServerConfig};
+    match transport {
+        "stdio" => {
+            let env = env
+                .iter()
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect();
+            Ok(McpServerConfig::Stdio(StdioServerConfig {
+                command: target.to_string(),
+                args: args.to_vec(),
+                env,
+                disabled: false,
+            }))
+        }
+        "http" => {
+            if !target.starts_with("http://") && !target.starts_with("https://") {
+                anyhow::bail!("http transport needs an http:// or https:// URL, got '{target}'");
+            }
+            if !args.is_empty() || !env.is_empty() {
+                anyhow::bail!(
+                    "arguments and --env apply to stdio servers only; \
+                     for HTTP headers use `oxideclaw mcp add-json`"
+                );
+            }
+            Ok(McpServerConfig::Http(HttpServerConfig {
+                url: target.to_string(),
+                headers: std::collections::HashMap::new(),
+                disabled: false,
+            }))
+        }
+        other => anyhow::bail!("unknown transport '{other}' (expected stdio or http)"),
+    }
 }
 
 /// Write an MCP server config to the settings file for `scope`; returns it.
@@ -1751,6 +1815,79 @@ mod cli_parse_tests {
         assert!(warns(&["--worktree", "feat"])[0].contains("--worktree"));
         assert!(warns(&["--tmux"])[0].contains("--tmux"));
         assert!(warns(&["--setting-sources", "user,project"])[0].contains("--setting-sources"));
+    }
+
+    /// The flag split values on spaces, so ordinary pretty JSON became
+    /// fragments that failed to parse and were dropped without a warning.
+    #[test]
+    fn mcp_config_json_with_spaces_is_one_value() {
+        let json = r#"{"fs": {"command": "npx", "args": ["-y", "server fs"]}}"#;
+        let cli = Cli::try_parse_from(["oxideclaw", "--mcp-config", json, "--mcp-config", "{}"])
+            .unwrap();
+        assert_eq!(cli.mcp_config, vec![json, "{}"]);
+        let servers = super::parse_mcp_config_arg(json).unwrap();
+        assert_eq!(servers.len(), 1);
+        let (name, crate::mcp::types::McpServerConfig::Stdio(s)) = &servers[0] else {
+            panic!("expected a stdio server: {servers:?}");
+        };
+        assert_eq!(name, "fs");
+        assert_eq!(s.args, vec!["-y", "server fs"]);
+    }
+
+    #[test]
+    fn mcp_config_reads_files_and_reports_bad_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers": {"web": {"url": "https://x.test/mcp"}}}"#)
+            .unwrap();
+        let servers = super::parse_mcp_config_arg(path.to_str().unwrap()).unwrap();
+        assert_eq!(servers[0].0, "web");
+
+        let err = super::parse_mcp_config_arg(r#"{"bad": {"cmd": "x"}}"#).unwrap_err();
+        assert!(err.contains("'bad'"), "{err}");
+        assert!(super::parse_mcp_config_arg("{not json").is_err());
+        assert!(super::parse_mcp_config_arg("/no/such/mcp.json").is_err());
+        assert!(super::parse_mcp_config_arg("[1]").is_err());
+    }
+}
+
+#[cfg(test)]
+mod mcp_add_tests {
+    use super::mcp_add_config;
+    use crate::mcp::types::McpServerConfig;
+
+    /// `-t http` was ignored: the URL was saved as a stdio command, and
+    /// startup then tried to run it as a program.
+    #[test]
+    fn http_transport_writes_an_http_server() {
+        let cfg = mcp_add_config("http", "https://mcp.example.test/mcp", &[], &[]).unwrap();
+        let McpServerConfig::Http(h) = &cfg else {
+            panic!("expected http: {cfg:?}");
+        };
+        assert_eq!(h.url, "https://mcp.example.test/mcp");
+        // It must also come back as http from settings.json.
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(matches!(
+            serde_json::from_value(json).unwrap(),
+            McpServerConfig::Http(_)
+        ));
+    }
+
+    #[test]
+    fn stdio_is_unchanged_and_bad_input_is_refused() {
+        let args = vec!["-y".to_string(), "pkg".to_string()];
+        let env = vec!["TOKEN=a=b".to_string()];
+        let McpServerConfig::Stdio(s) = mcp_add_config("stdio", "npx", &args, &env).unwrap()
+        else {
+            panic!("expected stdio");
+        };
+        assert_eq!(s.command, "npx");
+        assert_eq!(s.args, args);
+        assert_eq!(s.env["TOKEN"], "a=b");
+
+        assert!(mcp_add_config("sse", "https://x.test", &[], &[]).is_err());
+        assert!(mcp_add_config("http", "npx", &[], &[]).is_err());
+        assert!(mcp_add_config("http", "https://x.test", &args, &[]).is_err());
     }
 }
 
