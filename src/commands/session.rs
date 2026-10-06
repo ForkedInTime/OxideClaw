@@ -52,11 +52,18 @@ pub fn clipboard_write(text: &str) -> CommandAction {
     }
 }
 
-pub(super) fn cmd_session(args: &str, _ctx: &CommandContext) -> CommandAction {
+pub(super) fn cmd_session(args: &str) -> CommandAction {
     let (sub, sub_args) = split_first_word(args);
     match sub {
         "list" | "" => CommandAction::ListSessions,
-        "clear-all" | "clearall" | "clear" => CommandAction::ClearAllSessions,
+        // Deletes every saved conversation in every project, with no way
+        // back, so a guessed `/session clear` must not be enough.
+        "clear-all" | "clearall" if sub_args.trim() == "--yes" => CommandAction::ClearAllSessions,
+        "clear-all" | "clearall" | "clear" => CommandAction::Message(
+            "This permanently deletes ALL saved sessions (every project) except the current one.\n\
+             Re-run as: /session clear-all --yes"
+                .into(),
+        ),
         "search" => {
             if sub_args.is_empty() {
                 CommandAction::Message("Usage: /session search <query>".into())
@@ -203,3 +210,33 @@ pub(super) fn cmd_share(args: &str) -> CommandAction {
 }
 
 // ── Notifications ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod session_command_tests {
+    use super::{CommandAction, cmd_session};
+
+    /// `/session clear` wiped every saved session at once, unasked.
+    #[test]
+    fn clearing_all_sessions_needs_an_explicit_yes() {
+        for args in [
+            "clear",
+            "clear-all",
+            "clearall",
+            "clear --yes",
+            "clear-all yes",
+        ] {
+            match cmd_session(args) {
+                CommandAction::Message(m) => {
+                    assert!(m.contains("/session clear-all --yes"), "{args:?}: {m}")
+                }
+                _ => panic!("{args:?} must not clear sessions"),
+            }
+        }
+        for args in ["clear-all --yes", "clearall --yes", "clear-all  --yes "] {
+            assert!(
+                matches!(cmd_session(args), CommandAction::ClearAllSessions),
+                "{args:?}"
+            );
+        }
+    }
+}

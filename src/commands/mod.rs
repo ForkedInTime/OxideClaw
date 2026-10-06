@@ -440,8 +440,8 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "router" => cmd_router(args),
 
         // ── Session commands ──────────────────────────────────────────────
-        "session" => cmd_session(args, ctx),
-        "sessions" => cmd_session(args, ctx),
+        "session" => cmd_session(args),
+        "sessions" => cmd_session(args),
         "resume" => cmd_resume(args),
         "rename" => {
             if args.is_empty() {

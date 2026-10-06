@@ -533,8 +533,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     let current_id = session.id.clone();
                     let mut deleted = 0usize;
                     for meta in &list {
-                        if meta.id != current_id {
-                            let _ = Session::delete(&meta.id).await;
+                        if meta.id != current_id && Session::delete(&meta.id).await.is_ok() {
                             deleted += 1;
                         }
                     }
