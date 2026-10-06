@@ -156,6 +156,24 @@ impl SdkSession {
         // 2. Retrieve RAG context (silently ignore errors)
         let rag_context = self.retrieve_rag_context(&prompt);
 
+        // UserPromptSubmit hooks may add context, as in the TUI.
+        let prompt = match self.hooks() {
+            Some(h) => match crate::hooks::run_user_prompt_hooks(
+                h,
+                &prompt,
+                &self.session_id,
+                &self.config.cwd,
+            )
+            .await
+            {
+                Some(extra) => {
+                    format!("{prompt}\n\n<additional_context>{extra}</additional_context>")
+                }
+                None => prompt,
+            },
+            None => prompt,
+        };
+
         // 3. Push user message
         self.messages.push(Message {
             role: Role::User,
@@ -407,6 +425,32 @@ impl SdkSession {
                 continue;
             }
 
+            // PreToolUse guards run before the approval prompt, so the host is
+            // never asked about a call the user's own guard refuses, and before
+            // tool/started, so no start goes without a completion.
+            if let Some(h) = self.hooks() {
+                let args = serde_json::to_string(input).unwrap_or_default();
+                let r = crate::hooks::run_pre_tool_hooks(
+                    h,
+                    name,
+                    &args,
+                    &self.session_id,
+                    &self.config.cwd,
+                )
+                .await;
+                if !r.should_continue {
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: vec![ToolResultContent::text(
+                            r.stop_reason
+                                .unwrap_or_else(|| format!("PreToolUse hook blocked: {name}")),
+                        )],
+                        is_error: Some(true),
+                    });
+                    continue;
+                }
+            }
+
             let decision = self.policy_engine.evaluate(name);
 
             match decision {
@@ -520,6 +564,16 @@ impl SdkSession {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            if let Some(h) = self.hooks() {
+                crate::hooks::run_post_tool_hooks(
+                    h,
+                    name,
+                    &output_summary,
+                    &self.session_id,
+                    &self.config.cwd,
+                )
+                .await;
+            }
             let summary_truncated = if output_summary.len() > 500 {
                 // Find a safe UTF-8 boundary near 500 bytes
                 let mut end = 500;
@@ -642,6 +696,14 @@ impl SdkSession {
     }
 
     /// Send a notification, ignoring channel errors (host may have disconnected).
+    /// The user's hooks, unless `disableAllHooks` / `--bare` turned them off.
+    fn hooks(&self) -> Option<&crate::settings::HooksConfig> {
+        self.config
+            .hooks
+            .as_ref()
+            .filter(|_| !self.config.disable_all_hooks)
+    }
+
     fn send_notif(&self, notif: SdkNotification) {
         let _ = self.notif_tx.send(notif);
     }
@@ -785,5 +847,115 @@ mod cancel_tests {
             .expect("immediate");
         sig.reset();
         assert!(!sig.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+    use crate::settings::{HookEntry, HooksConfig};
+    use std::time::Duration;
+
+    fn session_with_hooks(
+        dir: &std::path::Path,
+        hooks: HooksConfig,
+        policy: Policy,
+    ) -> (SdkSession, mpsc::UnboundedReceiver<SdkNotification>) {
+        let cfg = crate::config::Config {
+            api_key: "sk-ant-test".into(),
+            cwd: dir.to_path_buf(),
+            hooks: Some(hooks),
+            ..Default::default()
+        };
+        let (ntx, _nrx) = mpsc::unbounded_channel();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let s =
+            SdkSession::new(cfg, vec![], policy, Capabilities::default(), ntx, atx, irx).unwrap();
+        (s, arx)
+    }
+
+    fn tool_use(name: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: name.into(),
+            input: serde_json::json!({"command": "rm -rf ~"}),
+        }]
+    }
+
+    fn text(block: &ContentBlock) -> String {
+        match block {
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .map(|c| {
+                    let ToolResultContent::Text { text } = c;
+                    text.clone()
+                })
+                .collect(),
+            other => panic!("not a tool result: {other:?}"),
+        }
+    }
+
+    /// `--headless` and `acp` ran no hooks at all, so a preToolUse guard the
+    /// user relied on was silently bypassed. It must also refuse before the
+    /// host is asked to approve.
+    #[tokio::test]
+    async fn a_pre_tool_guard_blocks_before_the_host_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = HooksConfig {
+            pre_tool_use: vec![HookEntry {
+                matcher: "Bash".into(),
+                command: "echo guarded; exit 2".into(),
+            }],
+            ..Default::default()
+        };
+        let (mut s, mut approvals) = session_with_hooks(dir.path(), hooks, Policy::default());
+        let out = tokio::time::timeout(
+            Duration::from_secs(30),
+            s.execute_tools_with_approval(&tool_use("Bash")),
+        )
+        .await
+        .expect("waited on host approval instead of running the guard")
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            }
+        ));
+        assert!(text(&out[0]).contains("guarded"), "{}", text(&out[0]));
+        assert!(approvals.try_recv().is_err(), "host was asked anyway");
+    }
+
+    #[tokio::test]
+    async fn post_tool_hooks_run_and_disable_all_hooks_skips_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("post.log");
+        let hooks = HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: "*".into(),
+                command: format!("echo \"$TOOL_NAME\" >> '{}'", log.display()),
+            }],
+            ..Default::default()
+        };
+        let policy = Policy {
+            allow: vec!["Ghost".into()],
+            ..Default::default()
+        };
+        let (mut s, _a) = session_with_hooks(dir.path(), hooks.clone(), policy.clone());
+        s.execute_tools_with_approval(&tool_use("Ghost"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "Ghost");
+
+        std::fs::remove_file(&log).unwrap();
+        let (mut s, _a) = session_with_hooks(dir.path(), hooks, policy);
+        s.config.disable_all_hooks = true;
+        s.execute_tools_with_approval(&tool_use("Ghost"))
+            .await
+            .unwrap();
+        assert!(!log.exists(), "disableAllHooks must skip hooks");
     }
 }

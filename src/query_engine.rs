@@ -553,6 +553,18 @@ impl QueryEngine {
                 for mw in &ctx.middlewares {
                     mw.after_tool(name, &output_text).await;
                 }
+                if let Some(hook_cfg) = &self.config.hooks
+                    && !self.config.disable_all_hooks
+                {
+                    crate::hooks::run_post_tool_hooks(
+                        hook_cfg,
+                        name,
+                        &output_text,
+                        "print-mode",
+                        &self.config.cwd,
+                    )
+                    .await;
+                }
 
                 if output.is_error && !self.stream_json_output && !self.quiet {
                     eprintln!(

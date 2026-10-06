@@ -1119,6 +1119,19 @@ async fn main() -> Result<()> {
         if cli.include_hook_events {
             engine.set_include_hook_events(true);
         }
+        let prompt = match &config.hooks {
+            Some(h) if !config.disable_all_hooks => {
+                match crate::hooks::run_user_prompt_hooks(h, &prompt, "print-mode", &config.cwd)
+                    .await
+                {
+                    Some(extra) => {
+                        format!("{prompt}\n\n<additional_context>{extra}</additional_context>")
+                    }
+                    None => prompt,
+                }
+            }
+            _ => prompt,
+        };
         engine.query(prompt).await?;
         return Ok(());
     }

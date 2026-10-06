@@ -368,6 +368,8 @@ User-defined shell commands that run at lifecycle events. Configure them under `
 
 Every hook also receives `CLAUDE_HOOK_EVENT`, `CLAUDE_SESSION_ID`, and `CLAUDE_CWD`. Long values are capped before export.
 
+`preToolUse`, `postToolUse` and `userPromptSubmit` also run in `-p`, `--headless` (SDK) and `oxideclaw acp`. There a `preToolUse` block runs before any host approval prompt, so the host is never asked about a call the guard refuses. `stop`, `sessionStart` and the compact events are interactive-only.
+
 ```json
 {
   "hooks": {

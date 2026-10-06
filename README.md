@@ -188,7 +188,7 @@ No runtime. No dependencies. No post-install scripts. `scp` it to a server and r
 
 ### 🪝 &nbsp; Lifecycle hooks
 
-Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the tool), `postToolUse`, `userPromptSubmit` (stdout becomes extra context), `notification`, `stop`, `sessionStart`, `preCompact`, `postCompact`. Match one tool or `*`. Hooks get the event in environment variables (`TOOL_NAME`, `TOOL_INPUT`, `TOOL_RESULT`, `CLAUDE_MESSAGE`, `CLAUDE_SESSION_ID`, `CLAUDE_CWD`) and may print JSON to block, add a system message, or stop the turn. 60-second timeout, own process group, `--bare` skips them all.
+Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the tool), `postToolUse`, `userPromptSubmit` (stdout becomes extra context), `notification`, `stop`, `sessionStart`, `preCompact`, `postCompact`. Match one tool or `*`. Hooks get the event in environment variables (`TOOL_NAME`, `TOOL_INPUT`, `TOOL_RESULT`, `CLAUDE_MESSAGE`, `CLAUDE_SESSION_ID`, `CLAUDE_CWD`) and may print JSON to block, add a system message, or stop the turn. 60-second timeout, own process group, `--bare` skips them all. In `-p`, `--headless` and `oxideclaw acp`, the tool and `userPromptSubmit` hooks run as well; `stop`, `sessionStart` and the compact hooks are interactive-only.
 
 ```json
 { "hooks": { "preToolUse": [ { "matcher": "Bash", "command": "./scripts/guard.sh" } ] } }
