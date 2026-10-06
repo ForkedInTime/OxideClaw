@@ -146,3 +146,74 @@ async fn bash_tool_abort_kills_grandchild_in_process_group() {
         panic!("grandchild pid {pid} still alive after BashTool abort — process group NOT killed");
     }
 }
+
+fn text(out: &oxideclaw::tools::ToolOutput) -> String {
+    out.content
+        .iter()
+        .map(|c| match c {
+            oxideclaw::api::types::ToolResultContent::Text { text } => text.as_str(),
+        })
+        .collect()
+}
+
+/// `server &` keeps the pipes open after the shell exits. The tool used to
+/// wait for EOF until the timeout, then discard the output and kill the
+/// server; it must return promptly and leave the job running (still able to
+/// write without dying of SIGPIPE).
+#[tokio::test]
+async fn a_backgrounded_job_returns_promptly_and_keeps_running() {
+    let tmp = TempDir::new().unwrap();
+    let pid_file = tmp.path().join("bg.pid");
+    let cmd = format!(
+        "echo started; (while true; do echo tick; sleep 0.1; done) & echo $! > {}",
+        pid_file.display()
+    );
+    let mut ctx = ToolContext::new(PathBuf::from("/tmp"));
+    ctx.default_shell = Some("bash".into());
+
+    let started = std::time::Instant::now();
+    let out = BashTool
+        .execute(json!({"command": cmd, "timeout": 20_000u64}), &ctx)
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let alive = pid_alive(pid);
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+
+    let t = text(&out);
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}: {t}");
+    assert!(!out.is_error, "{t}");
+    assert!(t.contains("started"), "{t}");
+    assert!(t.contains("background process is still running"), "{t}");
+    assert!(
+        alive,
+        "the background job was killed after the tool returned"
+    );
+}
+
+/// A timeout used to replace everything the command had printed with
+/// "Command timed out".
+#[tokio::test]
+async fn a_timeout_keeps_the_output_so_far() {
+    let mut ctx = ToolContext::new(PathBuf::from("/tmp"));
+    ctx.default_shell = Some("bash".into());
+    let out = BashTool
+        .execute(
+            json!({"command": "echo partial-output; sleep 30", "timeout": 500u64}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let t = text(&out);
+    assert!(out.is_error, "{t}");
+    assert!(t.contains("partial-output"), "{t}");
+    assert!(t.contains("timed out after 500ms"), "{t}");
+}

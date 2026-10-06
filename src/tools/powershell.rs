@@ -64,8 +64,9 @@ impl Tool for PowerShellTool {
             return Ok(ToolOutput::error(reason));
         }
 
+        use super::bash::{BACKGROUND_NOTE, Drained, MAX_OUTPUT_BYTES, read_to_cap};
         use tokio::process::Command;
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{Duration, Instant, timeout_at};
 
         // Parity with the Bash tool, which this had drifted from on two counts:
         //
@@ -76,7 +77,12 @@ impl Tool for PowerShellTool {
         //     does not kill the process unless `kill_on_drop` is set, so a
         //     timed-out command (and anything it spawned) kept running forever.
         //
-        // Uses the same ProcessGroupGuard as Bash so the whole subtree dies.
+        // Uses the same ProcessGroupGuard as Bash so the whole subtree dies,
+        // and the same exit-aware drain so a background job neither blocks
+        // until the timeout nor costs the output read so far.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut truncated = false;
         let fut = async {
             let mut cmd = Command::new("pwsh");
             cmd.args(["-NoProfile", "-NonInteractive", "-Command", &input.command])
@@ -104,24 +110,64 @@ impl Tool for PowerShellTool {
 
             // Read both concurrently — draining one to EOF first deadlocks if
             // the command fills the other pipe.
-            let (o, e) = tokio::join!(
-                super::bash::read_to_cap(&mut child_out, super::bash::MAX_OUTPUT_BYTES),
-                super::bash::read_to_cap(&mut child_err, super::bash::MAX_OUTPUT_BYTES),
-            );
-            let (stdout, out_trunc) = o?;
-            let (stderr, err_trunc) = e?;
-            let status = guard.child_mut().wait().await?;
-            guard.disarm();
-            Ok::<_, std::io::Error>((status, stdout, stderr, out_trunc || err_trunc))
+            let mut err_truncated = false;
+            let reads = async {
+                let (o, e) = tokio::join!(
+                    read_to_cap(
+                        &mut child_out,
+                        MAX_OUTPUT_BYTES,
+                        &mut stdout,
+                        &mut truncated
+                    ),
+                    read_to_cap(
+                        &mut child_err,
+                        MAX_OUTPUT_BYTES,
+                        &mut stderr,
+                        &mut err_truncated
+                    ),
+                );
+                o.and(e)
+            };
+            let (drained, status) =
+                super::bash::drain_until_exit(reads, guard.child_mut(), deadline).await?;
+            truncated |= err_truncated;
+            let status = match (drained, status) {
+                (Drained::TimedOut, _) => None,
+                (_, Some(st)) => Some(st),
+                (_, None) => timeout_at(deadline, guard.child_mut().wait())
+                    .await
+                    .ok()
+                    .transpose()?,
+            };
+            if status.is_some() {
+                guard.disarm();
+            }
+            if drained == Drained::ShellExited {
+                super::bash::discard_rest(child_out);
+                super::bash::discard_rest(child_err);
+            }
+            Ok::<_, std::io::Error>((status, drained))
         };
 
-        let result = timeout(Duration::from_millis(timeout_ms), fut).await;
+        let result = fut.await;
+        let mut stdout = String::from_utf8_lossy(&stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr).into_owned();
 
         match result {
-            Err(_) => Ok(ToolOutput::error(format!(
-                "PowerShell command timed out after {timeout_ms} ms."
-            ))),
-            Ok(Err(e)) => {
+            Ok((None, _)) => {
+                if !stderr.is_empty() {
+                    stdout.push_str("\n[stderr]\n");
+                    stdout.push_str(&stderr);
+                }
+                if !stdout.is_empty() && !stdout.ends_with('\n') {
+                    stdout.push('\n');
+                }
+                stdout.push_str(&format!(
+                    "PowerShell command timed out after {timeout_ms} ms."
+                ));
+                Ok(ToolOutput::error(stdout))
+            }
+            Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     Ok(ToolOutput::error(
                         "pwsh not found. Install PowerShell Core to use this tool.",
@@ -130,7 +176,7 @@ impl Tool for PowerShellTool {
                     Ok(ToolOutput::error(format!("Failed to run pwsh: {e}")))
                 }
             }
-            Ok(Ok((status, stdout, stderr, truncated))) => {
+            Ok((Some(status), drained)) => {
                 let mut out = String::new();
                 if !stdout.is_empty() {
                     out.push_str(&stdout);
@@ -144,6 +190,12 @@ impl Tool for PowerShellTool {
                 }
                 if truncated {
                     out.push_str("\n... (output truncated)");
+                }
+                if drained == Drained::ShellExited {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(BACKGROUND_NOTE);
                 }
                 if out.is_empty() {
                     out = format!("(exit code {})", status.code().unwrap_or(-1));

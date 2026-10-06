@@ -6,7 +6,7 @@ use serde_json::json;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 
 /// RAII guard that owns a running `tokio::process::Child` and, on drop, kills
 /// the *entire* Unix process group the child leads. This is required because:
@@ -135,34 +135,100 @@ fn absorb(
     }
 }
 
-/// Read a pipe to EOF keeping at most `cap` bytes.
+/// Read a pipe to EOF into `kept`, keeping at most `cap` bytes. What was read
+/// stays in `kept` if the future is dropped (timeout), so it can be reported.
 ///
 /// Draining past the cap matters: stopping the read leaves the child blocked on
 /// a full pipe until its timeout fires.
-pub(crate) async fn read_to_cap<R>(reader: &mut R, cap: usize) -> std::io::Result<(String, bool)>
+pub(crate) async fn read_to_cap<R>(
+    reader: &mut R,
+    cap: usize,
+    kept: &mut Vec<u8>,
+    truncated: &mut bool,
+) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut kept: Vec<u8> = Vec::new();
-    let mut truncated = false;
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
-            break;
+            return Ok(());
         }
         if kept.len() < cap {
             let room = cap - kept.len();
             kept.extend_from_slice(&buf[..room.min(n)]);
             if n > room {
-                truncated = true;
+                *truncated = true;
             }
         } else {
-            truncated = true;
+            *truncated = true;
         }
     }
-    Ok((String::from_utf8_lossy(&kept).into_owned(), truncated))
 }
+
+/// How long a background job's output is still collected once the shell
+/// itself has exited.
+const BACKGROUND_GRACE: Duration = Duration::from_millis(200);
+
+/// Why [`drain_until_exit`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Drained {
+    /// Both pipes reached EOF.
+    All,
+    /// The shell exited but something it started in the background still
+    /// holds the pipes open.
+    ShellExited,
+    TimedOut,
+}
+
+/// Run `reads` (which drains the command's pipes) until they close, the shell
+/// exits while a background job (`server &`) keeps them open, or `deadline`.
+/// Waiting for EOF alone blocked every `cmd &` until the timeout, which then
+/// discarded all output and killed the job the model had just started.
+/// Also returns the shell's exit status if it was reaped.
+pub(crate) async fn drain_until_exit<F>(
+    reads: F,
+    child: &mut Child,
+    deadline: Instant,
+) -> std::io::Result<(Drained, Option<std::process::ExitStatus>)>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(reads);
+    let mut status = None;
+    let mut grace: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            r = &mut reads => {
+                r?;
+                return Ok((Drained::All, status));
+            }
+            st = child.wait(), if status.is_none() => {
+                status = Some(st?);
+                grace = Some(Instant::now() + BACKGROUND_GRACE);
+            }
+            _ = sleep_until(grace.unwrap_or(deadline)), if grace.is_some() => {
+                return Ok((Drained::ShellExited, status));
+            }
+            _ = sleep_until(deadline) => return Ok((Drained::TimedOut, status)),
+        }
+    }
+}
+
+/// Keep reading a pipe a background job still writes to after we stop
+/// capturing it: closing our end would kill the job with SIGPIPE.
+pub(crate) fn discard_rest<R>(mut reader: R)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+    });
+}
+
+pub(crate) const BACKGROUND_NOTE: &str = "(a background process is still running; its \
+     further output is not captured: redirect it to a file to read it)";
 
 /// Strip ANSI escape sequences and carriage returns from terminal output.
 /// Prevents progress-bar output (e.g. from `ollama pull`) from corrupting the TUI.
@@ -217,7 +283,8 @@ impl Tool for BashTool {
         "Execute a bash command in the shell. Use for running tests, git commands, \
         build commands, installing packages, and other shell operations. \
         Avoid interactive commands. For long-running operations, consider adding \
-        a timeout."
+        a timeout. To start a server or other long-running background process, \
+        redirect its output (cmd > /tmp/cmd.log 2>&1 &) and read the log."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -257,6 +324,7 @@ impl Tool for BashTool {
         };
 
         let command_str = command.clone();
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let stream_tx = ctx.stream_tx.clone();
         let cwd = ctx.cwd.clone();
         // Resolve shell: ctx.default_shell → $SHELL env var → "bash"
@@ -325,28 +393,32 @@ impl Tool for BashTool {
             let mut stdout_done = false;
             let mut stderr_done = false;
 
-            while !(stdout_done && stderr_done) {
-                tokio::select! {
-                    r = stdout.read(&mut stdout_buf), if !stdout_done => {
-                        match r? {
-                            0 => stdout_done = true,
-                            n => absorb(
-                                &stdout_buf[..n], &mut stdout_partial,
-                                &stream_tx, &mut combined, &mut truncated,
-                            ),
+            let reads = async {
+                while !(stdout_done && stderr_done) {
+                    tokio::select! {
+                        r = stdout.read(&mut stdout_buf), if !stdout_done => {
+                            match r? {
+                                0 => stdout_done = true,
+                                n => absorb(
+                                    &stdout_buf[..n], &mut stdout_partial,
+                                    &stream_tx, &mut combined, &mut truncated,
+                                ),
+                            }
                         }
-                    }
-                    r = stderr.read(&mut stderr_buf), if !stderr_done => {
-                        match r? {
-                            0 => stderr_done = true,
-                            n => absorb(
-                                &stderr_buf[..n], &mut stderr_partial,
-                                &stream_tx, &mut combined, &mut truncated,
-                            ),
+                        r = stderr.read(&mut stderr_buf), if !stderr_done => {
+                            match r? {
+                                0 => stderr_done = true,
+                                n => absorb(
+                                    &stderr_buf[..n], &mut stderr_partial,
+                                    &stream_tx, &mut combined, &mut truncated,
+                                ),
+                            }
                         }
                     }
                 }
-            }
+                Ok(())
+            };
+            let (drained, status) = drain_until_exit(reads, guard.child_mut(), deadline).await?;
 
             // Flush any trailing text that never ended in a newline.
             for partial in [&mut stdout_partial, &mut stderr_partial] {
@@ -357,13 +429,42 @@ impl Tool for BashTool {
                 }
             }
 
-            let status = guard.child_mut().wait().await?;
-            // Process exited normally — disarm the kill guard so Drop
-            // doesn't try to signal a pid that has already been reaped.
-            guard.disarm();
-
             if truncated {
                 combined.push_str("\n... (output truncated)");
+            }
+
+            // Both pipes closed does not mean the shell is gone
+            // (`exec >&- 2>&-; sleep 999`), so the deadline still applies.
+            let status = match (drained, status) {
+                (Drained::TimedOut, _) => None,
+                (_, Some(st)) => Some(st),
+                (_, None) => timeout_at(deadline, guard.child_mut().wait())
+                    .await
+                    .ok()
+                    .transpose()?,
+            };
+            let Some(status) = status else {
+                // The guard kills the whole group as it drops; what the
+                // command printed so far is still worth returning.
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&format!(
+                    "Command timed out after {timeout_ms}ms: {command_str}"
+                ));
+                return Ok(ToolOutput::error(combined));
+            };
+            // The shell has been reaped — disarm the kill guard so Drop
+            // doesn't signal the group, which now holds only whatever the
+            // command deliberately left running in the background.
+            guard.disarm();
+            if drained == Drained::ShellExited {
+                discard_rest(stdout);
+                discard_rest(stderr);
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(BACKGROUND_NOTE);
             }
 
             if combined.is_empty() {
@@ -378,12 +479,6 @@ impl Tool for BashTool {
             })
         };
 
-        match timeout(Duration::from_millis(timeout_ms), fut).await {
-            Ok(result) => result,
-            Err(_) => Ok(ToolOutput::error(format!(
-                "Command timed out after {}ms: {}",
-                timeout_ms, command_str
-            ))),
-        }
+        fut.await
     }
 }
