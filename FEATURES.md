@@ -53,7 +53,9 @@ Models that don't support tool use get automatic text-only fallback. Ollama mode
 
 ### OpenAI-Compatible Providers
 
-OxideClaw supports any OpenAI-compatible API endpoint:
+OxideClaw supports any OpenAI-compatible API endpoint. Pick one with a
+`<prefix>:<model>` model string; the API key is read from that provider's
+own environment variable (shell or `.env`):
 
 | Provider | Model prefix | API key variable |
 |----------|--------------|------------------|
@@ -72,6 +74,13 @@ Keys come from the environment, never from `settings.json`. Export the variable 
 ```bash
 echo 'GROQ_API_KEY=gsk_...' >> ~/.config/oxideclaw/.env
 oxideclaw --model groq:llama-3.3-70b-versatile
+```
+
+Or switch at runtime:
+
+```
+/model groq:llama-3.3-70b-versatile
+/model oai:gpt-4o
 ```
 
 Each provider reads only its own variable, so your OpenAI key is never sent to Groq or OpenRouter.
@@ -470,6 +479,10 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
+| `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `MISTRAL_API_KEY`, `VENICE_API_KEY` | API key for the matching OpenAI-compatible provider |
+| `OPENAI_API_KEY` | API key for `oai:` and `openai-compat:` models |
+| `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix) |
+| `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`) |
 | `XDG_CONFIG_HOME` | Config directory base |
 | `XDG_DATA_HOME` | Data directory base |
 | `XDG_CACHE_HOME` | Cache directory base |
