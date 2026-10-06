@@ -171,7 +171,12 @@ struct TuiAsker {
 
 #[async_trait::async_trait]
 impl PermissionAsker for TuiAsker {
-    async fn ask(&self, tool_name: &str, description: &str) -> Option<PermissionDecision> {
+    async fn ask(
+        &self,
+        tool_name: &str,
+        description: &str,
+        _input: &serde_json::Value,
+    ) -> Option<PermissionDecision> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(AppEvent::PermissionRequest {
@@ -1484,7 +1489,7 @@ mod tui_asker_tests {
                 _ => panic!("expected a PermissionRequest"),
             }
         });
-        let got = asker.ask("Bash", "Bash: ls").await;
+        let got = asker.ask("Bash", "Bash: ls", &serde_json::json!({})).await;
         assert_eq!(got, Some(PermissionDecision::AlwaysAllow));
         ui.await.unwrap();
     }
@@ -1495,7 +1500,10 @@ mod tui_asker_tests {
         let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
         drop(rx);
         let asker = TuiAsker { tx };
-        assert_eq!(asker.ask("Bash", "Bash: ls").await, None);
+        assert_eq!(
+            asker.ask("Bash", "Bash: ls", &serde_json::json!({})).await,
+            None
+        );
     }
 
     /// TUI received the request but dropped the reply without answering.
@@ -1507,7 +1515,10 @@ mod tui_asker_tests {
             let ev = rx.recv().await;
             drop(ev);
         });
-        assert_eq!(asker.ask("Bash", "Bash: ls").await, None);
+        assert_eq!(
+            asker.ask("Bash", "Bash: ls", &serde_json::json!({})).await,
+            None
+        );
         ui.await.unwrap();
     }
 }

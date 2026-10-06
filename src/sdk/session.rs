@@ -69,7 +69,7 @@ pub struct SdkSession {
     tools: Vec<DynTool>,
     messages: Vec<Message>,
     cost_tracker: CostTracker,
-    policy_engine: PolicyEngine,
+    policy_engine: Arc<PolicyEngine>,
     capabilities: Capabilities,
     tools_used_this_turn: Vec<String>,
     tools_executed_count: u32,
@@ -78,7 +78,7 @@ pub struct SdkSession {
     /// Channel to send approval-needed notifications to the host.
     approval_tx: mpsc::UnboundedSender<SdkNotification>,
     /// Channel to receive approval/deny decisions from the host.
-    approval_rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
+    approval_rx: ApprovalReceiver,
     /// Set by `session/cancel`; checked between model calls and tools.
     cancel: Arc<CancelSignal>,
     /// Sub-agents (`Agent`) report each API response they pay for here.
@@ -124,13 +124,13 @@ impl SdkSession {
             tools,
             messages: Vec::new(),
             cost_tracker,
-            policy_engine: PolicyEngine::new(policy, interactive),
+            policy_engine: Arc::new(PolicyEngine::new(policy, interactive)),
             capabilities,
             tools_used_this_turn: Vec::new(),
             tools_executed_count: 0,
             read_cache: new_read_cache(),
             notif_tx,
-            approval_rx,
+            approval_rx: Arc::new(tokio::sync::Mutex::new(approval_rx)),
             approval_tx,
             cancel: Arc::new(CancelSignal::default()),
             child_usage_tx,
@@ -460,13 +460,29 @@ impl SdkSession {
         ctx.usage_sink = Some(self.child_usage_tx.clone());
         ctx.budget_remaining_usd = self.cost_tracker.remaining();
         // The host's policy and approval see only tool names, so the user's
-        // `permissions.deny` rules are checked here as well. This gate is for
-        // top-level calls only: ctx.permission_gate stays None so Agent
-        // children keep the stricter headless gate instead of inheriting a
-        // bypass.
+        // `permissions.deny` rules are checked here as well.
         let gate = crate::permissions::PermissionGate::bypass_with_deny(
             &self.config.permissions_deny,
             &self.config.cwd,
+        );
+        // `Agent` children go through the same deny rules and host policy,
+        // asking the host when the policy says Ask. Not the bypass gate
+        // above: that would let a child run anything the host never saw.
+        let child_asker = crate::sdk::approval::SdkPolicyAsker {
+            policy: Arc::clone(&self.policy_engine),
+            session_id: self.session_id.clone(),
+            approval_tx: self.approval_tx.clone(),
+            approval_rx: Arc::clone(&self.approval_rx),
+            cancel: Arc::clone(&self.cancel),
+        };
+        ctx.permission_gate = Some(
+            crate::permissions::PermissionGate::new(
+                crate::permissions::PermissionState::new(false, &[], &self.config.permissions_deny)
+                    .with_cwd(&self.config.cwd),
+                false,
+                Some(Arc::new(child_asker)),
+            )
+            .with_asker_for_all_tools(),
         );
 
         let mut results = Vec::new();
@@ -566,8 +582,10 @@ impl SdkSession {
                     // Wait for the matching reply; stale replies to earlier
                     // prompts are skipped rather than treated as this answer.
                     let timeout_secs = self.policy_engine.timeout_seconds();
+                    // The guard drops before the tool runs, so an Agent
+                    // child can take the receiver for its own prompts.
                     let outcome = await_approval(
-                        &mut self.approval_rx,
+                        &mut *self.approval_rx.lock().await,
                         &approval_id,
                         std::time::Duration::from_secs(timeout_secs),
                     )
@@ -801,6 +819,11 @@ impl SdkSession {
         let _ = self.notif_tx.send(notif);
     }
 }
+
+/// The host's approval replies, shared by the top-level loop and the
+/// `Agent` sub-agents it runs.
+pub(crate) type ApprovalReceiver =
+    Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, Option<String>)>>>;
 
 /// Outcome of waiting for the host's answer to one approval request.
 #[derive(Debug, PartialEq)]
@@ -1265,5 +1288,162 @@ mod guard_tests {
         assert!(s.cost_tracker.total_cost_usd > 1.0);
         assert!(s.cost_tracker.over_budget());
         assert_eq!(s.child_tokens, (1_000, 1_000_000));
+    }
+}
+
+#[cfg(test)]
+mod subagent_gate_tests {
+    use super::*;
+    use crate::permissions::GateOutcome;
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Stands in for `Agent`: puts each child call through the gate the
+    /// session published, as the real sub-engine does.
+    struct FakeAgent {
+        calls: Vec<(&'static str, Value)>,
+        outcomes: Arc<Mutex<Vec<GateOutcome>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FakeAgent {
+        fn name(&self) -> &str {
+            "Agent"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> Value {
+            json!({})
+        }
+        async fn execute(&self, _: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+            let Some(gate) = &ctx.permission_gate else {
+                return Ok(ToolOutput::error("no gate published"));
+            };
+            for (tool, input) in &self.calls {
+                let out = gate.decide(tool, input).await;
+                self.outcomes.lock().unwrap().push(out);
+            }
+            Ok(ToolOutput::success("done"))
+        }
+    }
+
+    type Host = (
+        mpsc::UnboundedReceiver<SdkNotification>,
+        mpsc::UnboundedSender<(String, Option<String>)>,
+    );
+
+    fn session(
+        policy: Policy,
+        interactive: bool,
+        deny: &[&str],
+        calls: Vec<(&'static str, Value)>,
+    ) -> (SdkSession, Arc<Mutex<Vec<GateOutcome>>>, Host) {
+        let dir = std::env::temp_dir();
+        let cfg = crate::config::Config {
+            api_key: "sk-ant-test".into(),
+            cwd: dir,
+            permissions_deny: deny.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let agent: DynTool = Arc::new(FakeAgent {
+            calls,
+            outcomes: Arc::clone(&outcomes),
+        });
+        let (ntx, _nrx) = mpsc::unbounded_channel();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let (itx, irx) = mpsc::unbounded_channel();
+        let caps = Capabilities {
+            interactive_approval: interactive,
+            ..Default::default()
+        };
+        let s = SdkSession::new(cfg, vec![agent], policy, caps, ntx, atx, irx).unwrap();
+        (s, outcomes, (arx, itx))
+    }
+
+    fn agent_call() -> Vec<ContentBlock> {
+        vec![ContentBlock::ToolUse {
+            id: "toolu_agent".into(),
+            name: "Agent".into(),
+            input: json!({"prompt": "go"}),
+        }]
+    }
+
+    /// A child must answer to the host's policy and the user's deny rules,
+    /// not to the headless gate (which let Read/WebFetch through unasked
+    /// and refused Bash outright whatever the host allowed).
+    #[tokio::test]
+    async fn agent_children_follow_the_host_policy_and_deny_rules() {
+        let policy = Policy {
+            allow: vec!["Agent".into(), "Read".into(), "Bash".into()],
+            deny: vec!["WebFetch".into()],
+            ..Default::default()
+        };
+        let (mut s, outcomes, _host) = session(
+            policy,
+            false,
+            &["Read(./secret.txt)"],
+            vec![
+                ("Bash", json!({"command": "echo hi"})),
+                ("Read", json!({"file_path": "notes.txt"})),
+                ("Read", json!({"file_path": "secret.txt"})),
+                ("WebFetch", json!({"url": "https://example.com"})),
+                ("Grep", json!({"pattern": "x"})),
+            ],
+        );
+        s.execute_tools_with_approval(&agent_call()).await.unwrap();
+        let got = outcomes.lock().unwrap();
+        let allowed: Vec<bool> = got.iter().map(|o| *o == GateOutcome::Allowed).collect();
+        // Bash and Read are host-allowed; secret.txt is a settings deny;
+        // WebFetch is a policy deny; Grep is unlisted with no host to ask.
+        assert_eq!(allowed, vec![true, true, false, false, false], "{got:?}");
+    }
+
+    /// ACP's default policy asks for everything: a child's Edit must reach
+    /// the editor as an approval request, and the parent's held receiver
+    /// must not deadlock it.
+    #[tokio::test]
+    async fn an_agent_child_asks_the_host_when_the_policy_says_ask() {
+        let (mut s, outcomes, (mut approvals, replies)) = session(
+            Policy::default(),
+            true,
+            &[],
+            vec![
+                ("Edit", json!({"file_path": "a.rs"})),
+                ("Bash", json!({"command": "rm -rf build"})),
+            ],
+        );
+        let host = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            while let Some(n) = approvals.recv().await {
+                if let SdkNotification::ToolApprovalNeeded {
+                    approval_id, tool, ..
+                } = n
+                {
+                    // Approve the Agent and the Edit, refuse the Bash.
+                    let deny = (tool == "Bash").then(|| "no".to_string());
+                    asked.push(tool);
+                    let _ = replies.send((approval_id, deny));
+                }
+                if asked.len() == 3 {
+                    break;
+                }
+            }
+            asked
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            s.execute_tools_with_approval(&agent_call()),
+        )
+        .await
+        .expect("child approval must not deadlock")
+        .unwrap();
+        let asked = host.await.unwrap();
+        assert_eq!(asked, vec!["Agent", "Edit", "Bash"]);
+        let got = outcomes.lock().unwrap();
+        assert_eq!(got[0], GateOutcome::Allowed);
+        assert!(matches!(got[1], GateOutcome::Denied(_)), "{got:?}");
     }
 }

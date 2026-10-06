@@ -1298,7 +1298,7 @@ mod permission_wiring_tests {
     struct AlwaysDeny;
     #[async_trait::async_trait]
     impl PermissionAsker for AlwaysDeny {
-        async fn ask(&self, _: &str, _: &str) -> Option<PermissionDecision> {
+        async fn ask(&self, _: &str, _: &str, _: &serde_json::Value) -> Option<PermissionDecision> {
             Some(PermissionDecision::Deny)
         }
     }

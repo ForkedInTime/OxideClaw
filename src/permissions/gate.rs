@@ -18,10 +18,15 @@ use std::sync::Arc;
 /// Something that can put a permission prompt in front of a human.
 #[async_trait::async_trait]
 pub trait PermissionAsker: Send + Sync {
-    /// `description` is the `describe_tool_call` rendering. Return `None`
-    /// when no answer could be obtained (UI gone, channel dropped) — the
-    /// gate treats that as Deny.
-    async fn ask(&self, tool_name: &str, description: &str) -> Option<PermissionDecision>;
+    /// `description` is the `describe_tool_call` rendering of `input`.
+    /// Return `None` when no answer could be obtained (UI gone, channel
+    /// dropped) — the gate treats that as Deny.
+    async fn ask(
+        &self,
+        tool_name: &str,
+        description: &str,
+        input: &serde_json::Value,
+    ) -> Option<PermissionDecision>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,6 +47,10 @@ pub struct PermissionGate {
     /// sub-agents through the gate, so a child launched in plan mode
     /// cannot write either.
     blocked: Vec<String>,
+    /// Consult the asker for every tool that passes the deny list, not only
+    /// the sensitive ones: an SDK/ACP host policy covers Read and WebFetch
+    /// too, and an `Agent` child must not get around it.
+    ask_every_tool: bool,
 }
 
 impl PermissionGate {
@@ -55,7 +64,14 @@ impl PermissionGate {
             suggest_mode,
             asker,
             blocked: Vec::new(),
+            ask_every_tool: false,
         }
+    }
+
+    /// Route every call the deny list lets through to the asker.
+    pub fn with_asker_for_all_tools(mut self) -> Self {
+        self.ask_every_tool = true;
+        self
     }
 
     /// Refuse these tools for the life of this gate (plan mode).
@@ -119,6 +135,10 @@ impl PermissionGate {
         } else {
             self.state.check_with_input(tool_name, Some(input))
         };
+        let check = match check {
+            CheckResult::Allow if self.ask_every_tool => CheckResult::Ask,
+            c => c,
+        };
 
         match check {
             CheckResult::Allow => GateOutcome::Allowed,
@@ -131,7 +151,7 @@ impl PermissionGate {
                 )),
                 Some(asker) => {
                     let description = describe_tool_call(tool_name, input);
-                    match asker.ask(tool_name, &description).await {
+                    match asker.ask(tool_name, &description, input).await {
                         Some(PermissionDecision::Allow) => GateOutcome::Allowed,
                         Some(PermissionDecision::AlwaysAllow) => {
                             self.state.record_always_allow(tool_name);
@@ -176,7 +196,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PermissionAsker for Scripted {
-        async fn ask(&self, tool_name: &str, description: &str) -> Option<PermissionDecision> {
+        async fn ask(
+            &self,
+            tool_name: &str,
+            description: &str,
+            _input: &serde_json::Value,
+        ) -> Option<PermissionDecision> {
             self.asked
                 .lock()
                 .unwrap()

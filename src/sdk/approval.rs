@@ -63,3 +63,61 @@ impl PolicyEngine {
         self.policy.approval_timeout_seconds
     }
 }
+
+/// The host's policy for calls made by `Agent` sub-agents. Without it a
+/// child ran under the headless gate: every Read/WebFetch ran whatever the
+/// host policy said, and every Bash/Edit was refused with no prompt.
+pub(crate) struct SdkPolicyAsker {
+    pub policy: std::sync::Arc<PolicyEngine>,
+    pub session_id: String,
+    pub approval_tx: tokio::sync::mpsc::UnboundedSender<crate::sdk::protocol::SdkNotification>,
+    /// Shared with the top-level loop, which holds it only while it waits,
+    /// never while a tool (and so a child) runs.
+    pub approval_rx: crate::sdk::session::ApprovalReceiver,
+    pub cancel: std::sync::Arc<crate::sdk::session::CancelSignal>,
+}
+
+#[async_trait::async_trait]
+impl crate::permissions::PermissionAsker for SdkPolicyAsker {
+    async fn ask(
+        &self,
+        tool_name: &str,
+        _description: &str,
+        input: &serde_json::Value,
+    ) -> Option<crate::permissions::PermissionDecision> {
+        use crate::permissions::PermissionDecision;
+        use crate::sdk::session::{ApprovalOutcome, await_approval};
+        match self.policy.evaluate(tool_name) {
+            ApprovalDecision::Allow | ApprovalDecision::AutoApprove => {
+                return Some(PermissionDecision::Allow);
+            }
+            ApprovalDecision::Deny => return Some(PermissionDecision::Deny),
+            ApprovalDecision::Ask if !self.policy.interactive_approval => {
+                return Some(PermissionDecision::Deny);
+            }
+            ApprovalDecision::Ask => {}
+        }
+        // Holding the lock before announcing the request means parallel
+        // children never consume each other's replies as stale.
+        let mut rx = self.approval_rx.lock().await;
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        self.approval_tx
+            .send(crate::sdk::protocol::SdkNotification::ToolApprovalNeeded {
+                session_id: self.session_id.clone(),
+                approval_id: approval_id.clone(),
+                tool: tool_name.to_string(),
+                args: input.clone(),
+                tool_use_id: format!("subagent-{approval_id}"),
+            })
+            .ok()?;
+        let timeout = std::time::Duration::from_secs(self.policy.timeout_seconds());
+        let outcome = tokio::select! {
+            o = await_approval(&mut rx, &approval_id, timeout) => o,
+            _ = self.cancel.cancelled() => return None,
+        };
+        match outcome {
+            ApprovalOutcome::Approved => Some(PermissionDecision::Allow),
+            _ => Some(PermissionDecision::Deny),
+        }
+    }
+}
