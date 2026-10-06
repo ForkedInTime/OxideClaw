@@ -20,14 +20,22 @@ jobs:
       matrix:
         include:
           # ── Linux ──────────────────────────────────────────────
+          # gnu builds link against a glibc 2.28 floor via cargo-zigbuild
+          # (Ubuntu 20.04+, Debian 10+, RHEL 8+). Built against the runner's
+          # own glibc they required GLIBC_2.39 and would not start on
+          # Ubuntu 22.04, Debian 12 or RHEL 9.
           - target: x86_64-unknown-linux-gnu
+            zigtarget: x86_64-unknown-linux-gnu.2.28
             os: ubuntu-latest
             artifact: oxideclaw-linux-x64
-            cross: true
+            cross: false
+            zig: true
           - target: aarch64-unknown-linux-gnu
+            zigtarget: aarch64-unknown-linux-gnu.2.28
             os: ubuntu-latest
             artifact: oxideclaw-linux-arm64
-            cross: true
+            cross: false
+            zig: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: oxideclaw-linux-x64-musl
@@ -64,10 +72,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Linux cross-compilation via cross
-      - name: Install cross (Linux only)
+      # Linux gnu via cargo-zigbuild (glibc floor in matrix.zigtarget). A
+      # venv because the runner's system Python refuses pip installs (PEP 668).
+      - name: Install cargo-zigbuild (Linux gnu)
+        if: matrix.zig
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.16.0 cargo-zigbuild==0.23.4
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+
+      # zigbuild drops the `.2.28` suffix from the output directory, so the
+      # binary still lands in target/<triple>/release.
+      - name: Build release (zigbuild)
+        if: matrix.zig
+        run: cargo zigbuild --release --locked --target ${{ matrix.zigtarget }}
+
+      # Linux musl via cross (pinned so a release does not track git main)
+      - name: Install cross (Linux musl)
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --locked --version 0.2.5
 
       - name: Build release (cross)
         if: matrix.cross
@@ -75,7 +98,7 @@ jobs:
 
       # Native builds (macOS / Windows)
       - name: Build release (native)
-        if: "!matrix.cross"
+        if: "!matrix.cross && !matrix.zig"
         run: cargo build --release --target ${{ matrix.target }}
 
       # ── Package ──────────────────────────────────────────────
@@ -84,6 +107,18 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/oxideclaw ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
+
+      # glibc refuses to load a binary that names any version it lacks, even
+      # for weak symbols, so one stray GLIBC_2.39 reference breaks older hosts.
+      - name: Check glibc floor (Linux gnu)
+        if: matrix.zig
+        run: |
+          max=$(readelf -V ${{ matrix.artifact }} | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -Vu | tail -1)
+          echo "highest glibc version required: $max"
+          if [ "$(printf '%s\n' "$max" GLIBC_2.28 | sort -V | tail -1)" != GLIBC_2.28 ]; then
+            echo "::error::${{ matrix.artifact }} requires $max, above the GLIBC_2.28 floor"
+            exit 1
+          fi
 
       - name: Rename binary (windows)
         if: runner.os == 'Windows'

@@ -80,7 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install
 ```
 
 Pre-built binaries attached to every [release](https://github.com/ForkedInTime/OxideClaw/releases):
-- Linux: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`
+- Linux: `x86_64-linux-gnu`, `aarch64-linux-gnu` (glibc 2.28+: Ubuntu 20.04, Debian 10, RHEL 8 or newer), `x86_64-linux-musl` (static, any distro)
 - macOS: `x86_64-apple-darwin` (Intel), `aarch64-apple-darwin` (Apple Silicon)
 - Windows: `oxideclaw-windows-x64.exe`
 </details>

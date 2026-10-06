@@ -55,6 +55,23 @@ if [ "$os" = "linux" ]; then
     platform="linux-${arch}-musl"
   else
     platform="linux-${arch}"
+    # The gnu builds need glibc 2.28+. On an older x64 host the static musl
+    # build runs anyway; arm64 has no such fallback.
+    glibc=$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+$' || true)
+    if [ -n "$glibc" ]; then
+      major=${glibc%%.*}
+      minor=${glibc#*.}
+      if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 28 ]; }; then
+        if [ "$arch" = "x64" ]; then
+          echo "glibc ${glibc} is older than 2.28 — installing the static musl build."
+          platform="linux-x64-musl"
+        else
+          echo "glibc ${glibc} is older than 2.28, which the prebuilt ${arch} binary needs." >&2
+          echo "Build from source instead: cargo install oxideclaw" >&2
+          exit 1
+        fi
+      fi
+    fi
   fi
 else
   platform="macos-${arch}"
