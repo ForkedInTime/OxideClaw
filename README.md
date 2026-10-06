@@ -204,7 +204,7 @@ Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the too
 
 ### 🛡️ &nbsp; Sandbox-first execution
 
-Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; set `"sandboxAllowNetwork": false` to cut the network), or a `strict` mode that is only a best-effort denylist of catastrophic commands with no filesystem or network isolation (the only mode on macOS/Windows). Approvals are per-session, per-command-family.
+Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; set `"sandboxAllowNetwork": false` to cut the network), or a `strict` mode that is only a best-effort denylist of catastrophic commands with no filesystem or network isolation (the only mode on macOS/Windows). Approvals last for the session: `[a]lways` trusts the whole tool (for Bash, every shell command) until you quit; use `permissions.allow` rules such as `Bash(git:*)` for narrower trust.
 
 ### 📁 &nbsp; Respects your config like a native tool
 
