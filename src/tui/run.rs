@@ -111,6 +111,33 @@ fn session_snapshot_base(session_id: &str) -> std::path::PathBuf {
     Config::sessions_dir().join(session_id).join("snapshots")
 }
 
+/// Add a prompt to the history and give its turn a fresh `turn-N` snapshot
+/// dir. /rewind n cuts at the n-th last prompt and restores the last n turn
+/// dirs, so every prompt the agent runs (typed, slash command, skill,
+/// plugin) takes exactly one turn here, before its task is spawned. A
+/// command prompt that took none made /rewind 1 after /review restore the
+/// previous prompt's files; one pushed only by `Done` left a turn without a
+/// prompt when the request failed or was cancelled.
+fn push_prompt_turn(
+    messages: &mut Vec<Message>,
+    content: Vec<ContentBlock>,
+    turn_counter: &mut usize,
+    config: &mut Config,
+    snap_base: &std::path::Path,
+) {
+    messages.push(Message {
+        role: Role::User,
+        content,
+    });
+    *turn_counter += 1;
+    let snap_dir = snap_base.join(format!("turn-{}", *turn_counter));
+    // snapshot_file keeps the first copy it finds, so leftovers from an
+    // earlier run or a partly failed /rewind would stand in for this turn's
+    // pre-edit state and /rewind would restore them.
+    let _ = std::fs::remove_dir_all(&snap_dir);
+    config.file_snapshot_dir = Some(snap_dir);
+}
+
 /// Record the session base before an agent turn can touch files. Needed
 /// whenever the next snapshot would be the first after the base (position
 /// 0): without it turn 1 parents on HEAD and `/undo` to the session base
@@ -1535,6 +1562,38 @@ mod resume_turn_counter_tests {
         let msgs = vec![user_text("a"), tool_result, user_text("b"), user_text("c")];
         assert_eq!(resume_turn_counter(tmp.path(), &msgs), 3);
         assert_eq!(resume_turn_counter(&tmp.path().join("missing"), &[]), 0);
+    }
+
+    /// A typed prompt, then /review: the second prompt is in the history
+    /// before its task starts and snapshots into its own fresh turn-2, so
+    /// /rewind 1 restores only what /review's turn touched, not the typed
+    /// prompt's turn-1 copies.
+    #[test]
+    fn every_prompt_takes_its_own_snapshot_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join("turn-2");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("a.rs"), "old run").unwrap();
+        let mut messages = Vec::new();
+        let mut turn_counter = 0;
+        let mut config = Config::default();
+
+        for prompt in ["edit a.rs", "Review the changes"] {
+            push_prompt_turn(
+                &mut messages,
+                vec![ContentBlock::Text {
+                    text: prompt.into(),
+                }],
+                &mut turn_counter,
+                &mut config,
+                tmp.path(),
+            );
+        }
+
+        assert_eq!(messages.iter().filter(|m| is_prompt(m)).count(), 2);
+        assert_eq!(turn_counter, 2);
+        assert_eq!(config.file_snapshot_dir.as_deref(), Some(stale.as_path()));
+        assert!(!stale.exists(), "a leftover turn dir must not survive");
     }
 }
 

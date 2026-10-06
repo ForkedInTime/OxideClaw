@@ -651,20 +651,13 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 text: final_text.clone(),
             });
 
-            messages.push(Message {
-                role: Role::User,
-                content: user_content,
-            });
-
-            // Set snapshot directory for this turn (file history checkpointing)
-            *turn_counter += 1;
-            let snap_dir =
-                session_snapshot_base(&session.id).join(format!("turn-{}", *turn_counter));
-            // snapshot_file keeps the first copy it finds, so leftovers from
-            // an earlier run or a partly failed /rewind would stand in for
-            // this turn's pre-edit state and /rewind would restore them.
-            let _ = std::fs::remove_dir_all(&snap_dir);
-            config.file_snapshot_dir = Some(snap_dir);
+            push_prompt_turn(
+                messages,
+                user_content,
+                turn_counter,
+                config,
+                &session_snapshot_base(&session.id),
+            );
 
             // Background incremental re-index: pick up any files changed since last index.
             // Fire-and-forget — doesn't block the user's message from being sent.

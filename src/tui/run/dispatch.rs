@@ -251,19 +251,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.follow_bottom = true;
         }
         CommandAction::SendPrompt(prompt) => {
-            // Ephemeral prompt (e.g. /summary, /review) — send to Claude but
-            // do NOT add to the persistent messages history so it doesn't bleed
-            // into future turns.
+            // Command prompts (/review, /init, /commit, ...) are real turns:
+            // Done hands back the full history with the prompt in it.
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config).await;
-            // Snapshot: existing history + ephemeral prompt, but don't mutate messages
-            let mut snapshot = messages.clone();
-            snapshot.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: prompt }],
-            });
+            push_prompt_turn(
+                messages,
+                vec![ContentBlock::Text { text: prompt }],
+                turn_counter,
+                config,
+                &session_snapshot_base(&session.id),
+            );
+            let snapshot = messages.clone();
             let c2 = client.clone();
             let tvec = tools.to_vec();
             let cfg = config.clone();
@@ -1366,11 +1367,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.scroll_to_bottom();
                 app.start_loading();
                 begin_agent_turn(session, config).await;
-                let mut snapshot = messages.clone();
-                snapshot.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: prompt }],
-                });
+                push_prompt_turn(
+                    messages,
+                    vec![ContentBlock::Text { text: prompt }],
+                    turn_counter,
+                    config,
+                    &session_snapshot_base(&session.id),
+                );
+                let snapshot = messages.clone();
                 let c2 = client.clone();
                 let tvec = tools.to_vec();
                 let cfg = config.clone();
@@ -2373,11 +2377,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config).await;
-            let mut snapshot = messages.clone();
-            snapshot.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: prompt }],
-            });
+            push_prompt_turn(
+                messages,
+                vec![ContentBlock::Text { text: prompt }],
+                turn_counter,
+                config,
+                &session_snapshot_base(&session.id),
+            );
+            let snapshot = messages.clone();
             let c2 = client.clone();
             let tvec = tools.to_vec();
             let cfg = config.clone();
@@ -2413,11 +2420,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config).await;
-            let mut snapshot = messages.clone();
-            snapshot.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: prompt }],
-            });
+            push_prompt_turn(
+                messages,
+                vec![ContentBlock::Text { text: prompt }],
+                turn_counter,
+                config,
+                &session_snapshot_base(&session.id),
+            );
+            let snapshot = messages.clone();
             let c2 = client.clone();
             let tvec = tools.to_vec();
             let cfg = config.clone();
@@ -2635,12 +2645,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.scroll_to_bottom();
                 app.start_loading();
                 begin_agent_turn(session, config).await;
-                // Skills are also ephemeral — don't contaminate history
-                let mut snapshot = messages.clone();
-                snapshot.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: prompt }],
-                });
+                push_prompt_turn(
+                    messages,
+                    vec![ContentBlock::Text { text: prompt }],
+                    turn_counter,
+                    config,
+                    &session_snapshot_base(&session.id),
+                );
+                let snapshot = messages.clone();
                 let c2 = client.clone();
                 let tvec = skill_turn_tools(tools, config.disable_skill_shell_execution);
                 let cfg = config.clone();
