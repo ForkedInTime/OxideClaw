@@ -150,6 +150,9 @@ impl OllamaClient {
             stream_options: Some(OaiStreamOptions {
                 include_usage: true,
             }),
+            // Ollama maps this to num_predict.
+            max_tokens: Some(request.max_tokens),
+            max_completion_tokens: None,
         };
 
         let resp = self

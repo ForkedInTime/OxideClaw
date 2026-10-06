@@ -190,6 +190,15 @@ pub(crate) struct OaiRequest {
     pub tools: Vec<OaiTool>,
     pub stream: bool,
     pub stream_options: Option<OaiStreamOptions>,
+    /// Output cap for most servers. Without it each provider applies its own
+    /// default (DeepSeek: 4096), cutting long Write/Edit calls short and
+    /// ignoring `maxTokens` / `maxTokensByModel`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// OpenAI's own API rejects `max_tokens` on its reasoning models (o-series,
+    /// gpt-5) and wants this name instead; every model there accepts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -707,6 +716,7 @@ impl OpenAiCompatClient {
             translate_tools(&request.tools)
         };
 
+        let official_openai = prefix == "oai";
         let mut oai_request = OaiRequest {
             model: model.clone(),
             messages: oai_messages,
@@ -715,6 +725,8 @@ impl OpenAiCompatClient {
             stream_options: Some(OaiStreamOptions {
                 include_usage: true,
             }),
+            max_tokens: (!official_openai).then_some(request.max_tokens),
+            max_completion_tokens: official_openai.then_some(request.max_tokens),
         };
 
         // Nothing has reached `on_text` yet, so retrying cannot duplicate
@@ -883,5 +895,119 @@ mod api_key_tests {
             "sk-openai-secret"
         );
         assert_eq!(provider_api_key(provider("lmstudio"), only_openai), "");
+    }
+}
+
+#[cfg(test)]
+mod max_tokens_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answers one chat completion with an empty stream and returns the JSON
+    /// body the client sent.
+    async fn capture_one_body() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body_start = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection closed before the body");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..body_start]).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            while buf.len() < body_start + len {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection closed mid-body");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      connection: close\r\n\r\ndata: [DONE]\n\n",
+                )
+                .await;
+            let _ = sock.shutdown().await;
+            serde_json::from_slice(&buf[body_start..body_start + len]).unwrap()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn request(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.into(),
+            max_tokens: 12345,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            system: Default::default(),
+            tools: vec![],
+            stream: None,
+            thinking: None,
+            output_config: None,
+            betas: vec![],
+            session_id: None,
+        }
+    }
+
+    fn client(base_url: String) -> OpenAiCompatClient {
+        OpenAiCompatClient {
+            client: Client::new(),
+            base_url,
+            api_key: String::new(),
+            provider_name: "test".into(),
+            extra_headers: vec![],
+            no_tools: Arc::new(AtomicBool::new(false)),
+            tools_notice_sent: Arc::new(AtomicBool::new(false)),
+            echo_reasoning: false,
+            retry_notifier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_providers_receive_max_tokens() {
+        let (url, body) = capture_one_body().await;
+        let _ = client(url)
+            .messages_stream(request("deepseek:deepseek-chat"), |_| {})
+            .await;
+        let body = body.await.unwrap();
+        assert_eq!(body["max_tokens"], 12345, "{body}");
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn openai_receives_max_completion_tokens() {
+        let (url, body) = capture_one_body().await;
+        let _ = client(url)
+            .messages_stream(request("oai:o4-mini"), |_| {})
+            .await;
+        let body = body.await.unwrap();
+        assert_eq!(body["max_completion_tokens"], 12345, "{body}");
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn ollama_receives_max_tokens() {
+        let (url, body) = capture_one_body().await;
+        let _ = crate::api::ollama::OllamaClient::new(url)
+            .unwrap()
+            .messages_stream(request("ollama:qwen3"), |_| {})
+            .await;
+        let body = body.await.unwrap();
+        assert_eq!(body["max_tokens"], 12345, "{body}");
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
     }
 }
