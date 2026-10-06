@@ -525,6 +525,29 @@ pub trait Tool: Send + Sync {
 
 pub type DynTool = Arc<dyn Tool>;
 
+/// Apply `--tools` / `--allowed-tools` / `--disallowed-tools` (case-insensitive).
+/// Every entry point that builds a tool list must call this: embedders rely
+/// on the flags to keep Bash or Write away from the model.
+pub fn apply_tool_filters(tools: &mut Vec<DynTool>, config: &crate::config::Config) {
+    if !config.allowed_tools.is_empty() {
+        // `--tools ""` stores the "__none__" sentinel: no tools at all.
+        tools.retain(|t| {
+            config
+                .allowed_tools
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(t.name()))
+        });
+    }
+    if !config.disallowed_tools.is_empty() {
+        tools.retain(|t| {
+            !config
+                .disallowed_tools
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(t.name()))
+        });
+    }
+}
+
 /// Build the default tool set.
 pub fn default_tools(net: crate::net_policy::NetPolicy) -> Vec<DynTool> {
     vec![

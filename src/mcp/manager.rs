@@ -182,6 +182,43 @@ cat >/dev/null"#;
         assert!(names.contains(&"Read"), "built-ins must still be there");
     }
 
+    /// ACP and `--headless` sessions take their tools from here; the CLI
+    /// filters used to apply only in -p and the TUI.
+    #[tokio::test]
+    async fn tools_for_config_applies_the_cli_tool_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::config::Config {
+            cwd: dir.path().to_path_buf(),
+            strict_mcp_config: true,
+            ..Default::default()
+        };
+        let names = |tools: Vec<crate::tools::DynTool>| -> Vec<String> {
+            tools.iter().map(|t| t.name().to_string()).collect()
+        };
+
+        let cfg = crate::config::Config {
+            disallowed_tools: vec!["bash".into(), "Write".into()],
+            ..base.clone()
+        };
+        let got = names(crate::mcp::tools_for_config(&cfg).await);
+        assert!(!got.iter().any(|n| n == "Bash" || n == "Write"), "{got:?}");
+        assert!(got.iter().any(|n| n == "Read"), "{got:?}");
+
+        let cfg = crate::config::Config {
+            allowed_tools: vec!["read".into(), "Grep".into()],
+            ..base.clone()
+        };
+        let mut got = names(crate::mcp::tools_for_config(&cfg).await);
+        got.sort();
+        assert_eq!(got, ["Grep", "Read"]);
+
+        let cfg = crate::config::Config {
+            allowed_tools: vec!["__none__".into()],
+            ..base
+        };
+        assert!(crate::mcp::tools_for_config(&cfg).await.is_empty());
+    }
+
     /// `/mcp disable` and `/plugin disable` write `"disabled": true` into the
     /// server's settings entry; that server must not be launched.
     #[tokio::test]

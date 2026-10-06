@@ -1092,27 +1092,6 @@ async fn main() -> Result<()> {
         };
 
         let mut tools = crate::mcp::tools_for_config(&config).await;
-        if !config.allowed_tools.is_empty() {
-            // "__none__" sentinel means no tools allowed
-            if config.allowed_tools.iter().any(|a| a == "__none__") {
-                tools.clear();
-            } else {
-                tools.retain(|t| {
-                    config
-                        .allowed_tools
-                        .iter()
-                        .any(|a| a.eq_ignore_ascii_case(t.name()))
-                });
-            }
-        }
-        if !config.disallowed_tools.is_empty() {
-            tools.retain(|t| {
-                !config
-                    .disallowed_tools
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(t.name()))
-            });
-        }
 
         // --json-schema: add a SyntheticOutputTool named "result" with the user's schema
         let json_schema_str = config.json_schema.clone();

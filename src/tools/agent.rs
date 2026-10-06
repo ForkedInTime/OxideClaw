@@ -198,22 +198,7 @@ impl Tool for AgentTool {
             tools.retain(|t| allowed.iter().any(|a| a.eq_ignore_ascii_case(t.name())));
         }
         // Apply parent allowed/disallowed tool filters too
-        if !sub_config.allowed_tools.is_empty() {
-            tools.retain(|t| {
-                sub_config
-                    .allowed_tools
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(t.name()))
-            });
-        }
-        if !sub_config.disallowed_tools.is_empty() {
-            tools.retain(|t| {
-                !sub_config
-                    .disallowed_tools
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(t.name()))
-            });
-        }
+        crate::tools::apply_tool_filters(&mut tools, &sub_config);
 
         let mut sub_engine = self.build_sub_engine(sub_config, tools, ctx)?;
         sub_engine.query_and_collect(&input.prompt).await

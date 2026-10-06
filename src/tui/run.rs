@@ -235,23 +235,7 @@ async fn run_loop(
     let browser_session_for_app = shared_state.browser_session.clone();
     let spawn_registry = crate::spawn::new_registry();
 
-    // Apply --allowed-tools / --disallowed-tools CLI filters
-    if !config.allowed_tools.is_empty() {
-        tools.retain(|t| {
-            config
-                .allowed_tools
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(t.name()))
-        });
-    }
-    if !config.disallowed_tools.is_empty() {
-        tools.retain(|t| {
-            !config
-                .disallowed_tools
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(t.name()))
-        });
-    }
+    crate::tools::apply_tool_filters(&mut tools, &config);
     let perm_state = PermissionState::new(
         config.dangerously_skip_permissions,
         &config.permissions_allow,

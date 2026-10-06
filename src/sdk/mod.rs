@@ -347,7 +347,8 @@ impl SdkServer {
 
                 // Clone config and build tools
                 let cfg = config.clone();
-                let (all_tools_list, shared_state) = crate::tools::all_tools_with_state(&cfg);
+                let (mut all_tools_list, shared_state) = crate::tools::all_tools_with_state(&cfg);
+                crate::tools::apply_tool_filters(&mut all_tools_list, &cfg);
                 let browser_session = shared_state.browser_session.clone();
 
                 // Channels: progress events from browse loop → notif forwarding task
