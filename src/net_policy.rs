@@ -9,7 +9,10 @@
 //! Two tiers:
 //!
 //! - **Always denied**: link-local (the metadata service lives there),
-//!   unspecified, multicast, broadcast. No agent use case exists.
+//!   unspecified, multicast, broadcast, plus the metadata endpoints that sit
+//!   outside link-local: Alibaba Cloud's `100.100.100.200` (inside CGNAT)
+//!   and AWS's IPv6 IMDS `fd00:ec2::254` (inside ULA). No agent use case
+//!   exists.
 //! - **Private** (loopback, RFC 1918, CGNAT, ULA): denied unless the policy
 //!   opts in. Developers do legitimately fetch `localhost:3000`, so the
 //!   opt-in is a plain setting (`allowPrivateNetworkFetch`), and the
@@ -21,7 +24,7 @@
 //! by hand so every hop goes through the same check.
 
 use anyhow::{Result, anyhow, bail};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio_stream::StreamExt;
 use url::{Host, Url};
 
@@ -31,6 +34,11 @@ pub const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     ")"
 );
+
+/// Cloud metadata endpoints that fall inside a *private* range rather than
+/// link-local, so the private opt-in would otherwise let them through.
+const METADATA_V4: [Ipv4Addr; 1] = [Ipv4Addr::new(100, 100, 100, 200)];
+const METADATA_V6: [Ipv6Addr; 1] = [Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)];
 
 /// Hard cap on redirect hops `fetch` will follow.
 pub const MAX_REDIRECTS: usize = 5;
@@ -75,14 +83,18 @@ impl NetPolicy {
                     || v4.is_multicast()
                     || v4.is_broadcast()
                     || v4.is_documentation()
+                    || METADATA_V4.contains(&v4)
             }
             IpAddr::V6(v6) => {
-                v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
+                v6.is_unspecified()
+                    || v6.is_multicast()
+                    || v6.is_unicast_link_local()
+                    || METADATA_V6.contains(&v6)
             }
         };
         if always_denied {
             bail!(
-                "destination {ip} is link-local or reserved and is never fetched (cloud metadata lives there)"
+                "destination {ip} is link-local, reserved or a cloud metadata endpoint and is never fetched"
             );
         }
         let private = match ip {
@@ -459,7 +471,15 @@ mod tests {
 
     #[test]
     fn link_local_and_metadata_are_denied_even_when_private_is_allowed() {
-        for a in ["169.254.169.254", "169.254.0.1", "fe80::1"] {
+        for a in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            // Alibaba Cloud (inside CGNAT) and AWS IPv6 IMDS (inside ULA).
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "::ffff:100.100.100.200",
+        ] {
             assert!(NetPolicy::LOCAL_OK.check_ip(ip(a)).is_err(), "{a}");
             assert!(NetPolicy::STRICT.check_ip(ip(a)).is_err(), "{a}");
         }
