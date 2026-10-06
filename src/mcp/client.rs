@@ -177,6 +177,10 @@ pub(crate) struct HttpTransport {
     /// `initialize`; every later request must echo it or the server
     /// answers 400.
     session_id: std::sync::Mutex<Option<String>>,
+    /// Deadline for a whole exchange, body included. `send()` resolves at
+    /// the headers, so a server that then stalls would otherwise hang the
+    /// tool call forever; reqwest has no default read timeout.
+    timeout: Duration,
 }
 
 impl HttpTransport {
@@ -204,6 +208,7 @@ impl HttpTransport {
             url: url.to_string(),
             client: builder.build()?,
             session_id: std::sync::Mutex::new(None),
+            timeout: REQUEST_TIMEOUT,
         })
     }
 }
@@ -221,7 +226,7 @@ impl HttpTransport {
             .clone()
     }
 
-    async fn post(&self, req: &JsonRpcRequest, method: &str) -> Result<reqwest::Response> {
+    async fn post(&self, req: &JsonRpcRequest) -> Result<reqwest::Response> {
         // Streamable-HTTP servers reject (406) a POST that does not accept
         // both; they may answer with plain JSON or an SSE stream.
         let mut builder = self
@@ -232,10 +237,7 @@ impl HttpTransport {
         if let Some(sid) = self.session() {
             builder = builder.header("Mcp-Session-Id", sid);
         }
-        let resp = tokio::time::timeout(REQUEST_TIMEOUT, builder.json(req).send())
-            .await
-            .map_err(|_| anyhow!("HTTP MCP request timed out ({})", method))??;
-        Ok(resp)
+        Ok(builder.json(req).send().await?)
     }
 
     /// Read a response body, refusing it once it exceeds the cap.
@@ -271,39 +273,34 @@ impl HttpTransport {
         method: &str,
     ) -> Result<JsonRpcResponse> {
         use tokio_stream::StreamExt;
-        let read = async {
-            let mut stream = resp.bytes_stream();
-            let mut buf: Vec<u8> = Vec::new();
-            let mut total = 0usize;
-            // Bytes of `buf` already searched for an event end, so a large
-            // event arriving in small chunks is not rescanned each time.
-            let mut scanned = 0usize;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                total += chunk.len();
-                if total > MAX_HTTP_BODY_BYTES {
-                    return Err(anyhow!(
-                        "HTTP MCP {method} response too large (limit {MAX_HTTP_BODY_BYTES} bytes)"
-                    ));
-                }
-                buf.extend_from_slice(&chunk);
-                while let Some((end, sep)) = sse_event_end(&buf, scanned) {
-                    let event: Vec<u8> = buf.drain(..end + sep).collect();
-                    scanned = 0;
-                    if let Some(r) = sse_event_response(&event[..end], id) {
-                        return Ok(r);
-                    }
-                }
-                // A terminator may straddle the next chunk boundary.
-                scanned = buf.len().saturating_sub(3);
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut total = 0usize;
+        // Bytes of `buf` already searched for an event end, so a large
+        // event arriving in small chunks is not rescanned each time.
+        let mut scanned = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            total += chunk.len();
+            if total > MAX_HTTP_BODY_BYTES {
+                return Err(anyhow!(
+                    "HTTP MCP {method} response too large (limit {MAX_HTTP_BODY_BYTES} bytes)"
+                ));
             }
-            // A final event may lack the trailing blank line.
-            sse_event_response(&buf, id)
-                .ok_or_else(|| anyhow!("HTTP MCP {method}: event stream ended without a response"))
-        };
-        tokio::time::timeout(REQUEST_TIMEOUT, read)
-            .await
-            .map_err(|_| anyhow!("HTTP MCP request timed out ({})", method))?
+            buf.extend_from_slice(&chunk);
+            while let Some((end, sep)) = sse_event_end(&buf, scanned) {
+                let event: Vec<u8> = buf.drain(..end + sep).collect();
+                scanned = 0;
+                if let Some(r) = sse_event_response(&event[..end], id) {
+                    return Ok(r);
+                }
+            }
+            // A terminator may straddle the next chunk boundary.
+            scanned = buf.len().saturating_sub(3);
+        }
+        // A final event may lack the trailing blank line.
+        sse_event_response(&buf, id)
+            .ok_or_else(|| anyhow!("HTTP MCP {method}: event stream ended without a response"))
     }
 }
 
@@ -345,11 +342,10 @@ fn sse_event_response(event: &[u8], id: u64) -> Option<JsonRpcResponse> {
     serde_json::from_value(v).ok()
 }
 
-#[async_trait]
-impl McpTransport for HttpTransport {
-    async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+impl HttpTransport {
+    async fn call_inner(&self, id: u64, method: &str, params: Value) -> Result<Value> {
         let req = JsonRpcRequest::new(id, method, params);
-        let resp = self.post(&req, method).await?;
+        let resp = self.post(&req).await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -396,12 +392,21 @@ impl McpTransport for HttpTransport {
 
         Ok(rpc_resp.result.unwrap_or(Value::Null))
     }
+}
+
+#[async_trait]
+impl McpTransport for HttpTransport {
+    async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+        tokio::time::timeout(self.timeout, self.call_inner(id, method, params))
+            .await
+            .map_err(|_| anyhow!("HTTP MCP request timed out ({method})"))?
+    }
 
     /// Streamable-HTTP servers expect `notifications/initialized` like any
     /// other transport; a notification has no id and its reply is ignored.
     async fn notify(&self, method: &str) {
         let req = JsonRpcRequest::notification(method);
-        let _ = self.post(&req, method).await;
+        let _ = tokio::time::timeout(self.timeout, self.post(&req)).await;
     }
 }
 
@@ -1017,6 +1022,36 @@ mod hardening_tests {
         for req in &seen[1..] {
             assert!(req.contains("mcp-session-id: sess-42"), "{req}");
         }
+    }
+
+    /// `send()` resolves at the headers; a body that then never finishes
+    /// used to hang the tool call forever.
+    #[tokio::test]
+    async fn http_transport_times_out_a_stalled_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut tmp = [0u8; 4096];
+            let _ = sock.read(&mut tmp).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 100\r\n\r\n{\"jsonrpc\"",
+                )
+                .await;
+            // Hold the connection open without finishing the body.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        let mut t = HttpTransport::new(&base, &HashMap::new()).unwrap();
+        t.timeout = Duration::from_millis(300);
+        let err = tokio::time::timeout(Duration::from_secs(10), t.call(1, "tools/call", json!({})))
+            .await
+            .expect("the transport's own deadline must fire")
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     /// A server answering with a multi-gigabyte body must be refused, not
