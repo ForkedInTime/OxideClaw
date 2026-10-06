@@ -1835,16 +1835,49 @@ mod instruction_file_symlink_tests {
 /// Write a settings/config JSON file atomically (sibling temp file + rename)
 /// so a crash mid-write never leaves the user's settings truncated.
 /// Creates the parent directory if needed.
+///
+/// The rename installs a new inode, so the file's mode and a symlink at
+/// `path` would otherwise be lost: a `chmod 600` settings.json came back
+/// umask-default (group-writable under umask 002, which makes
+/// `apiKeyHelper` get ignored; world-readable MCP tokens under 022), and a
+/// dotfile manager's link was replaced by a forked copy. Writes go to the
+/// link's target with the old mode (0600 for a new file).
 pub fn write_json_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    // A missing file or dangling link does not resolve; write `path` itself.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let tmp = target.with_extension(format!("json.{}.tmp", std::process::id()));
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&target)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600)
+    };
     let result = (|| {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // Not create_new: a stale temp from a crashed process whose PID
+            // was reused must not make every save fail.
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            // Explicit chmod, before any secret is written: the open mode
+            // is masked by umask and does not apply to a reused temp file.
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            f
+        };
+        #[cfg(not(unix))]
         let mut f = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut f, contents.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, &target)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -1883,6 +1916,72 @@ mod atomic_settings_write_tests {
         let path = dir.path().join("deep").join("settings.json");
         write_json_atomic(&path, "{}").unwrap();
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A model switch rewrote a chmod-600 settings.json with the umask
+    /// default, which turned off apiKeyHelper under umask 002 and exposed
+    /// MCP tokens under 022.
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for m in [0o600, 0o644] {
+            let path = dir.path().join(format!("settings-{m:o}.json"));
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).unwrap();
+            write_json_atomic(&path, "{\"model\": \"x\"}").unwrap();
+            assert_eq!(mode(&path), m);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        write_json_atomic(&path, "{}").unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    /// Dotfile managers (stow, home-manager) symlink settings.json; the
+    /// first setting change replaced the link with a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real = real_dir.join("claude-settings.json");
+        std::fs::write(&real, "{}").unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_json_atomic(&link, "{\"new\": true}").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "{\"new\": true}");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .chain(std::fs::read_dir(&real_dir).unwrap())
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".tmp")),
+            "temp files left behind: {names:?}"
+        );
     }
 }
 
