@@ -210,6 +210,8 @@ pub(crate) struct OaiStreamOptions {
 
 #[derive(Deserialize)]
 pub(crate) struct OaiChunk {
+    // Absent on error and usage-only chunks from some servers.
+    #[serde(default)]
     pub choices: Vec<OaiChoice>,
     #[serde(default)]
     pub usage: Option<OaiUsage>,
@@ -449,8 +451,32 @@ pub(crate) fn patch_system_no_tools(system: &str) -> String {
     format!("{patched}\n- Text-only mode: answer from knowledge, no file/command access.")
 }
 
+/// The message of a mid-stream error chunk, if `chunk` is one. OpenAI,
+/// Ollama and OpenRouter send `{"error": {...}}` (OpenRouter alongside
+/// `finish_reason: "error"`); vLLM sends `{"object": "error", "message": ...}`.
+/// Providers have already answered 200 by then, so this is the only place
+/// the failure shows up.
+fn chunk_error(chunk: &serde_json::Value) -> Option<String> {
+    let err = match chunk.get("error") {
+        Some(e) if !e.is_null() => e,
+        _ if chunk.get("object").and_then(|o| o.as_str()) == Some("error") => chunk,
+        _ => return None,
+    };
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| err.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string());
+    Some(msg)
+}
+
 /// Parse an SSE stream of OpenAI-format chunks into a StreamedResponse.
 /// Shared between OllamaClient and OpenAiCompatClient.
+///
+/// A provider failure after the 200 is an `Err`, never a short reply that
+/// looks finished: the caller would otherwise save a truncated answer, or
+/// run a tool whose cut-off arguments parsed to `{}`.
 pub(crate) async fn parse_oai_stream(
     resp: reqwest::Response,
     mut on_text: impl FnMut(&str),
@@ -462,14 +488,27 @@ pub(crate) async fn parse_oai_stream(
     let mut thinking_buf = String::new();
     let mut tool_bufs: HashMap<usize, (String, String, String)> = HashMap::new();
     let mut finish_reason: Option<String> = None;
+    let mut saw_done = false;
 
     while let Some(event) = super::next_sse_event(&mut stream).await? {
         if event.data == "[DONE]" {
+            saw_done = true;
             break;
         }
 
-        let chunk: OaiChunk = match serde_json::from_str(&event.data) {
-            Ok(c) => c,
+        let chunk: OaiChunk = match serde_json::from_str::<serde_json::Value>(&event.data) {
+            Ok(v) => {
+                if let Some(msg) = chunk_error(&v) {
+                    return Err(anyhow!("provider stream error: {msg}"));
+                }
+                match serde_json::from_value(v) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to parse SSE chunk: {e}: {}", event.data);
+                        continue;
+                    }
+                }
+            }
             Err(e) => {
                 warn!("Failed to parse SSE chunk: {e}: {}", event.data);
                 continue;
@@ -524,6 +563,19 @@ pub(crate) async fn parse_oai_stream(
                 }
             }
         }
+    }
+
+    if finish_reason.as_deref() == Some("error") {
+        return Err(anyhow!(
+            "provider stream error: the reply ended with finish_reason \"error\""
+        ));
+    }
+    // A clean close with neither marker is a dropped connection (proxy or
+    // server restart), not a finished reply.
+    if !saw_done && finish_reason.is_none() {
+        return Err(anyhow!(
+            "provider stream ended before the reply finished (no finish_reason or [DONE])"
+        ));
     }
 
     // ── Assemble final ContentBlocks ─────────────────────────────────────────
@@ -1009,5 +1061,101 @@ mod max_tokens_tests {
         let body = body.await.unwrap();
         assert_eq!(body["max_tokens"], 12345, "{body}");
         assert!(body.get("max_completion_tokens").is_none(), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod stream_error_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `body` as one SSE response and parses it.
+    async fn parse(body: &'static str) -> Result<StreamedResponse> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        let resp = reqwest::get(format!("http://{addr}")).await.unwrap();
+        parse_oai_stream(resp, |_| {}).await.map(|(r, _)| r)
+    }
+
+    #[tokio::test]
+    async fn error_chunk_is_an_error() {
+        let err = parse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hal\"},\"finish_reason\":null}]}\n\n\
+             data: {\"error\":{\"message\":\"model overloaded\",\"code\":503}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("model overloaded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn vllm_error_object_is_an_error() {
+        let err = parse(
+            "data: {\"object\":\"error\",\"message\":\"context too long\",\"code\":400}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("context too long"), "{err}");
+    }
+
+    /// OpenRouter: the error rides on a normal-looking chunk whose tool call
+    /// was cut off mid-arguments.
+    #[tokio::test]
+    async fn finish_reason_error_is_an_error() {
+        let err = parse(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\
+             \"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"file_pa\"}}]},\
+             \"finish_reason\":null}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("error"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_closed_without_an_end_marker_is_an_error() {
+        let err = parse("data: {\"choices\":[{\"delta\":{\"content\":\"Half an ans\"}}]}\n\n")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("before the reply finished"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_streams_still_parse() {
+        let r = parse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(r.usage.output_tokens, 1);
+        // A server that closes after finish_reason without [DONE] is fine.
+        let r = parse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.content, vec![ContentBlock::Text { text: "hi".into() }]);
     }
 }
