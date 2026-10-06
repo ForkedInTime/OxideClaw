@@ -181,6 +181,21 @@ pub async fn run_user_prompt_hooks(
         if !r.should_continue {
             return r;
         }
+        // `{"decision":"block"}` is the documented way for this hook to
+        // reject a prompt; it does not set `continue: false`.
+        if r.decision == Some(HookDecision::Block) {
+            let stop_reason = r.stop_reason.clone().or_else(|| {
+                Some(format!(
+                    "Blocked by UserPromptSubmit hook '{}'",
+                    hook.command
+                ))
+            });
+            return HookResult {
+                should_continue: false,
+                stop_reason,
+                ..r
+            };
+        }
         if let Some(ctx) = r.additional_context {
             additional.push(ctx);
         }
@@ -381,9 +396,20 @@ where
 fn hook_shell(login_shell: Option<&str>) -> String {
     login_shell
         .filter(|s| {
+            let name = std::path::Path::new(s)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            // Git Bash/MSYS hands native programs `...\bash.exe`.
+            let name = match name.len().checked_sub(4) {
+                Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".exe") => {
+                    &name[..i]
+                }
+                _ => name,
+            };
             matches!(
-                std::path::Path::new(s).file_name().and_then(|n| n.to_str()),
-                Some("sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "yash")
+                name.to_ascii_lowercase().as_str(),
+                "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "yash"
             )
         })
         .unwrap_or("sh")
@@ -596,6 +622,19 @@ mod tests {
         for posix in ["/bin/bash", "/usr/bin/zsh", "/bin/sh", "/bin/dash"] {
             assert_eq!(hook_shell(Some(posix)), posix);
         }
+        // Windows shells carry `.exe`, in any case.
+        for exe in ["/usr/bin/bash.exe", "/usr/bin/BASH.EXE"] {
+            assert_eq!(hook_shell(Some(exe)), exe);
+        }
+        assert_eq!(hook_shell(Some("/usr/bin/fish.exe")), "sh");
+        assert_eq!(hook_shell(Some("/usr/bin/bash.old")), "sh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_on_windows_keeps_its_shell() {
+        let p = r"C:\Program Files\Git\usr\bin\bash.exe";
+        assert_eq!(hook_shell(Some(p)), p);
     }
 
     fn cfg_pre(command: &str) -> HooksConfig {
@@ -877,6 +916,15 @@ mod tests {
         let r = prompt_hooks(&["echo context", "echo 'contains a secret'; exit 2"]).await;
         assert!(!r.should_continue, "exit 2 must stop the prompt");
         assert_eq!(r.stop_reason.as_deref(), Some("contains a secret"));
+    }
+
+    /// `decision: block` was mapped to should_continue = true, so the
+    /// prompt was sent anyway.
+    #[tokio::test]
+    async fn prompt_hook_decision_block_stops_the_prompt() {
+        let r = prompt_hooks(&[r#"echo '{"decision":"block","reason":"x"}'"#]).await;
+        assert!(!r.should_continue);
+        assert_eq!(r.stop_reason.as_deref(), Some("x"));
     }
 
     #[tokio::test]
