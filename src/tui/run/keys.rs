@@ -731,6 +731,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             let ctx = CommandContext {
                 config,
                 tokens_in: app.tokens_in,
+                context_window: app.context_window,
                 tokens_out: app.tokens_out,
                 cache_read_tokens: app.cache_read_tokens,
                 cost_summary: app.cost_tracker.summary(),

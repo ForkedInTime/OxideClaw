@@ -17,20 +17,48 @@ use crate::api::types::*;
 ///     available via `/compact` or triggered automatically when auto-compact
 ///     is enabled and the snip threshold has already been crossed.
 ///
-/// Token thresholds (mirroring apiMicrocompact.ts DEFAULT_* values):
-///   160 000  →  warn user that context is getting full
-///   170 000  →  auto-snip (if auto_compact_enabled)
-///   180 000  →  auto-summarise (if auto_compact_enabled)
+/// Token thresholds scale with the model's context window (80% warn, 85% snip,
+/// 90% summarise), which on a 200k window are apiMicrocompact.ts's
+/// 160k / 170k / 180k DEFAULT_* values.
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::config::Config;
 use anyhow::Result;
 
-/// Warn the user at this many input tokens.
-pub const COMPACT_WARN_TOKENS: u64 = 160_000;
-/// Auto-snip at this threshold.
-pub const COMPACT_SNIP_TOKENS: u64 = 170_000;
-/// Auto-summarise at this threshold.
-pub const COMPACT_SUMMARISE_TOKENS: u64 = 180_000;
+/// `(warn, snip, summarise)` input-token thresholds for a context window.
+pub fn thresholds(window: u64) -> (u64, u64, u64) {
+    (window / 100 * 80, window / 100 * 85, window / 100 * 90)
+}
+
+/// The window to compact against: the smallest among the configured model and
+/// every model a router may send the next turn to. A history that is fine on a
+/// 1M model is a prompt-too-long 400 once a simple prompt routes to Haiku.
+pub fn compaction_window(config: &Config, router: Option<&crate::router::RouterConfig>) -> u64 {
+    let mut models: Vec<&str> = vec![&config.model];
+    if let Some(r) = router.filter(|r| r.enabled) {
+        models.extend([
+            r.low_model.as_str(),
+            r.medium_model.as_str(),
+            r.high_model.as_str(),
+            r.super_high_model.as_str(),
+        ]);
+    }
+    let p = &config.phase_router;
+    if p.enabled {
+        models.extend([
+            p.research_model.as_str(),
+            p.plan_model.as_str(),
+            p.edit_model.as_str(),
+            p.review_model.as_str(),
+            p.default_model.as_str(),
+        ]);
+    }
+    models
+        .into_iter()
+        .filter(|m| !m.is_empty())
+        .map(crate::api::context_window_for_model)
+        .min()
+        .unwrap_or(200_000)
+}
 
 /// How many recent messages snipCompact always keeps untouched.
 const SNIP_KEEP_RECENT: usize = 20;
@@ -44,13 +72,15 @@ pub enum CompactNeeded {
     Summarise,
 }
 
-/// Decide what action to take based on the latest input_tokens count.
-pub fn compact_needed(input_tokens: u64) -> CompactNeeded {
-    if input_tokens >= COMPACT_SUMMARISE_TOKENS {
+/// Decide what action to take based on the latest input_tokens count and the
+/// context window it is measured against.
+pub fn compact_needed(input_tokens: u64, window: u64) -> CompactNeeded {
+    let (warn, snip, summarise) = thresholds(window);
+    if input_tokens >= summarise {
         CompactNeeded::Summarise
-    } else if input_tokens >= COMPACT_SNIP_TOKENS {
+    } else if input_tokens >= snip {
         CompactNeeded::Snip
-    } else if input_tokens >= COMPACT_WARN_TOKENS {
+    } else if input_tokens >= warn {
         CompactNeeded::Warn
     } else {
         CompactNeeded::None
@@ -379,6 +409,35 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()).unwrap();
         assert!(body["max_tokens"].as_u64().unwrap() >= 32_000, "{body}");
         assert_eq!(body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn thresholds_scale_with_the_window() {
+        assert_eq!(thresholds(200_000), (160_000, 170_000, 180_000));
+        // 180k on a 1M model is 18% full: nothing to do yet.
+        assert_eq!(compact_needed(180_000, 1_000_000), CompactNeeded::None);
+        assert_eq!(compact_needed(180_000, 200_000), CompactNeeded::Summarise);
+        assert_eq!(compact_needed(900_000, 1_000_000), CompactNeeded::Summarise);
+    }
+
+    #[test]
+    fn routed_sessions_compact_for_the_smallest_candidate() {
+        let cfg = config();
+        assert_eq!(compaction_window(&cfg, None), 1_000_000);
+
+        let mut router = crate::router::RouterConfig::new(&cfg.model);
+        assert_eq!(
+            compaction_window(&cfg, Some(&router)),
+            1_000_000,
+            "router off"
+        );
+        router.enabled = true;
+        // Default low tier is Haiku 4.5 (200k).
+        assert_eq!(compaction_window(&cfg, Some(&router)), 200_000);
+
+        let mut phased = config();
+        phased.phase_router.enabled = true;
+        assert_eq!(compaction_window(&phased, None), 200_000);
     }
 
     #[test]

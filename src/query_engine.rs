@@ -3,7 +3,9 @@
 use crate::api::types::*;
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::browser::middleware::MiddlewareVerdict;
-use crate::compact::{CompactNeeded, compact_needed, snip_compact, summarize_compact};
+use crate::compact::{
+    CompactNeeded, compact_needed, compaction_window, snip_compact, summarize_compact,
+};
 use crate::config::Config;
 use crate::rag;
 use crate::tools::{DynTool, ToolContext};
@@ -313,16 +315,18 @@ impl QueryEngine {
             }
 
             // Context compaction check
-            match compact_needed(response.usage.input_tokens) {
+            let window = compaction_window(&self.config, None);
+            match compact_needed(response.usage.input_tokens, window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
                     eprintln!(
                         "{}",
                         format!(
-                            "Warning: context is {:.0}% full ({} / ~200k tokens). \
+                            "Warning: context is {:.0}% full ({} / {} tokens). \
                              Use /compact or enable auto_compact.",
-                            response.usage.input_tokens as f64 / 2000.0,
-                            response.usage.input_tokens
+                            response.usage.input_tokens as f64 * 100.0 / window as f64,
+                            response.usage.input_tokens,
+                            window
                         )
                         .yellow()
                     );

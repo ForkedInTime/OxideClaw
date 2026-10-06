@@ -450,6 +450,84 @@ pub fn default_max_tokens() -> u32 {
     DEFAULT_MAX_TOKENS
 }
 
+/// Context window (input tokens) for `model`. Compaction thresholds and every
+/// "context % full" display scale with this, so it must not undercount: a
+/// 200k guess on a 1M model throws away history at 18% of the real window.
+pub fn context_window_for_model(model: &str) -> u64 {
+    let m = crate::commands::resolve_model_alias(model).to_lowercase();
+    // Bedrock/Vertex ids wrap the first-party id (`us.anthropic.claude-…`,
+    // `claude-…@date`), so parse from the `claude-` token on.
+    if let Some(i) = m.find("claude-") {
+        let id = m[i..].split(['@', ':']).next().unwrap_or_default();
+        let one_million = if id.contains("-fable") || id.contains("-mythos") {
+            true
+        } else if id.contains("-opus") || id.contains("-sonnet") {
+            matches!(thinking::model_version(id), Some((major, minor)) if major >= 5 || (major == 4 && minor >= 6))
+        } else {
+            // Haiku 4.5 and every Claude 3.x model.
+            false
+        };
+        return if one_million { 1_000_000 } else { 200_000 };
+    }
+    if ["gpt-4o", "gpt-4", "llama"].iter().any(|k| m.contains(k)) {
+        128_000
+    } else if m.contains("deepseek") {
+        64_000
+    } else if m.contains("mistral") {
+        32_000
+    } else if m.contains("gemma") {
+        8_192
+    } else {
+        // Unknown models: assume a 200k Claude-class window.
+        200_000
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::context_window_for_model as w;
+
+    #[test]
+    fn current_claude_models_have_a_1m_window() {
+        for m in [
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "sonnet",
+            "opus",
+            "us.anthropic.claude-opus-4-8",
+        ] {
+            assert_eq!(w(m), 1_000_000, "{m}");
+        }
+    }
+
+    #[test]
+    fn haiku_and_older_claude_models_stay_at_200k() {
+        for m in [
+            "claude-haiku-4-5",
+            "haiku",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-1",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet-20250219",
+            "claude-opus-4-5@20251101",
+        ] {
+            assert_eq!(w(m), 200_000, "{m}");
+        }
+    }
+
+    #[test]
+    fn non_claude_models_keep_their_table_values() {
+        assert_eq!(w("groq:llama-3.3-70b"), 128_000);
+        assert_eq!(w("deepseek-chat"), 64_000);
+        assert_eq!(w("something-new"), 200_000);
+    }
+}
+
 // ─── Unified backend ──────────────────────────────────────────────────────────
 
 /// Routes API calls to the Anthropic, Ollama, or OpenAI-compatible backend

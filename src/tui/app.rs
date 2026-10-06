@@ -677,6 +677,9 @@ pub struct App {
     pub router: crate::router::RouterConfig,
     /// Session cost tracker with per-model breakdown.
     pub cost_tracker: crate::cost::CostTracker,
+    /// Context window the status bar's ctx % is measured against; the main
+    /// loop keeps it equal to the window auto-compaction uses.
+    pub context_window: u64,
 
     /// Shared browser session — populated from `SharedToolState::browser_session`
     /// so `/browser`, `/browse`, `/screenshot` and the `browser_*` tools all
@@ -825,6 +828,7 @@ impl App {
             pending_redo_positions: None,
             router: crate::router::RouterConfig::new(model),
             cost_tracker: crate::cost::CostTracker::new(),
+            context_window: crate::api::context_window_for_model(model),
             browser_session: None,
             watcher: None,
             browse_approval: None,

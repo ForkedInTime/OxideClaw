@@ -66,7 +66,7 @@ pub(super) fn cmd_cost(ctx: &CommandContext) -> CommandAction {
 }
 
 pub(super) fn cmd_context(ctx: &CommandContext) -> CommandAction {
-    let limit: u64 = 200_000;
+    let limit = ctx.context_window;
     let used = ctx.tokens_in;
     let pct = (used * 100).checked_div(limit).unwrap_or(0);
     let bar_len = 30usize;
@@ -433,7 +433,7 @@ pub(super) fn cmd_env(ctx: &CommandContext) -> CommandAction {
 }
 
 pub(super) fn cmd_ctx_viz(ctx: &CommandContext) -> CommandAction {
-    let limit: u64 = 200_000;
+    let limit = ctx.context_window;
     let used = ctx.tokens_in;
     let pct = (used * 100).checked_div(limit).unwrap_or(0);
 
@@ -449,11 +449,8 @@ pub(super) fn cmd_ctx_viz(ctx: &CommandContext) -> CommandAction {
         format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled))
     };
 
-    let thresholds = [
-        (crate::compact::COMPACT_WARN_TOKENS, "warn"),
-        (crate::compact::COMPACT_SNIP_TOKENS, "snip"),
-        (crate::compact::COMPACT_SUMMARISE_TOKENS, "summarise"),
-    ];
+    let (warn, snip, summarise) = crate::compact::thresholds(limit);
+    let thresholds = [(warn, "warn"), (snip, "snip"), (summarise, "summarise")];
 
     let mut lines = vec![
         "Context Visualizer\n".to_string(),

@@ -2,7 +2,9 @@
 use crate::api::types::*;
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::commands::{CommandAction, CommandContext, dispatch};
-use crate::compact::{CompactNeeded, compact_needed, snip_compact, summarize_compact};
+use crate::compact::{
+    CompactNeeded, compact_needed, compaction_window, snip_compact, summarize_compact,
+};
 use crate::config::Config;
 use crate::hooks;
 use crate::mcp::{McpManager, mcp_dyn_tools};
@@ -820,6 +822,8 @@ async fn run_loop(
         // `app.entries` reaches the renderer through here, so this single call is
         // sufficient — no need to police ~40 individual push sites.
         app.trim_entries();
+        // /model, /router and /reload can all change it between frames.
+        app.context_window = compaction_window(&config, Some(&app.router));
 
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
@@ -1150,10 +1154,10 @@ async fn run_loop(
 
         // Auto-compact after API turn completes
         if !app.is_loading && last_tokens_in > 0 {
-            match compact_needed(last_tokens_in) {
+            match compact_needed(last_tokens_in, app.context_window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
-                    let pct = last_tokens_in * 100 / 200_000;
+                    let pct = last_tokens_in * 100 / app.context_window.max(1);
                     app.entries.push(ChatEntry::system(format!(
                         "Context ~{pct}% full ({last_tokens_in} tokens). Run /compact.",
                     )));

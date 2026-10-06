@@ -307,7 +307,7 @@ Context window usage after each API call.
 }
 ```
 
-`compaction_imminent` is `true` when `used_pct >= 85`.
+`tokens_max` is the session model's context window (1,000,000 on Opus/Sonnet 4.6+, Claude 5 and Fable; 200,000 on Haiku 4.5 and older models). `compaction_imminent` is `true` when `used_pct >= 85`.
 
 ---
 

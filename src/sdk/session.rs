@@ -17,9 +17,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// Maximum context window tokens (200K for Claude).  Used for health estimates.
-const MAX_CONTEXT_TOKENS: u64 = 200_000;
-
 /// Why a turn stopped. Maps onto ACP stop reasons and SDK notifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnEnd {
@@ -297,14 +294,14 @@ impl SdkSession {
             // Context health — input_tokens represents the full conversation context
             // sent to the model (system + messages + tools), which is the real measure
             // of how full the context window is.
-            let used_pct =
-                ((input_tok as f64 / MAX_CONTEXT_TOKENS as f64) * 100.0).min(100.0) as u8;
+            let window = crate::compact::compaction_window(&self.config, None);
+            let used_pct = ((input_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
             self.send_notif(SdkNotification::ContextHealth {
                 session_id: self.session_id.clone(),
                 used_pct,
                 tokens_used: input_tok,
-                tokens_max: MAX_CONTEXT_TOKENS,
-                compaction_imminent: used_pct >= 85,
+                tokens_max: window,
+                compaction_imminent: input_tok >= crate::compact::thresholds(window).1,
             });
 
             // Budget check

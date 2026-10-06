@@ -841,8 +841,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
 
     // Context usage % display
     if app.cost_tracker.last_input_tokens > 0 {
-        let ctx_window = context_window_for_model(&app.model_short);
-        let pct = app.cost_tracker.context_pct(ctx_window);
+        let pct = app.cost_tracker.context_pct(app.context_window);
         let ctx_color = if pct >= 90.0 {
             Color::Red
         } else if pct >= 70.0 {
@@ -895,27 +894,6 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         Paragraph::new(Span::styled(right_text, Style::default().fg(tc.assistant))),
         right_area,
     );
-}
-
-/// Estimate context window size (tokens) for a model name.
-fn context_window_for_model(model: &str) -> u64 {
-    let m = model.to_lowercase();
-    // Claude 4.x + 3.5 / 3.7 all ship 200k context windows today. If Anthropic
-    // changes this we want the table — not one branch per model — to update.
-    if ["opus", "sonnet", "haiku"].iter().any(|k| m.contains(k)) {
-        200_000
-    } else if ["gpt-4o", "gpt-4", "llama"].iter().any(|k| m.contains(k)) {
-        128_000
-    } else if m.contains("deepseek") {
-        64_000
-    } else if m.contains("mistral") {
-        32_000
-    } else if m.contains("gemma") {
-        8_192
-    } else {
-        // Conservative default for unknown models — assumes modern Claude-class.
-        200_000
-    }
 }
 
 // ── Browse approval dialog ────────────────────────────────────────────────────

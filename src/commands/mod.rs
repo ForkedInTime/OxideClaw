@@ -319,6 +319,9 @@ pub enum CommandAction {
 pub struct CommandContext<'a> {
     pub config: &'a Config,
     pub tokens_in: u64,
+    /// Context window auto-compaction measures against (see
+    /// `compact::compaction_window`).
+    pub context_window: u64,
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,

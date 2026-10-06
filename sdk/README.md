@@ -174,7 +174,7 @@ Every API call also streams a `context/health` notification:
 }
 ```
 
-Monitor `used_pct` to know when the context window is filling up. `compaction_imminent` flips to `true` at 85%.
+Monitor `used_pct` to know when the context window is filling up. `tokens_max` is the session model's context window (1M on current Opus/Sonnet/Fable, 200k on Haiku 4.5 and older models). `compaction_imminent` flips to `true` at 85%.
 
 ---
 
