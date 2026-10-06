@@ -35,6 +35,39 @@ impl AgentTool {
         }
         Ok(engine)
     }
+
+    /// The child's config: our build-time snapshot refreshed with the live
+    /// values the executor publishes in `ctx` each turn.
+    fn live_config(&self, ctx: &ToolContext) -> Config {
+        // Our own `self.config` is a snapshot taken at tool-build time and
+        // goes stale the moment the user runs `/model foo` mid-session. The
+        // run loop publishes the live provider choice through `ToolContext`
+        // each turn — prefer it so sub-agents actually run against the
+        // currently-active provider instead of silently falling back to the
+        // startup model. (Known regression in multiple competing tools.)
+        let mut sub_config = self.config.clone();
+        if let Some(ref m) = ctx.live_model {
+            sub_config.model = m.clone();
+        }
+        if let Some(ref k) = ctx.live_api_key {
+            sub_config.api_key = k.clone();
+        }
+        if let Some(ref h) = ctx.live_ollama_host {
+            sub_config.ollama_host = h.clone();
+        }
+        // Same staleness for the sandbox: `/sandbox enable` or `/reload`
+        // changes only the live config, and every executor publishes it in
+        // `ctx`. Trusting the snapshot ran the child's Bash unsandboxed.
+        sub_config.sandbox_enabled = ctx.sandbox_mode.is_some();
+        if let Some(m) = &ctx.sandbox_mode {
+            sub_config.sandbox_mode = m.clone();
+        }
+        sub_config.sandbox_allow_network = ctx.sandbox_allow_network;
+        if ctx.default_shell.is_some() {
+            sub_config.default_shell = ctx.default_shell.clone();
+        }
+        sub_config
+    }
 }
 
 #[derive(Deserialize)]
@@ -105,24 +138,10 @@ impl Tool for AgentTool {
             tracing::info!("[Agent: {}]", desc);
         }
 
-        // Build config for sub-agent, potentially with restricted tools.
-        //
-        // Our own `self.config` is a snapshot taken at tool-build time and
-        // goes stale the moment the user runs `/model foo` mid-session. The
-        // run loop publishes the live provider choice through `ToolContext`
-        // each turn — prefer it so sub-agents actually run against the
-        // currently-active provider instead of silently falling back to the
-        // startup model. (Known regression in multiple competing tools.)
-        let mut sub_config = self.config.clone();
-        if let Some(ref m) = ctx.live_model {
-            sub_config.model = m.clone();
-        }
-        if let Some(ref k) = ctx.live_api_key {
-            sub_config.api_key = k.clone();
-        }
-        if let Some(ref h) = ctx.live_ollama_host {
-            sub_config.ollama_host = h.clone();
-        }
+        let mut sub_config = self.live_config(ctx);
+        // Grandchild Agent tools get these live values too, but not the
+        // specialised prompt chosen for this child below.
+        let tool_config = sub_config.clone();
 
         // Apply subagent_type: override system prompt + restrict tools as needed
         let (system_prompt_override, allowed_tools): (Option<String>, Option<Vec<String>>) =
@@ -174,7 +193,7 @@ impl Tool for AgentTool {
         }
 
         // Spawn a fresh QueryEngine with the same config and tools
-        let mut tools: Vec<DynTool> = default_tools_with_config(&self.config);
+        let mut tools: Vec<DynTool> = default_tools_with_config(&tool_config);
         if let Some(allowed) = allowed_tools {
             tools.retain(|t| allowed.iter().any(|a| a.eq_ignore_ascii_case(t.name())));
         }
@@ -451,5 +470,40 @@ mod tests {
             !refused.exists(),
             "no gate on the context → headless → refused"
         );
+    }
+
+    /// `/sandbox enable` mid-session changes only the live config; the
+    /// child used to run Bash from the stale build-time snapshot, unsandboxed.
+    #[tokio::test]
+    async fn child_bash_honours_a_sandbox_enabled_after_the_tool_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = AgentTool { config: config() };
+        assert!(!tool.config.sandbox_enabled);
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.permission_gate = Some(PermissionGate::bypass());
+        ctx.sandbox_mode = Some("strict".into());
+        ctx.sandbox_allow_network = false;
+
+        let sub = tool.live_config(&ctx);
+        assert!(sub.sandbox_enabled);
+        assert_eq!(sub.sandbox_mode, "strict");
+        assert!(!sub.sandbox_allow_network);
+
+        // `echo mkfs` is harmless unsandboxed but matches strict's blocklist.
+        let bash: Vec<DynTool> = vec![Arc::new(crate::tools::bash::BashTool)];
+        let e = tool.build_sub_engine(sub, bash, &ctx).unwrap();
+        let call = vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo mkfs"}),
+        }];
+        let out = e.execute_tools(&call).await.unwrap();
+        let ContentBlock::ToolResult {
+            is_error, content, ..
+        } = &out[0]
+        else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(*is_error, Some(true), "{content:?}");
     }
 }
