@@ -812,10 +812,14 @@ async fn main() -> Result<()> {
                 let (approval_tx, mut approval_rx) =
                     mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(8);
 
-                // Spawn task to handle approval prompts: prompt on stderr, read from stdin
-                let _approval_task = tokio::spawn(async move {
+                // Prompt on stderr, read the answer from stdin. A plain OS
+                // thread, not a tokio task: a read left blocked by Ctrl-C or
+                // the gate's timeout would keep the runtime from shutting
+                // down, and the process would hang at exit until Enter.
+                // Returning from main ends this thread.
+                std::thread::spawn(move || {
                     use std::io::Write;
-                    while let Some(prompt) = approval_rx.recv().await {
+                    while let Some(prompt) = approval_rx.blocking_recv() {
                         eprint!(
                             "Approval needed [step {}]: {} on '{}' at {}\n  Reason: {}\nAllow? [y/N] ",
                             prompt.step,
@@ -831,7 +835,11 @@ async fn main() -> Result<()> {
                         } else {
                             false
                         };
-                        let _ = prompt.reply.send(allowed);
+                        // The gate stopped waiting while we read: say so,
+                        // rather than let the answer look like it counted.
+                        if prompt.reply.send(allowed).is_err() {
+                            eprintln!("Approval prompt had already expired; answer ignored.");
+                        }
                     }
                 });
 
