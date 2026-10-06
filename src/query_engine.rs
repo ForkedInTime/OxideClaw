@@ -595,9 +595,15 @@ impl QueryEngine {
                     println!("{}", event);
                 }
 
+                // Stored cut, so no later request in this run carries it whole.
+                let mut content = output.content;
+                for c in &mut content {
+                    let ToolResultContent::Text { text } = c;
+                    crate::compact::budget_tool_result(text);
+                }
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: output.content,
+                    content,
                     is_error: if output.is_error { Some(true) } else { None },
                 });
             }
@@ -1024,6 +1030,54 @@ mod scripted_api_tests {
                 .contains("validate_session_token"),
             "{user}"
         );
+    }
+
+    struct Huge;
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Huge {
+        fn name(&self) -> &str {
+            "Huge"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: &crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::success("x".repeat(3_000_000)))
+        }
+    }
+
+    /// `-p`, Agent children and /spawn stored a multi-megabyte Read/Grep
+    /// result whole, so the next request of the run was rejected.
+    #[tokio::test]
+    async fn oversized_tool_results_are_stored_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let e = QueryEngine::new(config, vec![Arc::new(Huge)]).unwrap();
+        let r = e
+            .execute_tools(&[ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Huge".into(),
+                input: serde_json::json!({}),
+            }])
+            .await
+            .unwrap();
+        let ContentBlock::ToolResult { content, .. } = &r[0] else {
+            panic!("{r:?}");
+        };
+        let ToolResultContent::Text { text } = &content[0];
+        assert!(text.len() < crate::compact::TOOL_RESULT_MAX_CHARS + 200);
+        assert!(text.contains("output truncated"));
     }
 
     /// Sub-agent engines printed "Tool: name(args)" for every call to the

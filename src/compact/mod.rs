@@ -24,6 +24,22 @@ use crate::api::{ApiBackend, MessagesRequest};
 use crate::config::Config;
 use anyhow::Result;
 
+/// Largest tool result, in characters, that goes to the model. Read and Grep
+/// cap lines, not characters, so one minified bundle or a broad content grep
+/// returns megabytes and every request that carries it is a 400.
+pub const TOOL_RESULT_MAX_CHARS: usize = 100_000;
+
+/// Cut `text` to `TOOL_RESULT_MAX_CHARS` characters, saying so in the text.
+pub fn budget_tool_result(text: &mut String) {
+    if let Some((cut, _)) = text.char_indices().nth(TOOL_RESULT_MAX_CHARS) {
+        text.truncate(cut);
+        text.push_str(&format!(
+            "\n\n[... output truncated to {TOOL_RESULT_MAX_CHARS} characters; \
+             use offset/limit or head_limit to narrow]"
+        ));
+    }
+}
+
 /// `(warn, snip, summarise)` input-token thresholds for a context window.
 pub fn thresholds(window: u64) -> (u64, u64, u64) {
     (window / 100 * 80, window / 100 * 85, window / 100 * 90)
@@ -448,5 +464,31 @@ mod tests {
         assert_eq!(summary_max_tokens(&cfg), 8_192);
         cfg.model = "claude-haiku-4-5".into();
         assert_eq!(summary_max_tokens(&cfg), 32_000);
+    }
+}
+
+#[cfg(test)]
+mod tool_result_budget_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_results_are_cut_on_a_char_boundary() {
+        let mut small = "é".repeat(TOOL_RESULT_MAX_CHARS);
+        budget_tool_result(&mut small);
+        assert_eq!(
+            small.chars().count(),
+            TOOL_RESULT_MAX_CHARS,
+            "at the cap: kept"
+        );
+
+        let mut big = "é".repeat(TOOL_RESULT_MAX_CHARS + 1);
+        budget_tool_result(&mut big);
+        assert!(big.starts_with(&"é".repeat(TOOL_RESULT_MAX_CHARS)));
+        assert!(
+            big.contains("output truncated"),
+            "{}",
+            &big[big.len() - 120..]
+        );
+        assert!(big.chars().count() < TOOL_RESULT_MAX_CHARS + 200);
     }
 }

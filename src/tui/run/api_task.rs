@@ -167,20 +167,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
 
         // Tool result budgeting — truncate oversized ToolResult payloads
         // to prevent context overflow (mirrors apiMicrocompact truncation).
-        const TOOL_RESULT_MAX_CHARS: usize = 100_000;
         let mut budgeted_messages = messages.clone();
         for msg in budgeted_messages.iter_mut() {
             for block in msg.content.iter_mut() {
                 if let ContentBlock::ToolResult { content, .. } = block {
                     for item in content.iter_mut() {
                         let ToolResultContent::Text { text } = item;
-                        if text.len() > TOOL_RESULT_MAX_CHARS {
-                            let truncated: String =
-                                text.chars().take(TOOL_RESULT_MAX_CHARS).collect();
-                            *text = format!(
-                                "{truncated}\n\n[... output truncated to {TOOL_RESULT_MAX_CHARS} characters]"
-                            );
-                        }
+                        crate::compact::budget_tool_result(text);
                     }
                 }
             }

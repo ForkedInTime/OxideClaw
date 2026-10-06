@@ -182,6 +182,7 @@ impl SdkSession {
         };
 
         // 3. Push user message
+        let base = self.messages.len();
         let mut content = vec![ContentBlock::Text { text: prompt }];
         if !rag_context.is_empty() {
             content.push(ContentBlock::Text { text: rag_context });
@@ -258,7 +259,17 @@ impl SdkSession {
                         end = TurnEnd::Cancelled;
                         break;
                     }
-                    r = call => r.context("API stream call failed")?,
+                    r = call => r,
+                }
+            };
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    // ACP runs every prompt on this session. Keeping a turn
+                    // whose request was rejected (say, too large) would resend
+                    // it, and fail the same way, on every later prompt.
+                    self.messages.truncate(base);
+                    return Err(e.context("API stream call failed"));
                 }
             };
 
@@ -624,10 +635,16 @@ impl SdkSession {
             }
             self.tools_executed_count += 1;
 
-            // Push result to message history
+            // Stored cut: an oversized result would be resent, and 400, on
+            // every later request of this session.
+            let mut content = output.content;
+            for c in &mut content {
+                let ToolResultContent::Text { text } = c;
+                crate::compact::budget_tool_result(text);
+            }
             results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content: output.content,
+                content,
                 is_error: if output.is_error { Some(true) } else { None },
             });
         }
@@ -1004,8 +1021,11 @@ mod guard_tests {
         fn input_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+        async fn execute(&self, input: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
+            if input["command"] == "huge" {
+                return Ok(ToolOutput::success("x".repeat(3_000_000)));
+            }
             Ok(ToolOutput::success("ran"))
         }
     }
@@ -1046,6 +1066,19 @@ mod guard_tests {
             name: "Bash".into(),
             input: serde_json::json!({ "command": command }),
         }]
+    }
+
+    fn result_text(r: &[ContentBlock]) -> String {
+        match &r[0] {
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .map(|c| {
+                    let ToolResultContent::Text { text } = c;
+                    text.as_str()
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
     }
 
     fn is_error(r: &[ContentBlock]) -> bool {
@@ -1108,5 +1141,48 @@ mod guard_tests {
         let r = s.execute_tools_with_approval(&call("ls")).await.unwrap();
         assert!(!is_error(&r), "{r:?}");
         assert!(marker.exists(), "postToolUse hook did not run");
+    }
+
+    /// A multi-megabyte Read/Grep result was stored whole, so every later
+    /// request in the session carried it and was rejected.
+    #[tokio::test]
+    async fn oversized_tool_results_are_stored_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = session(cfg(dir.path()));
+        let r = s.execute_tools_with_approval(&call("huge")).await.unwrap();
+        let text = result_text(&r);
+        assert!(text.len() < crate::compact::TOOL_RESULT_MAX_CHARS + 200);
+        assert!(text.contains("output truncated"));
+    }
+
+    /// A rejected request left its turn in the history, so in ACP, where
+    /// every prompt reuses the session, each later prompt resent it and
+    /// failed the same way.
+    #[tokio::test]
+    async fn a_failed_request_does_not_poison_the_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = session(cfg(dir.path()));
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(format!("http://{addr}"));
+        s.client = ApiBackend::Anthropic(c);
+
+        assert!(s.execute_turn("hi".into()).await.is_err());
+        assert!(s.messages.is_empty(), "the rejected turn stayed in history");
     }
 }
