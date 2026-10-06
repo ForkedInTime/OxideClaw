@@ -518,225 +518,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         let mut cfg = Config::default();
 
-        // ── Settings files: global (~/.claude/settings.json) → project (./.claude/settings.json)
-        // Project wins; env vars applied after (higher priority than settings files).
-        let settings = crate::settings::Settings::load(&cfg.cwd);
-        cfg.apply_browser_settings(&settings);
-        if let Some(model) = settings.model {
-            cfg.model = crate::commands::resolve_model_alias(&model);
-            cfg.settings_model = Some(cfg.model.clone());
-        }
-        if let Some(mt) = settings.max_tokens {
-            cfg.max_tokens = mt;
-        }
-        if let Some(map) = &settings.max_tokens_by_model {
-            for (k, v) in map {
-                let canonical = crate::commands::resolve_model_alias(k);
-                cfg.max_tokens_by_model.insert(canonical, *v);
-            }
-        }
-        if let Some(ac) = settings.auto_compact {
-            cfg.auto_compact_enabled = ac;
-        }
-        if let Some(v) = settings.verbose {
-            cfg.verbose = v;
-        }
-        if let Some(host) = settings.ollama_host {
-            cfg.ollama_host = normalize_ollama_host(&host);
-        }
-        if let Some(tbt) = settings.thinking_budget_tokens {
-            cfg.thinking_budget_tokens = Some(tbt);
-        }
-        cfg.show_thinking_summaries = settings.show_thinking_summaries.unwrap_or(false);
-        if let Some(pc) = settings.prompt_cache {
-            cfg.prompt_cache = pc;
-        }
-        cfg.hooks = settings.hooks;
-        cfg.permissions_allow = settings.permissions.allow;
-        cfg.permissions_deny = settings.permissions.deny;
-        // A rule we cannot parse used to do nothing at all, silently.
-        for (rule, effect) in cfg
-            .permissions_deny
-            .iter()
-            .map(|r| (r, "it blocks every call to that tool"))
-            .chain(cfg.permissions_allow.iter().map(|r| (r, "it is ignored")))
-        {
-            if !crate::permissions::rule_is_supported(rule) {
-                eprintln!(
-                    "Warning: permissions rule `{rule}` uses syntax OxideClaw does not \
-                     understand; {effect}."
-                );
-            }
-        }
-        if let Some(effort) = settings.effort {
-            cfg.effort = Some(effort);
-        }
-        cfg.env = settings.env;
-        cfg.api_key_helper = settings.api_key_helper;
-        cfg.untrusted_project_config = settings.untrusted_project_config;
-        cfg.settings_load_errors = settings.load_errors;
-        cfg.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
-        // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
-        // everything immediately?). Warn and treat as unset.
-        cfg.cleanup_period_days = match settings.cleanup_period_days {
-            Some(0) => {
-                eprintln!(
-                    "Warning: cleanupPeriodDays=0 is invalid — use a positive number of days, \
-                     or omit the setting to disable cleanup. Ignoring."
-                );
-                None
-            }
-            other => other,
-        };
-        cfg.default_shell = settings.default_shell;
-        cfg.include_co_authored_by = settings.include_co_authored_by.unwrap_or(true);
-        cfg.theme = settings.theme;
-        cfg.sandbox_enabled = settings.sandbox_enabled.unwrap_or(false);
-        cfg.allow_private_network_fetch = settings.allow_private_network_fetch.unwrap_or(false);
-        if let Some(mode) = settings.sandbox_mode {
-            cfg.sandbox_mode = mode;
-        }
-        cfg.voice_enabled = settings.voice_enabled.unwrap_or(false);
-        if let Some(url) = settings.voice_api_url {
-            cfg.voice_api_url = Some(url);
-        }
-        cfg.tts_enabled = settings.tts_enabled.unwrap_or(false);
-        if let Some(m) = settings.tts_voice_model {
-            cfg.tts_voice_model = Some(m);
-        }
-        cfg.notifications_enabled = settings.notifications_enabled.unwrap_or(false);
-        if let Some(style) = settings.spinner_style {
-            cfg.spinner_style = style;
-        }
-        cfg.sandbox_allow_network = settings.sandbox_allow_network.unwrap_or(true);
-        cfg.disable_skill_shell_execution = settings.disable_skill_shell_execution.unwrap_or(false);
-
-        // Smart model router settings
-        cfg.router_enabled = settings.router_enabled.unwrap_or(false);
-        cfg.router_budget = settings.router_budget;
-        cfg.router_low_model = settings.router_low_model;
-        cfg.router_medium_model = settings.router_medium_model;
-        cfg.router_high_model = settings.router_high_model;
-        cfg.router_super_high_model = settings.router_super_high_model;
-        if let Some(a) = settings.autonomy {
-            cfg.autonomy = a;
-        }
-        cfg.memory_auto_capture = settings.memory_auto_capture.unwrap_or(false);
-
-        // Phase-declarative model router settings
-        if let Some(pr) = &settings.phase_router {
-            cfg.phase_router.enabled = pr.enabled.unwrap_or(false);
-            if let Some(phases) = &pr.phases {
-                if let Some(m) = phases.get("research") {
-                    cfg.phase_router.research_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("plan") {
-                    cfg.phase_router.plan_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("edit") {
-                    cfg.phase_router.edit_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("review") {
-                    cfg.phase_router.review_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("default") {
-                    cfg.phase_router.default_model = crate::commands::resolve_model_alias(m);
-                }
-            }
-        }
-
-        // Auto-fix settings → AutoFixConfig
-        if let Some(ar) = &settings.auto_fix {
-            if let Some(e) = ar.enabled {
-                cfg.auto_fix.enabled = e;
-            }
-            if let Some(t) = &ar.trigger {
-                cfg.auto_fix.trigger = match t.to_ascii_lowercase().as_str() {
-                    "always" => crate::autofix::AutoFixTrigger::Always,
-                    "off" => crate::autofix::AutoFixTrigger::Off,
-                    _ => crate::autofix::AutoFixTrigger::Autonomous,
-                };
-            }
-            if ar.lint_command.is_some() {
-                cfg.auto_fix.lint_command = ar.lint_command.clone();
-            }
-            if ar.test_command.is_some() {
-                cfg.auto_fix.test_command = ar.test_command.clone();
-            }
-            if let Some(m) = ar.max_retries {
-                if (1..=10).contains(&m) {
-                    cfg.auto_fix.max_retries = m;
-                } else {
-                    tracing::warn!(
-                        "autoFixLoop.maxRetries = {m} is out of bounds (1..=10); \
-                         clamping to default (3)."
-                    );
-                    cfg.auto_fix.max_retries = 3;
-                }
-            }
-            if let Some(t) = ar.timeout_secs {
-                cfg.auto_fix.timeout_secs = t;
-            }
-        }
-
-        // Auto-commit settings → AutoCommitConfig
-        if let Some(ac) = &settings.auto_commit {
-            if let Some(e) = ac.enabled {
-                cfg.auto_commit.enabled = e;
-            }
-            if let Some(k) = ac.keep_sessions {
-                if k <= 1000 {
-                    cfg.auto_commit.keep_sessions = k;
-                } else {
-                    tracing::warn!(
-                        "autoCommit.keepSessions = {k} is out of bounds (0..=1000); \
-                         clamping to default ({})",
-                        crate::settings::DEFAULT_KEEP_SESSIONS
-                    );
-                    cfg.auto_commit.keep_sessions = crate::settings::DEFAULT_KEEP_SESSIONS;
-                }
-            }
-            if let Some(p) = &ac.message_prefix {
-                cfg.auto_commit.message_prefix = p.clone();
-            }
-        }
-
-        // Browse agent settings
-        if let Some(s) = settings.browse_max_steps {
-            cfg.browse_max_steps = s;
-        }
-        if let Some(p) = settings.browse_approval_patterns {
-            cfg.browse_approval_patterns = p;
-        }
-        cfg.browse_default_policy = settings
-            .browse_default_policy
-            .unwrap_or_else(|| cfg.browse_default_policy.clone());
-
-        // Resolve output style: load name from settings, look up prompt
-        if let Some(ref style_name) = settings.output_style
-            && style_name != "default"
-        {
-            let styles = Self::load_output_styles(&cfg.cwd);
-            if let Some(def) = styles
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(style_name))
-            {
-                cfg.output_style = Some(def.name.clone());
-                cfg.output_style_prompt = Some(def.prompt.clone());
-            }
-        }
-
-        // ── CLAUDE.md + AGENTS.md files (global + project hierarchy) — skipped in bare mode
-        if !cfg.bare_mode {
-            cfg.claudemd = Self::load_claude_md(&cfg.cwd);
-            cfg.agentsmd = Self::load_agents_md(&cfg.cwd);
-        }
-
-        // ── CLAUDE.md phase-routing directive override
-        // Syntax: <!-- phase-routing: research=haiku, edit=opus -->
-        // CLAUDE.md merges on top of settings.json per-phase: a user can set
-        // base defaults in settings and override individual phases in CLAUDE.md.
-        Self::apply_phase_routing_from_claudemd(&cfg.claudemd, &mut cfg.phase_router);
+        cfg.load_project();
 
         // ── Credential from the environment (not required for Ollama models).
         //
@@ -834,6 +616,364 @@ impl Config {
         }
 
         Ok(cfg)
+    }
+
+    /// Point a config built for the launch directory at another project, as
+    /// SDK `session/start` and ACP `session/new` do: that project's settings,
+    /// CLAUDE.md and AGENTS.md replace the launch directory's, while CLI flags,
+    /// env overrides and credentials are kept.
+    ///
+    /// The literal below names every field on purpose, so a new one fails to
+    /// compile until someone decides which side it comes from.
+    pub fn retarget_cwd(&mut self, dir: PathBuf) {
+        if dir == self.cwd {
+            return;
+        }
+        let project = |cwd: PathBuf, bare_mode: bool| {
+            let mut c = Config {
+                cwd,
+                bare_mode,
+                ..Config::default()
+            };
+            c.load_project();
+            c
+        };
+        // What the launch directory alone produced: a field that still equals
+        // it was not overridden by a CLI flag or env var after Config::load.
+        let launch = project(self.cwd.clone(), self.bare_mode);
+        let new = project(dir, self.bare_mode);
+        let old = std::mem::take(self);
+        macro_rules! unless_overridden {
+            ($f:ident) => {
+                if old.$f == launch.$f {
+                    new.$f
+                } else {
+                    old.$f
+                }
+            };
+        }
+        *self = Config {
+            // CLI/env may override these after the settings files.
+            model: unless_overridden!(model),
+            max_tokens: unless_overridden!(max_tokens),
+            verbose: unless_overridden!(verbose),
+            ollama_host: unless_overridden!(ollama_host),
+            thinking_budget_tokens: unless_overridden!(thinking_budget_tokens),
+            effort: unless_overridden!(effort),
+            disable_all_hooks: unless_overridden!(disable_all_hooks),
+
+            // The new project's files.
+            cwd: new.cwd,
+            settings_model: new.settings_model,
+            max_tokens_by_model: new.max_tokens_by_model,
+            auto_compact_enabled: new.auto_compact_enabled,
+            permissions_allow: new.permissions_allow,
+            permissions_deny: new.permissions_deny,
+            claudemd: new.claudemd,
+            agentsmd: new.agentsmd,
+            show_thinking_summaries: new.show_thinking_summaries,
+            prompt_cache: new.prompt_cache,
+            hooks: new.hooks,
+            env: new.env,
+            cleanup_period_days: new.cleanup_period_days,
+            default_shell: new.default_shell,
+            include_co_authored_by: new.include_co_authored_by,
+            output_style: new.output_style,
+            output_style_prompt: new.output_style_prompt,
+            theme: new.theme,
+            sandbox_enabled: new.sandbox_enabled,
+            untrusted_project_config: new.untrusted_project_config,
+            settings_load_errors: new.settings_load_errors,
+            sandbox_mode: new.sandbox_mode,
+            voice_enabled: new.voice_enabled,
+            voice_api_url: new.voice_api_url,
+            tts_enabled: new.tts_enabled,
+            tts_voice_model: new.tts_voice_model,
+            allow_private_network_fetch: new.allow_private_network_fetch,
+            browser_enabled: new.browser_enabled,
+            browser_headless: new.browser_headless,
+            browser_chrome_path: new.browser_chrome_path,
+            browser_cdp_endpoint: new.browser_cdp_endpoint,
+            browser_timeout_ms: new.browser_timeout_ms,
+            browse_max_steps: new.browse_max_steps,
+            browse_approval_patterns: new.browse_approval_patterns,
+            browse_default_policy: new.browse_default_policy,
+            notifications_enabled: new.notifications_enabled,
+            spinner_style: new.spinner_style,
+            sandbox_allow_network: new.sandbox_allow_network,
+            disable_skill_shell_execution: new.disable_skill_shell_execution,
+            router_enabled: new.router_enabled,
+            router_budget: new.router_budget,
+            router_low_model: new.router_low_model,
+            router_medium_model: new.router_medium_model,
+            router_high_model: new.router_high_model,
+            router_super_high_model: new.router_super_high_model,
+            autonomy: new.autonomy,
+            memory_auto_capture: new.memory_auto_capture,
+            phase_router: new.phase_router,
+            auto_fix: new.auto_fix,
+            auto_commit: new.auto_commit,
+
+            // Credentials (resolved once at startup) and CLI-only state.
+            api_key: old.api_key,
+            auth_is_oauth: old.auth_is_oauth,
+            auth_source: old.auth_source,
+            auth_warnings: old.auth_warnings,
+            api_key_helper: old.api_key_helper,
+            dangerously_skip_permissions: old.dangerously_skip_permissions,
+            plan_mode: old.plan_mode,
+            max_turns: old.max_turns,
+            allowed_tools: old.allowed_tools,
+            disallowed_tools: old.disallowed_tools,
+            system_prompt_override: old.system_prompt_override,
+            append_system_prompt: old.append_system_prompt,
+            session_name: old.session_name,
+            extra_dirs: old.extra_dirs,
+            extra_mcp_servers: old.extra_mcp_servers,
+            no_session_persistence: old.no_session_persistence,
+            strict_mcp_config: old.strict_mcp_config,
+            extra_betas: old.extra_betas,
+            bare_mode: old.bare_mode,
+            disable_slash_commands: old.disable_slash_commands,
+            fallback_model: old.fallback_model,
+            max_budget_usd: old.max_budget_usd,
+            input_format: old.input_format,
+            json_schema: old.json_schema,
+            replay_user_messages: old.replay_user_messages,
+            fork_session: old.fork_session,
+            custom_agents: old.custom_agents,
+            setting_sources: old.setting_sources,
+            file_snapshot_dir: old.file_snapshot_dir,
+            watch_debounce_ms: old.watch_debounce_ms,
+            watch_rate_limit_ms: old.watch_rate_limit_ms,
+            watch_markers: old.watch_markers,
+        };
+    }
+
+    /// Everything Config::load derives from `self.cwd`: settings.json (global
+    /// over project, trust-gated), the output style, CLAUDE.md / AGENTS.md and
+    /// their phase-routing directives. Expects settings-derived fields still
+    /// at their defaults.
+    fn load_project(&mut self) {
+        // ── Settings files: global (~/.claude/settings.json) → project (./.claude/settings.json)
+        // Project wins; env vars applied after (higher priority than settings files).
+        let settings = crate::settings::Settings::load(&self.cwd);
+        self.apply_browser_settings(&settings);
+        if let Some(model) = settings.model {
+            self.model = crate::commands::resolve_model_alias(&model);
+            self.settings_model = Some(self.model.clone());
+        }
+        if let Some(mt) = settings.max_tokens {
+            self.max_tokens = mt;
+        }
+        if let Some(map) = &settings.max_tokens_by_model {
+            for (k, v) in map {
+                let canonical = crate::commands::resolve_model_alias(k);
+                self.max_tokens_by_model.insert(canonical, *v);
+            }
+        }
+        if let Some(ac) = settings.auto_compact {
+            self.auto_compact_enabled = ac;
+        }
+        if let Some(v) = settings.verbose {
+            self.verbose = v;
+        }
+        if let Some(host) = settings.ollama_host {
+            self.ollama_host = normalize_ollama_host(&host);
+        }
+        if let Some(tbt) = settings.thinking_budget_tokens {
+            self.thinking_budget_tokens = Some(tbt);
+        }
+        self.show_thinking_summaries = settings.show_thinking_summaries.unwrap_or(false);
+        if let Some(pc) = settings.prompt_cache {
+            self.prompt_cache = pc;
+        }
+        self.hooks = settings.hooks;
+        self.permissions_allow = settings.permissions.allow;
+        self.permissions_deny = settings.permissions.deny;
+        // A rule we cannot parse used to do nothing at all, silently.
+        for (rule, effect) in self
+            .permissions_deny
+            .iter()
+            .map(|r| (r, "it blocks every call to that tool"))
+            .chain(self.permissions_allow.iter().map(|r| (r, "it is ignored")))
+        {
+            if !crate::permissions::rule_is_supported(rule) {
+                eprintln!(
+                    "Warning: permissions rule `{rule}` uses syntax OxideClaw does not \
+                     understand; {effect}."
+                );
+            }
+        }
+        if let Some(effort) = settings.effort {
+            self.effort = Some(effort);
+        }
+        self.env = settings.env;
+        self.api_key_helper = settings.api_key_helper;
+        self.untrusted_project_config = settings.untrusted_project_config;
+        self.settings_load_errors = settings.load_errors;
+        self.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
+        // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
+        // everything immediately?). Warn and treat as unset.
+        self.cleanup_period_days = match settings.cleanup_period_days {
+            Some(0) => {
+                eprintln!(
+                    "Warning: cleanupPeriodDays=0 is invalid — use a positive number of days, \
+                     or omit the setting to disable cleanup. Ignoring."
+                );
+                None
+            }
+            other => other,
+        };
+        self.default_shell = settings.default_shell;
+        self.include_co_authored_by = settings.include_co_authored_by.unwrap_or(true);
+        self.theme = settings.theme;
+        self.sandbox_enabled = settings.sandbox_enabled.unwrap_or(false);
+        self.allow_private_network_fetch = settings.allow_private_network_fetch.unwrap_or(false);
+        if let Some(mode) = settings.sandbox_mode {
+            self.sandbox_mode = mode;
+        }
+        self.voice_enabled = settings.voice_enabled.unwrap_or(false);
+        if let Some(url) = settings.voice_api_url {
+            self.voice_api_url = Some(url);
+        }
+        self.tts_enabled = settings.tts_enabled.unwrap_or(false);
+        if let Some(m) = settings.tts_voice_model {
+            self.tts_voice_model = Some(m);
+        }
+        self.notifications_enabled = settings.notifications_enabled.unwrap_or(false);
+        if let Some(style) = settings.spinner_style {
+            self.spinner_style = style;
+        }
+        self.sandbox_allow_network = settings.sandbox_allow_network.unwrap_or(true);
+        self.disable_skill_shell_execution = settings.disable_skill_shell_execution.unwrap_or(false);
+
+        // Smart model router settings
+        self.router_enabled = settings.router_enabled.unwrap_or(false);
+        self.router_budget = settings.router_budget;
+        self.router_low_model = settings.router_low_model;
+        self.router_medium_model = settings.router_medium_model;
+        self.router_high_model = settings.router_high_model;
+        self.router_super_high_model = settings.router_super_high_model;
+        if let Some(a) = settings.autonomy {
+            self.autonomy = a;
+        }
+        self.memory_auto_capture = settings.memory_auto_capture.unwrap_or(false);
+
+        // Phase-declarative model router settings
+        if let Some(pr) = &settings.phase_router {
+            self.phase_router.enabled = pr.enabled.unwrap_or(false);
+            if let Some(phases) = &pr.phases {
+                if let Some(m) = phases.get("research") {
+                    self.phase_router.research_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("plan") {
+                    self.phase_router.plan_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("edit") {
+                    self.phase_router.edit_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("review") {
+                    self.phase_router.review_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("default") {
+                    self.phase_router.default_model = crate::commands::resolve_model_alias(m);
+                }
+            }
+        }
+
+        // Auto-fix settings → AutoFixConfig
+        if let Some(ar) = &settings.auto_fix {
+            if let Some(e) = ar.enabled {
+                self.auto_fix.enabled = e;
+            }
+            if let Some(t) = &ar.trigger {
+                self.auto_fix.trigger = match t.to_ascii_lowercase().as_str() {
+                    "always" => crate::autofix::AutoFixTrigger::Always,
+                    "off" => crate::autofix::AutoFixTrigger::Off,
+                    _ => crate::autofix::AutoFixTrigger::Autonomous,
+                };
+            }
+            if ar.lint_command.is_some() {
+                self.auto_fix.lint_command = ar.lint_command.clone();
+            }
+            if ar.test_command.is_some() {
+                self.auto_fix.test_command = ar.test_command.clone();
+            }
+            if let Some(m) = ar.max_retries {
+                if (1..=10).contains(&m) {
+                    self.auto_fix.max_retries = m;
+                } else {
+                    tracing::warn!(
+                        "autoFixLoop.maxRetries = {m} is out of bounds (1..=10); \
+                         clamping to default (3)."
+                    );
+                    self.auto_fix.max_retries = 3;
+                }
+            }
+            if let Some(t) = ar.timeout_secs {
+                self.auto_fix.timeout_secs = t;
+            }
+        }
+
+        // Auto-commit settings → AutoCommitConfig
+        if let Some(ac) = &settings.auto_commit {
+            if let Some(e) = ac.enabled {
+                self.auto_commit.enabled = e;
+            }
+            if let Some(k) = ac.keep_sessions {
+                if k <= 1000 {
+                    self.auto_commit.keep_sessions = k;
+                } else {
+                    tracing::warn!(
+                        "autoCommit.keepSessions = {k} is out of bounds (0..=1000); \
+                         clamping to default ({})",
+                        crate::settings::DEFAULT_KEEP_SESSIONS
+                    );
+                    self.auto_commit.keep_sessions = crate::settings::DEFAULT_KEEP_SESSIONS;
+                }
+            }
+            if let Some(p) = &ac.message_prefix {
+                self.auto_commit.message_prefix = p.clone();
+            }
+        }
+
+        // Browse agent settings
+        if let Some(s) = settings.browse_max_steps {
+            self.browse_max_steps = s;
+        }
+        if let Some(p) = settings.browse_approval_patterns {
+            self.browse_approval_patterns = p;
+        }
+        self.browse_default_policy = settings
+            .browse_default_policy
+            .unwrap_or_else(|| self.browse_default_policy.clone());
+
+        // Resolve output style: load name from settings, look up prompt
+        if let Some(ref style_name) = settings.output_style
+            && style_name != "default"
+        {
+            let styles = Self::load_output_styles(&self.cwd);
+            if let Some(def) = styles
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(style_name))
+            {
+                self.output_style = Some(def.name.clone());
+                self.output_style_prompt = Some(def.prompt.clone());
+            }
+        }
+
+        // ── CLAUDE.md + AGENTS.md files (global + project hierarchy) — skipped in bare mode
+        if !self.bare_mode {
+            self.claudemd = Self::load_claude_md(&self.cwd);
+            self.agentsmd = Self::load_agents_md(&self.cwd);
+        }
+
+        // ── CLAUDE.md phase-routing directive override
+        // Syntax: <!-- phase-routing: research=haiku, edit=opus -->
+        // CLAUDE.md merges on top of settings.json per-phase: a user can set
+        // base defaults in settings and override individual phases in CLAUDE.md.
+        Self::apply_phase_routing_from_claudemd(&self.claudemd, &mut self.phase_router);
     }
 
     /// Apply browser_* fields from settings.json (blank paths become None,
@@ -2155,5 +2295,74 @@ mod external_system_prompt_tests {
         let prompt = cfg.build_system_prompt();
         assert!(prompt.starts_with("You are a highly capable AI coding assistant"));
         assert!(!prompt.contains("You are OxideClaw, an interactive CLI agent"));
+    }
+}
+
+#[cfg(test)]
+mod retarget_cwd_tests {
+    use super::Config;
+    use std::path::Path;
+
+    fn project(dir: &Path, marker: &str, settings: &str) {
+        std::fs::write(dir.join("CLAUDE.md"), marker).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), settings).unwrap();
+    }
+
+    /// What Config::load builds when launched in `dir`, minus credentials.
+    fn launched_in(dir: &Path) -> Config {
+        let mut c = Config {
+            cwd: dir.to_path_buf(),
+            ..Config::default()
+        };
+        c.load_project();
+        c
+    }
+
+    /// An editor starts one agent and opens sessions in other projects: each
+    /// session used the launch directory's CLAUDE.md and project settings.
+    #[test]
+    fn a_session_in_another_project_uses_that_projects_files() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        project(
+            a.path(),
+            "ALPHA-INSTRUCTIONS",
+            r#"{"model": "alpha-model", "maxTokens": 1111,
+                "permissions": {"deny": ["Bash(alpha:*)"]}}"#,
+        );
+        project(
+            b.path(),
+            "BRAVO-INSTRUCTIONS",
+            r#"{"model": "bravo-model", "maxTokens": 2222,
+                "permissions": {"deny": ["Bash(bravo:*)"]}}"#,
+        );
+
+        let mut cfg = launched_in(a.path());
+        cfg.max_turns = 7; // a CLI flag
+        cfg.retarget_cwd(b.path().to_path_buf());
+
+        assert_eq!(cfg.cwd, b.path());
+        assert!(cfg.claudemd.contains("BRAVO-INSTRUCTIONS"), "{}", cfg.claudemd);
+        assert!(!cfg.claudemd.contains("ALPHA-INSTRUCTIONS"));
+        assert_eq!(cfg.model, "bravo-model");
+        assert_eq!(cfg.max_tokens, 2222);
+        assert!(cfg.permissions_deny.contains(&"Bash(bravo:*)".to_string()));
+        assert!(!cfg.permissions_deny.contains(&"Bash(alpha:*)".to_string()));
+        assert_eq!(cfg.max_turns, 7);
+    }
+
+    /// `--model` / `ANTHROPIC_MODEL` outrank settings files, in any project.
+    #[test]
+    fn a_cli_or_env_model_survives_the_switch() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        project(a.path(), "A", r#"{"model": "alpha-model"}"#);
+        project(b.path(), "B", r#"{"model": "bravo-model"}"#);
+
+        let mut cfg = launched_in(a.path());
+        cfg.model = "cli-model".into();
+        cfg.retarget_cwd(b.path().to_path_buf());
+        assert_eq!(cfg.model, "cli-model");
     }
 }

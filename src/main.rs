@@ -668,7 +668,7 @@ async fn main() -> Result<()> {
             deeplink::DeepLinkAction::OpenTui { query, cwd } => {
                 let mut config = Config::load()?;
                 if let Some(dir) = cwd {
-                    config.cwd = std::path::PathBuf::from(dir);
+                    config.retarget_cwd(std::path::PathBuf::from(dir));
                 }
                 return tui::run_tui(config, None, Some(query)).await;
             }

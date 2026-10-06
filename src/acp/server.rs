@@ -176,7 +176,7 @@ impl State {
             .map_err(|m| RpcError::new(rpc::INVALID_PARAMS, m))?
             .expect("Some(cwd) validates to Some(dir)");
         let mut cfg = self.config.clone();
-        cfg.cwd = dir;
+        cfg.retarget_cwd(dir);
         if let Some(servers) = params.get("mcpServers").and_then(Value::as_array) {
             for s in servers {
                 let name = s.get("name").and_then(Value::as_str).unwrap_or("mcp");

@@ -149,7 +149,7 @@ impl SdkServer {
                 // Clone and override config
                 let mut cfg = config.clone();
                 match validate_session_cwd(cwd) {
-                    Ok(Some(dir)) => cfg.cwd = dir,
+                    Ok(Some(dir)) => cfg.retarget_cwd(dir),
                     Ok(None) => {}
                     Err(message) => {
                         transport

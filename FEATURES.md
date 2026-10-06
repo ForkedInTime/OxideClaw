@@ -340,7 +340,7 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 |---------------------|---------------------|
 | `initialize` | Protocol version 1. Advertises `embeddedContext`; no image/audio prompts, no `loadSession`, no HTTP/SSE MCP. |
 | `authenticate` | No-op. Credentials come from the normal chain (`ANTHROPIC_API_KEY`, `ant` profile, settings). |
-| `session/new` | Requires an existing `cwd`. Stdio `mcpServers` entries are recorded on the session config. |
+| `session/new` | Requires an existing `cwd`; the session reads that directory's CLAUDE.md, AGENTS.md and project settings. Stdio `mcpServers` entries are recorded on the session config. |
 | `session/prompt` | Text, `resource_link`, and embedded text resources are flattened into one prompt. Answers with `stopReason`: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` (budget exceeded), or `cancelled`. |
 | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call` (kind + title + raw input), `tool_call_update` (status + output summary). |
 | `session/request_permission` | Sent for every tool the SDK policy marks *ask* (the default for tools not on an allow list). Options: allow once / reject once. A `cancelled` outcome denies the tool. |
