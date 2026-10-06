@@ -983,12 +983,12 @@ fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
 }
 
 #[cfg(test)]
-mod scripted_api_tests {
+pub(crate) mod scripted_api_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn sse(blocks: &[serde_json::Value], stop_reason: &str) -> String {
+    pub(crate) fn sse(blocks: &[serde_json::Value], stop_reason: &str) -> String {
         let mut events = vec![
             r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#.to_string(),
         ];
@@ -1013,7 +1013,7 @@ mod scripted_api_tests {
 
     /// Anthropic stand-in: answers each connection with the next scripted
     /// response and records every request body.
-    async fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    pub(crate) async fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));

@@ -139,6 +139,37 @@ fn close_dangling_tool_uses(messages: &mut Vec<Message>) {
     }
 }
 
+/// End the turn on a detected loop like any other: keep its history and
+/// answer every tool_use, so the user can steer and the next request is
+/// valid. `results` must already hold the looping call's result.
+fn end_turn_on_loop(
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    messages: &mut Vec<Message>,
+    results: &mut Vec<ContentBlock>,
+    usage: &crate::api::types::Usage,
+    model: &str,
+    name: &str,
+    streak: usize,
+) {
+    messages.push(Message {
+        role: Role::User,
+        content: std::mem::take(results),
+    });
+    close_dangling_tool_uses(messages);
+    let _ = tx.send(AppEvent::SystemMessage(format!(
+        "Loop detected: '{name}' returned the same output {streak} times in a row — paused. \
+         Send a message to continue."
+    )));
+    let _ = tx.send(AppEvent::Done {
+        tokens_in: usage.input_tokens,
+        tokens_out: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        cache_write: usage.cache_creation_input_tokens,
+        messages: messages.clone(),
+        model_used: model.to_string(),
+    });
+}
+
 /// The history to continue from after a turn ended without `Done`, with
 /// every unanswered tool_use closed, and whether the session file must be
 /// rewritten rather than appended to: when the turn compacted and that
@@ -635,11 +666,26 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 is_error: true,
                                 text: msg.clone(),
                             });
+                            // Refused calls count too: a model retrying one
+                            // pays a full request each time.
+                            let streak = loop_guard.record(name, &args, &msg, true);
                             results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
                                 content: vec![ToolResultContent::text(msg)],
                                 is_error: Some(true),
                             });
+                            if streak >= LOOP_THRESHOLD {
+                                end_turn_on_loop(
+                                    &tx,
+                                    &mut messages,
+                                    &mut results,
+                                    &response.usage,
+                                    &config.model,
+                                    name,
+                                    streak,
+                                );
+                                return;
+                            }
                             continue;
                         }
 
@@ -666,11 +712,24 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                     is_error: true,
                                     text: msg.clone(),
                                 });
+                                let streak = loop_guard.record(name, &args, &msg, true);
                                 results.push(ContentBlock::ToolResult {
                                     tool_use_id: id.clone(),
                                     content: vec![ToolResultContent::text(msg)],
                                     is_error: Some(true),
                                 });
+                                if streak >= LOOP_THRESHOLD {
+                                    end_turn_on_loop(
+                                        &tx,
+                                        &mut messages,
+                                        &mut results,
+                                        &response.usage,
+                                        &config.model,
+                                        name,
+                                        streak,
+                                    );
+                                    return;
+                                }
                                 continue;
                             }
                             if let Some(sys_msg) = hook_result.system_message {
@@ -688,11 +747,24 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 is_error: true,
                                 text: reason.clone(),
                             });
+                            let streak = loop_guard.record(name, &args, &reason, true);
                             results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
                                 content: vec![ToolResultContent::text(reason)],
                                 is_error: Some(true),
                             });
+                            if streak >= LOOP_THRESHOLD {
+                                end_turn_on_loop(
+                                    &tx,
+                                    &mut messages,
+                                    &mut results,
+                                    &response.usage,
+                                    &config.model,
+                                    name,
+                                    streak,
+                                );
+                                return;
+                            }
                             continue;
                         }
 
@@ -784,9 +856,6 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         });
 
                         if same_call_streak >= LOOP_THRESHOLD {
-                            // End the turn like any other: keep its history
-                            // and answer every tool_use, so the user can
-                            // steer and the next request is valid.
                             results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
                                 content: vec![ToolResultContent::text(format!(
@@ -796,24 +865,15 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 ))],
                                 is_error: Some(true),
                             });
-                            messages.push(Message {
-                                role: Role::User,
-                                content: std::mem::take(&mut results),
-                            });
-                            close_dangling_tool_uses(&mut messages);
-                            let _ = tx.send(AppEvent::SystemMessage(format!(
-                                "Loop detected: '{name}' returned the same output \
-                                 {same_call_streak} times in a row — paused. Send a message to \
-                                 continue."
-                            )));
-                            let _ = tx.send(AppEvent::Done {
-                                tokens_in: response.usage.input_tokens,
-                                tokens_out: response.usage.output_tokens,
-                                cache_read: response.usage.cache_read_input_tokens,
-                                cache_write: response.usage.cache_creation_input_tokens,
-                                messages: messages.clone(),
-                                model_used: config.model.clone(),
-                            });
+                            end_turn_on_loop(
+                                &tx,
+                                &mut messages,
+                                &mut results,
+                                &response.usage,
+                                &config.model,
+                                name,
+                                same_call_streak,
+                            );
                             return;
                         }
 
@@ -1191,5 +1251,75 @@ mod loop_guard_tests {
         );
         // A different result resets the streak.
         assert_eq!(g.record("Edit", args, "ok", false), 1);
+    }
+
+    /// A refused call never reached the old guard's place after execution,
+    /// so a model retrying a plan-mode-blocked Bash ran until the 50-request
+    /// cap. Three identical refusals end the turn like three identical runs.
+    #[tokio::test]
+    async fn repeated_refused_calls_end_the_turn() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let bash = |id: &str| {
+            sse(
+                &[serde_json::json!({"type":"tool_use","id":id,"name":"Bash","input":{}})],
+                "tool_use",
+            )
+        };
+        let (url, seen) = serve(vec![
+            bash("t1"),
+            bash("t2"),
+            bash("t3"),
+            bash("t4"),
+            sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_api_task(ApiTask {
+            client: ApiBackend::Anthropic(c),
+            tools: Vec::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            }],
+            config,
+            perm_state: PermissionState::new(false, &[], &[]),
+            system_prompt: String::new(),
+            tx,
+            plan_mode: true,
+            skill_no_shell: false,
+            session_id: "s".into(),
+            budget_remaining_usd: None,
+            history: TurnHistory::default(),
+        })
+        .await;
+
+        assert_eq!(seen.lock().unwrap().len(), 3, "turn kept retrying");
+        let mut done = None;
+        let mut loop_notice = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Done { messages, .. } => done = Some(messages),
+                AppEvent::SystemMessage(m) if m.contains("Loop detected") => loop_notice = true,
+                _ => {}
+            }
+        }
+        assert!(loop_notice);
+        let messages = done.expect("turn ended with Done");
+        // One result per tool_use, no duplicate for the looping call.
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.len(), 1);
     }
 }
