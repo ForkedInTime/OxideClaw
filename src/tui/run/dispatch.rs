@@ -309,6 +309,19 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let n = n.min(prompts.len());
                 messages.truncate(prompts[prompts.len() - n]);
                 messages.shrink_to_fit();
+                if let Err(e) = rewrite_session_history(
+                    session,
+                    messages,
+                    !config.no_session_persistence,
+                    saved_count,
+                )
+                .await
+                {
+                    tracing::warn!("rewind: session rewrite failed: {e}");
+                    app.entries.push(ChatEntry::error(format!(
+                        "Rewind: could not rewrite the session file ({e}); a resume may still show the rewound turns."
+                    )));
+                }
                 // Display: drop everything from the n-th last user entry on.
                 let user_entries: Vec<usize> = app
                     .entries
@@ -933,6 +946,16 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let count = msgs.len();
                         let display = entries_from_messages(&msgs);
                         *messages = msgs;
+                        // The import is its own conversation: appending it to
+                        // the current session's file interleaved the two.
+                        // A fresh session (as /clear) keeps the old one
+                        // resumable.
+                        if !config.no_session_persistence
+                            && let Ok(fresh) = Session::new().await
+                        {
+                            *session = fresh;
+                            *turn_counter = 0;
+                        }
                         *saved_count = 0;
                         app.entries = display;
                         app.show_welcome = false;

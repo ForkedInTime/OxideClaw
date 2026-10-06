@@ -64,6 +64,26 @@ fn is_prompt(m: &Message) -> bool {
             .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
+/// Make the session file match a history that was cut short in place
+/// (/rewind). Done appends `messages[saved_count..]` only once history
+/// outgrows `saved_count`, so a stale count left the next turns unsaved, or
+/// started the append mid-turn on a tool_result whose tool_use was rewound
+/// away, and the resumed session then 400'd on every request. The count
+/// moves even if the rewrite fails: appends then still start at a prompt,
+/// so the file keeps the rewound turns but stays well-formed.
+async fn rewrite_session_history(
+    session: &Session,
+    messages: &[Message],
+    persist: bool,
+    saved_count: &mut usize,
+) -> Result<()> {
+    *saved_count = messages.len();
+    if persist {
+        session.overwrite(messages).await?;
+    }
+    Ok(())
+}
+
 /// Turn counter for a session just resumed. `turn-N` snapshot dirs outlive
 /// the process, so a counter restarted at 0 sent the next turn into a
 /// previous run's `turn-1`, where `snapshot_file` keeps the stale copy and
@@ -1573,5 +1593,90 @@ mod merge_compaction_tests {
         let mut rewritten = base();
         rewritten[1] = text(Role::Assistant, "other");
         assert!(merge_compaction(&rewritten, summary, "s1", &base(), "s1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod rewind_persistence_tests {
+    use super::*;
+
+    fn text(role: Role, t: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    fn tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: vec![],
+                is_error: None,
+            }],
+        }
+    }
+
+    /// The Done handler's save step, verbatim.
+    async fn done(session: &mut Session, saved_count: &mut usize, new_messages: &[Message]) {
+        if new_messages.len() > *saved_count {
+            let to_save = new_messages[*saved_count..].to_vec();
+            *saved_count = new_messages.len();
+            session.append(&to_save).await.unwrap();
+        }
+    }
+
+    /// Two saved exchanges, /rewind 1, then a text-only turn and a tool
+    /// turn. The file must end up exactly the in-memory history: before,
+    /// the first turn was never written and the second was appended from
+    /// its tool_result on, after the rewound exchange.
+    #[tokio::test]
+    async fn turns_after_a_rewind_are_saved_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = Session::at_path("s", path.clone());
+        let mut saved_count = 0;
+        let mut messages = vec![
+            text(Role::User, "p1"),
+            tool_use("a"),
+            tool_result("a"),
+            text(Role::Assistant, "done 1"),
+            text(Role::User, "p2"),
+            text(Role::Assistant, "a2"),
+        ];
+        done(&mut session, &mut saved_count, &messages).await;
+
+        messages.truncate(4);
+        rewrite_session_history(&session, &messages, true, &mut saved_count)
+            .await
+            .unwrap();
+
+        messages.push(text(Role::User, "p3"));
+        messages.push(text(Role::Assistant, "a3"));
+        done(&mut session, &mut saved_count, &messages).await;
+        messages.push(text(Role::User, "p4"));
+        messages.push(tool_use("b"));
+        messages.push(tool_result("b"));
+        messages.push(text(Role::Assistant, "done 4"));
+        done(&mut session, &mut saved_count, &messages).await;
+
+        let on_disk: Vec<Message> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(on_disk, messages);
     }
 }

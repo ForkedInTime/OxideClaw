@@ -92,6 +92,26 @@ impl Session {
         })
     }
 
+    /// A session whose transcript lives at `path`, so tests never touch the
+    /// real sessions directory. Only the `.jsonl` is written through it.
+    #[cfg(test)]
+    pub(crate) fn at_path(id: &str, path: PathBuf) -> Self {
+        Self {
+            id: id.to_string(),
+            meta: SessionMeta {
+                id: id.to_string(),
+                name: String::new(),
+                created_at: 0,
+                preview: "set".into(),
+                tags: Vec::new(),
+                auto_commits: Vec::new(),
+                undo_position: 0,
+                base_commit: None,
+            },
+            path,
+        }
+    }
+
     /// Resume an existing session by ID — loads meta, returns Session + messages.
     pub async fn resume(id: &str) -> Result<(Self, Vec<Message>)> {
         let meta = SessionMeta::load(id)
