@@ -505,6 +505,7 @@ impl Config {
         // ── Settings files: global (~/.claude/settings.json) → project (./.claude/settings.json)
         // Project wins; env vars applied after (higher priority than settings files).
         let settings = crate::settings::Settings::load(&cfg.cwd);
+        cfg.apply_browser_settings(&settings);
         if let Some(model) = settings.model {
             cfg.model = crate::commands::resolve_model_alias(&model);
         }
@@ -805,6 +806,27 @@ impl Config {
     /// explicit per-model override from `max_tokens_by_model` and falling
     /// back to the global `max_tokens`. Lookup is tried first on the raw
     /// model string, then on its alias-resolved form.
+    fn apply_browser_settings(&mut self, settings: &crate::settings::Settings) {
+        if let Some(v) = settings.browser_enabled {
+            self.browser_enabled = v;
+        }
+        if let Some(v) = settings.browser_headless {
+            self.browser_headless = v;
+        }
+        let non_blank = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        self.browser_chrome_path = non_blank(&settings.browser_chrome_path);
+        self.browser_cdp_endpoint = non_blank(&settings.browser_cdp_endpoint);
+        // 0 would make every navigate and wait time out at once.
+        if let Some(t) = settings.browser_timeout_ms {
+            self.browser_timeout_ms = t.clamp(1_000, 600_000);
+        }
+    }
+
     pub fn max_tokens_for(&self, model: &str) -> u32 {
         if let Some(v) = self.max_tokens_by_model.get(model) {
             return *v;
@@ -1708,6 +1730,59 @@ mod auto_fix_clamp_tests {
         assert!(json.contains("testCommand"));
         assert!(json.contains("maxRetries"));
         assert!(json.contains("timeoutSecs"));
+    }
+}
+
+#[cfg(test)]
+mod browser_settings_tests {
+    use super::Config;
+    use crate::settings::Settings;
+
+    #[test]
+    fn browser_keys_in_settings_json_reach_the_config() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "browserEnabled": false,
+                "browserHeadless": false,
+                "browserChromePath": "/usr/bin/brave-browser",
+                "browserCdpEndpoint": "ws://127.0.0.1:9222/devtools/browser/x",
+                "browserTimeoutMs": 45000
+            }"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_browser_settings(&settings);
+        assert!(!cfg.browser_enabled);
+        assert!(!cfg.browser_headless);
+        assert_eq!(
+            cfg.browser_chrome_path.as_deref(),
+            Some("/usr/bin/brave-browser")
+        );
+        assert_eq!(
+            cfg.browser_cdp_endpoint.as_deref(),
+            Some("ws://127.0.0.1:9222/devtools/browser/x")
+        );
+        assert_eq!(cfg.browser_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn absent_blank_or_extreme_browser_values_keep_a_working_browser() {
+        let mut cfg = Config::default();
+        cfg.apply_browser_settings(&Settings::default());
+        assert!(cfg.browser_enabled);
+        assert!(cfg.browser_headless);
+        assert_eq!(cfg.browser_timeout_ms, 30_000);
+
+        let settings = Settings {
+            browser_chrome_path: Some("  ".into()),
+            browser_cdp_endpoint: Some(String::new()),
+            browser_timeout_ms: Some(0),
+            ..Settings::default()
+        };
+        cfg.apply_browser_settings(&settings);
+        assert_eq!(cfg.browser_chrome_path, None);
+        assert_eq!(cfg.browser_cdp_endpoint, None);
+        assert_eq!(cfg.browser_timeout_ms, 1_000);
     }
 }
 

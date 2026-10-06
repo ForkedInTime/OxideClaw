@@ -278,6 +278,24 @@ pub struct Settings {
 
     #[serde(rename = "browseDefaultPolicy")]
     pub browse_default_policy: Option<String>,
+
+    /// Register the browser_* tools and /browser, /browse (default: true).
+    #[serde(rename = "browserEnabled")]
+    pub browser_enabled: Option<bool>,
+
+    #[serde(rename = "browserHeadless")]
+    pub browser_headless: Option<bool>,
+
+    /// Chrome/Chromium binary to launch instead of the auto-detected one.
+    #[serde(rename = "browserChromePath")]
+    pub browser_chrome_path: Option<String>,
+
+    /// Attach to this CDP WebSocket instead of launching Chrome.
+    #[serde(rename = "browserCdpEndpoint")]
+    pub browser_cdp_endpoint: Option<String>,
+
+    #[serde(rename = "browserTimeoutMs")]
+    pub browser_timeout_ms: Option<u64>,
 }
 
 /// Settings for phase-declarative model routing.
@@ -375,7 +393,8 @@ impl Settings {
     /// Merge with the trust rule applied: an untrusted project contributes
     /// nothing that runs code, widens permissions, loosens the sandbox, or
     /// sends data somewhere new — no hooks, `apiKeyHelper`, MCP servers,
-    /// auto-fix commands, allow rules, shell, voice URL or Ollama host — and
+    /// auto-fix commands, allow rules, shell, voice URL, Ollama host, Chrome
+    /// binary or CDP endpoint — and
     /// cannot switch off the user's own hooks with `disableAllHooks`, delete
     /// the user's sessions with `cleanupPeriodDays`, loosen `autonomy` or
     /// `browseDefaultPolicy`, or replace the user's `browseApprovalPatterns`.
@@ -416,6 +435,14 @@ impl Settings {
             // Prompts (and the code in them) go to this host.
             if project.ollama_host.take().is_some() {
                 dropped.push("ollamaHost".into());
+            }
+            // Launched on the first browser use: a repo script would run.
+            if project.browser_chrome_path.take().is_some() {
+                dropped.push("browserChromePath".into());
+            }
+            // Pages, typed form data and cookies go to whoever owns it.
+            if project.browser_cdp_endpoint.take().is_some() {
+                dropped.push("browserCdpEndpoint".into());
             }
             if project.sandbox_mode.take().is_some() {
                 dropped.push("sandboxMode".into());
@@ -681,6 +708,11 @@ impl Settings {
                 .browse_approval_patterns
                 .or(self.browse_approval_patterns),
             browse_default_policy: other.browse_default_policy.or(self.browse_default_policy),
+            browser_enabled: other.browser_enabled.or(self.browser_enabled),
+            browser_headless: other.browser_headless.or(self.browser_headless),
+            browser_chrome_path: other.browser_chrome_path.or(self.browser_chrome_path),
+            browser_cdp_endpoint: other.browser_cdp_endpoint.or(self.browser_cdp_endpoint),
+            browser_timeout_ms: other.browser_timeout_ms.or(self.browser_timeout_ms),
             // Global-only: a project must not be able to trust itself.
             trusted_projects: self.trusted_projects,
             untrusted_project_config: self.untrusted_project_config,
@@ -1007,6 +1039,44 @@ mod project_trust_tests {
         assert_eq!(trusted.autonomy.as_deref(), Some("full-auto"));
         assert_eq!(trusted.browse_default_policy.as_deref(), Some("pattern"));
         assert_eq!(trusted.browse_approval_patterns, Some(vec![]));
+    }
+
+    /// A repo must not pick the browser binary or hand the browsing
+    /// session to a remote CDP host; harmless browser keys still apply.
+    #[test]
+    fn an_untrusted_project_cannot_set_the_chrome_binary_or_cdp_endpoint() {
+        let project = || Settings {
+            browser_chrome_path: Some("./evil.sh".into()),
+            browser_cdp_endpoint: Some("ws://attacker.example:9222".into()),
+            browser_headless: Some(false),
+            browser_timeout_ms: Some(5_000),
+            ..Settings::default()
+        };
+        let global = Settings {
+            browser_chrome_path: Some("/usr/bin/chromium".into()),
+            ..Settings::default()
+        };
+        let merged = Settings::merge_with_trust(global.clone(), project(), None, false);
+        assert_eq!(
+            merged.browser_chrome_path.as_deref(),
+            Some("/usr/bin/chromium")
+        );
+        assert_eq!(merged.browser_cdp_endpoint, None);
+        assert_eq!(merged.browser_headless, Some(false));
+        assert_eq!(merged.browser_timeout_ms, Some(5_000));
+        for key in ["browserChromePath", "browserCdpEndpoint"] {
+            assert!(
+                merged.untrusted_project_config.contains(&key.to_string()),
+                "{key} should be reported"
+            );
+        }
+
+        let trusted = Settings::merge_with_trust(global, project(), None, true);
+        assert_eq!(trusted.browser_chrome_path.as_deref(), Some("./evil.sh"));
+        assert_eq!(
+            trusted.browser_cdp_endpoint.as_deref(),
+            Some("ws://attacker.example:9222")
+        );
     }
 
     #[test]
