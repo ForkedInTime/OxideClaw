@@ -66,6 +66,102 @@ Full QA pass (2026-10-05). Each item below was reproduced or traced end to end.
   README no longer documents `oxideclaw spawn`, `oxideclaw upgrade` or
   `browse --json`; installer `--global` and Alpine arm64 handling.
 
+### Fixed
+
+Second QA pass (2026-10-06).
+
+- **`/browse` approval gate.** "Place your order", "Delete this repository"
+  and Shopify checkouts went through unasked, as did bare element refs like
+  `e7`, Enter or Space on a focused destructive button, and URL patterns on
+  a page reached by redirect. A repo's `browseDefaultPolicy` could turn the
+  gate off, a web page could fake a successful result, and pressing `a` on
+  the browse popup could Always-allow a hidden tool prompt. Voice approval
+  no longer hears its own announcement as the reply.
+- **Browser network.** Redirects, clicks and script navigation (in `/browse`
+  and WebBrowser) could reach the cloud metadata service or loopback; the
+  Alibaba and AWS IPv6 metadata addresses are now always denied, and a
+  refused navigation no longer returns Chromium's error page as content.
+- **Files the agent should not touch.** Write, Edit and NotebookEdit could
+  reach `.git` or `~/.ssh` through a symlink, a different letter case or
+  `link/newdir/../file`; Grep printed `CERT.PEM` / `server.KEY` that Read
+  refuses; Skill and MemoryRead/MemoryWrite followed repo-shipped symlinks
+  to private files; a sandboxed command could get code run outside the
+  sandbox through `.git/`.
+- **Permissions and hooks.** `Bash(git push:*)` now blocks a bare
+  `git push`, and Claude Code style rules like `Read(./.env)` are enforced.
+  MCP tools ask for permission and are blocked in plan mode. `--headless`
+  and `oxideclaw acp` now apply `permissions.deny`, tool hooks and
+  `--tools` / `--allowed-tools` / `--disallowed-tools`, and Agent children
+  there follow the editor's policy. A preToolUse guard no longer fails open
+  for fish or nu users. `userPromptSubmit` output reaches the model and
+  exit 2 keeps the prompt from being sent. `disableSkillShellExecution`
+  now actually refuses shell commands in skill turns. The strict sandbox
+  catches `dd` onto a disk again (and is no longer described as isolating),
+  firejail mode runs commands, and sub-agents honour a sandbox enabled
+  mid-session.
+- **Untrusted repositories** can no longer wipe sessions, loosen autonomy or
+  browse approval, switch off your global hooks, redirect prompts via
+  `OLLAMA_HOST` / `ANTHROPIC_MODEL` in `.env`, or hang startup with a
+  `settings.json`, `.mcp.json` or `.env` linked to `/dev/zero` or
+  `/dev/tty`. `/trust` with a typo no longer trusts the project, and
+  `/trust revoke` takes trust back.
+- **Keys sent to the wrong place.** `OPENAI_API_KEY` is no longer sent to
+  Groq, DeepSeek, OpenRouter and other OpenAI-compatible providers, nor to a
+  custom `voiceApiUrl`; `oxideclaw mcp add` no longer writes tokens into
+  the repo's `.mcp.json`; `/voice speak on` no longer runs the project's own
+  XTTS script, and spoken replies no longer go to whatever listens on port
+  5002.
+- **Lost work.** ExitWorktree deleted uncommitted work, and tools after
+  EnterWorktree edited the main checkout. `/undo` to the session base wiped
+  pre-session uncommitted changes; `/rewind` after a resume, `/review`, a
+  skill or a plugin command restored the wrong files. Compaction could
+  replace history with a cut-off or empty summary, background `/compact`
+  could clobber new messages, and Esc, `/budget`, quit or an API error
+  erased the turn's tool calls. `/forget` deleted unrelated memories. A
+  session resumed after a crash mid-save became unloadable. Saving a
+  setting loosened a `chmod 600` `settings.json` or broke its symlink, and
+  `/plugin install` could wipe an unparseable one.
+- **Silent misconfiguration.** A typo in `settings.json` is reported instead
+  of silently dropping its deny rules and hooks. `browserChromePath`,
+  `browserCdpEndpoint`, `browserHeadless`, `browserEnabled` and
+  `browserTimeoutMs` now take effect, Ollama and OpenAI-compatible models
+  honour system prompt options, and `/reload` applies CLAUDE.md/AGENTS.md
+  edits without switching a `--model` session to the settings model.
+- **Requests that kept failing.** Switching to Claude after a reasoning
+  model, DeepSeek thinking models after a tool call, `-p`/SDK/ACP/`/browse`
+  after a tool call when RAG found code, and every request after a rejected
+  `/image` returned 400. An expired `ant auth login` token is refreshed
+  instead of failing with 401. Remote HTTP MCP servers built on the
+  official SDKs now connect.
+- **Machine-readable output.** Sub-agents printed into the TUI, SDK, ACP and
+  `-p` JSON streams; large SDK/ACP requests were corrupted while
+  notifications streamed; a huge Read or Grep result broke `-p`, sub-agents,
+  SDK and ACP. `browse/approval_reply` now reaches the gate and a failed
+  browse run reports `browse/completed`.
+- **MCP.** Servers now start in `-p`, `--headless` and ACP sessions; `/mcp
+  disable` and `/plugin disable` actually stop the server; files returned as
+  embedded resources (GitHub `get_file_contents`) reach the model.
+- **Cost.** Sub-agent spend counts toward `/cost` and `/budget`, and a
+  sub-agent is capped at what is left of the budget.
+- **TUI.** Shift+Enter no longer submits a half-typed prompt (Alt+Enter and
+  Ctrl+J insert a newline); raw control characters no longer reach the
+  terminal; a long model id in a narrow pane no longer crashes; the
+  permission popup shows the tail of wrapped commands; edit-then-test cycles
+  no longer trip the loop detector; `--continue` reopens the last session
+  you worked in; quitting while Ctrl+R records stops the mic; XTTS no
+  longer hangs on its license prompt and eats keystrokes; flags after the
+  prompt are no longer swallowed into it.
+- **Tools.** `cmd &` no longer hangs Bash until the timeout, and a timeout
+  keeps the output; multi-line Edit/MultiEdit match CRLF files; NotebookEdit
+  handles notebooks without cell ids and inserts cells Jupyter accepts;
+  deeply nested HTML no longer aborts WebFetch; JS dialogs and large pages
+  no longer wedge the browser; a missing lint or test tool no longer counts
+  as a failed edit in the auto-fix loop.
+- **Plugins and packaging.** `/plugin install` works for scoped packages and
+  with bun; `/plugin marketplace add` of a missing or private repo fails
+  instead of taking over the terminal. The Docker image includes bash, and
+  the Linux gnu binaries start on Ubuntu 22.04, Debian 12 and RHEL 9.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added
