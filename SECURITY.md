@@ -33,7 +33,7 @@ Instead, please email the maintainers or use [GitHub's private vulnerability rep
 OxideClaw executes shell commands and modifies files as part of its core functionality. Users should be aware of:
 
 - **API keys** — stored in `.env` files. Never commit these to version control.
-- **Tool execution** — the AI agent can run Bash commands. Use sandboxing (`bwrap`, `firejail`, `strict`) for untrusted workloads.
+- **Tool execution** — the AI agent can run Bash commands. Use an isolating sandbox (`bwrap` or `firejail`, Linux only) for untrusted workloads; `strict` mode is a pattern denylist and provides no containment.
 - **MCP plugins** — third-party plugins execute with the same permissions as OxideClaw. Project-scoped plugins (`.claude/settings.json`, `.mcp.json`), project hooks and a project `apiKeyHelper` are ignored until you run `/trust` in that folder — a cloned repository cannot run commands on your machine by itself.
 - **HTTP MCP servers use static headers.** The bearer token in `mcpServers.<name>.headers` is sent as-is; OxideClaw has no OAuth refresh flow. When a token expires the server returns 401, the failure is reported, and you replace the token and restart.
 - **SDK / Headless mode** — the NDJSON server accepts commands on stdin. Secure the transport layer in production deployments.
@@ -45,5 +45,5 @@ OxideClaw supports multiple sandbox backends to limit tool execution:
 ```
 bwrap      — bubblewrap, lightweight Linux sandboxing
 firejail   — security sandbox with predefined profiles
-strict     — most restrictive, minimal filesystem access
+strict     — best-effort command denylist only; no filesystem or network isolation
 ```

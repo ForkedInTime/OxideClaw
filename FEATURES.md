@@ -397,7 +397,7 @@ OxideClaw supports multiple sandbox backends for tool isolation:
 |---------|-------------|
 | `bwrap` | bubblewrap — lightweight Linux sandboxing |
 | `firejail` | Firejail — security sandbox with profiles |
-| `strict` | Most restrictive — minimal filesystem access |
+| `strict` | Best-effort denylist of catastrophic command literals — NOT isolation; no filesystem or network restriction (the only option on macOS/Windows) |
 
 ---
 
