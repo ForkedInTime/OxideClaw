@@ -599,6 +599,14 @@ impl QueryEngine {
                     None => crate::tools::ToolOutput::error(format!("Unknown tool: {name}")),
                 };
 
+                // A sub-agent earlier in this batch spent part of the
+                // budget; the next one may only have what is left.
+                self.absorb_child_usage();
+                ctx.budget_remaining_usd = self
+                    .config
+                    .max_budget_usd
+                    .map(|b| (b - self.cumulative_cost_usd).max(0.0));
+
                 // Same rule as the TUI: once a skill is loaded with
                 // disableSkillShellExecution set, no shell for this turn,
                 // including the rest of this response and any Agent child.
@@ -1205,6 +1213,106 @@ pub(crate) mod scripted_api_tests {
         ) -> Result<crate::tools::ToolOutput> {
             Ok(crate::tools::ToolOutput::success("x".repeat(3_000_000)))
         }
+    }
+
+    /// Stands in for a sub-agent: records the budget it was offered and
+    /// reports `spend` output tokens through the usage sink.
+    struct Spender {
+        spend: u64,
+        offered: Arc<Mutex<Vec<Option<f64>>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Spender {
+        fn name(&self) -> &str {
+            "Spender"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            ctx: &crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            self.offered.lock().unwrap().push(ctx.budget_remaining_usd);
+            if let Some(sink) = &ctx.usage_sink {
+                let _ = sink.send(("claude-sonnet-5".into(), usage(self.spend)));
+            }
+            Ok(crate::tools::ToolOutput::success("spent"))
+        }
+    }
+
+    fn calls(names: &[&str]) -> Vec<ContentBlock> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ContentBlock::ToolUse {
+                id: format!("t{i}"),
+                name: (*n).into(),
+                input: serde_json::json!({"prompt": "go"}),
+            })
+            .collect()
+    }
+
+    /// Two sub-agents in one response were each offered the whole budget:
+    /// what the first spent was only counted after the batch.
+    #[tokio::test]
+    async fn sub_agents_in_one_batch_share_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            max_budget_usd: Some(1.0),
+            ..Config::default()
+        };
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let spender = Arc::new(Spender {
+            spend: 10_000,
+            offered: offered.clone(),
+        });
+        let mut e = QueryEngine::new(config.clone(), vec![spender]).unwrap();
+        e.execute_tools(&calls(&["Spender", "Spender"]))
+            .await
+            .unwrap();
+        let spent = estimate_cost_usd("claude-sonnet-5", &usage(10_000));
+        assert!(spent > 0.0);
+        let offered = offered.lock().unwrap().clone();
+        assert_eq!(offered[0], Some(1.0));
+        let second = offered[1].unwrap();
+        assert!((second - (1.0 - spent)).abs() < 1e-9, "{offered:?}");
+
+        // The first child used it all up: the Agent launch after it is refused.
+        let spender = Arc::new(Spender {
+            spend: 1_000_000,
+            offered: Arc::new(Mutex::new(Vec::new())),
+        });
+        let agent = Arc::new(crate::tools::agent::AgentTool {
+            config: config.clone(),
+        });
+        let mut e = QueryEngine::new(config, vec![spender, agent])
+            .unwrap()
+            .with_permission_gate(crate::permissions::PermissionGate::new(
+                crate::permissions::PermissionState::new(true, &[], &[]),
+                false,
+                None,
+            ));
+        let r = e
+            .execute_tools(&calls(&["Spender", "Agent"]))
+            .await
+            .unwrap();
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &r[1]
+        else {
+            panic!("{r:?}");
+        };
+        let ToolResultContent::Text { text } = &content[0];
+        assert_eq!(*is_error, Some(true));
+        assert!(text.contains("budget is spent"), "{text}");
     }
 
     /// `-p`, Agent children and /spawn stored a multi-megabyte Read/Grep
