@@ -284,8 +284,12 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
 
-    /// Prompt to send (used with --print)
-    #[arg(trailing_var_arg = true)]
+    /// Prompt to send (used with --print). Flags may come before or after
+    /// it; quote the prompt or put it after `--` if it contains words that
+    /// start with `-`.
+    // Not trailing_var_arg: that swallowed every flag after the first prompt
+    // word (`-p "fix" --disallowed-tools Bash`) into the prompt text and
+    // silently dropped the restriction.
     prompt: Vec<String>,
 
     #[command(subcommand)]
@@ -1535,6 +1539,43 @@ mod self_update_tests {
     fn missing_asset_is_none_not_a_near_match() {
         let a = assets(&["oxideclaw-linux-x64.sha256", "oxideclaw-linux-x64-musl"]);
         assert!(super::pick_release_asset(&a, "linux-x64").is_none());
+    }
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    /// Flags after the prompt must still be parsed as flags, not appended to
+    /// the prompt text (where restrictions like --disallowed-tools vanish).
+    #[test]
+    fn flags_after_the_prompt_are_parsed() {
+        let cli = Cli::try_parse_from([
+            "oxideclaw",
+            "-p",
+            "refactor auth",
+            "--disallowed-tools",
+            "Bash",
+            "--max-budget-usd",
+            "1",
+        ])
+        .unwrap();
+        assert!(cli.print);
+        assert_eq!(cli.prompt, vec!["refactor auth"]);
+        assert_eq!(cli.disallowed_tools, vec!["Bash"]);
+        assert_eq!(cli.max_budget_usd, Some(1.0));
+    }
+
+    #[test]
+    fn unquoted_prompt_words_and_double_dash_still_collect() {
+        let cli = Cli::try_parse_from(["oxideclaw", "-p", "fix", "the", "doctor", "--verbose"]).unwrap();
+        assert_eq!(cli.prompt, vec!["fix", "the", "doctor"]);
+        assert!(cli.verbose);
+        assert!(cli.command.is_none());
+
+        let cli = Cli::try_parse_from(["oxideclaw", "-p", "--", "fix", "-x", "flag"]).unwrap();
+        assert_eq!(cli.prompt, vec!["fix", "-x", "flag"]);
     }
 }
 
