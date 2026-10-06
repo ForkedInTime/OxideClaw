@@ -196,6 +196,7 @@ impl Tool for BrowserSnapshotTool {
     }
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let client = clone_client(&self.session).await?;
+        browser::actions::ensure_page_allowed(&client).await?;
         let (tree, refs, names) = browser::snapshot::take_snapshot(&client).await?;
         // A redirect or JS navigation may have moved the page since the last
         // tool recorded its URL.
@@ -251,6 +252,9 @@ impl Tool for BrowserClickTool {
             (result, client)
         };
         let dialogs = dialog_trailer(&self.session).await;
+        // The click may have navigated somewhere blocked; check before the
+        // auto-snapshot reads the new page.
+        browser::actions::ensure_page_allowed(&client).await?;
 
         // Auto-snapshot uses only the client — no session lock held during
         // the CDP round-trip. If the snapshot fails (e.g. page navigated
@@ -355,6 +359,7 @@ impl Tool for BrowserScreenshotTool {
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let full_page = input["full_page"].as_bool().unwrap_or(false);
         let client = clone_client(&self.session).await?;
+        browser::actions::ensure_page_allowed(&client).await?;
         let b64 = browser::actions::screenshot(&client, full_page).await?;
 
         use base64::Engine;
@@ -404,8 +409,9 @@ impl Tool for BrowserGetTextTool {
     }
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let element_ref = required_str(&input, "ref")?;
+        let client = clone_client(&self.session).await?;
+        browser::actions::ensure_page_allowed(&client).await?;
         let mut session = self.session.lock().await;
-        let _ = session.client()?;
         let text = browser::actions::get_text(&mut session, element_ref).await?;
         Ok(ToolOutput::success(text))
     }

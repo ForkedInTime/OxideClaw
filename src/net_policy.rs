@@ -242,6 +242,18 @@ impl Drop for PolicyProxy {
     }
 }
 
+/// Chromium flags that force every connection through `proxy`.
+pub fn chromium_proxy_args(proxy: SocketAddr) -> [String; 3] {
+    [
+        format!("--proxy-server=http://{proxy}"),
+        // Chromium implicitly bypasses proxies for localhost; `<-loopback>`
+        // removes that, so loopback goes through the policy too.
+        "--proxy-bypass-list=<-loopback>".into(),
+        // WebRTC would otherwise send UDP straight past the proxy.
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
+    ]
+}
+
 /// Request heads larger than this are refused; no legitimate request needs it.
 const MAX_PROXY_HEAD: usize = 64 * 1024;
 
@@ -318,7 +330,7 @@ async fn proxy_one(mut client: tokio::net::TcpStream, policy: NetPolicy) {
             let _ = client
                 .write_all(&refusal(
                     "403 Forbidden",
-                    &format!("WebBrowser refused: {e}"),
+                    &format!("Blocked by OxideClaw network policy: {e}"),
                 ))
                 .await;
             return;

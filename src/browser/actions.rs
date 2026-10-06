@@ -62,6 +62,58 @@ pub async fn preflight_navigation_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to read a page that has moved to a blocked destination, and blank
+/// it. Chrome follows redirects, link clicks, meta refresh and script
+/// navigation without asking, so the preflight on the requested URL says
+/// nothing about where the page is now. A launched Chrome cannot even load
+/// such a page (its traffic goes through the policy proxy); this is what
+/// covers a Chrome attached through `browserCdpEndpoint`, which has no proxy.
+pub async fn ensure_page_allowed(client: &CdpClient) -> Result<()> {
+    let Some(href) = current_url(client).await else {
+        return Ok(());
+    };
+    if let Err(e) = landed_url_verdict(&href).await {
+        let _ = client
+            .send("Page.navigate", json!({"url": "about:blank"}))
+            .await;
+        bail!(
+            "the page moved to a blocked destination ({e}); the browser was reset to about:blank"
+        );
+    }
+    Ok(())
+}
+
+/// Policy verdict on a page's live location. Only addresses that resolve and
+/// fail the policy count: a host this machine cannot resolve (a Chrome in a
+/// container sees other DNS) is not evidence of anything, and Chrome's own
+/// schemes (about:, chrome-error:, data:) have no destination.
+async fn landed_url_verdict(href: &str) -> Result<()> {
+    let Ok(url) = url::Url::parse(href) else {
+        return Ok(());
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return Ok(());
+    }
+    let Some(port) = url.port_or_known_default() else {
+        return Ok(());
+    };
+    let ips: Vec<std::net::IpAddr> = match url.host() {
+        Some(url::Host::Ipv4(ip)) => vec![ip.into()],
+        Some(url::Host::Ipv6(ip)) => vec![ip.into()],
+        Some(url::Host::Domain(name)) => match tokio::net::lookup_host((name, port)).await {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    for ip in ips {
+        crate::net_policy::NetPolicy::LOCAL_OK
+            .check_ip(ip)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", url.host_str().unwrap_or("host")))?;
+    }
+    Ok(())
+}
+
 /// Navigate to a URL. Returns (title, status). Does NOT mutate session state —
 /// the caller is responsible for updating `current_url` / `current_title`
 /// after this returns, so the session lock can be released while we wait on
@@ -88,6 +140,8 @@ pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<
             Err(_) => anyhow::bail!("Page load timed out after {timeout_ms}ms"),
         }
     }
+    // A redirect may have taken the page somewhere the preflight would refuse.
+    ensure_page_allowed(client).await?;
 
     // Get page title
     let eval = client
@@ -431,5 +485,68 @@ mod fill_summary_tests {
         let v = format!("{}🦀", "a".repeat(49));
         let s = fill_summary("@e1", &v);
         assert!(!s.contains('🦀'));
+    }
+}
+
+#[cfg(test)]
+mod landed_url_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// CDP endpoint that reports `href` as the page location and records the
+    /// URL of every Page.navigate it receives.
+    async fn fake_cdp(href: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let navigations = Arc::new(Mutex::new(Vec::new()));
+        let seen = navigations.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let cmd: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if cmd["method"] == "Page.navigate" {
+                    let url = cmd["params"]["url"].as_str().unwrap_or("").to_string();
+                    seen.lock().unwrap().push(url);
+                }
+                let result = if cmd["method"] == "Runtime.evaluate" {
+                    json!({"result": {"type": "string", "value": href}})
+                } else {
+                    json!({})
+                };
+                let reply = json!({"id": cmd["id"], "result": result}).to_string();
+                if ws.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (format!("ws://{addr}"), navigations)
+    }
+
+    /// Only the URL handed to browser_navigate was checked, so a page that
+    /// redirected (or was clicked) to the metadata service was read freely.
+    #[tokio::test]
+    async fn a_page_that_landed_on_the_metadata_service_is_blanked() {
+        let (ws, navs) = fake_cdp("http://169.254.169.254/latest/meta-data/iam/").await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let err = ensure_page_allowed(&client).await.unwrap_err().to_string();
+        assert!(err.contains("169.254.169.254"), "{err}");
+        assert_eq!(*navs.lock().unwrap(), vec!["about:blank".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn local_dev_servers_and_chrome_pages_stay_readable() {
+        for href in [
+            "http://127.0.0.1:3000/",
+            "about:blank",
+            "chrome-error://chromewebdata/",
+        ] {
+            let (ws, navs) = fake_cdp(href).await;
+            let client = CdpClient::connect(&ws).await.unwrap();
+            ensure_page_allowed(&client).await.unwrap();
+            assert!(navs.lock().unwrap().is_empty(), "{href}");
+        }
     }
 }

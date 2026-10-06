@@ -136,7 +136,7 @@ async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option
 }
 
 fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &str) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         "--headless".into(),
         "--disable-gpu".into(),
         "--no-first-run".into(),
@@ -144,15 +144,10 @@ fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &s
         "--disable-component-update".into(),
         "--disable-sync".into(),
         format!("--user-data-dir={}", profile.display()),
-        format!("--proxy-server=http://{proxy}"),
-        // Chromium implicitly bypasses proxies for localhost; `<-loopback>`
-        // removes that, so loopback goes through the policy too.
-        "--proxy-bypass-list=<-loopback>".into(),
-        // WebRTC would otherwise send UDP straight past the proxy.
-        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
-        "--dump-dom".into(),
-        url.into(),
-    ]
+    ];
+    args.extend(crate::net_policy::chromium_proxy_args(proxy));
+    args.extend(["--dump-dom".into(), url.into()]);
+    args
 }
 
 /// Plain HTTP fetch as fallback.

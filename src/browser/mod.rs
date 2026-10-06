@@ -30,6 +30,9 @@ pub struct BrowserSession {
     child: Option<Child>,
     /// Temp user-data-dir — kept alive so Chrome's profile directory is not deleted.
     _user_data: Option<TempDir>,
+    /// Policy proxy every connection of a launched Chrome goes through; lives
+    /// as long as that Chrome.
+    _proxy: Option<crate::net_policy::PolicyProxy>,
     /// Element ref map: @e1 -> backend DOM node ID
     refs: HashMap<String, i64>,
     /// Element label map: @e1 -> accessible name (for approval gate pattern matching).
@@ -83,22 +86,16 @@ impl BrowserSession {
 
         let user_data = tempfile::tempdir()?;
         let port = find_free_port().await?;
+        // Chrome follows redirects, link clicks, meta refresh and script
+        // navigation and resolves DNS on its own, so the preflight on
+        // browser_navigate's URL left the metadata service one 302 away.
+        // Every connection it makes is resolved, checked and pinned by this
+        // proxy instead. LOCAL_OK: dev servers on loopback and the LAN stay
+        // reachable; link-local never is.
+        let proxy =
+            crate::net_policy::spawn_policy_proxy(crate::net_policy::NetPolicy::LOCAL_OK).await?;
 
-        let mut args = vec![
-            format!("--remote-debugging-port={port}"),
-            format!("--user-data-dir={}", user_data.path().display()),
-            "--no-first-run".to_string(),
-            "--no-default-browser-check".to_string(),
-            "--disable-background-networking".to_string(),
-            "--disable-extensions".to_string(),
-            // Container/sandbox robustness: prevent /dev/shm crashes, GPU hangs in headless
-            "--disable-dev-shm-usage".to_string(),
-        ];
-        if headless {
-            args.push("--headless=new".to_string());
-            args.push("--disable-gpu".to_string());
-        }
-        args.push("about:blank".to_string());
+        let args = launch_args(port, user_data.path(), proxy.addr, headless);
 
         let mut child = tokio::process::Command::new(&chrome)
             .args(&args)
@@ -128,6 +125,7 @@ impl BrowserSession {
         self.client = Some(client);
         self.child = Some(child);
         self._user_data = Some(user_data);
+        self._proxy = Some(proxy);
         Ok(())
     }
 
@@ -156,6 +154,7 @@ impl BrowserSession {
         }
         // Drop the TempDir now so the profile directory is removed.
         self._user_data = None;
+        self._proxy = None;
         self.refs.clear();
         self.ref_names.clear();
         self.current_url.clear();
@@ -231,6 +230,33 @@ pub fn normalize_ref(r: &str) -> String {
     } else {
         format!("@{r}")
     }
+}
+
+/// Chrome's command line for a launched session. Every connection goes
+/// through the policy proxy at `proxy`.
+fn launch_args(
+    port: u16,
+    user_data: &std::path::Path,
+    proxy: std::net::SocketAddr,
+    headless: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", user_data.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-background-networking".to_string(),
+        "--disable-extensions".to_string(),
+        // Container/sandbox robustness: prevent /dev/shm crashes, GPU hangs in headless
+        "--disable-dev-shm-usage".to_string(),
+    ];
+    args.extend(crate::net_policy::chromium_proxy_args(proxy));
+    if headless {
+        args.push("--headless=new".to_string());
+        args.push("--disable-gpu".to_string());
+    }
+    args.push("about:blank".to_string());
+    args
 }
 
 /// Search common Chrome/Chromium binary locations (Linux + macOS).
@@ -458,6 +484,23 @@ async fn poll_cdp_endpoint(port: u16) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A launched Chrome had no proxy, so it followed a 302 (or a click, or a
+    /// script) to 169.254.169.254 unchecked. All of its traffic, loopback
+    /// included, must go through the policy proxy.
+    #[test]
+    fn launched_chrome_is_pinned_to_the_policy_proxy() {
+        let proxy: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        for headless in [true, false] {
+            let args = launch_args(9222, std::path::Path::new("/p"), proxy, headless);
+            assert!(args.contains(&"--proxy-server=http://127.0.0.1:4242".to_string()));
+            assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
+            assert!(
+                args.contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into())
+            );
+            assert_eq!(args.last().unwrap(), "about:blank");
+        }
+    }
 
     #[test]
     fn dialogs_are_dismissed_except_beforeunload() {
