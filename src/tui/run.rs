@@ -1417,6 +1417,14 @@ async fn run_loop(
                 app.entries
                     .push(ChatEntry::system("Shutdown: pending question cancelled."));
             }
+            // Quitting mid-recording: ask the recorder to stop. The runtime
+            // may drop the task before it runs; kill_on_drop on the recorder
+            // child is the backstop that keeps the mic from outliving us.
+            if let Some(stop_tx) = app.voice_stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            app.voice_recording = false;
+            app.voice_task = None;
             // Quitting mid-turn: keep what the turn did for --continue.
             if let Some(handle) = app.api_task.take() {
                 handle.abort();

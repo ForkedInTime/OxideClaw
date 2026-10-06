@@ -113,6 +113,9 @@ fn tts_request_body(text: &str, speaker_wav: Option<&std::path::Path>) -> String
 
 /// Spawn the recorder process. Returns the child process handle.
 /// The caller is responsible for killing it when recording should stop.
+/// Dropping the child kills it: quitting mid-recording drops the recorder
+/// task with the runtime, and without that the mic kept recording to the
+/// temp WAV after OxideClaw exited.
 pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process::Child> {
     let out = temp_wav_path();
     // Clean up any previous recording
@@ -135,6 +138,7 @@ pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .kill_on_drop(true)
                 .spawn()?
         }
         RecorderBackend::Sox => {
@@ -152,6 +156,7 @@ pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .kill_on_drop(true)
                 .spawn()?
         }
         RecorderBackend::Ffmpeg => Command::new("ffmpeg")
@@ -170,6 +175,7 @@ pub async fn start_recording(backend: &RecorderBackend) -> Result<tokio::process
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()?,
     };
     Ok(child)
