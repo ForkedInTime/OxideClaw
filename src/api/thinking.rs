@@ -19,8 +19,14 @@ pub const MIN_BUDGET_TOKENS: u32 = 1024;
 /// `thinking` request field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
-    Adaptive,
-    Enabled { budget_tokens: u32 },
+    /// `summarized` asks for readable thinking text; without it, models
+    /// from Opus 4.7 on stream thinking blocks with empty text.
+    Adaptive {
+        summarized: bool,
+    },
+    Enabled {
+        budget_tokens: u32,
+    },
     Disabled,
 }
 
@@ -28,9 +34,12 @@ impl Serialize for ThinkingConfig {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         match self {
-            ThinkingConfig::Adaptive => {
-                let mut st = s.serialize_struct("ThinkingConfig", 1)?;
+            ThinkingConfig::Adaptive { summarized } => {
+                let mut st = s.serialize_struct("ThinkingConfig", 1 + *summarized as usize)?;
                 st.serialize_field("type", "adaptive")?;
+                if *summarized {
+                    st.serialize_field("display", "summarized")?;
+                }
                 st.end()
             }
             ThinkingConfig::Enabled { budget_tokens } => {
@@ -154,30 +163,47 @@ pub fn supports_effort(model: &str) -> bool {
 /// The `thinking` field for `model` given the user's budget setting.
 /// `None` budget = leave the API default. `Some(0)` = off. `effort` is the
 /// configured effort level, which decides whether "off" is legal on Opus 5.
+/// `show_summaries` asks for readable thinking text where the API would
+/// otherwise return empty thinking blocks.
 pub fn thinking_for(
     model: &str,
     budget: Option<u32>,
     max_tokens: u32,
     effort: Option<&str>,
+    show_summaries: bool,
 ) -> Option<ThinkingConfig> {
-    let budget = budget?;
     let model = canonical(model);
     family_of(&model)?;
     let adaptive = supports_adaptive_thinking(&model);
+    // Opus/Sonnet 4.6 already default to summarized display; from Opus 4.7
+    // on the default is "omitted", whose thinking blocks carry no text.
+    let summarized = show_summaries && adaptive && model_version(&model) > Some((4, 6));
+    // Where the API thinks even with the field omitted, sending adaptive is
+    // the same request plus the display choice. Opus 4.7/4.8 do not think
+    // by default, so adding the field there would turn thinking on.
+    let thinks_by_default = {
+        let family = family_of(&model).map(|(_, f)| f);
+        matches!(family, Some("fable" | "mythos"))
+            || model_version(&model).is_some_and(|(major, _)| major >= 5)
+    };
+    let api_default =
+        (summarized && thinks_by_default).then_some(ThinkingConfig::Adaptive { summarized });
+    let Some(budget) = budget else {
+        return api_default;
+    };
     if budget == 0 {
         // Opus 5 at xhigh/max: omitting the field (adaptive) is the only
         // request the API accepts, so effort wins over "off".
         let high_effort = effort
             .map(|e| e.trim().to_ascii_lowercase())
             .is_some_and(|e| e == "max" || e == "xhigh");
-        if high_effort && disabled_needs_low_effort(&model) {
-            return None;
+        if (high_effort && disabled_needs_low_effort(&model)) || rejects_disabled_thinking(&model) {
+            return api_default;
         }
-        return (adaptive && !rejects_disabled_thinking(&model))
-            .then_some(ThinkingConfig::Disabled);
+        return adaptive.then_some(ThinkingConfig::Disabled);
     }
     if adaptive {
-        return Some(ThinkingConfig::Adaptive);
+        return Some(ThinkingConfig::Adaptive { summarized });
     }
     // budget_tokens must be ≥ MIN and < max_tokens, or the API returns 400.
     let ceiling = max_tokens.checked_sub(1)?;
@@ -301,7 +327,10 @@ mod tests {
 
     #[test]
     fn thinking_serialises_to_the_three_api_shapes() {
-        assert_eq!(json(&ThinkingConfig::Adaptive), r#"{"type":"adaptive"}"#);
+        assert_eq!(
+            json(&ThinkingConfig::Adaptive { summarized: false }),
+            r#"{"type":"adaptive"}"#
+        );
         assert_eq!(
             json(&ThinkingConfig::Enabled {
                 budget_tokens: 2048
@@ -326,19 +355,19 @@ mod tests {
     #[test]
     fn claude_5_gets_adaptive_never_budget_tokens() {
         assert_eq!(
-            thinking_for("claude-sonnet-5", Some(10_000), 64_000, None),
-            Some(ThinkingConfig::Adaptive)
+            thinking_for("claude-sonnet-5", Some(10_000), 64_000, None, false),
+            Some(ThinkingConfig::Adaptive { summarized: false })
         );
         assert_eq!(
-            thinking_for("claude-opus-5", Some(100), 64_000, None),
-            Some(ThinkingConfig::Adaptive)
+            thinking_for("claude-opus-5", Some(100), 64_000, None, false),
+            Some(ThinkingConfig::Adaptive { summarized: false })
         );
     }
 
     #[test]
     fn haiku_keeps_the_budget_form() {
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(10_000), 64_000, None),
+            thinking_for("claude-haiku-4-5", Some(10_000), 64_000, None, false),
             Some(ThinkingConfig::Enabled {
                 budget_tokens: 10_000
             })
@@ -348,20 +377,20 @@ mod tests {
     #[test]
     fn budget_is_clamped_to_the_api_minimum_and_below_max_tokens() {
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(100), 64_000, None),
+            thinking_for("claude-haiku-4-5", Some(100), 64_000, None, false),
             Some(ThinkingConfig::Enabled {
                 budget_tokens: MIN_BUDGET_TOKENS
             })
         );
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(10_000), 4_096, None),
+            thinking_for("claude-haiku-4-5", Some(10_000), 4_096, None, false),
             Some(ThinkingConfig::Enabled {
                 budget_tokens: 4_095
             })
         );
         // max_tokens too small for any legal budget: omit rather than 400.
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(10_000), 1_000, None),
+            thinking_for("claude-haiku-4-5", Some(10_000), 1_000, None, false),
             None
         );
     }
@@ -369,11 +398,11 @@ mod tests {
     #[test]
     fn zero_budget_disables_explicitly_on_adaptive_models_and_omits_elsewhere() {
         assert_eq!(
-            thinking_for("claude-sonnet-5", Some(0), 64_000, None),
+            thinking_for("claude-sonnet-5", Some(0), 64_000, None, false),
             Some(ThinkingConfig::Disabled)
         );
         assert_eq!(
-            thinking_for("claude-haiku-4-5", Some(0), 64_000, None),
+            thinking_for("claude-haiku-4-5", Some(0), 64_000, None, false),
             None
         );
     }
@@ -388,15 +417,15 @@ mod tests {
             "claude-sonnet-5-5",
             "fable",
         ] {
-            assert_eq!(thinking_for(m, Some(0), 64_000, None), None, "{m}");
+            assert_eq!(thinking_for(m, Some(0), 64_000, None, false), None, "{m}");
             assert_eq!(
-                thinking_for(m, Some(4_096), 64_000, None),
-                Some(ThinkingConfig::Adaptive),
+                thinking_for(m, Some(4_096), 64_000, None, false),
+                Some(ThinkingConfig::Adaptive { summarized: false }),
                 "{m}"
             );
         }
         assert_eq!(
-            thinking_for("claude-opus-5", Some(0), 64_000, None),
+            thinking_for("claude-opus-5", Some(0), 64_000, None, false),
             Some(ThinkingConfig::Disabled)
         );
     }
@@ -406,11 +435,15 @@ mod tests {
     fn opus_5_keeps_thinking_on_when_effort_is_above_high() {
         for m in ["claude-opus-5", "opus"] {
             for e in ["max", "xhigh", " MAX "] {
-                assert_eq!(thinking_for(m, Some(0), 64_000, Some(e)), None, "{m} {e}");
+                assert_eq!(
+                    thinking_for(m, Some(0), 64_000, Some(e), false),
+                    None,
+                    "{m} {e}"
+                );
             }
             for e in ["low", "medium", "high"] {
                 assert_eq!(
-                    thinking_for(m, Some(0), 64_000, Some(e)),
+                    thinking_for(m, Some(0), 64_000, Some(e), false),
                     Some(ThinkingConfig::Disabled),
                     "{m} {e}"
                 );
@@ -419,19 +452,85 @@ mod tests {
         // Sonnet 5 and Opus 4.x accept disabled at any effort.
         for m in ["claude-sonnet-5", "claude-opus-4-8"] {
             assert_eq!(
-                thinking_for(m, Some(0), 64_000, Some("max")),
+                thinking_for(m, Some(0), 64_000, Some("max"), false),
                 Some(ThinkingConfig::Disabled),
                 "{m}"
             );
         }
     }
 
+    /// Default display is "omitted" from Opus 4.7 on: thinking blocks come
+    /// back empty and showThinkingSummaries would show nothing.
+    #[test]
+    fn show_summaries_requests_summarized_display() {
+        let summarized = Some(ThinkingConfig::Adaptive { summarized: true });
+        assert_eq!(
+            json(&summarized.clone().unwrap()),
+            r#"{"type":"adaptive","display":"summarized"}"#
+        );
+        // Models that think with the field omitted: send it with display.
+        for m in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "sonnet",
+        ] {
+            assert_eq!(thinking_for(m, None, 64_000, None, true), summarized, "{m}");
+            assert_eq!(
+                thinking_for(m, Some(4_096), 64_000, None, true),
+                summarized,
+                "{m}"
+            );
+        }
+        // Thinking that cannot be switched off is still shown.
+        assert_eq!(
+            thinking_for("claude-opus-5-5", Some(0), 64_000, None, true),
+            summarized
+        );
+        assert_eq!(
+            thinking_for("claude-opus-5", Some(0), 64_000, Some("max"), true),
+            summarized
+        );
+        // Off stays off.
+        assert_eq!(
+            thinking_for("claude-sonnet-5", Some(0), 64_000, None, true),
+            Some(ThinkingConfig::Disabled)
+        );
+        // Opus 4.7/4.8 do not think unless asked: no field without a budget.
+        assert_eq!(
+            thinking_for("claude-opus-4-8", None, 64_000, None, true),
+            None
+        );
+        assert_eq!(
+            thinking_for("claude-opus-4-8", Some(4_096), 64_000, None, true),
+            summarized
+        );
+        // 4.6 already summarizes; the budget form returns its text as is.
+        assert_eq!(
+            thinking_for("claude-sonnet-4-6", Some(4_096), 64_000, None, true),
+            Some(ThinkingConfig::Adaptive { summarized: false })
+        );
+        assert!(matches!(
+            thinking_for("claude-haiku-4-5", Some(4_096), 64_000, None, true),
+            Some(ThinkingConfig::Enabled { .. })
+        ));
+        assert_eq!(thinking_for("llama3.2", None, 64_000, None, true), None);
+    }
+
     #[test]
     fn unset_budget_and_non_claude_models_send_nothing() {
-        assert_eq!(thinking_for("claude-sonnet-5", None, 64_000, None), None);
-        assert_eq!(thinking_for("llama3.2", Some(4_096), 64_000, None), None);
         assert_eq!(
-            thinking_for("groq:llama-3.3-70b", Some(4_096), 64_000, None),
+            thinking_for("claude-sonnet-5", None, 64_000, None, false),
+            None
+        );
+        assert_eq!(
+            thinking_for("llama3.2", Some(4_096), 64_000, None, false),
+            None
+        );
+        assert_eq!(
+            thinking_for("groq:llama-3.3-70b", Some(4_096), 64_000, None, false),
             None
         );
     }
@@ -444,7 +543,7 @@ mod tests {
             })),
             vec![INTERLEAVED_THINKING_BETA.to_string()]
         );
-        assert!(thinking_betas(Some(&ThinkingConfig::Adaptive)).is_empty());
+        assert!(thinking_betas(Some(&ThinkingConfig::Adaptive { summarized: false })).is_empty());
         assert!(thinking_betas(Some(&ThinkingConfig::Disabled)).is_empty());
         assert!(thinking_betas(None).is_empty());
     }
@@ -502,7 +601,7 @@ mod tests {
             system: SystemContent::Plain(String::new()),
             tools: vec![],
             stream: None,
-            thinking: Some(ThinkingConfig::Adaptive),
+            thinking: Some(ThinkingConfig::Adaptive { summarized: false }),
             output_config: None,
             betas: vec![],
             session_id: None,
@@ -526,7 +625,7 @@ mod tests {
         let key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
         let client = ClaudeClient::new(key).unwrap();
         for model in ["claude-sonnet-5", "claude-haiku-4-5", "claude-sonnet-4-6"] {
-            let thinking = thinking_for(model, Some(2048), 4096, None);
+            let thinking = thinking_for(model, Some(2048), 4096, None, false);
             let betas = thinking_betas(thinking.as_ref());
             let mut system = String::from("Reply with one word.");
             let output_config = match effort_for(model, Some("low")) {

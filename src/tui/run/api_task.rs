@@ -340,6 +340,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
             config.thinking_budget_tokens,
             max_tokens,
             config.effort.as_deref(),
+            config.show_thinking_summaries,
         );
         let mut betas = crate::api::thinking::thinking_betas(thinking_cfg.as_ref());
         // Append extra betas from CLI --betas flag
