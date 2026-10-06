@@ -337,6 +337,22 @@ fn temp_index_cmd(cwd: &Path, temp_index: &Path) -> Command {
     cmd
 }
 
+/// Copy the user's index, mtime included. Git trusts an entry's stat data
+/// only when the file's mtime is older than the index file's own; a file
+/// rewritten (same size) in the same clock tick as the last `git add` or
+/// commit is "racily clean" and re-read. A plain copy gave the index a fresh
+/// mtime, so such an edit was taken as unchanged and the snapshot recorded
+/// the old content. The mtime is read first: a newer index swapped in
+/// mid-copy then only makes more entries racy, never fewer.
+fn copy_index(real: &Path, temp_index: &Path) -> std::io::Result<()> {
+    let mtime = std::fs::metadata(real)?.modified()?;
+    std::fs::copy(real, temp_index)?;
+    std::fs::File::options()
+        .write(true)
+        .open(temp_index)?
+        .set_modified(mtime)
+}
+
 /// Fill `temp_index` with `tree`, keeping the stat data of the user's real
 /// index for every entry whose blob already matches (`read-tree -m` with one
 /// tree does exactly that). A plain `read-tree` zeroes stat data, so `add -A`
@@ -344,7 +360,7 @@ fn temp_index_cmd(cwd: &Path, temp_index: &Path) -> Command {
 /// every turn, freezing the TUI for seconds in large repos.
 fn seed_index(cwd: &Path, tree: &str, temp_index: &Path) -> anyhow::Result<()> {
     let warm = git_output(git_cmd(cwd).args(["rev-parse", "--git-path", "index"]))
-        .is_ok_and(|real| std::fs::copy(cwd.join(real), temp_index).is_ok())
+        .is_ok_and(|real| copy_index(&cwd.join(real), temp_index).is_ok())
         && temp_index_cmd(cwd, temp_index)
             .args(["read-tree", "-m", tree])
             .stdout(Stdio::null())
@@ -1176,6 +1192,59 @@ mod snapshot_tests {
             .status()
             .unwrap();
         assert!(s.success());
+    }
+
+    /// A same-size edit in the clock tick of the last commit has the stat
+    /// data git recorded for the old content; only the index file's own
+    /// mtime tells git to re-read it. The copied index got a fresh mtime and
+    /// the snapshot kept "v1".
+    #[test]
+    fn snapshot_records_an_edit_made_in_the_same_tick_as_the_last_commit() {
+        let td = init_test_repo();
+        let repo = td.path();
+        // Only whole-second mtime and size decide "unchanged", so one fixed
+        // timestamp stands in for "the same tick" deterministically.
+        for (k, v) in [("core.trustctime", "false"), ("core.checkStat", "minimal")] {
+            assert!(
+                git_cmd(repo)
+                    .args(["config", k, v])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let tick =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_mtime = |p: &Path| {
+            fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(tick)
+                .unwrap()
+        };
+        write_file(repo, "app.txt", "v1\n");
+        set_mtime(&repo.join("app.txt"));
+        assert!(
+            git_cmd(repo)
+                .args(["add", "app.txt"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let s = git_cmd(repo).args(["commit", "-q", "-m", "v1"]).status();
+        assert!(s.unwrap().success());
+        set_mtime(&repo.join(".git/index"));
+        write_file(repo, "app.txt", "v2\n");
+        set_mtime(&repo.join("app.txt"));
+
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        let cfg = AutoCommitConfig::default();
+        snapshot_turn(repo, &cfg, "s", "v2", 1, &mut commits, &mut pos, None).unwrap();
+        assert_eq!(commits.len(), 1, "the edit was taken as unchanged");
+        let recorded = git_output(git_cmd(repo).args(["show", &format!("{}:app.txt", commits[0])]));
+        assert_eq!(recorded.unwrap(), "v2");
     }
 
     #[test]
