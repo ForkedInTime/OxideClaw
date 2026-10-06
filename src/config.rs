@@ -805,15 +805,17 @@ impl Config {
         // ── Last resort: the active `ant auth login` profile.
         //
         // Runs after the explicit mechanisms above so local configuration always
-        // wins over ambient machine state. `ant auth print-credentials` refreshes
-        // the short-lived token before printing, so there is no refresh flow to
-        // implement here.
+        // wins over ambient machine state. The token is short-lived and `ant`
+        // only refreshes it when run, so it is registered with PROFILE_TOKENS:
+        // the Anthropic client re-runs `ant` on a 401 and every copy of this
+        // key resolves to the newest token at send time.
         if cfg.api_key.is_empty()
             && let Some(resolved) = crate::auth::resolve_profile()
         {
             cfg.auth_is_oauth = resolved.credential.is_oauth();
             cfg.auth_source = Some(resolved.source.describe());
             cfg.api_key = resolved.credential.secret().to_string();
+            crate::auth::PROFILE_TOKENS.register(&cfg.api_key);
         }
 
         // ── Optional env var overrides (env wins over settings files)

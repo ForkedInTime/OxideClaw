@@ -19,19 +19,29 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    /// The request headers, with the credential in the wire format the
-    /// credential kind requires. Mirrors `api::AnthropicClient::with_credential`.
-    fn headers(&self) -> Vec<(&'static str, String)> {
+    /// The credential to send now: an `ant` profile token is swapped for
+    /// the newest one, since the copy taken at startup expires.
+    fn current_secret(&self) -> String {
+        if self.auth_is_oauth {
+            crate::auth::PROFILE_TOKENS.live(&self.api_key)
+        } else {
+            self.api_key.clone()
+        }
+    }
+
+    /// The request headers, with `secret` in the wire format the credential
+    /// kind requires. Mirrors `api::ClaudeClient::auth_header`.
+    fn headers(&self, secret: &str) -> Vec<(&'static str, String)> {
         let mut betas = vec![WEB_SEARCH_BETA];
         let mut h: Vec<(&'static str, String)> = vec![
             ("anthropic-version", "2023-06-01".into()),
             ("content-type", "application/json".into()),
         ];
         if self.auth_is_oauth {
-            h.push(("authorization", format!("Bearer {}", self.api_key)));
+            h.push(("authorization", format!("Bearer {secret}")));
             betas.push(crate::auth::OAUTH_BETA);
         } else {
-            h.push(("x-api-key", self.api_key.clone()));
+            h.push(("x-api-key", secret.to_string()));
         }
         h.push(("anthropic-beta", betas.join(",")));
         h
@@ -109,11 +119,24 @@ impl Tool for WebSearchTool {
         });
 
         let client = reqwest::Client::builder().timeout(SEARCH_TIMEOUT).build()?;
-        let mut request = client.post("https://api.anthropic.com/v1/messages");
-        for (name, value) in self.headers() {
-            request = request.header(name, value);
+        let send = |secret: String| {
+            let mut request = client.post("https://api.anthropic.com/v1/messages");
+            for (name, value) in self.headers(&secret) {
+                request = request.header(name, value);
+            }
+            request.json(&request_body).send()
+        };
+        let secret = self.current_secret();
+        let mut response = send(secret.clone()).await?;
+        // An expired `ant` profile token: refresh it once, as the main client does.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.auth_is_oauth
+            && let Ok(Some(fresh)) =
+                tokio::task::spawn_blocking(move || crate::auth::PROFILE_TOKENS.refresh(&secret))
+                    .await
+        {
+            response = send(fresh).await?;
         }
-        let response = request.json(&request_body).send().await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -175,7 +198,7 @@ mod tests {
             model: "m".into(),
             auth_is_oauth: false,
         };
-        let h = t.headers();
+        let h = t.headers(&t.current_secret());
         assert_eq!(header(&h, "x-api-key"), Some("sk-ant-x"));
         assert_eq!(header(&h, "authorization"), None);
         assert_eq!(header(&h, "anthropic-beta"), Some("web-search-2025-03-05"));
@@ -190,7 +213,7 @@ mod tests {
             model: "m".into(),
             auth_is_oauth: true,
         };
-        let h = t.headers();
+        let h = t.headers(&t.current_secret());
         assert_eq!(header(&h, "authorization"), Some("Bearer tok"));
         assert_eq!(header(&h, "x-api-key"), None);
         let beta = header(&h, "anthropic-beta").unwrap();

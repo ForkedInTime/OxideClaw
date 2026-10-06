@@ -20,7 +20,8 @@
 //! needed* before printing. Reading `credentials/<profile>.json` directly would
 //! mean reimplementing OAuth refresh against an on-disk format that is an
 //! implementation detail. Shelling out keeps us on a supported interface and
-//! gets refresh for free.
+//! gets refresh for free — but only when `ant` runs, which is why
+//! [`ProfileTokens`] runs it again when the API rejects an expired token.
 //!
 //! **Wire format differs by credential kind.** A static key goes in `x-api-key`;
 //! an OAuth token goes in `Authorization: Bearer` *and* additionally requires
@@ -215,6 +216,81 @@ pub fn resolve_profile() -> Option<Resolved> {
     })
 }
 
+/// Every access token the `ant` profile has handed this process, newest last.
+///
+/// `print-credentials` refreshes only when `ant` runs, so the token fetched
+/// at startup expired mid-session and every later request failed with 401.
+/// Copies of the startup token live on in the config, `/model` rebuilds,
+/// sub-agents and WebSearch; mapping any token we issued to the newest one
+/// at send time keeps all of them current without threading a handle through.
+/// Static keys and `ANTHROPIC_AUTH_TOKEN` are never registered here, so they
+/// pass through unchanged and a 401 on them still surfaces immediately.
+pub struct ProfileTokens {
+    issued: std::sync::RwLock<Vec<String>>,
+    /// Held while `fetch` runs, so concurrent 401s refresh once.
+    refreshing: std::sync::Mutex<()>,
+    fetch: fn() -> Option<String>,
+}
+
+/// The process-wide profile token store.
+pub static PROFILE_TOKENS: ProfileTokens = ProfileTokens::new(fetch_profile_token);
+
+fn fetch_profile_token() -> Option<String> {
+    non_empty(ProcessAuthEnv.ant_access_token())
+}
+
+impl ProfileTokens {
+    pub const fn new(fetch: fn() -> Option<String>) -> Self {
+        Self {
+            issued: std::sync::RwLock::new(Vec::new()),
+            refreshing: std::sync::Mutex::new(()),
+            fetch,
+        }
+    }
+
+    /// Record a token the profile issued.
+    pub fn register(&self, token: &str) {
+        let mut issued = self.issued.write().unwrap_or_else(|e| e.into_inner());
+        if issued.last().map(String::as_str) != Some(token) {
+            issued.push(token.to_string());
+        }
+    }
+
+    /// The token to send in place of `secret`: the newest profile token if
+    /// `secret` is one the profile issued, else `secret` itself.
+    pub fn live(&self, secret: &str) -> String {
+        let issued = self.issued.read().unwrap_or_else(|e| e.into_inner());
+        match issued.last() {
+            Some(newest) if issued.iter().any(|t| t == secret) => newest.clone(),
+            _ => secret.to_string(),
+        }
+    }
+
+    /// After the API refused `rejected`, a token worth retrying with: one a
+    /// concurrent refresh already fetched, or a fresh one from `ant`. `None`
+    /// when `rejected` is not a profile token or `ant` has nothing newer.
+    /// Blocks on `ant` for up to [`ANT_TIMEOUT`]; call from `spawn_blocking`.
+    pub fn refresh(&self, rejected: &str) -> Option<String> {
+        if !self
+            .issued
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|t| t == rejected)
+        {
+            return None;
+        }
+        let _single_flight = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        let newest = self.live(rejected);
+        if newest != rejected {
+            return Some(newest);
+        }
+        let fresh = (self.fetch)().filter(|t| t != rejected)?;
+        self.register(&fresh);
+        Some(fresh)
+    }
+}
+
 /// The real environment: process env vars plus the `ant` CLI.
 pub struct ProcessAuthEnv;
 
@@ -328,6 +404,46 @@ fn run_ant(args: &[&str]) -> Option<String> {
 #[allow(dead_code)] // library/SDK entry point; the binary uses the staged variants
 pub fn resolve() -> Option<Resolved> {
     resolve_with(&ProcessAuthEnv)
+}
+
+#[cfg(test)]
+mod profile_token_tests {
+    use super::ProfileTokens;
+
+    fn renewed() -> Option<String> {
+        Some("t2".into())
+    }
+    fn unchanged() -> Option<String> {
+        Some("t1".into())
+    }
+
+    #[test]
+    fn every_issued_token_resolves_to_the_newest() {
+        let p = ProfileTokens::new(renewed);
+        p.register("t1");
+        assert_eq!(p.live("t1"), "t1");
+        assert_eq!(p.refresh("t1").as_deref(), Some("t2"));
+        assert_eq!(p.live("t1"), "t2");
+        assert_eq!(p.live("t2"), "t2");
+        // A request that raced the refresh with the old token reuses it.
+        assert_eq!(p.refresh("t1").as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn foreign_credentials_are_never_swapped_or_refreshed() {
+        let p = ProfileTokens::new(renewed);
+        assert_eq!(p.refresh("env-token"), None);
+        p.register("t1");
+        assert_eq!(p.live("sk-ant-key"), "sk-ant-key");
+        assert_eq!(p.refresh("sk-ant-key"), None);
+    }
+
+    #[test]
+    fn no_retry_when_ant_returns_the_rejected_token() {
+        let p = ProfileTokens::new(unchanged);
+        p.register("t1");
+        assert_eq!(p.refresh("t1"), None);
+    }
 }
 
 #[cfg(test)]
