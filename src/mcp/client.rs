@@ -66,7 +66,24 @@ impl StdioTransport {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::process::Command;
 
-        let mut child = Command::new(command)
+        #[cfg(windows)]
+        let program = {
+            let path = env
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                .map(|(_, v)| std::ffi::OsString::from(v))
+                .or_else(|| std::env::var_os("PATH"));
+            resolve_on_path(
+                command,
+                path.as_deref(),
+                std::env::var_os("PATHEXT").as_deref(),
+            )
+            .unwrap_or_else(|| command.into())
+        };
+        #[cfg(not(windows))]
+        let program = command;
+
+        let mut child = Command::new(program)
             .args(args)
             .envs(env)
             .current_dir(cwd)
@@ -167,6 +184,31 @@ impl StdioTransport {
             closed,
         })
     }
+}
+
+/// Where a shell would find a bare `command`, walking PATH × PATHEXT.
+/// Windows process creation only tries `<name>.exe`, but `npx` (the usual
+/// MCP launcher) and most Node and Python shims are `.cmd` files, so
+/// `"command": "npx"` failed to spawn. Std quotes arguments safely when it
+/// runs a `.cmd`/`.bat` by full path.
+#[cfg(any(windows, test))]
+fn resolve_on_path(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    if command.contains(['/', '\\', ':']) || std::path::Path::new(command).extension().is_some() {
+        return None;
+    }
+    let exts = pathext
+        .and_then(|e| e.to_str())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD");
+    std::env::split_paths(path?).find_map(|dir| {
+        exts.split(';')
+            .filter(|e| !e.is_empty())
+            .map(|ext| dir.join(format!("{command}{ext}")))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 #[async_trait]
@@ -961,6 +1003,27 @@ mod tests {
         let calls = mock.calls();
         assert_eq!(calls[0].0, "initialize");
         assert_eq!(calls[0].1["capabilities"], json!({}));
+    }
+
+    /// `npx` is `npx.cmd` on Windows; spawning the bare name found nothing.
+    #[test]
+    fn bare_commands_resolve_through_pathext() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(b.path().join("npx.CMD"), "").unwrap();
+        std::fs::write(b.path().join("uvx.EXE"), "").unwrap();
+        std::fs::write(a.path().join("uvx.CMD"), "").unwrap();
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        let ext = std::ffi::OsStr::new(".COM;.EXE;.BAT;.CMD");
+        let find = |c: &str| resolve_on_path(c, Some(&path), Some(ext));
+        assert_eq!(find("npx"), Some(b.path().join("npx.CMD")));
+        // PATH order first, then PATHEXT order, as cmd.exe does.
+        assert_eq!(find("uvx"), Some(a.path().join("uvx.CMD")));
+        assert_eq!(find("missing"), None);
+        // Explicit paths and extensions are spawned as written.
+        assert_eq!(find("npx.cmd"), None);
+        assert_eq!(find("./npx"), None);
+        assert_eq!(find(r"C:\tools\npx"), None);
     }
 }
 
