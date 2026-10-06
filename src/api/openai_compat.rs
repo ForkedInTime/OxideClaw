@@ -149,6 +149,8 @@ pub(crate) struct OaiMessage {
     pub tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -247,7 +249,16 @@ pub(crate) struct OaiUsage {
 
 /// Translate Anthropic `Message`s into OpenAI-format messages.
 /// System prompt is handled separately (passed as role:system first message).
-pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiMessage> {
+///
+/// `echo_reasoning` sends an assistant turn's own (unsigned) reasoning back as
+/// `reasoning_content`. DeepSeek thinking models return 400 on a tool-call
+/// follow-up without it; other providers reject the unknown field, so it is
+/// per provider rather than always on (history survives `/model` switches).
+pub(crate) fn translate_messages(
+    system: &str,
+    messages: &[Message],
+    echo_reasoning: bool,
+) -> Vec<OaiMessage> {
     let mut out = Vec::with_capacity(messages.len() + 1);
 
     if !system.is_empty() {
@@ -256,6 +267,7 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
             content: Some(serde_json::Value::String(system.to_string())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
 
@@ -295,6 +307,7 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                             content: Some(serde_json::Value::String(text)),
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id.clone()),
+                            reasoning_content: None,
                         });
                     }
                 }
@@ -316,12 +329,14 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                         content: Some(serde_json::Value::String(text)),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
             }
 
             Role::Assistant => {
                 let mut text_parts: Vec<&str> = Vec::new();
+                let mut reasoning_parts: Vec<&str> = Vec::new();
                 let mut tool_calls: Vec<OaiToolCall> = Vec::new();
 
                 for block in &msg.content {
@@ -338,6 +353,12 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                                 },
                             });
                         }
+                        // A signed block is Anthropic's own thinking, not
+                        // this provider's reasoning: never echo it.
+                        ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } if signature.is_empty() => reasoning_parts.push(thinking.as_str()),
                         ContentBlock::Thinking { .. }
                         | ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. } => {}
@@ -350,6 +371,19 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                     Some(serde_json::Value::String(text_parts.join("\n")))
                 };
 
+                let reasoning_content = if !echo_reasoning {
+                    None
+                } else if !reasoning_parts.is_empty() {
+                    Some(reasoning_parts.join("\n"))
+                } else if !tool_calls.is_empty() {
+                    // Tool calls made by another model have no reasoning to
+                    // echo, and DeepSeek rejects both a missing and an empty
+                    // value there.
+                    Some(" ".into())
+                } else {
+                    None
+                };
+
                 out.push(OaiMessage {
                     role: "assistant".into(),
                     content,
@@ -359,6 +393,7 @@ pub(crate) fn translate_messages(system: &str, messages: &[Message]) -> Vec<OaiM
                         Some(tool_calls)
                     },
                     tool_call_id: None,
+                    reasoning_content,
                 });
             }
         }
@@ -537,6 +572,8 @@ pub struct OpenAiCompatClient {
     /// Set to true after the first 400 "does not support tools" error.
     no_tools: Arc<AtomicBool>,
     tools_notice_sent: Arc<AtomicBool>,
+    /// See [`translate_messages`]: only DeepSeek wants reasoning echoed back.
+    echo_reasoning: bool,
     /// See `ClaudeClient::retry_notifier`. Rate limiting is far more common on
     /// these providers than on Anthropic — Groq and OpenRouter throttle hard.
     retry_notifier: Option<super::retry::RetryNotifier>,
@@ -614,6 +651,7 @@ impl OpenAiCompatClient {
             extra_headers,
             no_tools: Arc::new(AtomicBool::new(false)),
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
+            echo_reasoning: provider.prefix == "deepseek",
         })
     }
 
@@ -658,7 +696,7 @@ impl OpenAiCompatClient {
             system_str.clone()
         };
 
-        let oai_messages = translate_messages(&system, &request.messages);
+        let oai_messages = translate_messages(&system, &request.messages, self.echo_reasoning);
         let oai_tools = if no_tools {
             vec![]
         } else {
@@ -707,7 +745,8 @@ impl OpenAiCompatClient {
                 self.no_tools.store(true, Ordering::Relaxed);
                 debug!("Model does not support tools — disabling for this session");
                 let patched_system = patch_system_no_tools(&system_str);
-                oai_request.messages = translate_messages(&patched_system, &request.messages);
+                oai_request.messages =
+                    translate_messages(&patched_system, &request.messages, self.echo_reasoning);
                 oai_request.tools = vec![];
 
                 super::retry::send_with_retry(
@@ -731,5 +770,70 @@ impl OpenAiCompatClient {
 
         let (result, _) = parse_oai_stream(resp, on_text).await?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod reasoning_echo_tests {
+    use super::*;
+
+    fn assistant(blocks: Vec<ContentBlock>) -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: blocks,
+            },
+        ]
+    }
+
+    fn tool_use() -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "a.rs"}),
+        }
+    }
+
+    fn thinking(signature: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: "plan: read a.rs".into(),
+            signature: signature.into(),
+        }
+    }
+
+    fn assistant_json(msgs: &[Message], echo: bool) -> serde_json::Value {
+        let out = translate_messages("", msgs, echo);
+        serde_json::to_value(&out[1]).unwrap()
+    }
+
+    #[test]
+    fn deepseek_gets_its_reasoning_back_on_tool_turns() {
+        let msgs = assistant(vec![thinking(""), tool_use()]);
+        let v = assistant_json(&msgs, true);
+        assert_eq!(v["reasoning_content"], "plan: read a.rs");
+        assert_eq!(v["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn other_providers_never_see_reasoning_content() {
+        let msgs = assistant(vec![thinking(""), tool_use()]);
+        let v = assistant_json(&msgs, false);
+        assert!(v.get("reasoning_content").is_none(), "{v}");
+    }
+
+    /// Anthropic's signed thinking is not this provider's reasoning; a tool
+    /// call without our own reasoning still needs a non-empty placeholder.
+    #[test]
+    fn signed_thinking_is_not_echoed() {
+        let msgs = assistant(vec![thinking("anthropic-sig"), tool_use()]);
+        let v = assistant_json(&msgs, true);
+        assert_eq!(v["reasoning_content"], " ");
+        let msgs = assistant(vec![ContentBlock::Text { text: "hi".into() }]);
+        let v = assistant_json(&msgs, true);
+        assert!(v.get("reasoning_content").is_none(), "{v}");
     }
 }
