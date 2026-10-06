@@ -54,6 +54,8 @@ pub(super) fn cmd_keybindings() -> CommandAction {
             "Input editing\n",
             "  Enter         Send message\n",
             "  Shift+Enter   Insert newline (multi-line prompt)\n",
+            "  Alt+Enter     Insert newline (works in every terminal and tmux)\n",
+            "  Ctrl+J        Insert newline\n",
             "  Backspace     Delete char before cursor\n",
             "  Delete        Delete char after cursor\n",
             "  ←/→           Move cursor left/right\n",

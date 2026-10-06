@@ -1059,12 +1059,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 .or_else(|_| std::env::var("EDITOR"))
                 .unwrap_or_else(|_| "nano".to_string());
             // Suspend raw mode, run editor, restore
-            let _ = crossterm::terminal::disable_raw_mode();
+            suspend_tty();
             let _ = tokio::process::Command::new(&editor)
                 .arg(&claude_md)
                 .status()
                 .await;
-            let _ = crossterm::terminal::enable_raw_mode();
+            resume_tty();
             // Reload CLAUDE.md into config
             config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
             *system_prompt = config.build_system_prompt();

@@ -299,7 +299,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              \n\
              **Sending messages**\n\
              - Type your message and press Enter\n\
-             - Shift+Enter inserts a newline (multi-line input)\n\
+             - Shift+Enter, Alt+Enter or Ctrl+J inserts a newline (multi-line input)\n\
              - Escape cancels the current request mid-stream\n\
              \n\
              **Scrolling**\n\

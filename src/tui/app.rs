@@ -1195,7 +1195,7 @@ impl App {
         self.input.iter().filter(|&&c| c == '\n').count() + 1
     }
 
-    /// Insert a newline at the cursor position (Shift+Enter).
+    /// Insert a newline at the cursor position (Shift+Enter, Alt+Enter, Ctrl+J).
     pub fn insert_newline(&mut self) {
         self.input.insert(self.cursor, '\n');
         self.cursor += 1;

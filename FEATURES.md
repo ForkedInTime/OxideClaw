@@ -456,7 +456,7 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Shift+Enter` | Newline |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Newline |
 | `Esc` | Cancel request / stop TTS / close overlay |
 | `Ctrl+S` | Stop TTS |
 | `Ctrl+R` | Voice record toggle |

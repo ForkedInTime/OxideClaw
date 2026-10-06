@@ -201,7 +201,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -211,6 +212,30 @@ use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 use std::io;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// Set once at startup when the terminal accepted the keyboard enhancement
+/// flags, so the child-process handoffs know to pop and re-push them.
+static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hand the terminal to a child (sudo, $EDITOR). With the flags still pushed,
+/// kitty-protocol terminals send Ctrl+C as `ESC[99;5u`, so the child cannot
+/// be interrupted and an editor receives garbage.
+fn suspend_tty() {
+    if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = disable_raw_mode();
+}
+
+fn resume_tty() {
+    let _ = enable_raw_mode();
+    if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+}
 
 pub async fn run_tui(
     config: Config,
@@ -223,8 +248,10 @@ pub async fn run_tui(
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        // Harmless on terminals that never took the flags.
         let _ = execute!(
             io::stdout(),
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             crossterm::cursor::Show
@@ -245,9 +272,22 @@ pub async fn run_tui(
         EnableBracketedPaste,
         EnableMouseCapture,
     )?;
+    // Without this Shift+Enter is a plain CR and submits the prompt. The
+    // query must run before run_loop opens the EventStream, which would
+    // otherwise swallow the terminal's reply.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        KEYBOARD_ENHANCED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let result = run_loop(config, resume_id, initial_input).await;
     disable_raw_mode()?;
     let mut cleanup = io::stdout();
+    if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(cleanup, PopKeyboardEnhancementFlags);
+    }
     execute!(
         cleanup,
         DisableBracketedPaste,
@@ -605,7 +645,7 @@ async fn run_loop(
         // /install-missing — drop raw mode so sudo can prompt for password
         if let Some(cmd) = app.pending_install.take() {
             drop(terminal);
-            let _ = crossterm::terminal::disable_raw_mode();
+            suspend_tty();
             let _ = execute!(io::stdout(), crossterm::cursor::Show);
             println!(); // blank line before package manager output
 
@@ -621,7 +661,7 @@ async fn run_loop(
             };
 
             println!(); // blank line after package manager output
-            let _ = crossterm::terminal::enable_raw_mode();
+            resume_tty();
             let _ = execute!(
                 io::stdout(),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::All),

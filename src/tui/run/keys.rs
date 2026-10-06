@@ -529,10 +529,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             app.scroll_to_bottom();
         }
 
-        // Shift+Enter inserts a newline in the input box (multi-line mode)
-        (Enter, KeyModifiers::SHIFT) => {
-            app.insert_newline();
-        }
+        (code, mods) if is_newline_key(code, mods) => app.insert_newline(),
 
         (Enter, _) => {
             let raw = app.take_input();
@@ -952,3 +949,43 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 }
 
 // ── Vim normal-mode key handler ───────────────────────────────────────────────
+
+/// Shift+Enter is only distinguishable from Enter where the terminal took
+/// the keyboard enhancement flags (kitty, foot, WezTerm, Ghostty); elsewhere
+/// and inside tmux it arrives as a plain Enter and would submit. Alt+Enter
+/// (ESC CR) and Ctrl+J (LF, which raw mode reports as Ctrl+J) reach us on
+/// every terminal.
+fn is_newline_key(code: KeyCode, mods: KeyModifiers) -> bool {
+    match code {
+        KeyCode::Enter => mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT),
+        KeyCode::Char('j') => mods == KeyModifiers::CONTROL,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod newline_key_tests {
+    use super::*;
+
+    /// The events crossterm's legacy parser yields in raw mode: CR is Enter,
+    /// ESC CR is Alt+Enter, LF is Ctrl+J; kitty's CSI 13;2u is Shift+Enter.
+    /// Only the last one matched before, so on most terminals no key could
+    /// insert a newline and Ctrl+J typed a literal 'j'.
+    #[test]
+    fn alt_enter_ctrl_j_and_shift_enter_insert_a_newline() {
+        assert!(is_newline_key(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(is_newline_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(is_newline_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(is_newline_key(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT | KeyModifiers::ALT
+        ));
+
+        assert!(!is_newline_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!is_newline_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(!is_newline_key(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
+    }
+}
