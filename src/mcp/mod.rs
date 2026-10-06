@@ -66,6 +66,20 @@ impl Tool for McpDynamicTool {
 
 // ── Helper: build DynTool list from an McpManager ────────────────────────────
 
+/// Built-in tools plus every configured MCP server's tools, for the entry
+/// points without a TUI (print mode, `--headless` SDK, ACP). Those modes have
+/// no /mcp panel, so a server that fails to start is reported on stderr.
+pub async fn tools_for_config(cfg: &crate::config::Config) -> Vec<DynTool> {
+    let manager = McpManager::start_for_config(cfg).await;
+    for name in &manager.failed {
+        eprintln!("Warning: MCP server '{name}' failed to start; its tools are unavailable.");
+    }
+    let mcp_tools = mcp_dyn_tools(&manager);
+    // The tools hold their own `Arc<McpClient>`, so the servers outlive
+    // `manager` for as long as the session keeps its tools.
+    crate::tools::all_tools_with_state_and_mcp(cfg, mcp_tools, manager.clients.clone()).0
+}
+
 /// Convert all connected MCP servers' tools into `Arc<dyn Tool>` entries.
 pub fn mcp_dyn_tools(manager: &McpManager) -> Vec<DynTool> {
     let mut tools: Vec<DynTool> = Vec::new();

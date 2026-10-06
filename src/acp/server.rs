@@ -7,7 +7,6 @@ use crate::sdk::protocol::{Capabilities, Policy, SdkNotification};
 use crate::sdk::session::{CancelSignal, SdkSession, TurnEnd};
 use crate::sdk::transport::stdio::{LineRead, read_line_bounded};
 use crate::sdk::validate_session_cwd;
-use crate::tools::all_tools;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -87,7 +86,7 @@ impl AcpServer {
                             if line.is_empty() {
                                 continue;
                             }
-                            st.handle_line(&line)
+                            st.handle_line(&line).await
                         }
                     }
                 }
@@ -111,11 +110,11 @@ async fn send<W: AsyncWrite + Unpin>(w: &mut W, frame: &Value) -> Result<()> {
 }
 
 impl State {
-    fn handle_line(&mut self, line: &str) -> Vec<Value> {
+    async fn handle_line(&mut self, line: &str) -> Vec<Value> {
         match rpc::parse(line) {
             Err(e) => vec![rpc::error(&Value::Null, e.code, e.message)],
             Ok(Incoming::Request { id, method, params }) => {
-                match self.handle_request(&id, &method, &params) {
+                match self.handle_request(&id, &method, &params).await {
                     Ok(frames) => frames,
                     Err(e) => vec![rpc::error(&id, e.code, e.message)],
                 }
@@ -133,7 +132,7 @@ impl State {
         }
     }
 
-    fn handle_request(
+    async fn handle_request(
         &mut self,
         id: &Value,
         method: &str,
@@ -152,7 +151,7 @@ impl State {
                         "call initialize before session/new",
                     ));
                 }
-                let sid = self.new_session(params)?;
+                let sid = self.new_session(params).await?;
                 Ok(vec![rpc::response(id, json!({"sessionId": sid}))])
             }
             "session/prompt" => {
@@ -166,7 +165,7 @@ impl State {
         }
     }
 
-    fn new_session(&mut self, params: &Value) -> Result<String, RpcError> {
+    async fn new_session(&mut self, params: &Value) -> Result<String, RpcError> {
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -220,7 +219,9 @@ impl State {
                 }
             }
         }
-        let tools = all_tools(&cfg);
+        // Starting servers here stalls other sessions' updates for up to the
+        // per-server startup timeout; acceptable for a once-per-session cost.
+        let tools = crate::mcp::tools_for_config(&cfg).await;
         let (approval_in_tx, approval_in_rx) = mpsc::unbounded_channel();
         let session = SdkSession::new(
             cfg,
@@ -830,6 +831,8 @@ mod tests {
         let cfg = Config {
             api_key: "sk-ant-test".into(),
             cwd: dir.path().to_path_buf(),
+            // session/new starts MCP servers; never the developer's own.
+            strict_mcp_config: true,
             ..Default::default()
         };
         (cfg, dir)

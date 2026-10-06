@@ -9,12 +9,26 @@ use std::sync::Arc;
 
 pub struct McpManager {
     pub clients: Vec<Arc<McpClient>>,
+    /// Servers that failed or timed out at startup, by name.
+    pub failed: Vec<String>,
 }
 
 /// How long startup waits for any one server to finish `initialize`.
 pub const PER_SERVER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl McpManager {
+    /// Start the servers a session built from `cfg` should have: settings.json
+    /// and .mcp.json (trust-gated inside `Settings::load`) unless
+    /// --strict-mcp-config, plus --mcp-config / ACP `session/new` servers.
+    pub async fn start_for_config(cfg: &crate::config::Config) -> Self {
+        let settings = if cfg.strict_mcp_config {
+            Settings::default()
+        } else {
+            Settings::load(&cfg.cwd)
+        };
+        Self::start_with_extra(&settings, &cfg.extra_mcp_servers).await
+    }
+
     /// Start all MCP servers listed in settings + any injected via CLI --mcp-config.
     /// Errors per-server are logged; the manager is always returned.
     pub async fn start_with_extra(
@@ -55,6 +69,7 @@ impl McpManager {
             .collect();
 
         let mut clients = Vec::new();
+        let mut failed = Vec::new();
         for h in handles {
             let Ok((name, result)) = h.await else {
                 continue;
@@ -71,6 +86,7 @@ impl McpManager {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("MCP '{}': failed to connect — {}", name, e);
+                    failed.push(name);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -78,10 +94,11 @@ impl McpManager {
                         name,
                         per_server
                     );
+                    failed.push(name);
                 }
             }
         }
-        Self { clients }
+        Self { clients, failed }
     }
 
     async fn connect_one(name: String, cfg: &McpServerConfig) -> anyhow::Result<McpClient> {
@@ -122,6 +139,41 @@ mod startup_tests {
         )
     }
 
+    /// A minimal stdio MCP server: answers initialize (id 1) and tools/list
+    /// (id 2, after the initialized notification) with one `ping` tool.
+    fn fake_server(name: &str) -> (String, McpServerConfig) {
+        let script = r#"read l
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}'
+read l; read l
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"p","inputSchema":{"type":"object"}}]}}'
+cat >/dev/null"#;
+        (
+            name.to_string(),
+            McpServerConfig::Stdio(StdioServerConfig {
+                command: "sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: Default::default(),
+            }),
+        )
+    }
+
+    /// Print mode, the SDK and ACP used to build tools without ever starting
+    /// MCP, so --mcp-config and ACP `session/new` servers were dropped.
+    #[tokio::test]
+    async fn tools_for_config_includes_configured_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            cwd: dir.path().to_path_buf(),
+            strict_mcp_config: true,
+            extra_mcp_servers: [fake_server("fake")].into_iter().collect(),
+            ..Default::default()
+        };
+        let tools = crate::mcp::tools_for_config(&cfg).await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"mcp__fake__ping"), "{names:?}");
+        assert!(names.contains(&"Read"), "built-ins must still be there");
+    }
+
     /// Three servers that never answer must cost one timeout, not three, and
     /// must not take the whole session down with them.
     #[tokio::test]
@@ -138,6 +190,7 @@ mod startup_tests {
         )
         .await;
         assert!(m.clients.is_empty());
+        assert_eq!(m.failed, ["a", "b", "c"]);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "took {:?}: servers were connected sequentially or untimed",

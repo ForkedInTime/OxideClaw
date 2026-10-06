@@ -13,7 +13,6 @@ pub use protocol::*;
 
 use crate::browser::browse_loop::{BrowsePolicy, BrowseProgress, BrowseRequest, run_browse};
 use crate::config::Config;
-use crate::tools::all_tools;
 use anyhow::Result;
 use session::SdkSession;
 use std::collections::HashMap;
@@ -162,7 +161,7 @@ impl SdkServer {
                     cfg.max_budget_usd = Some(budget);
                 }
 
-                let tools = all_tools(&cfg);
+                let tools = crate::mcp::tools_for_config(&cfg).await;
                 let session_policy = policy.unwrap_or_default();
                 let session_caps = capabilities.unwrap_or_default();
 

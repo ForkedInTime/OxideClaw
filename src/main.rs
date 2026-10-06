@@ -34,7 +34,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use query_engine::QueryEngine;
-use tools::all_tools;
 
 #[allow(unused_imports)]
 use colored::*;
@@ -1086,7 +1085,7 @@ async fn main() -> Result<()> {
             cli.prompt.join(" ")
         };
 
-        let mut tools = all_tools(&config);
+        let mut tools = crate::mcp::tools_for_config(&config).await;
         if !config.allowed_tools.is_empty() {
             // "__none__" sentinel means no tools allowed
             if config.allowed_tools.iter().any(|a| a == "__none__") {

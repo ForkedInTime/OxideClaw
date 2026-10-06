@@ -223,17 +223,7 @@ async fn run_loop(
     )?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
-    let settings = crate::settings::Settings::load(&config.cwd);
-    // --strict-mcp-config: only use CLI --mcp-config servers, ignore settings.json
-    let mcp_manager = if config.strict_mcp_config {
-        McpManager::start_with_extra(
-            &crate::settings::Settings::default(),
-            &config.extra_mcp_servers,
-        )
-        .await
-    } else {
-        McpManager::start_with_extra(&settings, &config.extra_mcp_servers).await
-    };
+    let mcp_manager = McpManager::start_for_config(&config).await;
     let mcp_tools = mcp_dyn_tools(&mcp_manager);
     let mcp_statuses = mcp_manager.statuses();
 
