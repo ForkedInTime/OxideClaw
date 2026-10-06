@@ -419,7 +419,10 @@ fn defeats_prefix_rules(cmd: &str) -> bool {
 
 /// Build a human-readable description of a tool call for the permission dialog.
 pub fn describe_tool_call(tool_name: &str, input: &serde_json::Value) -> String {
-    match tool_name {
+    // The model controls these strings. A raw ESC lets a command erase or
+    // redraw the approval prompt (TUI, ACP and SDK clients alike), so the
+    // user approves something other than what runs; show controls escaped.
+    let desc = match tool_name {
         "Bash" => {
             let cmd = input["command"].as_str().unwrap_or("(unknown)");
             format!("Run shell command:\n  {cmd}")
@@ -439,7 +442,19 @@ pub fn describe_tool_call(tool_name: &str, input: &serde_json::Value) -> String 
         }
         "ExitPlanMode" => "Leave plan mode and start making changes (approve the plan)".to_string(),
         _ => format!("{tool_name}({})", truncate(&input.to_string(), 80)),
+    };
+    if !desc.chars().any(|c| c.is_control() && c != '\n') {
+        return desc;
     }
+    desc.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -459,6 +474,21 @@ fn truncate(s: &str, max: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// An ESC in a model-supplied command must reach the approval prompt as
+    /// visible text, not as a terminal sequence that rewrites the prompt.
+    #[test]
+    fn describe_tool_call_escapes_control_chars() {
+        let input = serde_json::json!({ "command": "rm -rf ~\u{1b}[2K\u{1b}[Gls\u{7}\tx" });
+        let desc = super::describe_tool_call("Bash", &input);
+        assert!(
+            !desc.chars().any(|c| c.is_control() && c != '\n'),
+            "{desc:?}"
+        );
+        assert_eq!(
+            desc,
+            "Run shell command:\n  rm -rf ~\\u{1b}[2K\\u{1b}[Gls\\u{7}\\tx"
+        );
+    }
     /// NotebookEdit rewrites files exactly like Edit does; it must prompt the same way.
     #[test]
     fn notebook_edit_is_a_sensitive_tool() {
