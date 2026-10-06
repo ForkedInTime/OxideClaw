@@ -130,7 +130,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let tx2 = tx.clone();
                 let sid = session.id.clone();
                 tokio::spawn(async move {
-                    match summarize_compact(&c2, &msgs, &cfg).await {
+                    let bill = |u: &Usage| {
+                        let _ = tx2.send(AppEvent::usage(&cfg.model, u));
+                    };
+                    match summarize_compact(&c2, &msgs, &cfg, bill).await {
                         Ok(r) => {
                             let summary_len = r
                                 .first()
@@ -2303,9 +2306,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // Shared current-URL state
             let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
 
-            let cfg = config.clone();
+            let mut cfg = config.clone();
+            if let Some(left) = app.cost_tracker.remaining() {
+                cfg.max_budget_usd = Some(left);
+            }
             let all_tools = tools.to_vec();
             let browser_session = app.browser_session.clone();
+            let usage_sink = Some(crate::tui::events::forward_usage(tx.clone()));
 
             let browse_req = crate::browser::browse_loop::BrowseRequest {
                 goal,
@@ -2320,6 +2327,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     progress_tx,
                     approval_tx,
                     cancel,
+                    usage_sink,
                 };
                 let result = crate::browser::browse_loop::run_browse(
                     browse_req,

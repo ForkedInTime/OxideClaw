@@ -345,6 +345,11 @@ impl QueryEngine {
             // Track cost and check budget
             let turn_cost = estimate_cost_usd(&self.config.model, &response.usage);
             self.cumulative_cost_usd += turn_cost;
+            // /browse runs on this loop: its caller's /cost and /budget
+            // only see what reaches the sink.
+            if let Some(sink) = &self.usage_sink {
+                let _ = sink.send((self.config.model.clone(), response.usage.clone()));
+            }
             if let Some(budget) = self.config.max_budget_usd
                 && self.cumulative_cost_usd >= budget
             {
@@ -406,7 +411,17 @@ impl QueryEngine {
                             "Auto-compacting: summarising conversation (summarizeCompact)…"
                                 .yellow()
                         );
-                        match summarize_compact(&self.client, &self.messages, &self.config).await {
+                        // Billed like any other call: it carries the whole
+                        // history, so it is often the session's largest.
+                        let bill = |u: &Usage| {
+                            self.cumulative_cost_usd += estimate_cost_usd(&self.config.model, u);
+                            if let Some(sink) = &self.usage_sink {
+                                let _ = sink.send((self.config.model.clone(), u.clone()));
+                            }
+                        };
+                        match summarize_compact(&self.client, &self.messages, &self.config, bill)
+                            .await
+                        {
                             Ok(replacement) => {
                                 self.messages = replacement;
                                 eprintln!("{}", "Compaction complete. Conversation history replaced with summary.".green());
@@ -1109,6 +1124,64 @@ pub(crate) mod scripted_api_tests {
         .unwrap();
         let ctx = QueryEngine::retrieve_rag_context(dir.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
+
+    /// /browse runs on `query()`, which kept its spend to itself, and the
+    /// auto-compact summary (the whole history as input) was never billed:
+    /// both were missing from the session's /cost and /budget.
+    #[tokio::test]
+    async fn query_reports_every_call_including_the_compaction_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = sse(
+            &[serde_json::json!({"type":"text","text":"hi"})],
+            "end_turn",
+        )
+        .replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
+        let summary = sse(
+            &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
+            "end_turn",
+        );
+        let (url, seen) = serve(vec![full, summary]).await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            auto_compact_enabled: true,
+            ..Config::default()
+        };
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut e = QueryEngine::new(config, Vec::new())
+            .unwrap()
+            .with_usage_sink(Some(sink));
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+
+        e.query("hello").await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().len(), 2, "turn + summary");
+        let mut reported = Vec::new();
+        while let Ok((_, u)) = rx.try_recv() {
+            reported.push(u.input_tokens);
+        }
+        assert_eq!(reported, vec![950_000, 1]);
+        let call = |input_tokens| {
+            estimate_cost_usd(
+                "claude-sonnet-5",
+                &Usage {
+                    input_tokens,
+                    output_tokens: 5,
+                    ..Usage::default()
+                },
+            )
+        };
+        let both = call(950_000) + call(1);
+        assert!(
+            (e.cumulative_cost_usd - both).abs() < 1e-9,
+            "{}",
+            e.cumulative_cost_usd
+        );
     }
 
     /// RAG text went into `system` on the first request of a prompt only,

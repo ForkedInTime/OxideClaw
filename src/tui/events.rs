@@ -83,3 +83,31 @@ pub enum AppEvent {
     /// GitHub upgrade check completed
     UpgradeCheckDone { message: String },
 }
+
+impl AppEvent {
+    /// One billed API call, recorded by the event loop like a turn's own.
+    pub fn usage(model: &str, u: &crate::api::types::Usage) -> Self {
+        AppEvent::Usage {
+            model: model.to_string(),
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_read: u.cache_read_input_tokens,
+            cache_write: u.cache_creation_input_tokens,
+        }
+    }
+}
+
+/// A usage sink for engines that run outside the turn task (/spawn,
+/// /browse), so their spend reaches /cost and /budget. Forwarding ends when
+/// the engine drops its sender.
+pub fn forward_usage(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) -> crate::tools::UsageSink {
+    let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, _)>();
+    tokio::spawn(async move {
+        while let Some((model, usage)) = rx.recv().await {
+            if tx.send(AppEvent::usage(&model, &usage)).is_err() {
+                break;
+            }
+        }
+    });
+    sink
+}

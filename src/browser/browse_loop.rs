@@ -163,6 +163,9 @@ pub struct BrowseChannels {
     pub progress_tx: mpsc::Sender<BrowseProgress>,
     pub approval_tx: mpsc::Sender<ApprovalPrompt>,
     pub cancel: Arc<AtomicBool>,
+    /// Where each API call's usage goes, so a session's /cost and /budget
+    /// include the run. None where the run is the whole process.
+    pub usage_sink: Option<crate::tools::UsageSink>,
 }
 
 /// Middleware that syncs the browser session's `current_url` into the
@@ -227,6 +230,7 @@ pub async fn run_browse(
         progress_tx,
         approval_tx,
         cancel,
+        usage_sink,
     } = channels;
     // 1. Emit Started event + speak the goal if voice is enabled.
     let _ = progress_tx
@@ -321,7 +325,8 @@ pub async fn run_browse(
 
     // 9. Create the browse-mode query engine.
     let mut engine =
-        QueryEngine::new_for_browse(browse_config, browser_tools, system_prompt, middlewares)?;
+        QueryEngine::new_for_browse(browse_config, browser_tools, system_prompt, middlewares)?
+            .with_usage_sink(usage_sink);
 
     // 10. Spawn a task to forward nudges as BrowseProgress events.
     let progress_tx_nudge = progress_tx.clone();

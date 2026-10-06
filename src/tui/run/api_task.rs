@@ -473,7 +473,17 @@ pub(super) async fn run_api_task(task: ApiTask) {
             // snipped copy so the summary request has a chance to fit.
             let mut snipped = messages.clone();
             crate::compact::snip_compact(&mut snipped, &config.model);
-            match crate::compact::summarize_compact(&client, &snipped, &config).await {
+            let bill = |u: &Usage| {
+                task_cost.record_with_cache(
+                    &config.model,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_input_tokens,
+                    u.cache_creation_input_tokens,
+                );
+                let _ = tx.send(AppEvent::usage(&config.model, u));
+            };
+            match crate::compact::summarize_compact(&client, &snipped, &config, bill).await {
                 Ok(replacement) => {
                     let summary_len = replacement
                         .first()

@@ -331,10 +331,14 @@ fn summary_max_tokens(config: &Config, prompt: &str) -> u32 {
 /// the summary, prefixed so Claude knows the context is compacted.
 ///
 /// The caller should replace its `messages` vec with the returned vec.
+/// `on_usage` gets the summary call's usage whenever the API answered, even
+/// if the summary is then rejected: that call was billed either way, and it
+/// carries the whole history as input.
 pub async fn summarize_compact(
     client: &ApiBackend,
     messages: &[Message],
     config: &Config,
+    on_usage: impl FnOnce(&Usage),
 ) -> Result<Vec<Message>> {
     let history_text = render_history(messages);
     let prompt = format!("{SUMMARISE_PROMPT_PREFIX}{history_text}");
@@ -368,6 +372,7 @@ pub async fn summarize_compact(
             summary_text.push_str(chunk);
         })
         .await?;
+    on_usage(&resp.usage);
 
     // Every caller replaces (and the TUI persists) the history on Ok, so a
     // cut-off summary would silently drop the newest work (sections 8 and 9
@@ -483,26 +488,44 @@ mod tests {
     #[tokio::test]
     async fn truncated_summary_is_an_error_not_a_replacement() {
         let (url, _) = serve_once(sse("max_tokens", "1. Primary Request: refac")).await;
-        let res = summarize_compact(&backend(&url), &history(), &config()).await;
+        let res = summarize_compact(&backend(&url), &history(), &config(), |_| {}).await;
         assert!(
             res.is_err(),
             "a max_tokens summary must not replace history"
         );
     }
 
+    /// A rejected summary was still paid for.
+    #[tokio::test]
+    async fn truncated_summary_is_still_billed() {
+        let (url, _) = serve_once(sse("max_tokens", "1. Primary")).await;
+        let mut billed = None;
+        let res = summarize_compact(&backend(&url), &history(), &config(), |u| {
+            billed = Some(u.output_tokens)
+        })
+        .await;
+        assert!(res.is_err());
+        assert_eq!(billed, Some(5));
+    }
+
     #[tokio::test]
     async fn empty_summary_is_an_error() {
         let (url, _) = serve_once(sse("end_turn", "  ")).await;
-        let res = summarize_compact(&backend(&url), &history(), &config()).await;
+        let res = summarize_compact(&backend(&url), &history(), &config(), |_| {}).await;
         assert!(res.is_err(), "an empty summary must not replace history");
     }
 
     #[tokio::test]
     async fn complete_summary_requests_a_real_budget() {
         let (url, seen) = serve_once(sse("end_turn", "1. Primary Request: auth")).await;
-        let out = summarize_compact(&backend(&url), &history(), &config())
-            .await
-            .expect("complete summary");
+        let mut billed = None;
+        let out = summarize_compact(&backend(&url), &history(), &config(), |u| {
+            billed = Some(u.clone())
+        })
+        .await
+        .expect("complete summary");
+        let billed = billed.expect("the summary call is billed");
+        assert_eq!((billed.input_tokens, billed.output_tokens), (1, 5));
         let ContentBlock::Text { text } = &out[0].content[0] else {
             panic!("summary should be text");
         };

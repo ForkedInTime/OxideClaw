@@ -854,6 +854,7 @@ async fn main() -> Result<()> {
                     progress_tx,
                     approval_tx,
                     cancel,
+                    usage_sink: None,
                 };
                 let result =
                     run_browse(req, &config, tools, current_url, browser_session, channels).await?;

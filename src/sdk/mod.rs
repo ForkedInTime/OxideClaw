@@ -457,6 +457,7 @@ impl SdkServer {
                         progress_tx,
                         approval_tx,
                         cancel,
+                        usage_sink: None,
                     };
                     let outcome = run_browse(
                         browse_req,

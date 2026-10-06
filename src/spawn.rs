@@ -249,11 +249,10 @@ pub async fn spawn_agent(
     let desc = description.clone();
     let wt_path = worktree_path.clone();
     let orig_cwd = cwd.clone();
-    let (usage_tx, usage_rx) = mpsc::unbounded_channel();
-    forward_usage(usage_rx, event_tx.clone());
-
+    // Background spend is session spend: /cost and /budget see it.
+    let usage_sink = crate::tui::events::forward_usage(event_tx.clone());
     tokio::spawn(async move {
-        let result = run_spawned_agent(agent_config, &desc, cancel_rx, usage_tx).await;
+        let result = run_spawned_agent(agent_config, &desc, cancel_rx, usage_sink).await;
 
         // Collect the diff (committed + uncommitted changes since base)
         let diff = Command::new("git")
@@ -320,25 +319,6 @@ fn spawn_budget(engine_cap: Option<f64>, budget_left: Option<f64>) -> Result<Opt
         Some(left) => Ok(Some(engine_cap.map_or(left, |cap| cap.min(left)))),
         None => Ok(engine_cap),
     }
-}
-
-/// Report the agent's spend to the TUI like the session's own, so /cost, the
-/// status bar and /budget include it. Ends when the engine drops its sink.
-fn forward_usage(
-    mut usage_rx: mpsc::UnboundedReceiver<(String, crate::api::types::Usage)>,
-    event_tx: mpsc::UnboundedSender<AppEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some((model, u)) = usage_rx.recv().await {
-            let _ = event_tx.send(AppEvent::Usage {
-                model,
-                input: u.input_tokens,
-                output: u.output_tokens,
-                cache_read: u.cache_read_input_tokens,
-                cache_write: u.cache_creation_input_tokens,
-            });
-        }
-    });
 }
 
 /// Run the actual agent loop. Returns the final summary text.
@@ -810,9 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawned_agent_spend_reaches_the_tui_cost_tracker() {
-        let (usage_tx, usage_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        forward_usage(usage_rx, event_tx);
+        let usage_tx = crate::tui::events::forward_usage(event_tx);
         let usage = crate::api::types::Usage {
             input_tokens: 10,
             output_tokens: 20,
