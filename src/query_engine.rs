@@ -580,6 +580,7 @@ impl QueryEngine {
                 }
 
                 let tool = self.tools.iter().find(|t| t.name() == name);
+                ctx.cwd = crate::tools::session_cwd(&self.tools, &self.config.cwd);
 
                 let output = match tool {
                     Some(t) => match t.execute(input.clone(), &ctx).await {
@@ -1389,6 +1390,75 @@ mod permission_wiring_tests {
         }];
         e.execute_tools(&call).await.unwrap();
         assert_eq!(*probe.0.lock().unwrap(), Some((2, true)));
+    }
+
+    /// EnterWorktree only recorded the worktree; every executor kept building
+    /// ToolContext from config.cwd, so the "isolated" edits after it went to
+    /// the main checkout. Includes a Write in the same batch as the Enter.
+    #[tokio::test]
+    async fn tools_after_enter_worktree_run_in_the_worktree() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ][..],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        let state = crate::tools::worktree::new_worktree_state();
+        let e = engine(
+            &root,
+            vec![
+                Arc::new(crate::tools::worktree::EnterWorktreeTool {
+                    state: state.clone(),
+                }),
+                Arc::new(crate::tools::file_write::FileWriteTool),
+            ],
+        )
+        .with_permission_gate(PermissionGate::bypass());
+        let calls = vec![
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "EnterWorktree".into(),
+                input: json!({"name": "iso"}),
+            },
+            ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "Write".into(),
+                input: json!({"file_path": "new.txt", "content": "x"}),
+            },
+        ];
+        let out = e.execute_tools(&calls).await.unwrap();
+        let (is_error, text) = result(&out);
+        assert!(!is_error, "{text}");
+        let wt = state.lock().unwrap().as_ref().unwrap().path.clone();
+        assert!(
+            wt.join("new.txt").exists(),
+            "write must land in the worktree"
+        );
+        assert!(
+            !root.join("new.txt").exists(),
+            "main tree must be untouched"
+        );
     }
 }
 

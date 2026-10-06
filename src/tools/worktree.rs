@@ -24,6 +24,14 @@ pub fn new_worktree_state() -> WorktreeState {
     Arc::new(Mutex::new(None))
 }
 
+fn active_worktree(state: &WorktreeState) -> Option<PathBuf> {
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| s.path.clone())
+}
+
 // ── EnterWorktree ─────────────────────────────────────────────────────────────
 
 pub struct EnterWorktreeTool {
@@ -44,8 +52,13 @@ impl Tool for EnterWorktreeTool {
 
     fn description(&self) -> &str {
         "Create and enter a git worktree for isolated work. Creates a new branch \
-        and worktree directory so changes don't affect the main working tree. \
-        Use ExitWorktree when done."
+        and worktree directory; until ExitWorktree, relative paths and Bash commands \
+        run in the worktree so changes don't affect the main working tree. \
+        Commit your work on the branch, then use ExitWorktree when done."
+    }
+
+    fn session_cwd(&self) -> Option<PathBuf> {
+        active_worktree(&self.state)
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -155,7 +168,11 @@ impl Tool for EnterWorktreeTool {
             json!({
                 "worktreePath": worktree_path.to_string_lossy(),
                 "worktreeBranch": slug,
-                "message": format!("Entered worktree '{}' at {}", slug, worktree_path.display())
+                "message": format!(
+                    "Entered worktree '{}' at {}. Relative paths and Bash commands now run there.",
+                    slug,
+                    worktree_path.display()
+                )
             })
             .to_string(),
         ))
@@ -181,9 +198,13 @@ impl Tool for ExitWorktreeTool {
     }
 
     fn description(&self) -> &str {
-        "Exit the current git worktree and return to the original working directory. \
+        "Exit the current git worktree; tools run in the original working directory again. \
         Removes the worktree directory and keeps its branch. Uncommitted changes block \
         removal unless discard_changes is true; commit them on the branch first to keep them."
+    }
+
+    fn session_cwd(&self) -> Option<PathBuf> {
+        active_worktree(&self.state)
     }
 
     fn input_schema(&self) -> serde_json::Value {

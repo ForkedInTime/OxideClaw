@@ -587,6 +587,12 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with the given JSON input
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput>;
 
+    /// Directory this tool has moved the session into (EnterWorktree). The
+    /// executors run later tool calls there instead of `config.cwd`.
+    fn session_cwd(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Build the ToolDefinition to include in API requests
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -621,6 +627,16 @@ pub fn apply_tool_filters(tools: &mut Vec<DynTool>, config: &crate::config::Conf
                 .any(|d| d.eq_ignore_ascii_case(t.name()))
         });
     }
+}
+
+/// The cwd for the next tool call: the active worktree if EnterWorktree put
+/// the session in one, else `default`. Executors re-read it before every call
+/// so tools later in the same batch as EnterWorktree land in the worktree too.
+pub fn session_cwd(tools: &[DynTool], default: &std::path::Path) -> std::path::PathBuf {
+    tools
+        .iter()
+        .find_map(|t| t.session_cwd())
+        .unwrap_or_else(|| default.to_path_buf())
 }
 
 /// Build the default tool set.

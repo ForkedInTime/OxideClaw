@@ -141,6 +141,8 @@ impl Tool for AgentTool {
         }
 
         let mut sub_config = self.live_config(ctx);
+        // Inside an EnterWorktree session the child must work there too.
+        sub_config.cwd = ctx.cwd.clone();
         // A child given the whole budget again could spend it on top of
         // what the session already has.
         if let Some(left) = ctx.budget_remaining_usd {

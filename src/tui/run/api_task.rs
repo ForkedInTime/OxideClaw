@@ -693,6 +693,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         }
 
                         let tool = tools.iter().find(|t| t.name() == name);
+                        ctx.cwd = crate::tools::session_cwd(&tools, &config.cwd);
                         let output: ToolOutput = match tool {
                             Some(t) => t
                                 .execute(input.clone(), &ctx)

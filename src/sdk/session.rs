@@ -632,6 +632,7 @@ impl SdkSession {
             // Execute the tool
             let tool_start = Instant::now();
             let tool = self.tools.iter().find(|t| t.name() == name.as_str());
+            ctx.cwd = crate::tools::session_cwd(&self.tools, &self.config.cwd);
 
             let output = match tool {
                 Some(t) => match t.execute(input.clone(), &ctx).await {
