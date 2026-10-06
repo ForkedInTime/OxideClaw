@@ -97,7 +97,7 @@ pub(super) fn cmd_image(args: &str) -> CommandAction {
     if path.is_empty() {
         return CommandAction::Message(
             "Usage: /image <path>\n\nAttaches an image to your next message.\n\
-             Supported formats: PNG, JPEG, GIF, WebP\n\n\
+             Supported formats: PNG, JPEG, GIF, WebP (up to 3.75 MB)\n\n\
              Example: /image /home/user/screenshot.png"
                 .into(),
         );
@@ -113,10 +113,61 @@ pub(super) fn cmd_image(args: &str) -> CommandAction {
     } else {
         path.to_string()
     };
-    if !std::path::Path::new(&expanded).exists() {
-        return CommandAction::Message(format!("File not found: {expanded}"));
+    if let Err(why) = check_image_file(std::path::Path::new(&expanded)) {
+        return CommandAction::Message(why);
     }
     CommandAction::AttachImage(expanded)
+}
+
+/// Largest image file /image accepts. The API caps an image at 5 MB of
+/// base64, which is ~3.75 MB of raw bytes; anything bigger is a 400.
+pub const MAX_IMAGE_BYTES: u64 = 3_750_000;
+
+/// Media type from an image's magic bytes, for the formats the API accepts.
+/// The extension is not trusted: a JPEG saved as `.png` sent as image/png is
+/// a 400 just like a HEIC or a PDF.
+pub fn image_media_type(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Validate an /image path before it is attached. A rejected image would stay
+/// in the history and fail every later request, so reject it here instead.
+pub fn check_image_file(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let shown = path.display();
+    let meta = std::fs::metadata(path).map_err(|_| format!("File not found: {shown}"))?;
+    // Not a FIFO or device: reading those can block the UI forever.
+    if !meta.is_file() {
+        return Err(format!("Not a regular file: {shown}"));
+    }
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "Image too large: {shown} is {:.1} MB; the API accepts at most {:.2} MB. \
+             Resize or compress it first.",
+            meta.len() as f64 / 1e6,
+            MAX_IMAGE_BYTES as f64 / 1e6
+        ));
+    }
+    let mut head = [0u8; 12];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .map_err(|e| format!("Could not read {shown}: {e}"))?;
+    if image_media_type(&head[..n]).is_none() {
+        return Err(format!(
+            "Unsupported image: {shown} is not PNG, JPEG, GIF or WebP."
+        ));
+    }
+    Ok(())
 }
 
 /// A single help command entry: (slash_command, description).

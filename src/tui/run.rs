@@ -1070,6 +1070,18 @@ async fn run_loop(
                                 }
                             });
                         }
+                        // A failed API turn leaves its user message at the
+                        // tail of `messages` (only Done replaces it).
+                        AppEvent::Error(_) if app.api_task.is_some() => {
+                            let dropped = drop_unsent_images(&mut messages);
+                            app.apply(ev);
+                            if dropped {
+                                app.entries.push(ChatEntry::system(
+                                    "The attached image was removed from the conversation so \
+                                     it is not re-sent. Re-attach it with /image to retry.",
+                                ));
+                            }
+                        }
                         other => app.apply(other),
                     }
                     match rx.try_recv() {
