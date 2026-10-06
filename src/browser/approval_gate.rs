@@ -54,38 +54,43 @@ pub struct ApprovalGate {
 
 fn url_patterns() -> Vec<String> {
     vec![
-        r"/pay(ments?)?(/|\?|$)".into(),
-        r"/checkout(/|\?|$)".into(),
-        r"/purchase(/|\?|$)".into(),
-        r"/order-review".into(),
-        r"/billing/add-card".into(),
-        r"/wallet/transfer".into(),
-        r"/oauth/authorize".into(),
-        r"/consent".into(),
-        r"/authorize/grant".into(),
+        // Case-insensitive: paths like "/Checkout/Payment" are common, and
+        // Shopify serves its checkout under "/checkouts/<token>".
+        r"(?i)/pay(ments?)?(/|\?|$)".into(),
+        r"(?i)/checkouts?(/|\?|$)".into(),
+        r"(?i)/purchase(/|\?|$)".into(),
+        r"(?i)/order-review".into(),
+        r"(?i)/billing/add-card".into(),
+        r"(?i)/wallet/transfer".into(),
+        r"(?i)/oauth/authorize".into(),
+        r"(?i)/consent".into(),
+        r"(?i)/authorize/grant".into(),
     ]
 }
 
 fn button_patterns() -> Vec<String> {
     vec![
         // Category 2 — payment / purchase
-        r"(?i)confirm (purchase|order|payment)".into(),
+        // Real labels carry a determiner ("Place your order", "Delete this
+        // repository", "Close my account"), so the patterns allow one.
+        r"(?i)(confirm|complete) (my |your |the )?(purchase|order|payment)".into(),
         r"(?i)submit payment".into(),
-        r"(?i)place (my )?order".into(),
-        r"(?i)complete (purchase|order)".into(),
+        r"(?i)place (my |your |the )?order".into(),
         r"(?i)buy now".into(),
         r"(?i)pay (now|\$)".into(),
+        r"(?i)^\s*pay\s*$".into(),
         r"(?i)start (free )?trial".into(),
         r"(?i)try free for \d+ days?".into(),
         r"(?i)upgrade (to premium|plan|account)".into(),
         // Category 3 — account destruction
-        r"(?i)delete (account|repository|organization|workspace|project)".into(),
+        r"(?i)\bdelete (this |my |your |the )?(account|repository|repo|organization|workspace|project)"
+            .into(),
         r"(?i)remove (account|user)".into(),
         r"(?i)revoke (access|permissions|api key)".into(),
         r"(?i)permanently delete".into(),
         r"(?i)empty trash".into(),
         r"(?i)cancel subscription".into(),
-        r"(?i)close account".into(),
+        r"(?i)(close|deactivate) (my |your |this )?account".into(),
         r"(?i)deactivate".into(),
         // Category 4 — publication / blast radius
         r"(?i)post (tweet|publicly|to public)".into(),

@@ -216,3 +216,71 @@ fn invalid_user_pattern_is_skipped_not_crash() {
     };
     assert_eq!(g.check(&c), GateVerdict::Allow);
 }
+
+// Real-world destructive labels and checkout URLs carry determiners and
+// casing the original patterns missed ("Place your order", "Delete this
+// repository", Shopify's /checkouts/<token>).
+#[test]
+fn trips_on_real_world_destructive_labels_and_urls() {
+    let g = gate();
+    for label in [
+        "Place your order",
+        "Place the order",
+        "Confirm your payment",
+        "Complete my purchase",
+        "Complete payment",
+        "Delete this repository",
+        "I understand the consequences, delete this repository",
+        "Delete my account",
+        "Delete repo",
+        "Close my account",
+        "Deactivate your account",
+        "Pay",
+        "  Pay ",
+    ] {
+        let c = GateContext {
+            tool_name: "browser_click".into(),
+            target_text: label.into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }),
+            "{label:?} must be gated"
+        );
+    }
+    for url in [
+        "https://x.myshopify.com/checkouts/cn/abc",
+        "https://shop.example/Checkout/Payment",
+        "https://shop.example/CHECKOUT",
+    ] {
+        let c = GateContext {
+            tool_name: "browser_click".into(),
+            url: url.into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(g.check(&c), GateVerdict::RequireConfirmation { .. }),
+            "{url} must be gated"
+        );
+    }
+}
+
+#[test]
+fn does_not_trip_on_lookalike_labels() {
+    let g = gate();
+    for label in [
+        "Payment methods",
+        "Undelete project",
+        "Delete this comment",
+        "Display order",
+        "Paypal help",
+    ] {
+        let c = GateContext {
+            tool_name: "browser_click".into(),
+            url: "https://app.example/settings".into(),
+            target_text: label.into(),
+            ..Default::default()
+        };
+        assert_eq!(g.check(&c), GateVerdict::Allow, "{label:?} must pass");
+    }
+}
