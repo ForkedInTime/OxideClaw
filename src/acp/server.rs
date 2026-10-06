@@ -5,7 +5,7 @@ use super::rpc::{self, Incoming, RpcError};
 use crate::config::Config;
 use crate::sdk::protocol::{Capabilities, Policy, SdkNotification};
 use crate::sdk::session::{CancelSignal, SdkSession, TurnEnd};
-use crate::sdk::transport::stdio::{LineRead, read_line_bounded};
+use crate::sdk::transport::stdio::{LineRead, spawn_line_reader};
 use crate::sdk::validate_session_cwd;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -53,9 +53,9 @@ struct State {
 
 impl AcpServer {
     /// Serve ACP over `reader`/`writer` until the reader hits EOF.
-    pub async fn run<R, W>(config: Config, mut reader: R, mut writer: W) -> Result<()>
+    pub async fn run<R, W>(config: Config, reader: R, mut writer: W) -> Result<()>
     where
-        R: AsyncBufRead + Unpin,
+        R: AsyncBufRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin,
     {
         let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<SdkNotification>();
@@ -69,24 +69,26 @@ impl AcpServer {
             notif_tx,
             done_tx,
         };
-        let mut buf = String::new();
+        // A dedicated reader task: racing `read_line` itself in the select
+        // loses a partly-read line whenever a notification wins.
+        let mut lines = spawn_line_reader(reader, MAX_LINE_BYTES);
         loop {
             let frames = tokio::select! {
-                read = read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES) => {
+                read = lines.recv() => {
+                    let Some(read) = read else { break };
                     match read? {
-                        LineRead::Eof => break,
-                        LineRead::TooLong => vec![rpc::error(
+                        (LineRead::Eof, _) => break,
+                        (LineRead::TooLong, _) => vec![rpc::error(
                             &Value::Null,
                             rpc::PARSE_ERROR,
                             format!("line exceeds {MAX_LINE_BYTES} bytes"),
                         )],
-                        LineRead::Line => {
-                            let line = buf.trim().to_string();
-                            buf.clear();
+                        (LineRead::Line, line) => {
+                            let line = line.trim();
                             if line.is_empty() {
                                 continue;
                             }
-                            st.handle_line(&line).await
+                            st.handle_line(line).await
                         }
                     }
                 }

@@ -8,14 +8,15 @@ use crate::sdk::protocol::{SdkNotification, SdkRequest, SdkResponse};
 use crate::sdk::transport::Transport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, mpsc};
 
 /// Max line size: 4MB — generous limit for large tool outputs.
 const MAX_LINE_SIZE: usize = 4 * 1024 * 1024;
 
 pub struct StdioTransport {
-    reader: Mutex<BufReader<tokio::io::Stdin>>,
+    /// Started on the first read, so `new()` works outside a runtime.
+    lines: Option<mpsc::Receiver<std::io::Result<(LineRead, String)>>>,
     writer: Mutex<tokio::io::Stdout>,
 }
 
@@ -28,7 +29,7 @@ impl Default for StdioTransport {
 impl StdioTransport {
     pub fn new() -> Self {
         Self {
-            reader: Mutex::new(BufReader::new(tokio::io::stdin())),
+            lines: None,
             writer: Mutex::new(tokio::io::stdout()),
         }
     }
@@ -37,21 +38,21 @@ impl StdioTransport {
 #[async_trait]
 impl Transport for StdioTransport {
     async fn read_request(&mut self) -> Result<Option<SdkRequest>> {
-        let mut line = String::new();
-        let mut reader = self.reader.lock().await;
+        let lines = self.lines.get_or_insert_with(|| {
+            spawn_line_reader(BufReader::new(tokio::io::stdin()), MAX_LINE_SIZE)
+        });
         loop {
-            line.clear();
-            match read_line_bounded(&mut *reader, &mut line, MAX_LINE_SIZE)
-                .await
-                .context("Failed to read from stdin")?
-            {
-                LineRead::Eof => return Ok(None), // EOF — host closed stdin
-                LineRead::TooLong => {
-                    eprintln!("[sdk] Warning: line exceeds 4MB, skipping");
-                    continue;
-                }
-                LineRead::Line => {}
-            }
+            let line = match lines.recv().await {
+                None => return Ok(None),
+                Some(read) => match read.context("Failed to read from stdin")? {
+                    (LineRead::Eof, _) => return Ok(None), // EOF — host closed stdin
+                    (LineRead::TooLong, _) => {
+                        eprintln!("[sdk] Warning: line exceeds 4MB, skipping");
+                        continue;
+                    }
+                    (LineRead::Line, line) => line,
+                },
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue; // skip blank lines
@@ -88,6 +89,32 @@ pub(crate) enum LineRead {
     Line,
     /// The line exceeded `max` bytes; it was drained and discarded.
     TooLong,
+}
+
+/// Read lines on a task of their own and hand them over a channel.
+///
+/// The server loops `select!` a read against outgoing notifications, and a
+/// `read_line` future is not cancel-safe: when the other branch wins, the
+/// bytes it already consumed are lost and the rest of the line parses as
+/// garbage. `mpsc::Receiver::recv` is cancel-safe. The channel is bounded so
+/// a busy server applies backpressure instead of buffering stdin.
+/// Stops after EOF or the first error, which it delivers.
+pub(crate) fn spawn_line_reader<R: AsyncBufRead + Unpin + Send + 'static>(
+    mut reader: R,
+    max: usize,
+) -> mpsc::Receiver<std::io::Result<(LineRead, String)>> {
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        loop {
+            let mut line = String::new();
+            let read = read_line_bounded(&mut reader, &mut line, max).await;
+            let last = !matches!(read, Ok(LineRead::Line | LineRead::TooLong));
+            if tx.send(read.map(|r| (r, line))).await.is_err() || last {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 /// Read one line into `buf` without ever buffering more than `max` bytes
@@ -182,6 +209,42 @@ mod bounded_read_tests {
             LineRead::Line
         );
         assert_eq!(buf.trim(), "ok");
+    }
+
+    /// The servers race the next line against notifications. A 20 KiB line
+    /// arriving in 4 KiB pieces over a pipe must survive the other branch
+    /// winning over and over; racing `read_line` directly lost the consumed
+    /// prefix each time and parsed the tail as a new request.
+    #[tokio::test]
+    async fn lines_survive_a_select_that_keeps_cancelling_the_read() {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(20 * 1024));
+        let payload = format!("{big}\nok\n");
+        tokio::spawn(async move {
+            for chunk in payload.as_bytes().chunks(1000) {
+                tx.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut lines = spawn_line_reader(BufReader::new(rx), 1 << 20);
+        let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut got = Vec::new();
+        let mut notifs = 0usize;
+        while got.len() < 2 {
+            let _ = notif_tx.send(());
+            tokio::select! {
+                read = lines.recv() => match read.unwrap().unwrap() {
+                    (LineRead::Line, l) => got.push(l.trim().to_string()),
+                    other => panic!("unexpected {other:?}"),
+                },
+                Some(()) = notif_rx.recv() => notifs += 1,
+            }
+        }
+        assert!(notifs > 0, "the notification branch never won");
+        assert_eq!(got[0], big);
+        assert_eq!(got[1], "ok");
+        assert!(matches!(lines.recv().await, Some(Ok((LineRead::Eof, _)))));
     }
 
     #[test]
