@@ -24,12 +24,22 @@ pub enum BrowsePolicy {
 }
 
 impl BrowsePolicy {
-    /// Parse a settings.json-style string ("pattern" / "ask" / "yolo").
-    /// Unknown or empty strings fall back to `Pattern`.
+    /// Parse `browseDefaultPolicy` ("pattern" / "ask"). Unknown or empty
+    /// strings fall back to `Pattern`.
+    ///
+    /// "yolo" is deliberately not honored: settings.json can come from a
+    /// cloned, untrusted repo, and yolo switches off the approval gate for
+    /// purchases, submits and OAuth grants. It must be asked for per run
+    /// (--yolo, /browse --yolo, or SDK yolo with yolo_ack).
     pub fn from_settings_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "ask" => Self::Ask,
-            "yolo" => Self::Yolo,
+            "yolo" => {
+                tracing::warn!(
+                    "browseDefaultPolicy=yolo is ignored; use --yolo / /browse --yolo per run"
+                );
+                Self::Pattern
+            }
             _ => Self::Pattern,
         }
     }

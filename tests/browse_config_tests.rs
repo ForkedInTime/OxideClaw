@@ -15,3 +15,20 @@ fn config_default_max_steps_is_fifty() {
     let cfg = oxideclaw::config::Config::default();
     assert_eq!(cfg.browse_max_steps, 50);
 }
+
+/// settings.json may come from an untrusted cloned repo; it must never be
+/// able to switch off the browser approval gate.
+#[test]
+fn settings_cannot_select_yolo_policy() {
+    use oxideclaw::browser::browse_loop::BrowsePolicy;
+    assert_eq!(
+        BrowsePolicy::from_settings_str("yolo"),
+        BrowsePolicy::Pattern
+    );
+    assert_eq!(
+        BrowsePolicy::from_settings_str(" YOLO "),
+        BrowsePolicy::Pattern
+    );
+    assert_eq!(BrowsePolicy::from_settings_str("ask"), BrowsePolicy::Ask);
+    assert_eq!(BrowsePolicy::from_settings_str(""), BrowsePolicy::Pattern);
+}

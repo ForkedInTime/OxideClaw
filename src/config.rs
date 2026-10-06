@@ -346,7 +346,9 @@ pub struct Config {
     pub browse_max_steps: u32,
     /// User-appended destructive-action patterns (regex).
     pub browse_approval_patterns: Vec<String>,
-    /// Default policy: "pattern" (default), "ask", "yolo" (not honored from settings — per-run only).
+    /// Default policy: "pattern" (default) or "ask". "yolo" is ignored here
+    /// (it would let a repo's settings.json disable the approval gate) and
+    /// must be chosen per run.
     pub browse_default_policy: String,
 
     /// Watch debounce (ms) — coalesces rapid filesystem events.
