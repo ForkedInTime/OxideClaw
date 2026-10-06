@@ -545,10 +545,15 @@ impl Settings {
         Self::load_file(&crate::config::Config::claude_dir().join("settings.json"))
     }
 
-    /// Load and merge global + project settings + .mcp.json.
-    /// Priority: global → project → .mcp.json (for MCP servers only).
+    /// Load and merge global + project settings + .mcp.json + the user's
+    /// private per-project MCP file.
+    /// Priority: global → project → .mcp.json → private (MCP servers only).
     pub fn load(cwd: &Path) -> Self {
-        let global_path = crate::config::Config::claude_dir().join("settings.json");
+        Self::load_in(&crate::config::Config::claude_dir(), cwd)
+    }
+
+    pub(crate) fn load_in(claude_dir: &Path, cwd: &Path) -> Self {
+        let global_path = claude_dir.join("settings.json");
         let project_path = cwd.join(".claude").join("settings.json");
         let mcp_json_path = cwd.join(".mcp.json");
 
@@ -559,7 +564,25 @@ impl Settings {
         let mcp_extra = mcp_json_path
             .exists()
             .then(|| Self::load_mcp_json(&mcp_json_path));
-        Self::merge_with_trust(global, project, mcp_extra, trusted)
+        let merged = Self::merge_with_trust(global, project, mcp_extra, trusted);
+        // Written by the user (`mcp add --scope local`) and outside the repo,
+        // so the trust gate does not apply.
+        let local_path = Self::local_mcp_path(claude_dir, cwd);
+        if local_path.exists() {
+            merged.merge(Self::load_mcp_json(&local_path))
+        } else {
+            merged
+        }
+    }
+
+    /// `oxideclaw mcp add --scope local` (the default) target: servers private
+    /// to this user and project. It lives under the config dir, not in the
+    /// repo, so an `env` token is never committed with `.mcp.json`.
+    pub fn local_mcp_path(claude_dir: &Path, cwd: &Path) -> std::path::PathBuf {
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        claude_dir
+            .join("local-mcp")
+            .join(format!("{}.json", crate::tools::snapshot_name(&cwd)))
     }
 
     /// Load only the mcpServers block from a .mcp.json file.
@@ -743,20 +766,17 @@ impl Settings {
 
     /// Return the path(s) that were actually loaded, for diagnostics.
     pub fn loaded_paths(cwd: &Path) -> Vec<String> {
-        let mut paths = Vec::new();
-        let global = crate::config::Config::claude_dir().join("settings.json");
-        let project = cwd.join(".claude").join("settings.json");
-        let mcp_json = cwd.join(".mcp.json");
-        if global.exists() {
-            paths.push(global.display().to_string());
-        }
-        if project.exists() {
-            paths.push(project.display().to_string());
-        }
-        if mcp_json.exists() {
-            paths.push(mcp_json.display().to_string());
-        }
-        paths
+        let claude_dir = crate::config::Config::claude_dir();
+        [
+            claude_dir.join("settings.json"),
+            cwd.join(".claude").join("settings.json"),
+            cwd.join(".mcp.json"),
+            Self::local_mcp_path(&claude_dir, cwd),
+        ]
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect()
     }
 }
 

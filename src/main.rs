@@ -344,7 +344,8 @@ enum McpSubcommand {
         command: String,
         /// Arguments for the command
         args: Vec<String>,
-        /// Configuration scope: user, project, or local (default: local)
+        /// Configuration scope: local (default; private to you, this project),
+        /// project (.claude/settings.json, usually committed), or user
         #[arg(short = 's', long, default_value = "local")]
         scope: String,
         /// Transport type: stdio (default) or http
@@ -360,13 +361,15 @@ enum McpSubcommand {
         name: String,
         /// JSON configuration string
         json: String,
-        /// Configuration scope: user, project, or local (default: local)
+        /// Configuration scope: local (default; private to you, this project),
+        /// project (.claude/settings.json, usually committed), or user
         #[arg(short = 's', long, default_value = "local")]
         scope: String,
     },
     /// Import MCP servers from Claude Desktop configuration
     AddFromClaudeDesktop {
-        /// Configuration scope: user, project, or local (default: local)
+        /// Configuration scope: local (default; private to you, this project),
+        /// project (.claude/settings.json, usually committed), or user
         #[arg(short = 's', long, default_value = "local")]
         scope: String,
     },
@@ -1314,14 +1317,20 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                     env: env_map,
                     disabled: false,
                 });
-            mcp_write_server(name, cfg, scope, &config)?;
-            println!("Added MCP server '{name}' (scope: {scope})");
+            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::claude_dir())?;
+            println!(
+                "Added MCP server '{name}' (scope: {scope}) to {}",
+                path.display()
+            );
         }
         Some(McpSubcommand::AddJson { name, json, scope }) => {
             let cfg: crate::mcp::types::McpServerConfig =
                 serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
-            mcp_write_server(name, cfg, scope, &config)?;
-            println!("Added MCP server '{name}' (scope: {scope})");
+            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::claude_dir())?;
+            println!(
+                "Added MCP server '{name}' (scope: {scope}) to {}",
+                path.display()
+            );
         }
         Some(McpSubcommand::AddFromClaudeDesktop { scope }) => {
             let desktop_config = find_claude_desktop_config();
@@ -1354,7 +1363,13 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                             val.clone(),
                         ) {
                             Ok(cfg) => {
-                                mcp_write_server(name, cfg, scope, &config)?;
+                                mcp_write_server(
+                                    name,
+                                    cfg,
+                                    scope,
+                                    &config.cwd,
+                                    &Config::claude_dir(),
+                                )?;
                                 println!("  Imported: {name}");
                                 imported += 1;
                             }
@@ -1368,7 +1383,8 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             }
         }
         Some(McpSubcommand::Remove { name, scope }) => {
-            let removed = mcp_remove_server(name, scope.as_deref(), &config)?;
+            let removed =
+                mcp_remove_server(name, scope.as_deref(), &config.cwd, &Config::claude_dir())?;
             if removed {
                 println!("Removed MCP server '{name}'.");
             } else {
@@ -1395,35 +1411,55 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
     Ok(())
 }
 
-/// Write an MCP server config to the appropriate settings file for the given scope.
+/// Write an MCP server config to the settings file for `scope`; returns it.
 fn mcp_write_server(
     name: &str,
     cfg: crate::mcp::types::McpServerConfig,
     scope: &str,
-    config: &Config,
-) -> Result<()> {
-    let path = mcp_scope_path(scope, config);
+    cwd: &std::path::Path,
+    claude_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let path = mcp_scope_path(scope, cwd, claude_dir)?;
+    if scope == "project" {
+        let has_secrets = match &cfg {
+            crate::mcp::types::McpServerConfig::Stdio(s) => !s.env.is_empty(),
+            crate::mcp::types::McpServerConfig::Http(h) => !h.headers.is_empty(),
+        };
+        if has_secrets {
+            eprintln!(
+                "Warning: '{name}' has env/headers and {} is usually committed; \
+                 use --scope local to keep tokens out of the repo.",
+                path.display()
+            );
+        }
+    }
     let mut json = config::read_json_object(&path)?;
     if json.get("mcpServers").is_none() {
         json["mcpServers"] = serde_json::json!({});
     }
     json["mcpServers"][name] = serde_json::to_value(&cfg)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
-    Ok(())
+    // New files are created 0600 and existing modes kept, so a token in
+    // `env` is not left world-readable.
+    config::write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
+    Ok(path)
 }
 
 /// Remove an MCP server from the specified scope (or all scopes if scope is None).
-fn mcp_remove_server(name: &str, scope: Option<&str>, config: &Config) -> Result<bool> {
+fn mcp_remove_server(
+    name: &str,
+    scope: Option<&str>,
+    cwd: &std::path::Path,
+    claude_dir: &std::path::Path,
+) -> Result<bool> {
     let paths: Vec<std::path::PathBuf> = if let Some(s) = scope {
-        vec![mcp_scope_path(s, config)]
+        vec![mcp_scope_path(s, cwd, claude_dir)?]
     } else {
         vec![
-            mcp_scope_path("user", config),
-            mcp_scope_path("project", config),
-            mcp_scope_path("local", config),
+            mcp_scope_path("user", cwd, claude_dir)?,
+            mcp_scope_path("project", cwd, claude_dir)?,
+            mcp_scope_path("local", cwd, claude_dir)?,
+            // Where older versions wrote `--scope local`.
+            cwd.join(".mcp.json"),
         ]
     };
     let mut removed = false;
@@ -1435,7 +1471,7 @@ fn mcp_remove_server(name: &str, scope: Option<&str>, config: &Config) -> Result
         if let Some(servers) = json.get_mut("mcpServers").and_then(|v| v.as_object_mut())
             && servers.remove(name).is_some()
         {
-            std::fs::write(path, serde_json::to_string_pretty(&json)?)?;
+            config::write_json_atomic(path, &serde_json::to_string_pretty(&json)?)?;
             removed = true;
         }
     }
@@ -1443,11 +1479,19 @@ fn mcp_remove_server(name: &str, scope: Option<&str>, config: &Config) -> Result
 }
 
 /// Resolve the settings file path for an mcp scope.
-fn mcp_scope_path(scope: &str, config: &Config) -> std::path::PathBuf {
+fn mcp_scope_path(
+    scope: &str,
+    cwd: &std::path::Path,
+    claude_dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
     match scope {
-        "user" => Config::claude_dir().join("settings.json"),
-        "project" => config.cwd.join(".claude").join("settings.json"),
-        _ => config.cwd.join(".mcp.json"), // "local" scope = .mcp.json
+        "user" => Ok(claude_dir.join("settings.json")),
+        "project" => Ok(cwd.join(".claude").join("settings.json")),
+        // Private, outside the repo, and loaded without the trust gate: the
+        // old `.mcp.json` target leaked `-e` tokens into a shared file and
+        // was then ignored in untrusted projects.
+        "local" => Ok(crate::settings::Settings::local_mcp_path(claude_dir, cwd)),
+        other => anyhow::bail!("unknown scope '{other}' (expected local, project or user)"),
     }
 }
 
@@ -1758,5 +1802,70 @@ mod dotenv_allowlist_tests {
                 std::env::set_var("OXIDECLAW_VERBOSE", v);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_scope_tests {
+    use super::{mcp_remove_server, mcp_write_server};
+    use crate::mcp::types::{McpServerConfig, StdioServerConfig};
+
+    fn server_with_token() -> McpServerConfig {
+        McpServerConfig::Stdio(StdioServerConfig {
+            command: "npx".into(),
+            args: vec!["srv".into()],
+            env: [("GITHUB_TOKEN".to_string(), "ghp_x".to_string())].into(),
+            disabled: false,
+        })
+    }
+
+    /// `mcp add -e TOKEN=...` with the default scope wrote the token into the
+    /// repo's shared `.mcp.json`, which an untrusted project then ignored.
+    #[test]
+    fn default_local_scope_is_private_and_loaded_in_an_untrusted_project() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let path =
+            mcp_write_server("gh", server_with_token(), "local", repo.path(), home.path()).unwrap();
+
+        assert!(path.starts_with(home.path()), "{}", path.display());
+        assert!(!repo.path().join(".mcp.json").exists());
+        assert!(!repo.path().join(".claude").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let settings = crate::settings::Settings::load_in(home.path(), repo.path());
+        assert!(settings.mcp_servers.contains_key("gh"));
+        assert!(settings.untrusted_project_config.is_empty());
+
+        assert!(mcp_remove_server("gh", None, repo.path(), home.path()).unwrap());
+        let settings = crate::settings::Settings::load_in(home.path(), repo.path());
+        assert!(!settings.mcp_servers.contains_key("gh"));
+    }
+
+    #[test]
+    fn an_unknown_scope_is_an_error_not_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            mcp_write_server("gh", server_with_token(), "loacl", repo.path(), home.path()).is_err()
+        );
+        assert!(!repo.path().join(".mcp.json").exists());
+    }
+
+    /// Entries older versions wrote to `.mcp.json` can still be removed.
+    #[test]
+    fn remove_without_scope_also_sweeps_legacy_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let legacy = repo.path().join(".mcp.json");
+        std::fs::write(&legacy, r#"{"mcpServers":{"gh":{"command":"npx"}}}"#).unwrap();
+        assert!(mcp_remove_server("gh", None, repo.path(), home.path()).unwrap());
+        let left = std::fs::read_to_string(&legacy).unwrap();
+        assert!(!left.contains("\"gh\""), "{left}");
     }
 }
