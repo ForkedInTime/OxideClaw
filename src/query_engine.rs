@@ -902,6 +902,18 @@ impl QueryEngine {
         Ok(engine)
     }
 
+    /// Continue a saved conversation: the next `query` sends `messages`
+    /// first, under that session's id.
+    pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
+        self.session_id = Some(session_id);
+        self.messages = messages;
+    }
+
+    /// The conversation so far, to save it.
+    pub fn history(&self) -> &[Message] {
+        &self.messages
+    }
+
     /// How many turns the engine has executed since the last `query()` call.
     pub fn turns_used(&self) -> u32 {
         self.turns
@@ -1182,6 +1194,54 @@ pub(crate) mod scripted_api_tests {
             "{}",
             e.cumulative_cost_usd
         );
+    }
+
+    /// `-c -p` ran a fresh conversation: the resumed turns must be sent
+    /// ahead of the new prompt, and the whole history returned for saving.
+    #[tokio::test]
+    async fn resumed_history_is_sent_with_the_next_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, seen) = serve(vec![sse(
+            &[serde_json::json!({"type":"text","text":"second answer"})],
+            "end_turn",
+        )])
+        .await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        let turn = |role, text: &str| Message {
+            role,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        };
+        e.resume_history(
+            "saved-session".into(),
+            vec![
+                turn(Role::User, "first question"),
+                turn(Role::Assistant, "first answer"),
+            ],
+        );
+
+        e.query("second question").await.unwrap();
+
+        let body: serde_json::Value =
+            serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        let sent: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"][0]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(sent, ["first question", "first answer", "second question"]);
+        assert_eq!(e.history().len(), 4);
+        assert_eq!(e.session_id.as_deref(), Some("saved-session"));
     }
 
     /// RAG text went into `system` on the first request of a prompt only,

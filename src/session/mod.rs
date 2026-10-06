@@ -1237,6 +1237,23 @@ mod continue_tests {
         meta(dir.path(), "empty", 1_000);
         assert_eq!(Session::most_recent_in(dir.path()).await, None);
     }
+
+    /// `--session` is documented as taking an id prefix, but the prefix was
+    /// passed on as the id and the session was never found.
+    #[tokio::test]
+    async fn session_flag_resolves_a_unique_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        meta(d, "ab12-first", 1_000);
+        meta(d, "ab34-second", 2_000);
+        meta(d, "ab34", 3_000);
+        let find = |p: &'static str| async move { Session::resolve_in(d, p).await.ok() };
+        assert_eq!(find("ab1").await.as_deref(), Some("ab12-first"));
+        assert_eq!(find("ab34").await.as_deref(), Some("ab34"), "exact id wins");
+        assert_eq!(find("ab").await, None, "ambiguous");
+        assert_eq!(find("zz").await, None);
+        assert_eq!(find("").await, None);
+    }
 }
 
 #[cfg(test)]

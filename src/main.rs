@@ -1076,6 +1076,32 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --session-id takes priority: resume that exact session if it exists,
+    // otherwise start a new one under that ID. --session also takes the short
+    // IDs and names the picker shows; an unknown one is an error rather than a
+    // silently fresh session.
+    let resume_id = if let Some(raw) = cli.session_id {
+        let id = uuid::Uuid::parse_str(raw.trim())
+            .map_err(|e| anyhow::anyhow!("--session-id must be a valid UUID: {e}"))?
+            .to_string();
+        if session::Session::exists(&id) {
+            Some(id)
+        } else {
+            config.new_session_id = Some(id);
+            None
+        }
+    } else if let Some(q) = cli.session {
+        Some(
+            session::Session::resolve(&q)
+                .await
+                .map_err(|e| anyhow::anyhow!("--session: {e}"))?,
+        )
+    } else if cli.resume || cli.continue_session {
+        session::Session::most_recent().await
+    } else {
+        None
+    };
+
     // --print mode: non-interactive, no TUI
     if cli.print {
         // --input-format=stream-json: read prompt from JSON-line events on stdin
@@ -1131,6 +1157,18 @@ async fn main() -> Result<()> {
         }
 
         let mut engine = QueryEngine::new(config.clone(), tools)?;
+        // -p used to ignore the resume flags and run a fresh conversation.
+        let mut resumed = None;
+        if let Some(id) = &resume_id {
+            let (mut s, history) = session::Session::resume(id).await?;
+            if config.fork_session && !config.no_session_persistence {
+                s.fork(&history).await?;
+            }
+            engine.resume_history(s.id.clone(), history);
+            resumed = Some(s);
+        } else if cli.resume || cli.continue_session {
+            anyhow::bail!("No previous session to continue.");
+        }
         match cli.output_format {
             OutputFormat::Json => engine.set_json_output(true),
             OutputFormat::StreamJson => engine.set_stream_json_output(true),
@@ -1162,34 +1200,14 @@ async fn main() -> Result<()> {
             _ => prompt,
         };
         engine.query(prompt).await?;
+        // Overwrite, not append: compaction may have rewritten the history.
+        if let Some(s) = resumed
+            && !config.no_session_persistence
+        {
+            s.overwrite(engine.history()).await?;
+        }
         return Ok(());
     }
-
-    // --session-id takes priority: resume that exact session if it exists,
-    // otherwise start a new one under that ID. --session also takes the short
-    // IDs and names the picker shows; an unknown one is an error rather than a
-    // silently fresh session.
-    let resume_id = if let Some(raw) = cli.session_id {
-        let id = uuid::Uuid::parse_str(raw.trim())
-            .map_err(|e| anyhow::anyhow!("--session-id must be a valid UUID: {e}"))?
-            .to_string();
-        if session::Session::exists(&id) {
-            Some(id)
-        } else {
-            config.new_session_id = Some(id);
-            None
-        }
-    } else if let Some(q) = cli.session {
-        Some(
-            session::Session::resolve(&q)
-                .await
-                .map_err(|e| anyhow::anyhow!("--session: {e}"))?,
-        )
-    } else if cli.resume || cli.continue_session {
-        session::Session::most_recent().await
-    } else {
-        None
-    };
 
     // --fork-session: generate a new UUID instead of reusing the original
     let resume_id = if config.fork_session && resume_id.is_some() {
