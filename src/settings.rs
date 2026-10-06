@@ -88,6 +88,12 @@ pub struct Settings {
     #[serde(skip)]
     pub untrusted_project_config: Vec<String>,
 
+    /// Settings files that exist but could not be read or parsed, as
+    /// "<path>: <error>". Such a file contributes nothing — not even its
+    /// `permissions.deny` or hooks — so the user has to be told.
+    #[serde(skip)]
+    pub load_errors: Vec<String>,
+
     /// Max tokens per response (global fallback)
     pub max_tokens: Option<u32>,
 
@@ -376,6 +382,15 @@ pub struct PermissionsConfig {
     pub deny: Vec<String>,
 }
 
+/// User-facing text for `Settings::load_errors`.
+pub fn load_errors_notice(errors: &[String]) -> String {
+    format!(
+        "Could not load settings — ignored, so none of their permissions, hooks \
+         or other settings are in effect:\n  {}\nFix the file and restart oxideclaw.",
+        errors.join("\n  ")
+    )
+}
+
 impl Settings {
     /// Is `cwd` in the global `trustedProjects` list? Compared canonically
     /// so `./`, symlinks and trailing slashes do not matter.
@@ -589,20 +604,50 @@ impl Settings {
     /// Returns a Settings with only mcp_servers populated.
     fn load_mcp_json(path: &Path) -> Self {
         let mut s = Self::default();
-        if let Ok(content) = std::fs::read_to_string(path)
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(obj) = json.get("mcpServers").and_then(|v| v.as_object())
-        {
+        let json = match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c.strip_prefix('\u{feff}').unwrap_or(&c))
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(json) => json,
+            Err(e) => return Self::load_failed(path, e),
+        };
+        if let Some(obj) = json.get("mcpServers").and_then(|v| v.as_object()) {
             for (name, val) in obj {
-                if let Ok(cfg) = serde_json::from_value::<McpServerConfig>(val.clone()) {
-                    s.mcp_servers.insert(name.clone(), cfg);
+                match serde_json::from_value::<McpServerConfig>(val.clone()) {
+                    Ok(cfg) => {
+                        s.mcp_servers.insert(name.clone(), cfg);
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "{}: mcpServers.{name}: {e} — server ignored",
+                            path.display()
+                        );
+                        tracing::warn!("{msg}");
+                        s.load_errors.push(msg);
+                    }
                 }
             }
         }
         s
     }
 
-    /// Try to read and parse a settings file; silently return defaults on any error.
+    /// Defaults plus a load error: the file contributes nothing, and the
+    /// error is shown at startup, in /reload, /trust and /doctor.
+    fn load_failed(path: &Path, e: impl std::fmt::Display) -> Self {
+        let msg = format!("{}: {e} — file ignored", path.display());
+        tracing::warn!("{msg}");
+        Self {
+            load_errors: vec![msg],
+            ..Self::default()
+        }
+    }
+
+    /// Read and parse a settings file. A missing or empty file is defaults;
+    /// one that cannot be read or parsed is defaults plus a `load_errors`
+    /// entry. Settings is strictly typed, so one wrong-typed value anywhere
+    /// (`"maxTokens": "8000"`) fails the whole file, deny rules included.
     ///
     /// Security hardening: `apiKeyHelper` is stripped from the parsed settings
     /// if the source file is world- or group-writable, since the helper is
@@ -610,14 +655,20 @@ impl Settings {
     /// shell-injection vector on shared hosts. The warning is emitted via
     /// `tracing::warn` so it shows up in the log file without corrupting TUI.
     fn from_file(path: &Path) -> Self {
-        if !path.exists() {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => return Self::load_failed(path, e),
+        };
+        // Windows editors save a BOM, which serde_json rejects.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        if text.trim().is_empty() {
             return Self::default();
         }
-        let parsed: Self = match std::fs::read_to_string(path) {
-            Err(_) => return Self::default(),
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        };
-        Self::sanitize_unsafe_helper(parsed, path)
+        match serde_json::from_str(text) {
+            Ok(parsed) => Self::sanitize_unsafe_helper(parsed, path),
+            Err(e) => Self::load_failed(path, e),
+        }
     }
 
     /// If `parsed.api_key_helper` is Some and the source file has unsafe
@@ -740,6 +791,11 @@ impl Settings {
             // Global-only: a project must not be able to trust itself.
             trusted_projects: self.trusted_projects,
             untrusted_project_config: self.untrusted_project_config,
+            load_errors: {
+                let mut v = self.load_errors;
+                v.extend(other.load_errors);
+                v
+            },
             permissions: PermissionsConfig {
                 // Union both lists — project additions stack on top of global
                 allow: {
@@ -1137,5 +1193,71 @@ mod project_trust_tests {
         );
         assert!(!Settings::is_trusted(&global, &canonical.join("sub")));
         assert!(!Settings::is_trusted(&Settings::default(), &canonical));
+    }
+}
+
+#[cfg(test)]
+mod load_error_tests {
+    use super::*;
+
+    fn load(global: Option<&str>, project: Option<&str>) -> Settings {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        if let Some(g) = global {
+            std::fs::write(home.path().join("settings.json"), g).unwrap();
+        }
+        if let Some(p) = project {
+            std::fs::create_dir(repo.path().join(".claude")).unwrap();
+            std::fs::write(repo.path().join(".claude").join("settings.json"), p).unwrap();
+        }
+        Settings::load_in(home.path(), repo.path())
+    }
+
+    /// A trailing comma or one wrong-typed value used to turn the whole file,
+    /// deny rules included, into defaults without a word.
+    #[test]
+    fn an_unparsable_settings_file_is_reported() {
+        let s = load(Some(r#"{"permissions": {"deny": ["Bash"]},}"#), None);
+        assert!(s.permissions.deny.is_empty());
+        assert_eq!(s.load_errors.len(), 1);
+        assert!(
+            s.load_errors[0].contains("settings.json"),
+            "{:?}",
+            s.load_errors
+        );
+
+        let s = load(
+            Some(r#"{"permissions": {"deny": ["Bash"]}}"#),
+            Some(r#"{"maxTokens": "8000"}"#),
+        );
+        assert_eq!(s.permissions.deny, vec!["Bash".to_string()]);
+        assert_eq!(s.load_errors.len(), 1);
+        assert!(s.load_errors[0].contains(".claude"), "{:?}", s.load_errors);
+    }
+
+    #[test]
+    fn bom_empty_and_missing_files_are_not_errors() {
+        let s = load(Some("\u{feff}{\"model\": \"opus\"}"), Some("  \n"));
+        assert_eq!(s.model.as_deref(), Some("opus"));
+        assert!(s.load_errors.is_empty(), "{:?}", s.load_errors);
+        assert!(load(None, None).load_errors.is_empty());
+    }
+
+    #[test]
+    fn a_broken_mcp_server_entry_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {"ok": {"command": "x"}, "bad": {"args": 1}}}"#,
+        )
+        .unwrap();
+        let s = Settings::load_mcp_json(&path);
+        assert!(s.mcp_servers.contains_key("ok"));
+        assert_eq!(s.load_errors.len(), 1);
+        assert!(s.load_errors[0].contains("mcpServers.bad"));
+
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(Settings::load_mcp_json(&path).load_errors.len(), 1);
     }
 }

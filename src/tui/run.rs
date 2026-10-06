@@ -267,6 +267,12 @@ async fn run_loop(
             list.join("\n")
         )));
     }
+    if !config.settings_load_errors.is_empty() {
+        app.entries
+            .push(ChatEntry::system(crate::settings::load_errors_notice(
+                &config.settings_load_errors,
+            )));
+    }
     if !config.untrusted_project_config.is_empty() {
         app.entries.push(ChatEntry::system(format!(
             "This project's settings define {} — ignored because the project is not trusted. \

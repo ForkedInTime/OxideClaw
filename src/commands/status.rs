@@ -128,6 +128,9 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     if data_dir != config_dir {
         checks.push(format!("✓ Data dir: {}", data_dir.display()));
     }
+    for e in &ctx.config.settings_load_errors {
+        checks.push(format!("✗ Settings not loaded: {e}"));
+    }
 
     // API key
     if ctx.config.api_key.len() >= 4 {

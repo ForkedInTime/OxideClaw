@@ -244,29 +244,30 @@ pub(super) async fn plugin_install_task(
     let _ = tx.send(AppEvent::PluginInstallDone { success, message });
 }
 
-/// Register an MCP server entry in ~/.claude/settings.json.
+/// Register an MCP server entry in the global settings.json.
 pub(super) async fn register_mcp_server(
     name: &str,
     server_cfg: serde_json::Value,
 ) -> anyhow::Result<()> {
-    let settings_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-        .join(".claude")
-        .join("settings.json");
-    let mut json: serde_json::Value = if settings_path.exists() {
-        let content = tokio::fs::read_to_string(&settings_path)
-            .await
-            .unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let settings_path = crate::config::Config::claude_dir().join("settings.json");
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || add_mcp_server_entry(&settings_path, &name, server_cfg))
+        .await?
+}
 
-    if json.get("mcpServers").is_none() || json["mcpServers"].is_null() {
+/// Read-modify-write that refuses a settings.json it cannot parse: falling
+/// back to `{}` would replace the user's whole file with just `mcpServers`.
+fn add_mcp_server_entry(
+    settings_path: &std::path::Path,
+    name: &str,
+    server_cfg: serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut json = crate::config::read_json_object(settings_path)?;
+    if !json.get("mcpServers").is_some_and(|v| v.is_object()) {
         json["mcpServers"] = serde_json::json!({});
     }
     json["mcpServers"][name] = server_cfg;
-    tokio::fs::write(&settings_path, serde_json::to_string_pretty(&json)?).await?;
+    crate::config::write_json_atomic(settings_path, &serde_json::to_string_pretty(&json)?)?;
     Ok(())
 }
 
@@ -290,4 +291,34 @@ pub(super) async fn track_plugin(name: &str, spec: &str, marketplace: bool) -> a
     });
     tokio::fs::write(&plugins_path, serde_json::to_string_pretty(&plugins)?).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_mcp_server_entry;
+
+    #[test]
+    fn plugin_install_never_overwrites_an_unparsable_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let broken = r#"{"permissions": {"deny": ["Bash(rm:*)"]},}"#;
+        std::fs::write(&path, broken).unwrap();
+
+        let err = add_mcp_server_entry(&path, "p", serde_json::json!({"command": "x"}));
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn plugin_install_keeps_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"permissions": {"deny": ["Bash(rm:*)"]}}"#).unwrap();
+
+        add_mcp_server_entry(&path, "p", serde_json::json!({"command": "x"})).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["permissions"]["deny"][0], "Bash(rm:*)");
+        assert_eq!(json["mcpServers"]["p"]["command"], "x");
+    }
 }

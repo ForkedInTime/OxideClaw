@@ -311,6 +311,12 @@ pub struct Config {
     #[serde(skip)]
     pub untrusted_project_config: Vec<String>,
 
+    /// Settings files that could not be read or parsed and were ignored
+    /// whole (see `Settings::load_errors`). Shown at startup, on stderr in
+    /// non-interactive modes, and in /reload, /trust and /doctor.
+    #[serde(skip)]
+    pub settings_load_errors: Vec<String>,
+
     /// Active sandbox mode: "strict", "bwrap", or "firejail".
     pub sandbox_mode: String,
 
@@ -462,6 +468,7 @@ impl Default for Config {
             file_snapshot_dir: None,
             sandbox_enabled: false,
             untrusted_project_config: Vec::new(),
+            settings_load_errors: Vec::new(),
             sandbox_mode: "strict".to_string(),
             voice_enabled: false,
             voice_api_url: None,
@@ -543,6 +550,7 @@ impl Config {
         cfg.env = settings.env;
         cfg.api_key_helper = settings.api_key_helper;
         cfg.untrusted_project_config = settings.untrusted_project_config;
+        cfg.settings_load_errors = settings.load_errors;
         cfg.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
         // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
         // everything immediately?). Warn and treat as unset.

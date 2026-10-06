@@ -738,6 +738,7 @@ async fn main() -> Result<()> {
                 }
 
                 let config = Config::load()?;
+                warn_settings_load_errors(&config);
 
                 // Determine policy: --yolo > --ask > settings.browseDefaultPolicy > Pattern.
                 let policy = if *yolo {
@@ -1039,6 +1040,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The TUI shows these in the transcript; the other modes only have stderr.
+    if cli.print || cli.headless || matches!(cli.command, Some(Commands::Acp)) {
+        warn_settings_load_errors(&config);
+    }
+
     // `oxideclaw acp`: Agent Client Protocol over stdio
     if matches!(cli.command, Some(Commands::Acp)) {
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -1242,8 +1248,20 @@ fn self_update_target() -> String {
     }
 }
 
+/// stderr notice for `Config::settings_load_errors` outside the TUI.
+fn warn_settings_load_errors(config: &Config) {
+    if !config.settings_load_errors.is_empty() {
+        eprintln!(
+            "Warning: {}",
+            settings::load_errors_notice(&config.settings_load_errors)
+        );
+    }
+}
+
 async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()> {
     let config = Config::load()?;
+    // Otherwise a typo in settings.json reads as "No MCP servers configured".
+    warn_settings_load_errors(&config);
     match subcommand {
         None | Some(McpSubcommand::List) => {
             let settings = crate::settings::Settings::load(&config.cwd);

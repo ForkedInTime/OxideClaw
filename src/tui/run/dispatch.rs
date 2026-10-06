@@ -1137,7 +1137,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
             config.agentsmd = crate::config::Config::load_agents_md(&config.cwd);
 
-            let msg = if reloaded.is_empty() {
+            let mut msg = if reloaded.is_empty() {
                 "Settings reloaded (no changes detected). CLAUDE.md + AGENTS.md refreshed."
                     .to_string()
             } else {
@@ -1146,6 +1146,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     reloaded.join(", ")
                 )
             };
+            // Otherwise a typo reads as "no changes detected".
+            if !settings.load_errors.is_empty() {
+                msg.push_str("\n");
+                msg.push_str(&crate::settings::load_errors_notice(&settings.load_errors));
+            }
+            config.settings_load_errors = settings.load_errors;
             app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
@@ -2138,7 +2144,15 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 .unwrap_or_else(|_| config.cwd.clone())
                 .to_string_lossy()
                 .into_owned();
-            let msg = if status_only || trusted {
+            // An unparsable global file reads as an empty trust list: saying
+            // "NOT trusted", or saving [this project] over the user's list
+            // (a wrong-typed value still parses as JSON), would both be wrong.
+            let msg = if !global.load_errors.is_empty() {
+                format!(
+                    "Cannot check or change trust for {canonical}.\n{}",
+                    crate::settings::load_errors_notice(&global.load_errors)
+                )
+            } else if status_only || trusted {
                 format!(
                     "Project {canonical} is {}.{}",
                     if trusted { "trusted" } else { "NOT trusted" },
