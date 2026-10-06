@@ -42,7 +42,7 @@ pub(super) fn cmd_config(ctx: &CommandContext) -> CommandAction {
          permissions.allow:  {allow}\n\
          permissions.deny:   {deny}",
         model = ctx.config.model,
-        max_tok = ctx.config.max_tokens,
+        max_tok = ctx.config.max_tokens_for(&ctx.config.model),
         cwd = ctx.config.cwd.display(),
         compact = ctx.config.auto_compact_enabled,
         skip_perms = ctx.config.dangerously_skip_permissions,

@@ -152,8 +152,9 @@ pub struct Config {
     #[serde(skip)]
     pub settings_model: Option<String>,
 
-    /// Max tokens per response (global fallback)
-    pub max_tokens: u32,
+    /// Max tokens per response (global fallback). `None` = the model's
+    /// default from `api::default_max_tokens`.
+    pub max_tokens: Option<u32>,
 
     /// Per-model max_tokens overrides. Keys are matched exact-then-alias
     /// against the resolved request model. Falls back to `max_tokens`
@@ -428,7 +429,7 @@ impl Default for Config {
             auth_warnings: Vec::new(),
             model: crate::api::default_model().to_string(),
             settings_model: None,
-            max_tokens: crate::api::default_max_tokens(),
+            max_tokens: None,
             max_tokens_by_model: HashMap::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             verbose: false,
@@ -761,7 +762,7 @@ impl Config {
             self.settings_model = Some(self.model.clone());
         }
         if let Some(mt) = settings.max_tokens {
-            self.max_tokens = mt;
+            self.max_tokens = Some(mt);
         }
         if let Some(map) = &settings.max_tokens_by_model {
             for (k, v) in map {
@@ -1001,8 +1002,9 @@ impl Config {
 
     /// Return the effective max_tokens for a given model, preferring an
     /// explicit per-model override from `max_tokens_by_model` and falling
-    /// back to the global `max_tokens`. Lookup is tried first on the raw
-    /// model string, then on its alias-resolved form.
+    /// back to the global `max_tokens`, then to the model's default. Lookup
+    /// is tried first on the raw model string, then on its alias-resolved
+    /// form.
     pub fn max_tokens_for(&self, model: &str) -> u32 {
         if let Some(v) = self.max_tokens_by_model.get(model) {
             return *v;
@@ -1012,6 +1014,7 @@ impl Config {
             return *v;
         }
         self.max_tokens
+            .unwrap_or_else(|| crate::api::default_max_tokens(model))
     }
 
     /// Parse `<!-- phase-routing: research=haiku, edit=opus -->` directives from
@@ -2350,7 +2353,7 @@ mod retarget_cwd_tests {
         );
         assert!(!cfg.claudemd.contains("ALPHA-INSTRUCTIONS"));
         assert_eq!(cfg.model, "bravo-model");
-        assert_eq!(cfg.max_tokens, 2222);
+        assert_eq!(cfg.max_tokens, Some(2222));
         assert!(cfg.permissions_deny.contains(&"Bash(bravo:*)".to_string()));
         assert!(!cfg.permissions_deny.contains(&"Bash(alpha:*)".to_string()));
         assert_eq!(cfg.max_turns, 7);
@@ -2368,5 +2371,40 @@ mod retarget_cwd_tests {
         cfg.model = "cli-model".into();
         cfg.retarget_cwd(b.path().to_path_buf());
         assert_eq!(cfg.model, "cli-model");
+    }
+}
+
+#[cfg(test)]
+mod max_tokens_default_tests {
+    use super::Config;
+
+    /// Adaptive thinking shares max_tokens with the answer; the old flat
+    /// 8096 left a thinking turn too little room for a large Write.
+    #[test]
+    fn unset_max_tokens_follows_the_model() {
+        let mut cfg = Config::default();
+        cfg.max_tokens = None;
+        cfg.max_tokens_by_model.clear();
+        for m in [
+            "claude-sonnet-5",
+            "sonnet",
+            "claude-opus-5-5",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(cfg.max_tokens_for(m), 32_000, "{m}");
+        }
+        for m in [
+            "claude-3-5-sonnet-20241022",
+            "llama3.2",
+            "groq:llama-3.3-70b",
+        ] {
+            assert_eq!(cfg.max_tokens_for(m), 8_192, "{m}");
+        }
+        // An explicit setting, global or per model, always wins.
+        cfg.max_tokens = Some(8_192);
+        assert_eq!(cfg.max_tokens_for("claude-sonnet-5"), 8_192);
+        cfg.max_tokens_by_model
+            .insert("claude-sonnet-5".into(), 64_000);
+        assert_eq!(cfg.max_tokens_for("sonnet"), 64_000);
     }
 }

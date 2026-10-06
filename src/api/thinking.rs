@@ -16,6 +16,9 @@ pub const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// Smallest `budget_tokens` the API accepts.
 pub const MIN_BUDGET_TOKENS: u32 = 1024;
 
+/// Output a `budget_tokens` request always leaves for the answer itself.
+const ANSWER_HEADROOM_TOKENS: u32 = 4096;
+
 /// `thinking` request field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
@@ -205,8 +208,10 @@ pub fn thinking_for(
     if adaptive {
         return Some(ThinkingConfig::Adaptive { summarized });
     }
-    // budget_tokens must be ≥ MIN and < max_tokens, or the API returns 400.
-    let ceiling = max_tokens.checked_sub(1)?;
+    // budget_tokens must be ≥ MIN and < max_tokens, or the API returns 400,
+    // and thinking draws from max_tokens: keep 4k (or half of a smaller cap)
+    // for the answer, or a turn that thinks hard stops before its tool call.
+    let ceiling = max_tokens - (max_tokens / 2).min(ANSWER_HEADROOM_TOKENS);
     if ceiling < MIN_BUDGET_TOKENS {
         return None;
     }
@@ -382,10 +387,23 @@ mod tests {
                 budget_tokens: MIN_BUDGET_TOKENS
             })
         );
+        // Thinking shares max_tokens with the answer: 4k (or half) stays free.
+        assert_eq!(
+            thinking_for("claude-haiku-4-5", Some(10_000), 8_192, None, false),
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: 4_096
+            })
+        );
         assert_eq!(
             thinking_for("claude-haiku-4-5", Some(10_000), 4_096, None, false),
             Some(ThinkingConfig::Enabled {
-                budget_tokens: 4_095
+                budget_tokens: 2_048
+            })
+        );
+        assert_eq!(
+            thinking_for("claude-haiku-4-5", Some(10_000), 32_000, None, false),
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: 10_000
             })
         );
         // max_tokens too small for any legal budget: omit rather than 400.

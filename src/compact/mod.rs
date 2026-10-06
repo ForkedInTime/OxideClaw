@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn legacy_claude_3_keeps_its_configured_cap() {
         let mut cfg = config();
-        cfg.max_tokens = 8_192;
+        cfg.max_tokens = Some(8_192);
         cfg.model = "claude-3-5-sonnet-20241022".into();
         assert_eq!(summary_max_tokens(&cfg, ""), 8_192);
         cfg.model = "claude-haiku-4-5".into();
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn summary_budget_fits_in_what_the_window_has_left() {
         let mut cfg = config();
-        cfg.max_tokens = 8_192;
+        cfg.max_tokens = Some(8_192);
         cfg.model = "claude-sonnet-4-0".into();
         let window = crate::api::context_window_for_model(&cfg.model);
         assert_eq!(window, 200_000);

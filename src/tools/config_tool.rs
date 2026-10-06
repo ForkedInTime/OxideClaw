@@ -32,7 +32,7 @@ impl Tool for ConfigTool {
 
         let mut lines = vec![
             format!("model: {model}"),
-            format!("max_tokens: {}", cfg.max_tokens),
+            format!("max_tokens: {}", cfg.max_tokens_for(model)),
             format!("prompt_cache: {}", cfg.prompt_cache),
             format!("plan_mode: {}", cfg.plan_mode),
         ];

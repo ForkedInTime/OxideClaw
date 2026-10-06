@@ -21,7 +21,7 @@ pub use types::*;
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
-const DEFAULT_MAX_TOKENS: u32 = 8096;
+const DEFAULT_MAX_TOKENS: u32 = 8_192;
 
 /// Maximum time to wait for the *next* bytes of an SSE response before declaring
 /// the stream dead.
@@ -584,8 +584,18 @@ pub fn default_model() -> &'static str {
     DEFAULT_MODEL
 }
 
-pub fn default_max_tokens() -> u32 {
-    DEFAULT_MAX_TOKENS
+/// Per-turn output cap when the user has not set `maxTokens`. Adaptive
+/// thinking shares this allowance with the answer, so 8k leaves a turn that
+/// thinks first no room for a large Write. Turns stream, so a 32k cap is safe
+/// on every Claude model from 4.5 on; older and non-Claude models (whose
+/// caps vary) keep 8k.
+pub fn default_max_tokens(model: &str) -> u32 {
+    let model = crate::commands::resolve_model_alias(model);
+    if thinking::model_version(&model).is_some_and(|v| v >= (4, 5)) {
+        32_000
+    } else {
+        DEFAULT_MAX_TOKENS
+    }
 }
 
 /// Context window (input tokens) for `model`. Compaction thresholds and every

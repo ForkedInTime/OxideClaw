@@ -1029,7 +1029,7 @@ async fn main() -> Result<()> {
                 config.model = crate::commands::resolve_model_alias(&m);
             }
             if let Some(mt) = extra.max_tokens {
-                config.max_tokens = mt;
+                config.max_tokens = Some(mt);
             }
             if let Some(ah) = extra.api_key_helper {
                 config.api_key_helper = Some(ah);

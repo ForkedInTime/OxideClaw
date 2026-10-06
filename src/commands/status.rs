@@ -34,7 +34,7 @@ pub(super) fn cmd_status(ctx: &CommandContext) -> CommandAction {
          Auto-compact: {compact}",
         ver = env!("CARGO_PKG_VERSION"),
         model = ctx.config.model,
-        max_tok = ctx.config.max_tokens,
+        max_tok = ctx.config.max_tokens_for(&ctx.config.model),
         branch = git_branch,
         api = api_key_status,
         vim = if ctx.vim_mode { "on" } else { "off" },
