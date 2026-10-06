@@ -269,7 +269,140 @@ pub fn chromium_proxy_args(proxy: SocketAddr) -> [String; 3] {
 /// Request heads larger than this are refused; no legitimate request needs it.
 const MAX_PROXY_HEAD: usize = 64 * 1024;
 
+///
+/// Chromium launched without this proxy follows `HTTP(S)_PROXY` (Linux) or
+/// the system proxy; pinned to it, it would lose all access on a network
+/// that requires an egress proxy. So public destinations are chained
+/// through the proxy the environment names (see [`Upstream::from_env`]),
+/// after the same policy check.
 pub async fn spawn_policy_proxy(policy: NetPolicy) -> Result<PolicyProxy> {
+    spawn_policy_proxy_with(policy, Upstream::from_env()).await
+}
+
+/// An HTTP proxy the policy proxy forwards public destinations through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    host: String,
+    port: u16,
+    /// `Proxy-Authorization` value from the URL's userinfo.
+    auth: Option<String>,
+    /// `NO_PROXY` entries, lower-case, without a leading `.` or `*.`.
+    no_proxy: Vec<String>,
+}
+
+impl Upstream {
+    /// The proxy `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (either case,
+    /// in that order) names, with `NO_PROXY`. Only `http://` proxies (or a
+    /// bare `host:port`) can be chained; anything else is ignored.
+    pub fn from_env() -> Option<Self> {
+        Self::from_vars(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+    }
+
+    fn from_vars(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let either = |k: &str| get(k).or_else(|| get(&k.to_ascii_lowercase()));
+        let raw = either("HTTPS_PROXY")
+            .or_else(|| either("HTTP_PROXY"))
+            .or_else(|| either("ALL_PROXY"))?;
+        let raw = raw.trim();
+        let with_scheme = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            format!("http://{raw}")
+        };
+        let url = match Url::parse(&with_scheme) {
+            Ok(u) if u.scheme() == "http" => u,
+            _ => {
+                tracing::warn!(
+                    "browser: proxy {raw:?} is not an http:// proxy; launched Chrome connects directly"
+                );
+                return None;
+            }
+        };
+        let host = url.host_str()?.to_string();
+        let port = url.port_or_known_default()?;
+        let auth = (!url.username().is_empty()).then(|| {
+            use base64::Engine as _;
+            let creds = format!(
+                "{}:{}",
+                percent_decode(url.username()),
+                percent_decode(url.password().unwrap_or(""))
+            );
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(creds)
+            )
+        });
+        let no_proxy = either("NO_PROXY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|e| {
+                let e = e.trim().to_ascii_lowercase();
+                let e = e.trim_start_matches("*.").trim_start_matches('.');
+                // `host:port` entries: the host part is what is compared.
+                match e.rsplit_once(':') {
+                    Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => h.to_string(),
+                    _ => e.to_string(),
+                }
+            })
+            .filter(|e| !e.is_empty())
+            .collect();
+        Some(Self {
+            host,
+            port,
+            auth,
+            no_proxy,
+        })
+    }
+
+    /// `NO_PROXY` covers `host` (itself or a parent domain, or `*`).
+    fn bypasses(&self, host: &str) -> bool {
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        self.no_proxy.iter().any(|e| {
+            e == "*"
+                || host == *e
+                || host
+                    .strip_suffix(e.as_str())
+                    .is_some_and(|r| r.ends_with('.'))
+        })
+    }
+}
+
+/// `%XX` decoding for proxy userinfo.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(hex) = std::str::from_utf8(&b[i + 1..i + 3])
+            && let Ok(v) = u8::from_str_radix(hex, 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where one proxied connection goes after the policy check.
+enum Route {
+    /// Straight to these checked addresses.
+    Direct(Vec<SocketAddr>),
+    /// Through the environment's proxy, which resolves the host itself.
+    Upstream(Upstream),
+}
+
+async fn spawn_policy_proxy_with(
+    policy: NetPolicy,
+    upstream: Option<Upstream>,
+) -> Result<PolicyProxy> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -279,7 +412,7 @@ pub async fn spawn_policy_proxy(policy: NetPolicy) -> Result<PolicyProxy> {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((sock, _)) => {
-                        conns.spawn(proxy_one(sock, policy));
+                        conns.spawn(proxy_one(sock, policy, upstream.clone()));
                     }
                     Err(_) => break,
                 },
@@ -290,7 +423,11 @@ pub async fn spawn_policy_proxy(policy: NetPolicy) -> Result<PolicyProxy> {
     Ok(PolicyProxy { addr, task })
 }
 
-async fn proxy_one(mut client: tokio::net::TcpStream, policy: NetPolicy) {
+async fn proxy_one(
+    mut client: tokio::net::TcpStream,
+    policy: NetPolicy,
+    upstream: Option<Upstream>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = Vec::with_capacity(4096);
@@ -336,26 +473,122 @@ async fn proxy_one(mut client: tokio::net::TcpStream, policy: NetPolicy) {
             return;
         }
     };
-    let addrs = match policy.resolve(&url).await {
-        Ok(a) => a,
+    let host = url.host_str().unwrap_or("").to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+    let chain = upstream.filter(|u| !u.bypasses(&host));
+    // The policy check always runs first. Public destinations then go
+    // through the environment's proxy; loopback/LAN targets (allowed by the
+    // policy) and NO_PROXY hosts connect directly. A name that does not
+    // resolve here may still resolve at the upstream proxy (a network whose
+    // only way out is that proxy): the hostname checks applied, but the
+    // address pin cannot, since the upstream proxy does its own DNS.
+    let route = match policy.resolve(&url).await {
+        Ok(addrs) => match chain {
+            Some(up)
+                if addrs
+                    .iter()
+                    .all(|a| NetPolicy::STRICT.check_ip(a.ip()).is_ok()) =>
+            {
+                Route::Upstream(up)
+            }
+            _ => Route::Direct(addrs),
+        },
         Err(e) => {
+            let unresolvable = match url.host() {
+                Some(Host::Domain(d)) => tokio::net::lookup_host((d, port)).await.is_err(),
+                _ => false,
+            };
+            match chain {
+                Some(up) if unresolvable => Route::Upstream(up),
+                _ => {
+                    let _ = client
+                        .write_all(&refusal(
+                            "403 Forbidden",
+                            &format!("Blocked by OxideClaw network policy: {e}"),
+                        ))
+                        .await;
+                    return;
+                }
+            }
+        }
+    };
+    let (mut upstream, via) = match route {
+        Route::Direct(addrs) => match tokio::net::TcpStream::connect(&addrs[..]).await {
+            Ok(s) => (s, None),
+            Err(_) => {
+                let _ = client
+                    .write_all(&refusal("502 Bad Gateway", "could not connect"))
+                    .await;
+                return;
+            }
+        },
+        Route::Upstream(up) => {
+            match tokio::net::TcpStream::connect((up.host.as_str(), up.port)).await {
+                Ok(s) => (s, Some(up)),
+                Err(_) => {
+                    let _ = client
+                        .write_all(&refusal("502 Bad Gateway", "could not reach the proxy"))
+                        .await;
+                    return;
+                }
+            }
+        }
+    };
+
+    if connect && let Some(up) = &via {
+        // Open the tunnel at the upstream proxy first; only its 2xx is
+        // passed on as ours.
+        let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some(a) = &up.auth {
+            req.push_str(&format!("Proxy-Authorization: {a}\r\n"));
+        }
+        req.push_str("\r\n");
+        if upstream.write_all(req.as_bytes()).await.is_err() {
+            return;
+        }
+        let mut head = Vec::new();
+        let extra = loop {
+            if let Some(i) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                break head.split_off(i + 4);
+            }
+            if head.len() > MAX_PROXY_HEAD {
+                return;
+            }
+            let mut chunk = [0u8; 4096];
+            match upstream.read(&mut chunk).await {
+                Ok(0) | Err(_) => {
+                    let _ = client
+                        .write_all(&refusal("502 Bad Gateway", "the proxy closed the tunnel"))
+                        .await;
+                    return;
+                }
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let status = String::from_utf8_lossy(&head);
+        let ok = status
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|c| c.starts_with('2'));
+        if !ok {
+            let line = status.lines().next().unwrap_or("").to_string();
             let _ = client
                 .write_all(&refusal(
-                    "403 Forbidden",
-                    &format!("Blocked by OxideClaw network policy: {e}"),
+                    "502 Bad Gateway",
+                    &format!("the upstream proxy refused the tunnel: {line}"),
                 ))
                 .await;
             return;
         }
-    };
-    let Ok(mut upstream) = tokio::net::TcpStream::connect(&addrs[..]).await else {
-        let _ = client
-            .write_all(&refusal("502 Bad Gateway", "could not connect"))
-            .await;
-        return;
-    };
-
-    if connect {
+        if client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+            || (!extra.is_empty() && client.write_all(&extra).await.is_err())
+        {
+            return;
+        }
+    } else if connect {
         if client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -364,15 +597,23 @@ async fn proxy_one(mut client: tokio::net::TcpStream, policy: NetPolicy) {
             return;
         }
     } else {
-        // Origin-form for the server, and `Connection: close` so a reused
-        // proxy connection can never carry a request for another host to
-        // this already-checked upstream.
+        // Origin-form for the server (absolute-form for an upstream proxy),
+        // and `Connection: close` so a reused proxy connection can never
+        // carry a request for another host to this already-checked upstream.
         let mut path = url.path().to_string();
         if let Some(q) = url.query() {
             path.push('?');
             path.push_str(q);
         }
-        let mut out = format!("{method} {path} {version}\r\n");
+        let target = if via.is_some() {
+            url.as_str().to_string()
+        } else {
+            path
+        };
+        let mut out = format!("{method} {target} {version}\r\n");
+        if let Some(a) = via.as_ref().and_then(|u| u.auth.as_ref()) {
+            out.push_str(&format!("Proxy-Authorization: {a}\r\n"));
+        }
         for line in lines.filter(|l| !l.is_empty()) {
             let name = line.split(':').next().unwrap_or("").trim();
             if name.eq_ignore_ascii_case("connection")
@@ -676,7 +917,9 @@ mod tests {
     async fn proxy_refuses_hops_the_policy_denies() {
         let (base, hits) = scripted_server(vec![ok("secret")]).await;
         let authority = base.trim_start_matches("http://");
-        let strict = spawn_policy_proxy(NetPolicy::STRICT).await.unwrap();
+        let strict = spawn_policy_proxy_with(NetPolicy::STRICT, None)
+            .await
+            .unwrap();
         for req in [
             format!("GET {base}/ HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
             format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
@@ -687,7 +930,9 @@ mod tests {
             assert!(got.starts_with("HTTP/1.1 403"), "{req:?} -> {got}");
             assert!(!got.contains("secret"));
         }
-        let local = spawn_policy_proxy(NetPolicy::LOCAL_OK).await.unwrap();
+        let local = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, None)
+            .await
+            .unwrap();
         let got = via_proxy(
             &local,
             "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\n\r\n",
@@ -701,7 +946,9 @@ mod tests {
     async fn proxy_forwards_allowed_requests_and_tunnels() {
         let (base, hits) = scripted_server(vec![ok("hello")]).await;
         let authority = base.trim_start_matches("http://");
-        let proxy = spawn_policy_proxy(NetPolicy::LOCAL_OK).await.unwrap();
+        let proxy = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, None)
+            .await
+            .unwrap();
 
         let got = via_proxy(
             &proxy,
@@ -725,5 +972,155 @@ mod tests {
         );
         assert!(got.ends_with("hello"), "{got}");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    // ── upstream proxy chaining ──────────────────────────────────────────
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    #[test]
+    fn upstream_comes_from_the_proxy_variables() {
+        let up = Upstream::from_vars(vars(&[
+            ("https_proxy", "http://u%40corp:p%3Ass@proxy.corp:3128"),
+            ("HTTP_PROXY", "http://other:1"),
+            ("NO_PROXY", "localhost, .internal.corp,*.lan,10.0.0.1:8080"),
+        ]))
+        .unwrap();
+        assert_eq!((up.host.as_str(), up.port), ("proxy.corp", 3128));
+        use base64::Engine as _;
+        let creds = base64::engine::general_purpose::STANDARD.encode("u@corp:p:ss");
+        assert_eq!(up.auth, Some(format!("Basic {creds}")));
+        assert!(up.bypasses("localhost"));
+        assert!(up.bypasses("git.internal.corp"));
+        assert!(up.bypasses("printer.lan"));
+        assert!(up.bypasses("10.0.0.1"));
+        assert!(!up.bypasses("example.com"));
+        assert!(!up.bypasses("notinternal.corp"));
+
+        let bare = Upstream::from_vars(vars(&[("ALL_PROXY", "proxy:8080")])).unwrap();
+        assert_eq!(
+            (bare.host.as_str(), bare.port, bare.auth),
+            ("proxy", 8080, None)
+        );
+        assert!(Upstream::from_vars(vars(&[("ALL_PROXY", "socks5://proxy:1080")])).is_none());
+        assert!(Upstream::from_vars(vars(&[])).is_none());
+    }
+
+    /// A stand-in egress proxy: records each request head and answers it.
+    async fn fake_upstream(answer: &'static str) -> (Upstream, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = sock.write_all(answer.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let up = Upstream {
+            host: "127.0.0.1".into(),
+            port,
+            auth: Some("Basic dTpw".into()),
+            no_proxy: Vec::new(),
+        };
+        (up, seen)
+    }
+
+    use std::sync::Arc;
+
+    /// Launched Chrome was pinned to the policy proxy, which connected
+    /// directly: behind an egress proxy every page failed. Public hosts now
+    /// go through the environment's proxy, after the policy check.
+    #[tokio::test]
+    async fn public_destinations_are_chained_through_the_upstream_proxy() {
+        let (up, seen) =
+            fake_upstream("HTTP/1.1 200 Connection established\r\n\r\ntunnel-data").await;
+        let proxy = spawn_policy_proxy_with(NetPolicy::STRICT, Some(up))
+            .await
+            .unwrap();
+        // 93.184.215.14 is a public literal: no DNS needed for the check.
+        let got = via_proxy(&proxy, "CONNECT 93.184.215.14:443 HTTP/1.1\r\n\r\n").await;
+        assert!(
+            got.starts_with("HTTP/1.1 200 Connection Established"),
+            "{got}"
+        );
+        assert!(got.ends_with("tunnel-data"), "{got}");
+        let got = via_proxy(
+            &proxy,
+            "GET http://93.184.215.14/a?b=1 HTTP/1.1\r\nHost: 93.184.215.14\r\n\r\n",
+        )
+        .await;
+        assert!(got.contains("tunnel-data"), "{got}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[0].starts_with("CONNECT 93.184.215.14:443 HTTP/1.1\r\n"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("Proxy-Authorization: Basic dTpw"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].starts_with("GET http://93.184.215.14/a?b=1 HTTP/1.1\r\n"),
+            "{}",
+            seen[1]
+        );
+        assert!(
+            seen[1].contains("Proxy-Authorization: Basic dTpw"),
+            "{}",
+            seen[1]
+        );
+    }
+
+    /// The upstream proxy must not become a way around the policy, and
+    /// loopback targets the policy allows still connect directly.
+    #[tokio::test]
+    async fn the_policy_still_applies_and_lan_targets_stay_direct() {
+        let (up, seen) = fake_upstream("HTTP/1.1 200 OK\r\n\r\nfrom-proxy").await;
+        let strict = spawn_policy_proxy_with(NetPolicy::STRICT, Some(up.clone()))
+            .await
+            .unwrap();
+        for req in [
+            "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\n\r\n",
+            "CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n",
+            "CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n",
+        ] {
+            let got = via_proxy(&strict, req).await;
+            assert!(got.starts_with("HTTP/1.1 403"), "{req:?} -> {got}");
+        }
+
+        let (base, hits) = scripted_server(vec![ok("local")]).await;
+        let local = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, Some(up))
+            .await
+            .unwrap();
+        let got = via_proxy(&local, &format!("GET {base}/ HTTP/1.1\r\n\r\n")).await;
+        assert!(got.ends_with("local"), "{got}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the proxy"
+        );
     }
 }

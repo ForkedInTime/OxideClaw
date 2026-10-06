@@ -81,6 +81,10 @@ Second QA pass (2026-10-06).
   and WebBrowser) could reach the cloud metadata service or loopback; the
   Alibaba and AWS IPv6 metadata addresses are now always denied, and a
   refused navigation no longer returns Chromium's error page as content.
+  Behind an egress proxy (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, an
+  `http://` proxy) the checked connections are chained through it, honouring
+  `NO_PROXY`; launched Chrome no longer follows the system proxy settings
+  on macOS and Windows.
 - **Files the agent should not touch.** Write, Edit and NotebookEdit could
   reach `.git` or `~/.ssh` through a symlink, a different letter case or
   `link/newdir/../file`; Grep printed `CERT.PEM` / `server.KEY` that Read
