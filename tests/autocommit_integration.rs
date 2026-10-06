@@ -235,7 +235,7 @@ fn prune_integration_15_refs_keeps_10() {
         .unwrap();
     }
 
-    let deleted = prune_old_refs(td.path(), 10).unwrap();
+    let deleted = prune_old_refs(td.path(), 10, None).unwrap();
     assert_eq!(deleted, 5);
 
     let out = Command::new("git")

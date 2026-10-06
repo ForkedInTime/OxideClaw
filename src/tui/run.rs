@@ -591,9 +591,11 @@ async fn run_loop(
     if let Err(e) = oxideclaw::autocommit::migrate_legacy_refs(&config.cwd) {
         tracing::warn!("autoCommit ref migration failed: {e}");
     }
-    if let Err(e) =
-        oxideclaw::autocommit::prune_old_refs(&config.cwd, config.auto_commit.keep_sessions)
-    {
+    if let Err(e) = oxideclaw::autocommit::prune_old_refs(
+        &config.cwd,
+        config.auto_commit.keep_sessions,
+        Some(&session.id),
+    ) {
         tracing::warn!("autoCommit startup prune failed: {e}");
     }
 

@@ -489,7 +489,17 @@ pub fn snapshot_turn(
 
     // 4. Update the shadow ref, compare-and-swap against the value we started
     //    from. An empty expected-old tells git the ref must not exist yet.
-    let expected_old = expected_ref.as_deref().unwrap_or("");
+    //    A ref that is gone while we hold a chain was deleted (startup prune
+    //    of a session later resumed, a fork's fresh id, by hand), not written
+    //    by a concurrent instance, which would have created it. Re-create it;
+    //    this commit's parents still reach the earlier snapshots. Treating it
+    //    as a conflict failed every later turn of the session.
+    let ref_exists =
+        git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", &ref_name])).is_ok();
+    let expected_old = match &expected_ref {
+        Some(sha) if ref_exists => sha.as_str(),
+        _ => "",
+    };
     let update_status = git_cmd(cwd)
         .args(["update-ref", &ref_name, &commit_sha, expected_old])
         .status()?;
@@ -818,7 +828,9 @@ pub fn migrate_legacy_refs(cwd: &Path) -> anyhow::Result<u32> {
     Ok(moved)
 }
 
-pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
+/// `current_session` is never deleted: a resumed old session would otherwise
+/// lose its ref at startup.
+pub fn prune_old_refs(cwd: &Path, keep: u32, current_session: Option<&str>) -> anyhow::Result<u32> {
     if keep == 0 || !is_git_repo(cwd) {
         return Ok(0);
     }
@@ -850,7 +862,9 @@ pub fn prune_old_refs(cwd: &Path, keep: u32) -> anyhow::Result<u32> {
         return Ok(0);
     }
 
-    let to_delete = select_refs_to_delete(rows, keep as usize);
+    let current = current_session.map(shadow_ref);
+    let mut to_delete = select_refs_to_delete(rows, keep as usize);
+    to_delete.retain(|r| Some(r) != current.as_ref());
 
     let mut deleted = 0u32;
     for r in &to_delete {
@@ -1858,7 +1872,7 @@ mod prune_tests {
         make_ref(td.path(), &recovery_ref("s0"), &rec);
         make_ref(td.path(), &recovery_ref("s4"), &rec);
 
-        let deleted = prune_old_refs(td.path(), 3).unwrap();
+        let deleted = prune_old_refs(td.path(), 3, None).unwrap();
         assert_eq!(deleted, 2, "should delete the 2 oldest of 5 refs");
         // The recovery ref of a pruned session would keep all of its
         // snapshots alive through their parents.
@@ -1885,6 +1899,29 @@ mod prune_tests {
         assert_eq!(remaining.lines().count(), 3);
     }
 
+    /// A resumed session older than the newest `keep` lost its ref at
+    /// startup, and every later turn then reported a false conflict.
+    #[test]
+    fn prune_never_deletes_the_current_session() {
+        let td = init_test_repo();
+        for i in 0..5 {
+            let sha = make_empty_commit(td.path(), &format!("session-{i}"));
+            make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
+        }
+        // Created in order, so s0 and s1 are the two oldest.
+        assert_eq!(prune_old_refs(td.path(), 3, Some("s0")).unwrap(), 1);
+        let has = |r: &str| {
+            git_cmd(td.path())
+                .args(["rev-parse", "--verify", "-q", r])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(has("refs/oxideclaw/sessions/s0"), "current session pruned");
+        assert!(!has("refs/oxideclaw/sessions/s1"));
+    }
+
     #[test]
     fn prune_noop_when_unlimited() {
         let td = init_test_repo();
@@ -1898,7 +1935,7 @@ mod prune_tests {
             let sha = make_empty_commit(td.path(), &format!("s{i}"));
             make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
         }
-        let deleted = prune_old_refs(td.path(), 0).unwrap();
+        let deleted = prune_old_refs(td.path(), 0, None).unwrap();
         assert_eq!(deleted, 0);
     }
 
@@ -1915,7 +1952,58 @@ mod prune_tests {
             let sha = make_empty_commit(td.path(), &format!("s{i}"));
             make_ref(td.path(), &format!("refs/oxideclaw/sessions/s{i}"), &sha);
         }
-        let deleted = prune_old_refs(td.path(), 10).unwrap();
+        let deleted = prune_old_refs(td.path(), 10, None).unwrap();
         assert_eq!(deleted, 0);
+    }
+}
+
+#[cfg(test)]
+mod resume_and_restore_tests {
+    use super::git_detection_tests::init_test_repo;
+    use super::snapshot_tests::write_file;
+    use super::*;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let s = git_cmd(repo).args(args).status().unwrap();
+        assert!(s.success(), "git {args:?}");
+    }
+
+    fn turn(repo: &Path, commits: &mut Vec<String>, pos: &mut usize, n: u32) -> SnapshotOutcome {
+        snapshot_turn(
+            repo,
+            &AutoCommitConfig::default(),
+            "s",
+            "p",
+            n,
+            commits,
+            pos,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The ref was pruned at startup (or the session forked to a new id)
+    /// while `auto_commits` still held the chain: no other writer exists, so
+    /// the turn must be recorded, not reported as a conflict forever.
+    #[test]
+    fn a_deleted_session_ref_is_recreated_not_a_conflict() {
+        let td = init_test_repo();
+        let (mut commits, mut pos) = (Vec::new(), 0);
+        write_file(td.path(), "f.txt", "1\n");
+        assert!(matches!(
+            turn(td.path(), &mut commits, &mut pos, 1),
+            SnapshotOutcome::Committed { .. }
+        ));
+        git(td.path(), &["update-ref", "-d", &shadow_ref("s")]);
+
+        write_file(td.path(), "f.txt", "2\n");
+        let out = turn(td.path(), &mut commits, &mut pos, 2);
+        assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
+        let head = git_output(git_cmd(td.path()).args(["rev-parse", &shadow_ref("s")])).unwrap();
+        assert_eq!(head, commits[1]);
+        let parent =
+            git_output(git_cmd(td.path()).args(["rev-parse", &format!("{}^", commits[1])]))
+                .unwrap();
+        assert_eq!(parent, commits[0], "the chain must stay linked");
     }
 }

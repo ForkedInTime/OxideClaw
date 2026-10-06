@@ -498,7 +498,7 @@ fn dogfood_prune_touches_only_shadow_refs() {
     );
     assert_eq!(refs_before.lines().count(), 15);
 
-    let deleted = prune_old_refs(td.path(), 10).unwrap();
+    let deleted = prune_old_refs(td.path(), 10, None).unwrap();
     assert_eq!(deleted, 5);
 
     // Verify exactly 10 shadow refs remain.
