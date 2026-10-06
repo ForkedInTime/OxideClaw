@@ -719,4 +719,29 @@ mod model_catalogue_tests {
         }
         assert_eq!(super::super::api::default_model(), "claude-sonnet-5");
     }
+
+    /// `/model` rejected ids the rest of the app prices and supports, and
+    /// the documented opus-4-5 / sonnet-4-5 shorthands always failed:
+    /// cmd_model accepts a Claude id only if its alias target is listed.
+    #[test]
+    fn model_accepts_every_supported_claude_id_and_shorthand() {
+        let ids: Vec<&str> = KNOWN_MODELS.iter().map(|(id, _)| *id).collect();
+        for m in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "opus-4-6",
+            "sonnet4.6",
+            "opus-4-5",
+            "sonnet4.5",
+        ] {
+            let id = resolve_model_alias(m);
+            assert!(ids.contains(&id.as_str()), "/model {m} ({id}) is rejected");
+        }
+    }
 }

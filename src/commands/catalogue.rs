@@ -5,6 +5,14 @@ use super::*;
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-5", "Smart & fast — recommended (default)"),
     (
+        "claude-sonnet-5-5",
+        "Newest Sonnet — thinking cannot be switched off",
+    ),
+    (
+        "claude-opus-5-5",
+        "Newest Opus — cheaper than Opus 5; thinking cannot be switched off",
+    ),
+    (
         "claude-opus-5",
         "Most capable general model — complex, long tasks",
     ),
@@ -16,8 +24,12 @@ pub const KNOWN_MODELS: &[(&str, &str)] = &[
         "claude-haiku-4-5",
         "Fastest & cheapest — great for simple tasks",
     ),
+    ("claude-opus-4-8", "Previous Opus generation"),
+    ("claude-opus-4-7", "Previous Opus generation"),
     ("claude-opus-4-6", "Previous Opus generation"),
     ("claude-sonnet-4-6", "Previous Sonnet generation"),
+    ("claude-opus-4-5", "Older Opus — budget_tokens thinking"),
+    ("claude-sonnet-4-5", "Older Sonnet — budget_tokens thinking"),
 ];
 
 // ── Command action ────────────────────────────────────────────────────────────
