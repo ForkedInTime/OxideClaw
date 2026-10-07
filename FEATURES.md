@@ -67,7 +67,7 @@ own environment variable (shell or `.env`):
 | Mistral | `mistral:` | `MISTRAL_API_KEY` |
 | Venice.ai | `venice:` | `VENICE_API_KEY` |
 | OpenAI | `oai:` | `OPENAI_API_KEY` |
-| Generic | `openai-compat:` | `OPENAI_API_KEY`, plus `OPENAI_BASE_URL` (required) |
+| Generic | `openai-compat:` | `OPENAI_API_KEY` (optional: unset sends no `Authorization` header), plus `OPENAI_BASE_URL` (required) |
 
 Keys come from the environment, never from `settings.json`. Export the variable or put it in `~/.env` or `~/.config/oxideclaw/.env`, then pick the model. `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not read from `.env` files; export them in your shell.
 
@@ -481,7 +481,7 @@ XDG paths are opt-in: they are used only when the matching variable is set. Othe
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
 | `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `MISTRAL_API_KEY`, `VENICE_API_KEY` | API key for the matching OpenAI-compatible provider |
-| `OPENAI_API_KEY` | API key for `oai:` and `openai-compat:` models |
+| `OPENAI_API_KEY` | API key for `oai:` models, and for `openai-compat:` endpoints that need one |
 | `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix; shell only, not `.env`) |
 | `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |
 | `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |

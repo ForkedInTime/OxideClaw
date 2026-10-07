@@ -756,13 +756,17 @@ impl OpenAiCompatClient {
     /// Create a client for a specific provider prefix + model string.
     /// Resolves base_url from the provider registry and API key from env vars.
     pub fn from_model(model: &str) -> Result<Self> {
+        Self::from_model_env(model, |k| std::env::var(k).ok())
+    }
+
+    fn from_model_env(model: &str, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let (provider, _bare) = parse_provider_model(model)
             .ok_or_else(|| anyhow!("Unknown provider prefix in '{model}'"))?;
 
         // Resolve base URL
         let base_url = if provider.prefix == "openai-compat" {
             // Generic escape hatch: MUST have OPENAI_BASE_URL set
-            std::env::var("OPENAI_BASE_URL").map_err(|_| {
+            env("OPENAI_BASE_URL").ok_or_else(|| {
                 anyhow!(
                     "openai-compat: requires OPENAI_BASE_URL env var.\n\
                      Set it to your endpoint, e.g.:\n  \
@@ -771,16 +775,23 @@ impl OpenAiCompatClient {
             })?
         } else if provider.prefix == "lmstudio" {
             // LM Studio: allow override via LM_STUDIO_HOST
-            std::env::var("LM_STUDIO_HOST").unwrap_or_else(|_| provider.base_url.to_string())
+            env("LM_STUDIO_HOST").unwrap_or_else(|| provider.base_url.to_string())
         } else {
             provider.base_url.to_string()
         };
+        // Requests append "/chat/completions"; a trailing slash made "//"
+        // and a 404 on servers that route on the exact path.
+        let base_url = base_url.trim_end_matches('/').to_string();
 
-        let api_key = provider_api_key(provider, |k| std::env::var(k).ok());
+        let api_key = provider_api_key(provider, &env);
 
-        // Warn if cloud provider has no key (local providers are fine without)
+        // Warn if cloud provider has no key (local providers are fine without).
+        // openai-compat is whatever endpoint the user pointed it at, often a
+        // keyless vLLM/llama.cpp box on the LAN; no key just means no
+        // Authorization header.
         if api_key.is_empty()
             && !provider.key_env.is_empty()
+            && provider.prefix != "openai-compat"
             && !base_url.starts_with("http://localhost")
             && !base_url.starts_with("http://127.0.0.1")
         {
@@ -1088,6 +1099,29 @@ mod api_key_tests {
             "sk-openai-secret"
         );
         assert_eq!(provider_api_key(provider("lmstudio"), only_openai), "");
+    }
+
+    /// A keyless vLLM/llama.cpp box on the LAN is a normal openai-compat
+    /// target; only loopback hosts used to be allowed without a key.
+    #[test]
+    fn openai_compat_on_a_lan_host_needs_no_key() {
+        let env = |k: &str| (k == "OPENAI_BASE_URL").then(|| "http://10.0.0.5:8000/v1".to_string());
+        let c = OpenAiCompatClient::from_model_env("openai-compat:qwen", env).unwrap();
+        assert_eq!(c.api_key, "");
+        // Cloud providers still refuse to start without their key.
+        assert!(OpenAiCompatClient::from_model_env("groq:llama", |_| None).is_err());
+    }
+
+    /// "/chat/completions" is appended to the base; a trailing slash made
+    /// "//chat/completions" and a 404.
+    #[test]
+    fn trailing_slash_on_base_url_is_dropped() {
+        let env = |k: &str| (k == "OPENAI_BASE_URL").then(|| "http://h:8000/v1/".to_string());
+        let c = OpenAiCompatClient::from_model_env("openai-compat:m", env).unwrap();
+        assert_eq!(c.base_url, "http://h:8000/v1");
+        let env = |k: &str| (k == "LM_STUDIO_HOST").then(|| "http://box:1234/v1//".to_string());
+        let c = OpenAiCompatClient::from_model_env("lmstudio:m", env).unwrap();
+        assert_eq!(c.base_url, "http://box:1234/v1");
     }
 }
 
