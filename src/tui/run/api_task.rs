@@ -8,10 +8,11 @@ use super::*;
 pub(super) const MAX_TOOL_ITERATIONS: u32 = 50;
 
 /// Destructive tools blocked when plan mode is active. PowerShell runs
-/// commands like Bash; Agent spawns a sub-agent with its own (unblocked)
-/// tools; the browser actions click and type on live sites; MCP tools can
-/// do anything their server does and do not say whether they write;
-/// ExitWorktree deletes the worktree directory.
+/// commands like Bash; the browser actions click and type on live sites;
+/// MCP tools can do anything their server does and do not say whether they
+/// write; ExitWorktree deletes the worktree directory. Agent is not listed:
+/// sub-agents inherit this list through the permission gate, so Explore and
+/// Plan helpers can still research while every write they try is refused.
 pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "Bash",
     "PowerShell",
@@ -22,7 +23,6 @@ pub(super) const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &[
     "MemoryWrite",
     "EnterWorktree",
     "ExitWorktree",
-    "Agent",
     "browser_click",
     "browser_fill",
     "browser_press_key",
@@ -614,33 +614,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 ctx.live_ollama_host = Some(config.ollama_host.clone());
                 ctx.usage_sink = Some(child_usage_tx.clone());
                 ctx.budget_remaining_usd = task_cost.remaining();
-                // One gate per turn (autonomy can change between turns via
-                // /autonomy). Published on the context so `Agent` children
-                // prompt through the same user.
-                let mut gate = PermissionGate::new(
-                    perm_state.clone(),
-                    config.autonomy == "suggest",
-                    Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
-                )
-                .with_blocked_tools(if effective_plan_mode {
-                    PLAN_MODE_BLOCKED_TOOLS
-                } else {
-                    &[]
-                });
-                if skill_shell_blocked {
-                    gate = gate.with_skill_shell_blocked();
-                }
-                ctx.permission_gate = Some(gate.clone());
-                let mut results: Vec<ContentBlock> = Vec::new();
-
-                // Auto-fix loop: accumulate file paths touched by Write/Edit/MultiEdit
-                // in this assistant turn. After the tool-use loop we run the detected
-                // lint + test commands and, on failure, feed the output back to the
-                // model as a synthetic user turn via `continue`, up to
-                // `config.auto_fix.max_retries` times.
-                let mut auto_fix_touched: Vec<std::path::PathBuf> = Vec::new();
-
-                // Drain any pending plan_mode changes before processing tools
+                // Drain any pending plan_mode changes before building the gate
                 while let Ok(enabled) = plan_rx.try_recv() {
                     effective_plan_mode = enabled;
                     let msg = if enabled {
@@ -651,6 +625,38 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     let _ = tx.send(AppEvent::SystemMessage(msg.into()));
                     let _ = tx.send(AppEvent::SetPlanMode(enabled));
                 }
+
+                // One gate per response (autonomy can change between turns
+                // via /autonomy), rebuilt when plan mode flips mid-response.
+                // Published on the context so `Agent` children prompt
+                // through the same user and inherit the plan-mode blocks.
+                let build_gate = |plan: bool, skill_shell: bool| {
+                    let gate = PermissionGate::new(
+                        perm_state.clone(),
+                        config.autonomy == "suggest",
+                        Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
+                    )
+                    .with_blocked_tools(if plan {
+                        PLAN_MODE_BLOCKED_TOOLS
+                    } else {
+                        &[]
+                    });
+                    if skill_shell {
+                        gate.with_skill_shell_blocked()
+                    } else {
+                        gate
+                    }
+                };
+                let mut gate = build_gate(effective_plan_mode, skill_shell_blocked);
+                ctx.permission_gate = Some(gate.clone());
+                let mut results: Vec<ContentBlock> = Vec::new();
+
+                // Auto-fix loop: accumulate file paths touched by Write/Edit/MultiEdit
+                // in this assistant turn. After the tool-use loop we run the detected
+                // lint + test commands and, on failure, feed the output back to the
+                // model as a synthetic user turn via `continue`, up to
+                // `config.auto_fix.max_retries` times.
+                let mut auto_fix_touched: Vec<std::path::PathBuf> = Vec::new();
 
                 for block in &response.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
@@ -846,6 +852,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         }
 
                         // Check if a plan mode change was emitted by a tool (EnterPlanMode / ExitPlanMode)
+                        let was_plan_mode = effective_plan_mode;
                         while let Ok(enabled) = plan_rx.try_recv() {
                             effective_plan_mode = enabled;
                             let msg = if enabled {
@@ -855,6 +862,12 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             };
                             let _ = tx.send(AppEvent::SystemMessage(msg.into()));
                             let _ = tx.send(AppEvent::SetPlanMode(enabled));
+                        }
+                        // An Agent later in this response must get the new
+                        // blocks, not the gate built before the switch.
+                        if effective_plan_mode != was_plan_mode {
+                            gate = build_gate(effective_plan_mode, skill_shell_blocked);
+                            ctx.permission_gate = Some(gate.clone());
                         }
 
                         let same_call_streak =
@@ -1443,6 +1456,111 @@ mod loop_guard_tests {
             }
         }
         assert!(failed.is_some_and(|e| e.contains("Budget")));
+    }
+
+    /// Stands in for the Agent tool: records whether the gate it would
+    /// hand its sub-agent refuses Bash. An unblocked gate would prompt the
+    /// user, which nobody answers here, hence the timeout.
+    struct AgentProbe(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for AgentProbe {
+        fn name(&self) -> &str {
+            "Agent"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
+            let gate = ctx.permission_gate.clone().unwrap();
+            let decided = tokio::time::timeout(
+                Duration::from_millis(200),
+                gate.decide("Bash", &serde_json::json!({"command": "touch x"})),
+            )
+            .await;
+            let denied = matches!(decided, Ok(GateOutcome::Denied(_)));
+            self.0.lock().unwrap().push(denied);
+            Ok(ToolOutput::success("ok"))
+        }
+    }
+
+    /// EnterPlanMode without the approval round-trip.
+    struct Planner;
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for Planner {
+        fn name(&self) -> &str {
+            "Planner"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
+            let _ = ctx.plan_mode_tx.as_ref().unwrap().send(true);
+            Ok(ToolOutput::success("planning"))
+        }
+    }
+
+    async fn run_with_probe(plan_mode: bool, calls: &[&str]) -> (Vec<bool>, Vec<String>) {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let blocks: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, n)| serde_json::json!({"type":"tool_use","id":format!("t{i}"),"name":n,"input":{}}))
+            .collect();
+        let (url, _) = serve(vec![
+            sse(&blocks, "tool_use"),
+            sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut t, mut rx) = task(url, dir.path(), None);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        t.tools = vec![
+            std::sync::Arc::new(AgentProbe(seen.clone())),
+            std::sync::Arc::new(Planner),
+        ];
+        t.plan_mode = plan_mode;
+        t.perm_state = PermissionState::new(false, &["Agent".into(), "Planner".into()], &[]);
+        run_api_task(t).await;
+        let mut errors = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::ToolResult {
+                is_error: true,
+                text,
+            } = ev
+            {
+                errors.push(text);
+            }
+        }
+        let seen = seen.lock().unwrap().clone();
+        (seen, errors)
+    }
+
+    /// Plan mode refused the Agent tool outright, so the read-only Explore
+    /// and Plan helpers could not research a plan; the sub-agent inherits
+    /// the plan-mode blocks through the gate instead.
+    #[tokio::test]
+    async fn plan_mode_runs_agents_under_its_blocks() {
+        let (seen, errors) = run_with_probe(true, &["Agent"]).await;
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(seen, vec![true]);
+    }
+
+    /// The gate was built once per response, so an Agent launched after
+    /// EnterPlanMode in the same response got an unblocked one.
+    #[tokio::test]
+    async fn an_agent_after_entering_plan_mode_inherits_the_blocks() {
+        let (seen, errors) = run_with_probe(false, &["Planner", "Agent"]).await;
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(seen, vec![true]);
     }
 
     /// A connection that dies after the headers but before any text is
