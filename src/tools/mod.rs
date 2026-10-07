@@ -955,17 +955,20 @@ pub trait Tool: Send + Sync {
 
 pub type DynTool = Arc<dyn Tool>;
 
-/// Apply `--tools` / `--allowed-tools` / `--disallowed-tools` (case-insensitive).
-/// Every entry point that builds a tool list must call this: embedders rely
-/// on the flags to keep Bash or Write away from the model.
+/// Apply `--tools` / `--allowed-tools` / `--disallowed-tools`. Names match
+/// case-insensitively, and as in permission rules `mcp__<server>` (or
+/// `mcp__<server>__*`) covers every tool of that server and `mcp__*` every
+/// MCP tool. Every entry point that builds a tool list must call this:
+/// embedders rely on the flags to keep Bash or Write away from the model.
 pub fn apply_tool_filters(tools: &mut Vec<DynTool>, config: &crate::config::Config) {
+    use crate::permissions::name_rule_matches;
     if !config.allowed_tools.is_empty() {
         // `--tools ""` stores the "__none__" sentinel: no tools at all.
         tools.retain(|t| {
             config
                 .allowed_tools
                 .iter()
-                .any(|a| a.eq_ignore_ascii_case(t.name()))
+                .any(|a| name_rule_matches(a, t.name()))
         });
     }
     if !config.disallowed_tools.is_empty() {
@@ -973,7 +976,7 @@ pub fn apply_tool_filters(tools: &mut Vec<DynTool>, config: &crate::config::Conf
             !config
                 .disallowed_tools
                 .iter()
-                .any(|d| d.eq_ignore_ascii_case(t.name()))
+                .any(|d| name_rule_matches(d, t.name()))
         });
     }
     refresh_tool_search(tools);
@@ -1582,6 +1585,40 @@ mod tool_search_snapshot_tests {
         let found = search(&tools, "notebook").await;
         assert!(!found.contains("NotebookEdit:"), "{found}");
         assert!(found.contains("NotebookRead:"), "{found}");
+    }
+
+    /// `--disallowed-tools mcp__jira` must remove the server's tools, as the
+    /// same name does in a permission rule, not match nothing.
+    #[test]
+    fn mcp_server_names_filter_every_tool_of_the_server() {
+        let mcp = || -> Vec<DynTool> { vec![Arc::new(FakeMcp)] };
+        let has_jira = |cfg: &crate::config::Config| {
+            let (mut tools, _) = all_tools_with_state_and_mcp(cfg, mcp(), vec![]);
+            apply_tool_filters(&mut tools, cfg);
+            tools.iter().any(|t| t.name() == "mcp__jira__create_issue")
+        };
+        for name in [
+            "mcp__jira",
+            "mcp__jira__*",
+            "mcp__*",
+            "MCP__JIRA__CREATE_ISSUE",
+        ] {
+            let deny = crate::config::Config {
+                disallowed_tools: vec![name.into()],
+                ..Default::default()
+            };
+            assert!(!has_jira(&deny), "--disallowed-tools {name}");
+            let allow = crate::config::Config {
+                allowed_tools: vec![name.into()],
+                ..Default::default()
+            };
+            assert!(has_jira(&allow), "--allowed-tools {name}");
+        }
+        let other = crate::config::Config {
+            disallowed_tools: vec!["mcp__jir".into()],
+            ..Default::default()
+        };
+        assert!(has_jira(&other));
     }
 }
 

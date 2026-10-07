@@ -518,7 +518,7 @@ fn path_rule_hit(inner: &str, path: &str, cwd: &Path, home: &Path, deny: bool) -
 /// `mcp__github` and `mcp__github__*` cover every tool of that server and
 /// `mcp__*` every MCP tool; otherwise one "always allow" per tool would be
 /// the only way to trust a server, and a server-wide deny would not exist.
-fn name_rule_matches(rule: &str, tool_name: &str) -> bool {
+pub fn name_rule_matches(rule: &str, tool_name: &str) -> bool {
     if rule.eq_ignore_ascii_case(tool_name) {
         return true;
     }
