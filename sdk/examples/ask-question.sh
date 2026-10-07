@@ -7,11 +7,12 @@ set -euo pipefail
 PROMPT="${1:-What does the main function do in this project? Be brief.}"
 
 (
-  cat <<EOF
-{"id":"1","type":"session/start","prompt":"$PROMPT","max_turns":1,"policy":{"allow":["Read","Glob","Grep"]}}
-EOF
-  # Keep stdin open while the model responds
-  sleep 30
+  # jq escapes quotes and newlines in the prompt. Reading files and then
+  # answering takes several agentic turns, so leave max_turns room.
+  jq -nc --arg p "$PROMPT" \
+    '{id:"1", type:"session/start", prompt:$p, max_turns:10, policy:{allow:["Read","Glob","Grep"]}}'
+  # Keep stdin open while the model responds; EOF stops the server.
+  sleep 60
 ) | oxideclaw --headless 2>/dev/null | while IFS= read -r line; do
   TYPE=$(echo "$line" | jq -r '.type // empty')
   case "$TYPE" in

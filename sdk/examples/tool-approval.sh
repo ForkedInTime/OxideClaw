@@ -3,75 +3,81 @@
 # The SDK asks permission before running Bash commands.
 # Requires ANTHROPIC_API_KEY to be set.
 #
-# This example uses a named pipe (FIFO) so we can send requests
-# at any time while the server is running.
+# The server talks NDJSON over two named pipes (FIFOs): one we write
+# requests into at any time, one we read its events from. Your y/n answer
+# comes from the terminal, not from either pipe.
 
 set -euo pipefail
 
-FIFO=$(mktemp -u)
-mkfifo "$FIFO"
-trap 'rm -f "$FIFO"' EXIT
+DIR=$(mktemp -d)
+IN="$DIR/in"
+OUT="$DIR/out"
+mkfifo "$IN" "$OUT"
+trap 'rm -rf "$DIR"' EXIT
 
-# Start the server, reading from the FIFO
-oxideclaw --headless < "$FIFO" 2>/dev/null &
+oxideclaw --headless < "$IN" > "$OUT" 2>/dev/null &
 SERVER_PID=$!
 
-# Open the FIFO for writing (keeps it open)
-exec 3>"$FIFO"
+# Hold the request pipe open for the whole conversation; closing it is EOF,
+# which shuts the server down.
+exec 3>"$IN"
 
-# Send a session/start that requires Bash (which needs approval)
-cat >&3 <<'EOF'
-{"id":"1","type":"session/start","prompt":"List the files in the current directory using ls -la","max_turns":1,"policy":{"allow":["Read","Glob","Grep"],"ask":["Bash"]}}
-EOF
+# Bash is in "ask", so running it needs approval. Calling a tool and then
+# answering takes more than one agentic turn, so leave max_turns room.
+jq -nc '{id:"1", type:"session/start",
+         prompt:"List the files in the current directory using ls -la",
+         max_turns:10,
+         policy:{allow:["Read","Glob","Grep"], ask:["Bash"]}}' >&3
 
 echo "Sent prompt. Waiting for tool approval request..."
 echo ""
 
-# Read server output line by line
+N=0
 while IFS= read -r line; do
-  TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+  TYPE=$(jq -r '.type // empty' <<<"$line" 2>/dev/null) || continue
 
   case "$TYPE" in
     session/started)
-      echo "[started] model=$(echo "$line" | jq -r '.model')"
+      echo "[started] model=$(jq -r '.model' <<<"$line")"
       ;;
     message/delta)
-      printf '%s' "$(echo "$line" | jq -r '.content')"
+      printf '%s' "$(jq -r '.content' <<<"$line")"
       ;;
     tool/approval_needed)
-      APPROVAL_ID=$(echo "$line" | jq -r '.approval_id')
-      TOOL=$(echo "$line" | jq -r '.tool')
-      ARGS=$(echo "$line" | jq -r '.args')
+      APPROVAL_ID=$(jq -r '.approval_id' <<<"$line")
       echo ""
       echo "---"
-      echo "APPROVAL NEEDED: $TOOL"
-      echo "Args: $ARGS"
+      echo "APPROVAL NEEDED: $(jq -r '.tool' <<<"$line")"
+      echo "Args: $(jq -c '.args' <<<"$line")"
       echo ""
-      read -p "Approve? (y/n): " ANSWER
+      read -r -p "Approve? (y/n): " ANSWER </dev/tty
+      N=$((N + 1))
       if [ "$ANSWER" = "y" ]; then
-        echo "{\"id\":\"approve-1\",\"type\":\"tool/approve\",\"approval_id\":\"$APPROVAL_ID\"}" >&3
+        jq -nc --arg id "approve-$N" --arg a "$APPROVAL_ID" \
+          '{id:$id, type:"tool/approve", approval_id:$a}' >&3
         echo "[approved]"
       else
-        echo "{\"id\":\"deny-1\",\"type\":\"tool/deny\",\"approval_id\":\"$APPROVAL_ID\",\"reason\":\"User denied\"}" >&3
+        jq -nc --arg id "deny-$N" --arg a "$APPROVAL_ID" \
+          '{id:$id, type:"tool/deny", approval_id:$a, reason:"User denied"}' >&3
         echo "[denied]"
       fi
       ;;
     tool/completed)
-      echo "[tool done] $(echo "$line" | jq -r '.tool') ($(echo "$line" | jq -r '.duration_ms')ms)"
+      echo "[tool done] $(jq -r '.tool' <<<"$line") ($(jq -r '.duration_ms' <<<"$line")ms)"
       ;;
     turn/completed)
       echo ""
       echo "---"
-      echo "Turn complete. Cost: \$$(echo "$line" | jq -r '.cost_usd')"
+      echo "Turn complete. Cost: \$$(jq -r '.cost_usd' <<<"$line")"
       break
       ;;
     error)
-      echo "ERROR: $(echo "$line" | jq -r '.message')" >&2
+      echo "ERROR: $(jq -r '.message' <<<"$line")" >&2
       break
       ;;
   esac
-done < <(cat /proc/$SERVER_PID/fd/1 2>/dev/null || wait $SERVER_PID)
+done < "$OUT"
 
-# Clean up
+# EOF on the request pipe stops the server.
 exec 3>&-
-wait $SERVER_PID 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true

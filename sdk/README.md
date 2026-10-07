@@ -25,7 +25,7 @@ This starts a long-running server that reads JSON requests from stdin and writes
 ### 2. Ask a question
 
 ```bash
-(echo '{"id":"1","type":"session/start","prompt":"What does the main function do?","max_turns":1}'; sleep 30) \
+(echo '{"id":"1","type":"session/start","prompt":"What does the main function do?"}'; sleep 30) \
   | oxideclaw --headless 2>/dev/null
 ```
 
