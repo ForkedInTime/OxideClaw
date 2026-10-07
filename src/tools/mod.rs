@@ -2,7 +2,6 @@
 pub mod agent;
 pub mod ask_user;
 pub mod bash;
-pub mod brief_tool;
 pub mod browser_tools;
 pub mod config_tool;
 pub mod discover_skills;
@@ -154,13 +153,6 @@ impl ToolContext {
             usage_sink: None,
             budget_remaining_usd: None,
             middlewares: Vec::new(),
-        }
-    }
-
-    /// Send a live output line to the TUI (if a stream channel is set).
-    pub fn stream_line(&self, line: &str) {
-        if let Some(tx) = &self.stream_tx {
-            let _ = tx.send(line.to_string());
         }
     }
 }
@@ -727,9 +719,6 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     tools.push(Arc::new(memory::MemoryReadTool));
     tools.push(Arc::new(memory::MemoryWriteTool));
 
-    // BriefTool — always-on in Rust (no build-time KAIROS flag system)
-    tools.push(Arc::new(brief_tool::BriefTool));
-
     // Agent swarm tools — enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1
     if send_message::is_agent_swarms_enabled() {
         tools.push(Arc::new(send_message::SendMessageTool));
@@ -1167,6 +1156,17 @@ mod sensitive_path_tests {
 #[cfg(test)]
 mod schema_contract_tests {
     use super::*;
+
+    /// SendUserMessage (upstream's KAIROS-only Brief tool) only streamed its
+    /// text: dropped in -p/SDK/ACP, collapsed out of sight in the TUI, yet it
+    /// told the model "delivered" and billed itself as the primary output
+    /// channel. Answers belong in plain assistant text.
+    #[test]
+    fn no_tool_swallows_messages_meant_for_the_user() {
+        let cfg = crate::config::Config::default();
+        let tools = all_tools_with_state(&cfg).0;
+        assert!(!tools.iter().any(|t| t.name() == "SendUserMessage"));
+    }
 
     /// Every tool's advertised schema must be internally consistent.
     ///
