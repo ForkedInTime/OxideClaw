@@ -151,9 +151,7 @@ impl PermissionGate {
         {
             return GateOutcome::Denied(format!("{tool_name} is blocked {reason}"));
         }
-        let check = if self.suggest_mode && matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
-            CheckResult::Ask
-        } else if is_command_tool(tool_name) {
+        let check = if is_command_tool(tool_name) {
             // Compound commands are split so a prefix rule cannot authorise
             // whatever is chained after the first statement.
             match input.get("command").and_then(|c| c.as_str()) {
@@ -163,8 +161,16 @@ impl PermissionGate {
         } else {
             self.state.check_with_input(tool_name, Some(input))
         };
+        // Suggest mode only turns an Allow into a prompt: a deny rule must
+        // still refuse outright instead of becoming one more routine approval.
         let check = match check {
-            CheckResult::Allow if self.ask_every_tool => CheckResult::Ask,
+            CheckResult::Allow
+                if self.ask_every_tool
+                    || (self.suggest_mode
+                        && matches!(tool_name, "Write" | "Edit" | "MultiEdit")) =>
+            {
+                CheckResult::Ask
+            }
             c => c,
         };
 
@@ -370,6 +376,28 @@ mod tests {
             GateOutcome::Allowed
         );
         assert_eq!(asker.asked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn suggest_mode_still_refuses_denied_edits_without_prompting() {
+        let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+        let deny = vec!["Write(./secrets/**)".to_string()];
+        let g = PermissionGate::new(
+            PermissionState::new(false, &[], &deny).with_cwd(std::path::Path::new("/proj")),
+            true,
+            Some(asker.clone() as Arc<dyn PermissionAsker>),
+        );
+        let out = g
+            .decide("Write", &json!({"file_path": "/proj/secrets/x"}))
+            .await;
+        assert!(matches!(out, GateOutcome::Denied(_)), "{out:?}");
+        assert!(asker.asked().is_empty(), "a denied write must not prompt");
+        assert_eq!(
+            g.decide("Write", &json!({"file_path": "/proj/src/x"}))
+                .await,
+            GateOutcome::Allowed
+        );
+        assert_eq!(asker.asked().len(), 1, "other writes still prompt");
     }
 
     #[tokio::test]
