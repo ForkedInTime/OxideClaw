@@ -245,7 +245,10 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ),
             ("/remember", "save a memory"),
             ("/forget", "remove matching memories"),
-            ("/agents", "list custom agents in .claude/agents"),
+            (
+                "/agents",
+                "list agent files in .claude/agents (not loaded yet)",
+            ),
             ("/init-verifiers", "create verifier skills for this project"),
             ("/edit-claude-md", "open your user CLAUDE.md in $EDITOR"),
             (

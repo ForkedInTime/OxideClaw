@@ -160,14 +160,19 @@ pub(super) fn cmd_agents(ctx: &CommandContext) -> CommandAction {
         lines.push(String::new());
     }
 
+    // Nothing reads these files yet: the Agent tool only knows its
+    // built-in types, so do not invite users to write agents that never run.
     if total == 0 {
-        lines.push(
-            "No agents found. Create agent definitions in .claude/agents/ or ~/.claude/agents/."
-                .into(),
-        );
+        lines.push("No agent definitions found in .claude/agents/ or ~/.claude/agents/.".into());
     } else {
-        lines.insert(1, format!("{total} agent(s) found\n"));
+        lines.insert(1, format!("{total} agent definition(s) found\n"));
     }
+    lines.push(
+        "Note: OxideClaw lists these files but does not load them yet. The Agent tool \
+         supports only its built-in types: general-purpose, Explore, Plan, verification, \
+         oxideclaw-guide, statusline-setup."
+            .into(),
+    );
 
     CommandAction::Message(lines.join("\n"))
 }
