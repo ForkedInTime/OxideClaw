@@ -741,6 +741,19 @@ async fn run() -> Result<()> {
         }
     }
 
+    // --settings is merged over the settings files inside Config::load, so
+    // every key applies, its apiKeyHelper runs with the other credential
+    // sources, and the CLI flags below still override it. Parsed only where
+    // a config is loaded, so `version` and `completions` never fail on it.
+    let flag_settings = || {
+        cli.settings.as_deref().map(|arg| {
+            parse_settings_arg(arg).unwrap_or_else(|e| {
+                eprintln!("Error: --settings: {e}");
+                std::process::exit(1);
+            })
+        })
+    };
+
     // Handle subcommands
     if let Some(cmd) = &cli.command {
         match cmd {
@@ -827,7 +840,7 @@ async fn run() -> Result<()> {
                     std::process::exit(1);
                 }
 
-                let config = Config::load()?;
+                let config = Config::load_with(None, flag_settings())?;
                 warn_settings_load_errors(&config);
 
                 // Determine policy: --yolo > --ask > settings.browseDefaultPolicy > Pattern.
@@ -931,8 +944,13 @@ async fn run() -> Result<()> {
                     run_browse(req, &config, tools, current_url, browser_session, channels).await?;
                 progress_task.await.ok();
 
-                // Print final result as JSON
+                // Print final result as JSON. A goal not reached (a setup
+                // failure such as a missing key included) is a non-zero
+                // exit for scripts and CI.
                 println!("{}", serde_json::to_string_pretty(&result)?);
+                if !result.achieved {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
         }
@@ -942,16 +960,7 @@ async fn run() -> Result<()> {
         eprintln!("warning: {w}");
     }
 
-    // --settings is merged over the settings files inside Config::load, so
-    // every key applies, its apiKeyHelper runs with the other credential
-    // sources, and the CLI flags below still override it.
-    let flag_settings = cli.settings.as_deref().map(|arg| {
-        parse_settings_arg(arg).unwrap_or_else(|e| {
-            eprintln!("Error: --settings: {e}");
-            std::process::exit(1);
-        })
-    });
-    let mut config = Config::load_with(None, flag_settings)?;
+    let mut config = Config::load_with(None, flag_settings())?;
 
     // Apply CLI overrides (highest priority)
     if cli.verbose {
@@ -1236,6 +1245,14 @@ async fn run() -> Result<()> {
             }
             engine.resume_history(s.id.clone(), history);
             resumed = Some(s);
+        } else if let Some(id) = config.new_session_id.clone()
+            && !config.no_session_persistence
+        {
+            // --session-id naming a session that does not exist yet starts
+            // it, so the next `-p --session-id <same>` continues it.
+            let s = session::Session::new_with_id(id).await?;
+            engine.resume_history(s.id.clone(), Vec::new());
+            resumed = Some(s);
         } else if cli.resume || cli.continue_session {
             anyhow::bail!("No previous session to continue.");
         }
@@ -1382,8 +1399,12 @@ fn self_update_target() -> String {
 
 /// The `--settings` value: a settings file path or inline JSON. Unlike the
 /// settings files, a bad value is an error: it was asked for explicitly.
+/// A file gets the same writable-file check on its apiKeyHelper as the
+/// settings files: on a shared mount another user could rewrite it.
 fn parse_settings_arg(arg: &str) -> std::result::Result<settings::Settings, String> {
-    let text = if std::path::Path::new(arg).is_file() {
+    let path = std::path::Path::new(arg);
+    let is_file = path.is_file();
+    let text = if is_file {
         std::fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?
     } else if arg.trim_start().starts_with('{') {
         arg.to_string()
@@ -1391,7 +1412,13 @@ fn parse_settings_arg(arg: &str) -> std::result::Result<settings::Settings, Stri
         return Err(format!("{arg}: not a file or a JSON object"));
     };
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    serde_json::from_str(text).map_err(|e| format!("invalid settings JSON: {e}"))
+    let parsed: settings::Settings =
+        serde_json::from_str(text).map_err(|e| format!("invalid settings JSON: {e}"))?;
+    Ok(if is_file {
+        settings::Settings::sanitize_unsafe_helper(parsed, path)
+    } else {
+        parsed
+    })
 }
 
 /// One `--mcp-config` value: a file path or inline JSON, holding server
@@ -1970,6 +1997,28 @@ mod settings_arg_tests {
         std::fs::write(&path, "\u{feff}{\"model\": \"haiku\"}").unwrap();
         let s = parse_settings_arg(path.to_str().unwrap()).unwrap();
         assert_eq!(s.model.as_deref(), Some("haiku"));
+    }
+
+    /// A world-writable --settings file's apiKeyHelper ran through `sh -c`,
+    /// while the same file as ~/.claude/settings.json was refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_settings_file_does_not_run_its_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team.json");
+        std::fs::write(&path, r#"{"apiKeyHelper": "echo key"}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let s = parse_settings_arg(path.to_str().unwrap()).unwrap();
+        assert_eq!(s.api_key_helper, None);
+        assert!(!s.helper_rejected.is_empty());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let s = parse_settings_arg(path.to_str().unwrap()).unwrap();
+        assert_eq!(s.api_key_helper.as_deref(), Some("echo key"));
+        // Inline JSON is the caller's own argument.
+        let s = parse_settings_arg(r#"{"apiKeyHelper": "echo key"}"#).unwrap();
+        assert_eq!(s.api_key_helper.as_deref(), Some("echo key"));
     }
 }
 
