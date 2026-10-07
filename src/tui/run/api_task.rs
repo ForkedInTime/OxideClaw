@@ -411,7 +411,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // server's `retry-after`. The Anthropic client retries an
                     // overload (529 or a pre-text overloaded_error) the same
                     // way, so only other backends' overloads are retried here.
-                    // The connection cases stay for a drop on the first event.
+                    // The connection cases cover a stream that dropped before
+                    // any text: next_sse_event names a mid-body drop, and the
+                    // stall timeout says the connection was likely dropped.
                     let overloaded = !matches!(client, crate::api::ApiBackend::Anthropic(_))
                         && crate::api::retry::is_overloaded(&e);
                     let is_retryable = overloaded
@@ -1441,5 +1443,41 @@ mod loop_guard_tests {
             }
         }
         assert!(failed.is_some_and(|e| e.contains("Budget")));
+    }
+
+    /// A connection that dies after the headers but before any text is
+    /// safe to re-send; its error text never matched the retry check, so
+    /// the turn failed on the first network blip.
+    #[tokio::test]
+    async fn a_connection_dropped_before_any_text_is_retried() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let start = r#"data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#;
+        // The body promises more than it delivers before the socket closes.
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100000\r\n\r\n{start}\n\n"
+        );
+        let (url, seen) = serve(vec![
+            cut,
+            sse(
+                &[serde_json::json!({"type":"text","text":"answer"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (t, mut rx) = task(url, dir.path(), None);
+        run_api_task(t).await;
+
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let (mut done, mut failed) = (false, None);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Done { .. } => done = true,
+                AppEvent::TurnFailed(e) => failed = Some(e),
+                _ => {}
+            }
+        }
+        assert_eq!(failed, None);
+        assert!(done);
     }
 }

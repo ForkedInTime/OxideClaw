@@ -88,7 +88,19 @@ where
     match stream.next().await {
         None => Ok(None),
         Some(Ok(event)) => Ok(Some(event)),
-        Some(Err(e)) => Err(anyhow!("SSE stream error: {e}")),
+        Some(Err(e)) => {
+            let e = e.to_string();
+            // reqwest reports a connection that dies mid-body only as "error
+            // decoding response body"; name the drop so callers that retry
+            // dropped connections recognise it.
+            if e.starts_with("Transport error") {
+                Err(anyhow!(
+                    "SSE stream error: connection dropped mid-stream ({e})"
+                ))
+            } else {
+                Err(anyhow!("SSE stream error: {e}"))
+            }
+        }
     }
 }
 
@@ -1177,6 +1189,21 @@ mod sse_idle_tests {
             .expect("keepalives must keep the stream alive");
         assert_eq!(got.map(|e| e.data).as_deref(), Some("answer"));
         assert!(next_sse_event(&mut stream).await.unwrap().is_none());
+    }
+
+    /// A connection reset mid-body reaches the parser as a body-decode
+    /// error whose text never mentions the connection, so the TUI's
+    /// dropped-connection retry never matched it.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_stream_transport_error_names_the_dropped_connection() {
+        let bytes = futures_util::stream::iter(vec![
+            Ok(b"data: first\n\n".to_vec()),
+            Err("error decoding response body"),
+        ]);
+        let mut stream = idle_bounded(bytes).eventsource();
+        assert!(next_sse_event(&mut stream).await.unwrap().is_some());
+        let err = next_sse_event(&mut stream).await.unwrap_err().to_string();
+        assert!(err.contains("connection dropped"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
