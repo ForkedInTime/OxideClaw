@@ -240,12 +240,24 @@ fn bwrap_wrap_with_home(
          --unshare-pid \
          --new-session \
          --die-with-parent \
-         -- bash -c {shell_quoted}",
+         -- {shell} -c {shell_quoted}",
+        shell = sandbox_shell(),
         cwd = cwd_quoted,
         home_binds = home_binds,
         net_flag = net_flag,
         shell_quoted = shell_quote(command),
     )
+}
+
+/// The shell inside the namespace sandboxes: bash, the Bash tool's
+/// contract, or `/bin/sh` on hosts without it (Alpine/BusyBox), where a
+/// hard-coded `bash` failed every command.
+fn sandbox_shell() -> &'static str {
+    if crate::tools::bash::has_bash() {
+        "bash"
+    } else {
+        "/bin/sh"
+    }
 }
 
 // ── firejail wrapper ──────────────────────────────────────────────────────────
@@ -258,7 +270,8 @@ pub fn firejail_wrap(command: &str, _cwd: &std::path::Path, allow_network: bool)
     // full egress, so the same setting meant different things in the two modes.
     let net_flag = if allow_network { "" } else { "--net=none " };
     format!(
-        "firejail --quiet --private-tmp --noroot {net_flag}-- bash -c {cmd}",
+        "firejail --quiet --private-tmp --noroot {net_flag}-- {shell} -c {cmd}",
+        shell = sandbox_shell(),
         net_flag = net_flag,
         cmd = shell_quote(command),
     )
@@ -477,9 +490,13 @@ mod tests {
     fn namespace_wrappers_run_commands_with_bash() {
         let bw = bwrap_wrap("echo hi", Path::new("/tmp"), true);
         let fj = firejail_wrap("echo hi", Path::new("/tmp"), true);
+        let want = if crate::tools::bash::has_bash() {
+            "-- bash -c 'echo hi'"
+        } else {
+            "-- /bin/sh -c 'echo hi'"
+        };
         for w in [&bw, &fj] {
-            assert!(w.contains("-- bash -c 'echo hi'"), "{w}");
-            assert!(!w.contains("/bin/sh"), "{w}");
+            assert!(w.contains(want), "{w}");
         }
     }
 

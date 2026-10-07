@@ -297,19 +297,43 @@ pub fn shell_file_name(shell: &str) -> &str {
 /// setting, else the login shell only when it speaks bash syntax, else `bash`.
 /// The tool contract and the model's commands are bash; under a fish, nu or
 /// tcsh login shell heredocs, `if ...; then` and `$?` would all fail to parse.
+/// Where bash is not installed (Alpine/BusyBox, SHELL=/bin/sh) a POSIX login
+/// shell, else `sh`, beats a shell that does not exist.
 pub fn bash_tool_shell(default_shell: Option<&str>, login_shell: Option<&str>) -> String {
+    bash_tool_shell_with(default_shell, login_shell, has_bash)
+}
+
+fn bash_tool_shell_with(
+    default_shell: Option<&str>,
+    login_shell: Option<&str>,
+    has_bash: impl Fn() -> bool,
+) -> String {
     if let Some(s) = default_shell {
         return s.to_string();
     }
-    login_shell
-        .filter(|s| {
-            matches!(
-                shell_file_name(s).to_ascii_lowercase().as_str(),
-                "bash" | "zsh"
-            )
-        })
-        .unwrap_or("bash")
+    let login_is = |names: &[&str]| {
+        login_shell.filter(|s| names.contains(&shell_file_name(s).to_ascii_lowercase().as_str()))
+    };
+    if let Some(s) = login_is(&["bash", "zsh"]) {
+        return s.to_string();
+    }
+    if has_bash() {
+        return "bash".to_string();
+    }
+    login_is(&["sh", "ash", "dash", "ksh", "mksh", "posh"])
+        .unwrap_or("sh")
         .to_string()
+}
+
+/// Whether `bash` is on PATH (looked up once).
+pub fn has_bash() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        std::env::var_os("PATH").is_some_and(|p| {
+            std::env::split_paths(&p)
+                .any(|d| d.join("bash").is_file() || d.join("bash.exe").is_file())
+        })
+    })
 }
 
 pub struct BashTool;
@@ -607,6 +631,7 @@ mod shell_choice_tests {
 
     #[test]
     fn non_bash_login_shells_fall_back_to_bash() {
+        let shell = |d: Option<&str>, l: Option<&str>| bash_tool_shell_with(d, l, || true);
         for login in [
             "/usr/bin/fish",
             "/usr/bin/nu",
@@ -614,21 +639,27 @@ mod shell_choice_tests {
             "xonsh",
             "/bin/sh",
         ] {
-            assert_eq!(bash_tool_shell(None, Some(login)), "bash", "{login}");
+            assert_eq!(shell(None, Some(login)), "bash", "{login}");
         }
-        assert_eq!(bash_tool_shell(None, None), "bash");
+        assert_eq!(shell(None, None), "bash");
         for login in ["/bin/bash", "/usr/local/bin/zsh", r"C:\Git\bin\bash.exe"] {
-            assert_eq!(bash_tool_shell(None, Some(login)), login);
+            assert_eq!(shell(None, Some(login)), login);
         }
         // An explicit defaultShell is the user's choice and always wins.
-        assert_eq!(
-            bash_tool_shell(Some("powershell"), Some("/bin/bash")),
-            "powershell"
-        );
-        assert_eq!(
-            bash_tool_shell(Some("/usr/bin/fish"), None),
-            "/usr/bin/fish"
-        );
+        assert_eq!(shell(Some("powershell"), Some("/bin/bash")), "powershell");
+        assert_eq!(shell(Some("/usr/bin/fish"), None), "/usr/bin/fish");
+    }
+
+    /// Alpine/BusyBox ship no bash and set SHELL=/bin/sh: every Bash tool
+    /// call failed to spawn a `bash` that does not exist.
+    #[test]
+    fn without_bash_a_posix_shell_runs_commands() {
+        let shell = |l: Option<&str>| bash_tool_shell_with(None, l, || false);
+        assert_eq!(shell(Some("/bin/sh")), "/bin/sh");
+        assert_eq!(shell(Some("/bin/ash")), "/bin/ash");
+        assert_eq!(shell(Some("/usr/bin/fish")), "sh");
+        assert_eq!(shell(None), "sh");
+        assert_eq!(shell(Some("/bin/zsh")), "/bin/zsh");
     }
 
     #[test]
