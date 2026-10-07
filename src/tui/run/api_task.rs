@@ -253,6 +253,15 @@ pub(super) async fn run_api_task(task: ApiTask) {
     if let Some(left) = budget_remaining_usd {
         task_cost.set_budget(left);
     }
+    // Plain prompts are refused over budget before they get here, but slash
+    // commands that start a turn (/review, skills, plugin commands) were not:
+    // each sent one more full-history request before /budget stopped it.
+    if budget_remaining_usd.is_some_and(|left| left <= 0.0) {
+        let _ = tx.send(AppEvent::TurnFailed(
+            "Budget reached — not sending. Use /budget to raise or clear it.".into(),
+        ));
+        return;
+    }
     let (child_usage_tx, mut child_usage_rx) = tokio::sync::mpsc::unbounded_channel();
     // Set up AskUserQuestion channel: tool → TUI dialog
     let (ask_tx, mut ask_rx) =
@@ -1407,5 +1416,30 @@ mod loop_guard_tests {
         }
         assert_eq!(failed, None);
         assert!(compacted && done);
+    }
+
+    /// A slash command that starts a turn (/review, a skill, a plugin
+    /// command) over the /budget cap sent one more request before the
+    /// Usage handler stopped it.
+    #[tokio::test]
+    async fn a_turn_started_over_budget_sends_nothing() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let (url, seen) = serve(vec![sse(
+            &[serde_json::json!({"type":"text","text":"spent"})],
+            "end_turn",
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (t, mut rx) = task(url, dir.path(), Some(0.0));
+        run_api_task(t).await;
+
+        assert!(seen.lock().unwrap().is_empty(), "request sent over budget");
+        let mut failed = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::TurnFailed(e) = ev {
+                failed = Some(e);
+            }
+        }
+        assert!(failed.is_some_and(|e| e.contains("Budget")));
     }
 }
