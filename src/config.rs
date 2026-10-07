@@ -977,39 +977,7 @@ impl Config {
             }
         }
 
-        // Auto-fix settings → AutoFixConfig
-        if let Some(ar) = &settings.auto_fix {
-            if let Some(e) = ar.enabled {
-                self.auto_fix.enabled = e;
-            }
-            if let Some(t) = &ar.trigger {
-                self.auto_fix.trigger = match t.to_ascii_lowercase().as_str() {
-                    "always" => crate::autofix::AutoFixTrigger::Always,
-                    "off" => crate::autofix::AutoFixTrigger::Off,
-                    _ => crate::autofix::AutoFixTrigger::Autonomous,
-                };
-            }
-            if ar.lint_command.is_some() {
-                self.auto_fix.lint_command = ar.lint_command.clone();
-            }
-            if ar.test_command.is_some() {
-                self.auto_fix.test_command = ar.test_command.clone();
-            }
-            if let Some(m) = ar.max_retries {
-                if (1..=10).contains(&m) {
-                    self.auto_fix.max_retries = m;
-                } else {
-                    tracing::warn!(
-                        "autoFixLoop.maxRetries = {m} is out of bounds (1..=10); \
-                         clamping to default (3)."
-                    );
-                    self.auto_fix.max_retries = 3;
-                }
-            }
-            if let Some(t) = ar.timeout_secs {
-                self.auto_fix.timeout_secs = t;
-            }
-        }
+        self.apply_auto_fix_settings(settings.auto_fix.as_ref());
 
         // Auto-commit settings → AutoCommitConfig
         if let Some(ac) = &settings.auto_commit {
@@ -1077,6 +1045,52 @@ impl Config {
         self.claude_dir_override
             .clone()
             .unwrap_or_else(Self::claude_dir)
+    }
+
+    /// Rebuild `auto_fix` from the `autoFixLoop` settings block. Untrusted projects have their
+    /// `autoFixLoop` block dropped by the trust merge, so whenever trust
+    /// changes mid-session (/trust, /reload) this must run again; otherwise a
+    /// project that turned auto-fix off, or set its own lint / test commands,
+    /// would get the auto-detected runner until restart.
+    pub fn apply_auto_fix_settings(&mut self, settings: Option<&crate::settings::AutoFixSettings>) {
+        let mut af = crate::autofix::AutoFixConfig::default();
+        if let Some(ar) = settings {
+            if let Some(e) = ar.enabled {
+                af.enabled = e;
+            }
+            if let Some(t) = &ar.trigger {
+                af.trigger = match t.to_ascii_lowercase().as_str() {
+                    "always" => crate::autofix::AutoFixTrigger::Always,
+                    "off" => crate::autofix::AutoFixTrigger::Off,
+                    _ => crate::autofix::AutoFixTrigger::Autonomous,
+                };
+            }
+            af.lint_command = ar.lint_command.clone();
+            af.test_command = ar.test_command.clone();
+            if let Some(m) = ar.max_retries {
+                if (1..=10).contains(&m) {
+                    af.max_retries = m;
+                } else {
+                    tracing::warn!(
+                        "autoFixLoop.maxRetries = {m} is out of bounds (1..=10); \
+                         clamping to default (3)."
+                    );
+                    af.max_retries = 3;
+                }
+            }
+            if let Some(t) = ar.timeout_secs {
+                af.timeout_secs = t;
+            }
+        }
+        self.auto_fix = af;
+    }
+
+    /// Re-read trust after /trust or /reload, together with the auto-fix
+    /// block that trust gates.
+    pub fn refresh_trust(&mut self) {
+        let settings = self.load_settings();
+        self.project_trusted = settings.project_trusted;
+        self.apply_auto_fix_settings(settings.auto_fix.as_ref());
     }
 
     /// Settings files for `self.cwd`, with `--settings` on top.
@@ -2673,6 +2687,44 @@ mod flag_settings_retarget_tests {
 
         std::fs::write(home.path().join("settings.json"), &own).unwrap();
         assert!(cfg.load_settings().project_trusted);
+    }
+
+    /// A project's own autoFixLoop block is dropped while it is untrusted;
+    /// /trust must bring it back, or auto-fix runs detected commands the
+    /// project turned off.
+    #[test]
+    fn refresh_trust_applies_the_projects_auto_fix_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+        std::fs::write(
+            project.path().join(".claude/settings.json"),
+            r#"{"autoFixLoop": {"enabled": false, "lintCommand": "make lint"}}"#,
+        )
+        .unwrap();
+        let mut cfg = Config {
+            cwd: project.path().into(),
+            claude_dir_override: Some(home.path().into()),
+            ..Config::default()
+        };
+        cfg.refresh_trust();
+        assert!(!cfg.project_trusted);
+        assert!(cfg.auto_fix.enabled);
+        assert_eq!(cfg.auto_fix.lint_command, None);
+
+        let trust = serde_json::json!({ "trustedProjects": [project.path()] }).to_string();
+        std::fs::write(home.path().join("settings.json"), trust).unwrap();
+        cfg.refresh_trust();
+        assert!(cfg.project_trusted);
+        assert!(!cfg.auto_fix.enabled);
+        assert_eq!(cfg.auto_fix.lint_command.as_deref(), Some("make lint"));
+
+        // Revoking puts the defaults back rather than keeping the project's.
+        std::fs::write(home.path().join("settings.json"), "{}").unwrap();
+        cfg.refresh_trust();
+        assert!(!cfg.project_trusted);
+        assert!(cfg.auto_fix.enabled);
+        assert_eq!(cfg.auto_fix.lint_command, None);
     }
 
     #[test]

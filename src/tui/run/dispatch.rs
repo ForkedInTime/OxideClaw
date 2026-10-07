@@ -1114,6 +1114,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // Hot-reload settings.json without restarting
             let settings = config.load_settings();
             let mut reloaded = Vec::new();
+            // Trust may have changed since startup, and it gates the
+            // project's autoFixLoop block; rebuild both together.
+            config.project_trusted = settings.project_trusted;
+            config.apply_auto_fix_settings(settings.auto_fix.as_ref());
+            if settings.auto_fix.is_some() {
+                reloaded.push("autoFixLoop");
+            }
 
             if let Some(model) = reloaded_model(
                 settings.model.as_deref(),
@@ -1174,7 +1181,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 config.sandbox_mode = mode;
                 reloaded.push("sandboxMode");
             }
-            config.project_trusted = settings.project_trusted;
 
             // Reload CLAUDE.md + AGENTS.md; --bare never loads them.
             if !config.bare_mode {
@@ -2287,8 +2293,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 ),
             };
             app.entries.push(ChatEntry::system(msg));
-            // Auto-fix reads trust per edit, so a change applies at once.
-            config.project_trusted = config.load_settings().project_trusted;
+            // Auto-fix reads trust and its settings per edit, so a change
+            // applies at once, including the project's own autoFixLoop block.
+            config.refresh_trust();
         }
         CommandAction::AutoCommitStatus => {
             let cwd_ok = oxideclaw::autocommit::is_git_repo(&config.cwd);
