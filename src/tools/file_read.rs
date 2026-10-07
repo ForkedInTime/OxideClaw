@@ -130,10 +130,14 @@ impl Tool for FileReadTool {
         let total_lines = lines.len();
 
         let offset = input.offset.unwrap_or(1).saturating_sub(1); // convert to 0-indexed
-        let limit = input.limit.unwrap_or(MAX_LINES_DEFAULT);
+        let limit = input.limit.unwrap_or(MAX_LINES_DEFAULT).max(1);
 
+        // offset/limit come straight from model input: a limit near usize::MAX
+        // would wrap `end` below the start and the slice would panic, which
+        // aborts the whole process under panic = "abort".
+        let start = offset.min(total_lines);
         let end = offset.saturating_add(limit).min(total_lines);
-        let selected = &lines[offset.min(total_lines)..end];
+        let selected = &lines[start..end];
 
         // Format with line numbers (cat -n style), 1-indexed
         let mut output = String::new();
@@ -142,8 +146,13 @@ impl Tool for FileReadTool {
             output.push_str(&format!("{}\t{}\n", line_num, line));
         }
 
-        if output.is_empty() {
+        if total_lines == 0 {
             output = "(empty file)".to_string();
+        } else if output.is_empty() {
+            output = format!(
+                "(no lines at offset {}: the file has {total_lines} lines)",
+                offset + 1
+            );
         } else if end < total_lines {
             // Without this the model treats the default 2000-line cap as the
             // whole file and edits or reasons from a partial view.
@@ -388,5 +397,38 @@ mod tests {
 
         let past = text(&read(&ctx, json!({"file_path": "huge.log", "offset": n + 5})).await);
         assert!(past.contains(&format!("the file has {n} lines")), "{past}");
+    }
+
+    #[tokio::test]
+    async fn offset_past_end_is_not_reported_as_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("three.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        let past = text(&read(&ctx, json!({"file_path": "three.txt", "offset": 10})).await);
+        assert_eq!(past, "(no lines at offset 10: the file has 3 lines)");
+
+        let empty = text(&read(&ctx, json!({"file_path": "empty.txt"})).await);
+        assert_eq!(empty, "(empty file)");
+    }
+
+    #[tokio::test]
+    async fn huge_limit_reads_exactly_to_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("three.txt"), "a\nb\nc\n").unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        let out = read(
+            &ctx,
+            json!({"file_path": "three.txt", "offset": 2, "limit": u64::MAX}),
+        )
+        .await;
+        assert_eq!(text(&out), "2\tb\n3\tc\n");
+
+        // The streamed path for files over the size cap has the same sum.
+        let path = dir.path().join("three.txt");
+        let section = read_section(&path, 1, usize::MAX, 6).await.unwrap();
+        assert_eq!(section, "2\tb\n3\tc\n");
     }
 }
