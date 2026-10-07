@@ -309,12 +309,18 @@ Optional. Each prompt goes to one of four tiers, and a tier can be any model `/m
 
 The router starts on once two or more tiers are set. `"enabled": false` keeps it off; `"enabled": true` turns it on with fewer, and unset tiers keep their defaults. With one tier or none and no `enabled`, it stays off. `/router on` and `/router off` switch it for the session. `/router` (or `/router status`) shows the tiers, the classifier, the model the last turn ran on, any skipped tiers and the estimated savings. Routing applies in the TUI, in `-p` (unless `--model` names the model for the run) and in SDK sessions whose `session/start` names no `model`. ACP sessions are not routed.
 
-| Tier | Default model | Example |
-|-----------|-----------|---------|
-| Low | `claude-haiku-4-5` | "What does this function do?" |
-| Medium | `claude-sonnet-5` | "Add a test for parse_config" |
-| High | your current model | "Debug this race condition" |
-| Super-high | `claude-opus-5` | Whole-codebase analysis |
+| Tier | Default on a Claude session | Default on an Ollama or OpenAI-compatible session | Example |
+|-----------|-----------|-----------|---------|
+| Low | `claude-haiku-4-5` | your current model | "What does this function do?" |
+| Medium | `claude-sonnet-5` | your current model | "Add a test for parse_config" |
+| High | your current model | your current model | "Debug this race condition" |
+| Super-high | `claude-opus-5` | your current model | Whole-codebase analysis |
+
+On a local or OpenAI-compatible session, only the tiers you name go to another provider, so switching the router on never sends prompts somewhere you did not choose. Unset tiers follow `/model`; tiers set in settings.json or with `/router <tier>` stay.
+
+Tiers, `enabled: true` and the classifier in a project's `.claude/settings.json` apply only once the project is `/trust`ed, since they decide which provider gets your prompts. An untrusted project can still switch the router off.
+
+Compaction measures the history against the largest window among the tiers a turn can still go to; tiers skipped for the session or without a credential do not count, and with none left the session model's window applies.
 
 **Picking the tier.** By default a keyword and length heuristic scores the prompt: signal words such as debug, refactor or audit, prompt length, code blocks and file paths. With `"classifier": "model"` the low tier is asked for a one-word label (`low`, `mid`, `high` or `super-high`) under a strict prompt, with 16 output tokens and 3 seconds. On a timeout, an error or any other answer the heuristic decides. The classifier's call is billed like any other turn and counts in `/cost` and `/budget`. When the history is too large for the chosen tier's window, the turn goes to the next tier up that holds it.
 
@@ -560,10 +566,10 @@ Earlier versions accepted `auto-edit` (then the default) and `full-auto` but pro
 | `router` | `{ "low", "mid", "high", "superHigh", "enabled", "classifier" }` | unset | The [smart model router](#smart-model-router): a model per tier (any provider), `enabled` (unset: on once two tiers are set) and `classifier` (`heuristic` or `model`) |
 | `routerEnabled` | `true` / `false` | unset | Older form of `router.enabled` |
 | `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`) |
-| `routerLowModel` | any model name | `claude-haiku-4-5` | Older form of `router.low` |
-| `routerMediumModel` | any model name | `claude-sonnet-5` | Older form of `router.mid` |
+| `routerLowModel` | any model name | `claude-haiku-4-5` (your `model` on a non-Claude session) | Older form of `router.low` |
+| `routerMediumModel` | any model name | `claude-sonnet-5` (your `model` on a non-Claude session) | Older form of `router.mid` |
 | `routerHighModel` | any model name | your `model` | Older form of `router.high` |
-| `routerSuperHighModel` | any model name | `claude-opus-5` | Older form of `router.superHigh` |
+| `routerSuperHighModel` | any model name | `claude-opus-5` (your `model` on a non-Claude session) | Older form of `router.superHigh` |
 | `allowPrivateNetworkFetch` | `true` / `false` | `false` | Let WebFetch, WebBrowser and the `browser_*` tools reach loopback, RFC 1918, CGNAT and ULA addresses (e.g. a dev server on `localhost:3000`). Without it, `browser_navigate` asks once per loopback `host:port` in an interactive session (the TUI, `/browse`, an SDK host) and refuses elsewhere; LAN addresses are refused. Link-local and cloud metadata endpoints stay refused either way. Behind an `HTTP(S)_PROXY` the same check runs on the locally resolved address before the proxy is used; see [SECURITY.md](SECURITY.md#network-access-from-webfetch-and-webbrowser) |
 | `updateCheck` | `true` / `false` | `true` | Once every 24 h the TUI looks up the latest GitHub release (the one `oxideclaw update` installs) in the background, with a 3 s timeout, and shows one dim line when it is newer than yours. `false` in any settings file turns it off; `-p`, `--headless`, `acp` and `browse` never check. The last answer is cached in `$XDG_CACHE_HOME/oxideclaw/update-check.json` (default `~/.cache/oxideclaw/`). Uses `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |

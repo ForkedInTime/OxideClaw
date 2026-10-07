@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The router starts on once two tiers are set.** With two or more tiers
+  configured and no `enabled` / `routerEnabled`, the router is on at
+  startup; `"enabled": false` keeps it off. Earlier versions needed
+  `routerEnabled: true` even with tiers set.
+- **`-p` and SDK sessions are routed.** `-p` without `--model` and SDK
+  sessions whose `session/start` names no `model` use the router settings,
+  as the TUI does. ACP sessions are not routed.
+- **Routed sessions compact against the largest usable tier.** Each turn
+  goes to a tier whose window holds the history, so compaction waits for
+  the largest window among the tiers a turn can still go to, instead of
+  the smallest. Tiers skipped for the session or without a credential do
+  not count.
+- **Router settings from an untrusted project are ignored.** The `router`
+  block, `routerEnabled: true` and the `router*Model` keys in a project's
+  `.claude/settings.json` decide which provider gets your prompts, so they
+  apply only after `/trust`; a project can still switch the router off.
 - **`oai:` uses OpenAI's Responses API.** Requests go to `/v1/responses`
   with `store: false`, so nothing is kept on OpenAI's side. On reasoning
   models (o-series, GPT-5 and later, Codex) the encrypted reasoning behind
@@ -42,6 +58,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as activity for `cleanupPeriodDays`. Session files, imported or not, are
   now created owner-only (0600, in a 0700 directory).
   `~/.claude` is only read.
+- **Router tiers on any provider.** The `router` settings block
+  (`{"low": "ollama:qwen3-coder", "mid": "claude-sonnet-5", "high":
+  "claude-opus-5"}`) takes any model `/model` accepts per tier; the flat
+  `routerEnabled` / `router*Model` keys keep working, and within one file
+  the block wins. On an Ollama or OpenAI-compatible session a tier you do
+  not set is the session model, so only the tiers you name go to another
+  provider; the Claude defaults apply to Claude sessions.
+- **Model classifier.** `"classifier": "model"` asks the low tier for a
+  one-word tier label (16 tokens, 3 seconds), billed in `/cost` and
+  `/budget`; the keyword heuristic answers on a timeout or any other reply.
+- **Escalation.** A turn that fails on a lower tier (an API error other
+  than auth or rate limits, malformed tool calls twice in a row, the loop
+  detector, a context too large for the window) continues once on the next
+  tier up, unless resending the history there could pass `/budget`.
+- **Skipped tiers.** A tier with no credential, or whose Ollama, LM Studio
+  or `openai-compat:` host does not answer within 1.5 seconds, is skipped
+  for the session with one notice; `/router status` lists them and
+  `/router on` checks again.
+- **The routed model is shown.** The TUI status bar shows `ROUTER →
+  <model>`, `-p --verbose` prints a `[router]` line, and SDK hosts get a
+  `model/routed` notification.
 - **Keyless start on a local Ollama.** With no Anthropic credential and no
   model chosen (`--model`, `ANTHROPIC_MODEL`, settings), the TUI and `-p`
   look for a running Ollama, pick a pulled model that can call tools and
