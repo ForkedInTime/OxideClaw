@@ -81,10 +81,9 @@ impl Tool for WebFetchTool {
 
         // Convert to readable text
         let text = if content_type.contains("text/html") || content_type.is_empty() {
-            let html = String::from_utf8_lossy(&bytes);
-            html_to_text(&html)
+            html_to_text(&crate::net_policy::decode_body(&content_type, &bytes))
         } else if content_type.contains("text/") || content_type.contains("json") {
-            String::from_utf8_lossy(&bytes).into_owned()
+            crate::net_policy::decode_body(&content_type, &bytes)
         } else {
             return Ok(ToolOutput::error(format!(
                 "Unsupported content type: {content_type}"
@@ -180,6 +179,22 @@ mod tests {
         let out = run(NetPolicy::LOCAL_OK, &base).await;
         assert!(!out.is_error, "{}", text(&out));
         assert!(text(&out).contains("Hello there"), "{}", text(&out));
+    }
+
+    /// The body was always read as UTF-8. The script server only sends
+    /// strings, so declare windows-1252 over the UTF-8 bytes of "é"
+    /// (C3 A9), which that charset reads as "Ã©".
+    #[tokio::test]
+    async fn body_is_decoded_by_the_declared_charset() {
+        let (base, _) = scripted_server(vec![
+            ok_with("text/plain; charset=windows-1252", "caf\u{e9}"),
+            ok_with("text/html; charset=windows-1252", "<p>caf\u{e9}</p>"),
+        ])
+        .await;
+        for _ in 0..2 {
+            let out = run(NetPolicy::LOCAL_OK, &base).await;
+            assert!(text(&out).contains("caf\u{c3}\u{a9}"), "{}", text(&out));
+        }
     }
 
     #[tokio::test]

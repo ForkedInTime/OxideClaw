@@ -193,7 +193,7 @@ async fn fetch_plain(url: &str, policy: &NetPolicy, max_chars: usize) -> Result<
         anyhow::bail!("HTTP {}", fetched.status);
     }
     Ok(strip_html(
-        &String::from_utf8_lossy(&fetched.body),
+        &crate::net_policy::decode_body(&fetched.content_type, &fetched.body),
         max_chars,
     ))
 }

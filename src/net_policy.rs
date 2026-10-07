@@ -265,6 +265,65 @@ async fn fetch_with_env(
     bail!("too many redirects (more than {MAX_REDIRECTS} hops)")
 }
 
+/// Decode a fetched body the way a browser would: BOM, then the
+/// Content-Type `charset=`, then an HTML `<meta charset>` in the first KiB,
+/// else UTF-8. Lossy UTF-8 turned every legacy-encoded page (cp1251,
+/// Shift_JIS, latin-1, ...) into replacement characters.
+pub fn decode_body(content_type: &str, body: &[u8]) -> String {
+    let declared = charset_param(content_type)
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+        .or_else(|| {
+            if !(content_type.is_empty() || content_type.contains("html")) {
+                return None;
+            }
+            let enc = meta_charset(&body[..body.len().min(1024)])
+                .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))?;
+            // A meta tag is read as ASCII, so it can't really mean UTF-16
+            // (HTML spec: treat it as UTF-8).
+            Some(
+                if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE {
+                    encoding_rs::UTF_8
+                } else {
+                    enc
+                },
+            )
+        });
+    // `decode` lets a BOM override the declared encoding.
+    let (text, _, _) = declared.unwrap_or(encoding_rs::UTF_8).decode(body);
+    text.into_owned()
+}
+
+fn charset_param(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        k.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| v.trim().trim_matches(['"', '\'']).to_string())
+    })
+}
+
+/// `<meta charset="x">` or `<meta http-equiv=... content="...; charset=x">`.
+fn meta_charset(head: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let mut rest = head.as_str();
+    while let Some(i) = rest.find("<meta") {
+        let tag = &rest[i..];
+        let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+        if let Some(j) = tag.find("charset=") {
+            let label: String = tag[j + "charset=".len()..]
+                .trim_start_matches(['"', '\''])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || "-_:.".contains(*c))
+                .collect();
+            if !label.is_empty() {
+                return Some(label);
+            }
+        }
+        rest = &rest[i + "<meta".len()..];
+    }
+    None
+}
+
 /// A loopback forward proxy that applies a [`NetPolicy`] to every connection
 /// a child process makes. Headless Chromium follows redirects, meta refresh
 /// and JS navigation and resolves DNS itself, so checking only the URL it is
@@ -769,6 +828,55 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    // ── charset decoding ─────────────────────────────────────────────────
+
+    #[test]
+    fn body_is_decoded_by_its_declared_charset() {
+        // "Привет" in windows-1251; lossy UTF-8 made it all U+FFFD.
+        let cp1251: &[u8] = &[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
+        assert_eq!(
+            decode_body("text/html; charset=windows-1251", cp1251),
+            "Привет"
+        );
+        assert_eq!(
+            decode_body("text/plain; Charset=\"CP1251\"", cp1251),
+            "Привет"
+        );
+
+        let mut page = b"<html><head><META charset='windows-1251'></head><body>".to_vec();
+        page.extend_from_slice(cp1251);
+        assert!(decode_body("text/html", &page).ends_with("<body>Привет"));
+        let mut page =
+            b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=koi8-r\">".to_vec();
+        page.extend_from_slice(&[0xF0, 0xD2, 0xC9, 0xD7, 0xC5, 0xD4]);
+        assert!(decode_body("", &page).ends_with("Привет"));
+
+        // The header wins over meta; a BOM wins over both.
+        assert!(
+            decode_body(
+                "text/html; charset=utf-8",
+                "<meta charset=latin1>é".as_bytes()
+            )
+            .ends_with('é')
+        );
+        assert_eq!(
+            decode_body("text/html; charset=latin1", b"\xEF\xBB\xBFh\xC3\xA9"),
+            "hé"
+        );
+
+        // No or unknown label: UTF-8.
+        assert_eq!(decode_body("text/html", "héllo".as_bytes()), "héllo");
+        assert_eq!(
+            decode_body("text/html; charset=bogus", "héllo".as_bytes()),
+            "héllo"
+        );
+        // A meta tag can't switch to UTF-16.
+        assert_eq!(
+            decode_body("text/html", b"<meta charset=utf-16>hi"),
+            "<meta charset=utf-16>hi"
+        );
     }
 
     // ── address classification ───────────────────────────────────────────
