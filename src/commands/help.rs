@@ -182,7 +182,7 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
         "Code & git",
         "Commits, PRs, reviews, diffs",
         &[
-            ("/diff", "git diff"),
+            ("/diff", "uncommitted changes, incl. staged and new files"),
             ("/branch", "show/switch branches"),
             ("/commit", "generate & run a git commit"),
             ("/commit-push-pr", "commit, push, and create PR"),

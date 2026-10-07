@@ -2573,17 +2573,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
         }
         CommandAction::ShowDiff(path) => {
-            // Use tokio::process::Command with separate args — NEVER sh -c
-            // with a formatted path (user-controlled → shell injection).
-            let mut cmd = tokio::process::Command::new("git");
-            cmd.arg("diff").current_dir(&config.cwd);
-            if let Some(p) = &path {
-                cmd.arg("--").arg(p);
-            }
-            match cmd.output().await {
-                Ok(output) if output.status.success() => {
-                    let diff_text = String::from_utf8_lossy(&output.stdout).into_owned();
-                    if diff_text.trim().is_empty() {
+            match uncommitted_diff(&config.cwd, path.as_deref()).await {
+                Ok((diff_text, untracked)) => {
+                    if diff_text.trim().is_empty() && untracked.is_empty() {
                         app.entries
                             .push(ChatEntry::system("No uncommitted changes."));
                     } else {
@@ -2591,6 +2583,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let summary: String = files
                             .iter()
                             .map(|f| format!("  {} (+{} -{})", f.path, f.additions, f.deletions))
+                            .chain(untracked.iter().map(|f| format!("  {f} (new, untracked)")))
                             .collect::<Vec<_>>()
                             .join("\n");
                         app.overlay = Some(Overlay::new(
@@ -2598,11 +2591,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             format!("Diff Review\n\n{summary}\n\n{diff_text}"),
                         ));
                     }
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    app.entries
-                        .push(ChatEntry::error(format!("git diff failed: {stderr}")));
                 }
                 Err(e) => {
                     app.entries
@@ -2674,6 +2662,48 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// /diff: everything a commit would pick up, not just unstaged edits. Bare
+/// `git diff` hid staged changes and every file the agent created with
+/// Write, then reported "No uncommitted changes." Returns the diff against
+/// HEAD (the index, before the first commit) and the untracked files.
+async fn uncommitted_diff(
+    cwd: &std::path::Path,
+    path: Option<&str>,
+) -> anyhow::Result<(String, Vec<String>)> {
+    // Separate args, never `sh -c` with a formatted path (shell injection).
+    let git = |args: &[&str]| {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(args).current_dir(cwd);
+        if let Some(p) = path {
+            cmd.arg("--").arg(p);
+        }
+        cmd.output()
+    };
+    let mut out = git(&["diff", "HEAD"]).await?;
+    if !out.status.success() {
+        // No HEAD yet: everything is staged against the empty tree.
+        let cached = git(&["diff", "--cached"]).await?;
+        if !cached.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        out = cached;
+    }
+    let others = git(&[
+        "ls-files",
+        "-z",
+        "--full-name",
+        "--others",
+        "--exclude-standard",
+    ])
+    .await?;
+    let untracked = String::from_utf8_lossy(&others.stdout)
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok((String::from_utf8_lossy(&out.stdout).into_owned(), untracked))
 }
 
 /// Commands that send a prompt to the model, mirroring the arms below that
@@ -2854,5 +2884,65 @@ mod budget_tests {
             btw_note: None,
         };
         dispatch(input, &ctx)
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::uncommitted_diff;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// Staged edits and new files used to give "No uncommitted changes."
+    #[tokio::test]
+    async fn diff_includes_staged_and_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q"]);
+        // The helper's own git calls lack the env isolation above.
+        git(d, &["config", "core.fsmonitor", "false"]);
+        std::fs::write(d.join("staged.txt"), "one\n").unwrap();
+        git(d, &["add", "staged.txt"]);
+
+        // Before the first commit there is no HEAD to diff against.
+        let (diff, untracked) = uncommitted_diff(d, None).await.unwrap();
+        assert!(diff.contains("+one"), "{diff}");
+        assert!(untracked.is_empty());
+
+        git(
+            d,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::write(d.join("staged.txt"), "two\n").unwrap();
+        git(d, &["add", "staged.txt"]);
+        std::fs::write(d.join("new.txt"), "new\n").unwrap();
+
+        let (diff, untracked) = uncommitted_diff(d, None).await.unwrap();
+        assert!(diff.contains("+two"), "{diff}");
+        assert_eq!(untracked, ["new.txt"]);
+
+        let (diff, untracked) = uncommitted_diff(d, Some("new.txt")).await.unwrap();
+        assert!(diff.is_empty(), "{diff}");
+        assert_eq!(untracked, ["new.txt"]);
     }
 }
