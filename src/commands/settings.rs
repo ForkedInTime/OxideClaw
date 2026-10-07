@@ -228,9 +228,12 @@ pub(super) fn cmd_autonomy(args: &str) -> CommandAction {
     match level.as_str() {
         "suggest" | "auto-edit" | "full-auto" => CommandAction::SetAutonomy(level),
         "" => CommandAction::Message(
-            "Autonomy levels:\n  suggest   — show diff + ask before every Write/Edit\n  \
-             auto-edit — auto-apply edits, ask for new files (default)\n  \
-             full-auto — apply all changes without asking\n\n\
+            "Autonomy levels:\n  \
+             suggest   — ask before every Write/Edit/MultiEdit, even always-allowed ones;\n              \
+             the auto-fix loop does not run\n  \
+             auto-edit — normal permission rules (default): Write/Edit ask unless allowed\n              \
+             with 'a' or permissions.allow; the auto-fix loop runs\n  \
+             full-auto — currently the same as auto-edit\n\n\
              Usage: /autonomy <level>"
                 .into(),
         ),
@@ -631,5 +634,26 @@ mod hooks_command_tests {
         });
         assert!(out.contains("Pre-tool-use:\n  [Bash]  echo run"), "{out}");
         assert!(!out.contains("No hooks defined"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod autonomy_command_tests {
+    use super::{CommandAction, cmd_autonomy};
+
+    /// PermissionGate only special-cases "suggest"; the bare /autonomy text
+    /// used to promise prompt-free edits for auto-edit/full-auto.
+    #[test]
+    fn levels_are_described_as_they_behave() {
+        let CommandAction::Message(text) = cmd_autonomy("") else {
+            panic!("bare /autonomy should print the levels");
+        };
+        assert!(!text.contains("without asking"), "{text}");
+        assert!(!text.contains("auto-apply"), "{text}");
+        assert!(text.contains("currently the same as auto-edit"), "{text}");
+        assert!(matches!(
+            cmd_autonomy("Full-Auto"),
+            CommandAction::SetAutonomy(l) if l == "full-auto"
+        ));
     }
 }

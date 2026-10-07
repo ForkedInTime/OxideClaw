@@ -313,7 +313,7 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/vim", "toggle vim editing mode"),
             (
                 "/autonomy",
-                "set file change oversight (suggest/auto-edit/full-auto)",
+                "suggest = confirm every edit; auto-edit (default) = normal rules",
             ),
             ("/theme", "switch theme (dark, light, solarized)"),
             ("/btw", "prepend a note to next message"),

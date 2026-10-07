@@ -267,9 +267,11 @@ pub struct Settings {
     pub router_super_high_model: Option<String>,
 
     /// Autonomy level for file modifications: "suggest", "auto-edit", "full-auto".
-    /// - "suggest": show diff preview + ask before applying any Write/Edit
-    /// - "auto-edit": auto-apply edits to existing files, ask for new files (default)
-    /// - "full-auto": apply all changes without asking
+    /// - "suggest": ask before every Write/Edit/MultiEdit, even when an allow
+    ///   rule covers it; the auto-fix loop does not run
+    /// - "auto-edit": normal permission rules apply (default)
+    /// - "full-auto": currently the same as "auto-edit"; neither skips the
+    ///   Write/Edit prompt unless a permissions.allow / always-allow rule does
     pub autonomy: Option<String>,
 
     /// Auto-capture notable decisions/preferences from assistant responses into persistent memory.

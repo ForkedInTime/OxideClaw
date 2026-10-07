@@ -405,7 +405,8 @@ pub struct Config {
     pub router_super_high_model: Option<String>,
 
     /// Autonomy level: "suggest" | "auto-edit" | "full-auto".
-    /// Controls whether Write/Edit show diff previews before applying.
+    /// "suggest" forces a prompt for every Write/Edit/MultiEdit and skips the
+    /// auto-fix loop; the other two use the normal permission rules.
     pub autonomy: String,
 
     /// Auto-capture notable decisions/preferences from assistant responses into memory.
