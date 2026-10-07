@@ -462,15 +462,16 @@ impl QueryEngine {
             // Context compaction check
             let window = compaction_window(&self.config, None, None);
             let mut summarise_after_tools = false;
-            match compact_needed(response.usage.input_tokens, window) {
+            let context_tokens = response.usage.context_tokens();
+            match compact_needed(context_tokens, window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
                     self.notice(
                         format!(
                             "Warning: context is {:.0}% full ({} / {} tokens). \
                              Use /compact or enable auto_compact.",
-                            response.usage.input_tokens as f64 * 100.0 / window as f64,
-                            response.usage.input_tokens,
+                            context_tokens as f64 * 100.0 / window as f64,
+                            context_tokens,
                             window
                         )
                         .yellow(),
@@ -1267,6 +1268,44 @@ pub(crate) mod scripted_api_tests {
             "{}",
             e.cumulative_cost_usd
         );
+    }
+
+    /// Context size is the whole prompt. With prompt caching most of it is
+    /// reported as cache reads, which `input_tokens` excludes, so a nearly
+    /// full context never triggered compaction in -p.
+    #[tokio::test]
+    async fn compaction_counts_prompt_cache_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = sse(
+            &[serde_json::json!({"type":"text","text":"hi"})],
+            "end_turn",
+        )
+        .replace(
+            r#""input_tokens":1,"#,
+            r#""input_tokens":1,"cache_read_input_tokens":950000,"#,
+        );
+        let summary = sse(
+            &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
+            "end_turn",
+        );
+        let (url, seen) = serve(vec![full, summary]).await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            auto_compact_enabled: true,
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        e.resume_history("saved-session".into(), Vec::new());
+
+        e.query("hello").await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().len(), 2, "turn + summary");
     }
 
     /// -p summarised only after its final turn, when the loop was about to

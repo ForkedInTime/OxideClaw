@@ -399,21 +399,22 @@ impl SdkSession {
                 model: self.config.model.clone(),
             });
 
-            // Context health — input_tokens represents the full conversation context
-            // sent to the model (system + messages + tools), which is the real measure
-            // of how full the context window is.
+            // Context health: the whole prompt sent (system + messages +
+            // tools), prompt-cache hits included, is the real measure of
+            // how full the context window is.
+            let context_tok = response.usage.context_tokens();
             let window = crate::compact::compaction_window(&self.config, None, None);
-            let used_pct = ((input_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
+            let used_pct = ((context_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
             self.send_notif(SdkNotification::ContextHealth {
                 session_id: self.session_id.clone(),
                 used_pct,
-                tokens_used: input_tok,
+                tokens_used: context_tok,
                 tokens_max: window,
-                compaction_imminent: input_tok >= crate::compact::thresholds(window).1,
+                compaction_imminent: context_tok >= crate::compact::thresholds(window).1,
             });
             let mut summarise_after_tools = false;
             if self.config.auto_compact_enabled {
-                match crate::compact::compact_needed(input_tok, window) {
+                match crate::compact::compact_needed(context_tok, window) {
                     crate::compact::CompactNeeded::Snip => {
                         if crate::compact::snip_compact(&mut self.messages, &self.config.model) {
                             self.forget_reads();

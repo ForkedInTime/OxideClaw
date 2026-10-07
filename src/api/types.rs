@@ -207,6 +207,14 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
 }
 
+impl Usage {
+    /// Prompt size: everything the model read, cached or not. `input_tokens`
+    /// alone excludes prompt-cache reads and writes.
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+}
+
 /// SSE streaming event types
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
