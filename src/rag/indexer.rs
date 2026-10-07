@@ -458,18 +458,29 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
             .to_string();
         seen.insert(rel_path.clone());
 
+        let meta = match path.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                files_skipped += 1;
+                continue;
+            }
+        };
+        // Check size before reading: oversized files never get a row, so the
+        // mtime check below never skips them and every pass (one per prompt)
+        // would buffer the whole file (a 200 MB .ts video, a bundled .js).
+        if meta.len() > 100_000 {
+            files_skipped += 1;
+            continue;
+        }
+
         // Check mtime for incremental indexing
-        let mtime: i64 = path
-            .metadata()
-            .map(|m| {
-                m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    // Nanoseconds: whole seconds missed an edit made within the
-                    // same second as the previous index.
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0)
-            })
+        let mtime: i64 = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            // Nanoseconds: whole seconds missed an edit made within the
+            // same second as the previous index.
+            .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
         if !force {
@@ -585,6 +596,22 @@ mod tests {
         assert_eq!(db.file_count().unwrap(), 1, "gone.rs chunks must be pruned");
         let hits = super::super::search::search(&db, "gone", 10).unwrap();
         assert!(hits.is_empty(), "search still returns the deleted file");
+    }
+
+    /// Oversized files are skipped from metadata alone, every pass: they never
+    /// get a row, so the mtime check cannot short-circuit them.
+    #[test]
+    fn oversized_files_are_skipped_on_every_pass() {
+        let tmp = setup_project(&[("small.rs", "fn small() {}")]);
+        let big = std::fs::File::create(tmp.path().join("bundle.js")).unwrap();
+        big.set_len(64 * 1024 * 1024).unwrap();
+        drop(big);
+        let db = RagDb::open(tmp.path()).unwrap();
+        for _ in 0..2 {
+            let r = index_project(&db, tmp.path(), false).unwrap();
+            assert_eq!(r.files_scanned, 2);
+            assert_eq!(db.file_count().unwrap(), 1, "bundle.js must not be indexed");
+        }
     }
 
     /// Whole-second mtimes missed an edit made within the same second as
