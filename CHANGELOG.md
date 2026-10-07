@@ -65,9 +65,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the SDK's `cost/updated` carry `cache_read_tokens` and
   `cache_write_tokens`, and library callers can resume an `SdkSession`
   from a saved history.
+- **MCP `2026-07-28`.** MCP servers that speak the stateless `2026-07-28`
+  revision are used without the `initialize` handshake or a session: every
+  request carries the protocol version, client name and (empty) client
+  capabilities in `_meta`, and Streamable HTTP POSTs also send
+  `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and the `Mcp-Param-*`
+  headers a tool's `x-mcp-header` asks for (a tool with an invalid one is
+  left out). Each server is probed once per connection with
+  `server/discover`: a discovery result or one of the revision's own errors
+  means `2026-07-28`; any other error, an HTTP 4xx without such an error,
+  or no answer within 5 seconds means an older server, which gets the
+  handshake. A stdio server that exits on the probe is started again
+  without it. Mid-request `input_required` elicitations are declined; a
+  sampling or roots request fails that call, since OxideClaw serves
+  neither.
 
 ### Changed
 
+- **MCP startup and handshake.** A server that stays silent on methods it
+  does not know now adds up to 5 seconds to its startup (the
+  `server/discover` probe timeout). Handshake-era servers are offered
+  `2025-06-18` instead of `2024-11-05` and keep the version they answer
+  (`2025-03-26` and `2024-11-05` work as before); over HTTP that version is
+  sent as `MCP-Protocol-Version` on every later request. `oxideclaw mcp
+  list` now starts the trusted, enabled servers a session in the current
+  directory would start, to report each one's negotiated revision, and
+  names the ones that fail to connect.
 - **`tokens_in` on OpenAI-compatible providers excludes cache hits.** In
   the `-p` JSON result and the SDK's `cost/updated` `input_tokens`, cached
   prompt tokens are now reported as `cache_read_tokens` instead of being
