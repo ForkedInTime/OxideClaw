@@ -535,6 +535,25 @@ pub fn review_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
     Ok(output)
 }
 
+/// Cancel every running agent; returns how many were stopped. Each agent is
+/// capped at what was left of /budget when it started and counts only its
+/// own spend, so concurrent agents (and the foreground session) together
+/// could overspend the budget several times over.
+pub fn cancel_running(registry: &SpawnRegistry) -> usize {
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = 0;
+    for agent in reg.values_mut() {
+        if agent.status == SpawnStatus::Running {
+            if let Some(tx) = agent.cancel_tx.take() {
+                let _ = tx.send(());
+            }
+            agent.status = SpawnStatus::Cancelled;
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Cancel a running agent.
 pub fn kill_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
     let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -773,6 +792,21 @@ mod tests {
         }
         drop(r);
         reg
+    }
+
+    #[test]
+    fn cancel_running_stops_only_running_agents() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut running = entry("aaaa", SpawnStatus::Running);
+        running.cancel_tx = Some(tx);
+        let reg = registry_with(vec![running, entry("bbbb", SpawnStatus::Completed)]);
+        assert_eq!(cancel_running(&reg), 1);
+        assert!(rx.try_recv().is_ok(), "cancel signal not sent");
+        let r = reg.lock().unwrap();
+        assert_eq!(r["aaaa"].status, SpawnStatus::Cancelled);
+        assert_eq!(r["bbbb"].status, SpawnStatus::Completed);
+        drop(r);
+        assert_eq!(cancel_running(&reg), 0);
     }
 
     #[test]

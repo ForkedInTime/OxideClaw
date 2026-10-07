@@ -1100,6 +1100,15 @@ async fn run_loop(
                             turn_tokens.0 += input + cache_read + cache_write;
                             turn_tokens.1 += output;
                             if app.cost_tracker.over_budget() {
+                                // Background agents each started with what was
+                                // left then and count only their own spend.
+                                let stopped = crate::spawn::cancel_running(&spawn_registry);
+                                if stopped > 0 {
+                                    app.entries.push(ChatEntry::system(format!(
+                                        "Budget exceeded — {stopped} background agent(s) stopped. Use /budget to raise or clear the limit."
+                                    )));
+                                    app.scroll_to_bottom();
+                                }
                                 // A /browse run is its own task; its engine
                                 // only knows the cap it started with, so a
                                 // lowered /budget would not stop it.
