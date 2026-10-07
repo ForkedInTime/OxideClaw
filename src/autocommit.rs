@@ -460,24 +460,43 @@ fn stage_worktree(
     // index has other staging.
     if let Some(tree) = seed_tree {
         seed_index(cwd, tree, temp_index)?;
+        // The exclude below only stops `add` from touching the database; a
+        // copy already in the seed (a snapshot from before the exclusion, or
+        // a HEAD that tracks it) would ride along into every later snapshot
+        // and make /undo delete the live file. `-f`: that stale copy matches
+        // neither the file nor HEAD, and plain `rm --cached` refuses it.
+        let rm = temp_index_cmd(cwd, temp_index)
+            .args([
+                "rm",
+                "--cached",
+                "-f",
+                "-r",
+                "-q",
+                "--ignore-unmatch",
+                "--",
+                RAG_DB_PATHSPEC,
+            ])
+            .stdout(Stdio::null())
+            .status()?;
+        if !rm.success() {
+            anyhow::bail!("git rm --cached {RAG_DB_PATHSPEC} failed");
+        }
     }
     let add_status = temp_index_cmd(cwd, temp_index)
         // Whole tree from any subdirectory, minus OxideClaw's own SQLite
         // index/memory store: snapshotting it stored a binary blob per turn,
         // and /undo overwrote the live database (rolling back memories).
-        .args([
-            "add",
-            "-A",
-            "--",
-            ":(top)",
-            ":(top,exclude,glob)**/.claude/rag.db*",
-        ])
+        .args(["add", "-A", "--", ":(top)", RAG_DB_EXCLUDE])
         .status()?;
     if !add_status.success() {
         anyhow::bail!("git add -A failed");
     }
     git_output(temp_index_cmd(cwd, temp_index).args(["write-tree"]))
 }
+
+/// OxideClaw's own SQLite index/memory store, wherever a `.claude/` sits.
+const RAG_DB_PATHSPEC: &str = ":(top,glob)**/.claude/rag.db*";
+const RAG_DB_EXCLUDE: &str = ":(top,exclude,glob)**/.claude/rag.db*";
 
 /// `git commit-tree` with OxideClaw as author, so shadow commits never carry
 /// the user's identity or depend on it being configured.
@@ -783,6 +802,11 @@ pub fn restore_to(
                 filter,
                 &live_tree,
                 &tree_sha,
+                // A target that holds the database (a pre-exclusion snapshot,
+                // or a HEAD that tracks it) must not overwrite the live one.
+                "--",
+                ":(top)",
+                RAG_DB_EXCLUDE,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1654,6 +1678,76 @@ mod restore_tests {
         let files = list_tree_files(td.path(), &tree);
         assert!(files.iter().any(|f| f == "app.txt"), "{files:?}");
         assert!(!files.iter().any(|f| f.contains("rag.db")), "{files:?}");
+    }
+
+    /// A chain recorded before the exclusion carries a rag.db blob. Seeding
+    /// from it kept that stale copy in every later snapshot, and /undo to
+    /// the base deleted the live database (memories included); /undo to the
+    /// old snapshot overwrote it.
+    #[test]
+    fn a_snapshot_chain_that_holds_the_rag_database_never_touches_the_live_one() {
+        let td = init_test_repo();
+        write_file(td.path(), "README.md", "base\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        let head = resolve_head(td.path()).unwrap();
+        write_file(td.path(), "app.txt", "v1\n");
+        write_file(td.path(), ".claude/rag.db", "OLD");
+        // A pre-upgrade snapshot: the database went in with everything else.
+        let idx = tempfile::TempDir::new().unwrap();
+        let old_index = idx.path().join("old.index");
+        git_cmd(td.path())
+            .env("GIT_INDEX_FILE", &old_index)
+            .args(["read-tree", &head])
+            .status()
+            .unwrap();
+        git_cmd(td.path())
+            .env("GIT_INDEX_FILE", &old_index)
+            .args(["add", "-A"])
+            .status()
+            .unwrap();
+        let old_tree = git_output(
+            git_cmd(td.path())
+                .env("GIT_INDEX_FILE", &old_index)
+                .args(["write-tree"]),
+        )
+        .unwrap();
+        assert!(list_tree_files(td.path(), &old_tree).contains(&".claude/rag.db".to_string()));
+        let old = commit_tree(td.path(), &old_tree, &[&head], "old turn").unwrap();
+        let mut commits = vec![old];
+        let mut pos = 1usize;
+
+        write_file(td.path(), "app.txt", "v2\n");
+        write_file(td.path(), ".claude/rag.db", "NEW");
+        snapshot_turn(
+            td.path(),
+            &AutoCommitConfig::default(),
+            "s",
+            "t",
+            2,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
+        let tree = tree_of_commit(td.path(), &commits[1]).unwrap();
+        let files = list_tree_files(td.path(), &tree);
+        assert!(!files.iter().any(|f| f.contains("rag.db")), "{files:?}");
+
+        let db = td.path().join(".claude/rag.db");
+        let report = restore_to(td.path(), "s", &commits, 0).unwrap();
+        assert_eq!(report.orphaned_files, vec![PathBuf::from("app.txt")]);
+        assert_eq!(std::fs::read_to_string(&db).unwrap(), "NEW");
+
+        restore_to(td.path(), "s", &commits, 1).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("app.txt")).unwrap(),
+            "v1\n"
+        );
+        assert_eq!(std::fs::read_to_string(&db).unwrap(), "NEW");
     }
 
     /// Launched from `repo/pkg`, /undo must restore `repo/pkg/x` in place,
