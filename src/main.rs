@@ -636,18 +636,22 @@ fn prepare_config_dirs() {
         eprintln!("{notice}");
     }
     // A directory the user named is theirs to fill.
-    if choice.source.is_explicit() {
-        return;
-    }
-    let data = Config::data_dir();
-    if let Some(claude) = Config::claude_code_dir().filter(|d| d.is_dir())
-        && claude_import::needs_migration(&choice.dir)
-    {
-        for line in claude_import::migrate(&claude, &choice.dir, &data) {
+    if !choice.source.is_explicit() {
+        let data = Config::data_dir();
+        if let Some(claude) = Config::claude_code_dir().filter(|d| d.is_dir())
+            && claude_import::needs_migration(&choice.dir)
+        {
+            for line in claude_import::migrate(&claude, &choice.dir, &data) {
+                eprintln!("{line}");
+            }
+        }
+        if let Some(line) = claude_import::move_sessions_to_data_dir(&choice.dir, &data) {
             eprintln!("{line}");
         }
     }
-    if let Some(line) = claude_import::move_sessions_to_data_dir(&choice.dir, &data) {
+    // After the import, which runs only into an empty dir. A named dir
+    // ($CLAUDE_CONFIG_DIR) is where older versions kept their settings.
+    if let Some(line) = config::migrate_legacy_autonomy(&choice.dir) {
         eprintln!("{line}");
     }
 }

@@ -1811,6 +1811,56 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
 /// Read a JSON settings file for a read-modify-write. Missing or empty is
 /// `{}`; anything that does not parse as an object is an error, because
 /// writing back `{}` plus one key would silently delete the user's config.
+/// Left in the config dir once its `settings.json` `autonomy` has been
+/// carried over to the modes that pre-approve; its presence stops a second
+/// run from rewriting a value chosen since.
+pub const AUTONOMY_MIGRATION_MARKER: &str = ".autonomy-modes";
+
+/// Before the modes meant what they say, `auto-edit` (the old default) and
+/// `full-auto` both prompted for every edit. Once per config dir, a stored
+/// value of either becomes `ask`, so upgrading switches nobody to
+/// unprompted edits. Returns the line telling the user, if anything changed
+/// or could not be changed. Claude Code's `~/.claude` is never written.
+pub fn migrate_legacy_autonomy(config_dir: &Path) -> Option<String> {
+    if Config::claude_code_dir().is_some_and(|c| same_dir(config_dir, &c)) {
+        return None;
+    }
+    let marker = config_dir.join(AUTONOMY_MIGRATION_MARKER);
+    if marker.exists() {
+        return None;
+    }
+    let path = config_dir.join("settings.json");
+    // Unreadable: the load reports it, and this runs again once it is fixed.
+    let mut json = read_json_object(&path).ok()?;
+    let legacy = json
+        .get("autonomy")
+        .and_then(|v| v.as_str())
+        .map(|a| a.trim().to_string())
+        .filter(|a| a.eq_ignore_ascii_case("auto-edit") || a.eq_ignore_ascii_case("full-auto"));
+    let mut line = None;
+    if let Some(old) = legacy {
+        json["autonomy"] = serde_json::Value::String("ask".into());
+        let written = serde_json::to_string_pretty(&json)
+            .map_err(std::io::Error::other)
+            .and_then(|text| write_json_atomic(&path, &text));
+        if let Err(e) = written {
+            return Some(format!(
+                "Warning: could not update \"autonomy\": \"{old}\" in {}: {e}. It now \
+                 pre-approves edits; set it to \"ask\" to keep being asked.",
+                path.display()
+            ));
+        }
+        line = Some(format!(
+            "Autonomy: \"{old}\" in {} used to prompt for every edit and now \
+             pre-approves them, so it was changed to \"ask\", which keeps the prompts. \
+             Run /autonomy for what each mode does.",
+            path.display()
+        ));
+    }
+    let _ = std::fs::create_dir_all(config_dir).and_then(|()| std::fs::write(&marker, ""));
+    line
+}
+
 pub fn read_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -3275,9 +3325,66 @@ mod keyless_ollama_tests {
 }
 
 #[cfg(test)]
-mod autonomy_load_tests {
+mod autonomy_migration_tests {
     use super::*;
     use crate::permissions::Autonomy;
+
+    fn autonomy_in(dir: &Path) -> serde_json::Value {
+        read_json_object(&dir.join("settings.json")).unwrap()["autonomy"].clone()
+    }
+
+    /// `auto-edit` was the default and, like `full-auto`, still prompted;
+    /// a stored value must not turn into unprompted edits on upgrade, and a
+    /// value chosen after the upgrade must not be rewritten.
+    #[test]
+    fn stored_legacy_modes_become_ask_once() {
+        for old in ["auto-edit", "Full-Auto"] {
+            let dir = tempfile::tempdir().unwrap();
+            let settings = serde_json::json!({"autonomy": old, "model": "m"});
+            std::fs::write(dir.path().join("settings.json"), settings.to_string()).unwrap();
+            let line = migrate_legacy_autonomy(dir.path()).expect("the user is told");
+            assert!(line.contains(old) && line.contains("\"ask\""), "{line}");
+            assert_eq!(autonomy_in(dir.path()), "ask");
+            assert_eq!(
+                read_json_object(&dir.path().join("settings.json")).unwrap()["model"],
+                "m"
+            );
+
+            // Chosen again after the upgrade: kept.
+            let settings = serde_json::json!({"autonomy": "auto-edit"});
+            std::fs::write(dir.path().join("settings.json"), settings.to_string()).unwrap();
+            assert_eq!(migrate_legacy_autonomy(dir.path()), None);
+            assert_eq!(autonomy_in(dir.path()), "auto-edit");
+        }
+    }
+
+    #[test]
+    fn other_values_and_fresh_dirs_are_left_alone_but_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"autonomy": "suggest"}"#,
+        )
+        .unwrap();
+        assert_eq!(migrate_legacy_autonomy(dir.path()), None);
+        assert_eq!(autonomy_in(dir.path()), "suggest");
+        assert!(dir.path().join(AUTONOMY_MIGRATION_MARKER).exists());
+
+        // A new install: nothing to migrate, and an `auto-edit` written
+        // later is the user's choice.
+        let fresh = tempfile::tempdir().unwrap();
+        let cfg = fresh.path().join("oxideclaw");
+        assert_eq!(migrate_legacy_autonomy(&cfg), None);
+        std::fs::write(cfg.join("settings.json"), r#"{"autonomy": "auto-edit"}"#).unwrap();
+        assert_eq!(migrate_legacy_autonomy(&cfg), None);
+        assert_eq!(autonomy_in(&cfg), "auto-edit");
+
+        // An unreadable file is retried once fixed, not marked done.
+        let bad = tempfile::tempdir().unwrap();
+        std::fs::write(bad.path().join("settings.json"), "{ nope").unwrap();
+        assert_eq!(migrate_legacy_autonomy(bad.path()), None);
+        assert!(!bad.path().join(AUTONOMY_MIGRATION_MARKER).exists());
+    }
 
     /// `full-auto` without bwrap/firejail starts as `ask` and says why;
     /// unknown names are reported instead of silently meaning something.

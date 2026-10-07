@@ -171,3 +171,36 @@ fn xdg_config_home_and_the_override_variables_pick_the_dir() {
     let s = settings(&h.config().join("settings.json"));
     assert_eq!(s["mcpServers"]["d"]["command"], "x");
 }
+
+/// Older versions kept settings in `$XDG_CONFIG_HOME/oxideclaw`, where
+/// `"autonomy": "auto-edit"` still prompted for every edit. The upgrade
+/// rewrites it to `ask` once, says so, and leaves a later choice alone.
+#[test]
+fn a_stored_legacy_autonomy_is_migrated_to_ask_once() {
+    let h = Home::new();
+    let xdg = h.home.join("xdg");
+    let dir = xdg.join("oxideclaw");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{"autonomy": "auto-edit", "model": "m"}"#,
+    )
+    .unwrap();
+    let out = h.run(&["mcp", "list"], &[("XDG_CONFIG_HOME", &xdg)]);
+    let err = stderr(&out);
+    assert!(
+        err.contains("\"auto-edit\"") && err.contains("\"ask\""),
+        "{err}"
+    );
+    let s = settings(&dir.join("settings.json"));
+    assert_eq!(s["autonomy"], "ask");
+    assert_eq!(s["model"], "m");
+
+    std::fs::write(dir.join("settings.json"), r#"{"autonomy": "auto-edit"}"#).unwrap();
+    let out = h.run(&["mcp", "list"], &[("XDG_CONFIG_HOME", &xdg)]);
+    assert!(!stderr(&out).contains("Autonomy"), "{}", stderr(&out));
+    assert_eq!(
+        settings(&dir.join("settings.json"))["autonomy"],
+        "auto-edit"
+    );
+}
