@@ -130,6 +130,27 @@ impl QueryEngine {
         self
     }
 
+    /// The cap, once this engine's spend has reached it.
+    fn spent_budget(&self) -> Option<f64> {
+        self.config
+            .max_budget_usd
+            .filter(|b| self.cumulative_cost_usd >= *b)
+    }
+
+    /// A quiet engine runs under the TUI (/browse), where stderr lands on
+    /// the viewport.
+    fn note_budget_stop(&self, budget: f64) {
+        let note = format!(
+            "Budget limit reached: ${:.4} / ${:.4} — stopping.",
+            self.cumulative_cost_usd, budget
+        );
+        if self.quiet {
+            tracing::warn!("{note}");
+        } else {
+            eprintln!("{}", note.yellow());
+        }
+    }
+
     /// Count what sub-agents spent during the last tool round, and pass it
     /// up to this engine's own parent.
     fn absorb_child_usage(&mut self) {
@@ -296,6 +317,13 @@ impl QueryEngine {
         let user_input = user_input.into();
         self.turns = 0;
         self.skill_shell_blocked = false;
+        // /browse starts with what is left of the session budget; with
+        // nothing left, the check after each response let one more full
+        // request through first.
+        if let Some(budget) = self.spent_budget() {
+            self.note_budget_stop(budget);
+            return Ok(());
+        }
 
         // --replay-user-messages: echo user message in stream-json output
         if self.replay_user_messages() && self.stream_json_output {
@@ -414,14 +442,7 @@ impl QueryEngine {
             if let Some(budget) = self.config.max_budget_usd
                 && self.cumulative_cost_usd >= budget
             {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "Budget limit reached: ${:.4} / ${:.4} — stopping.",
-                        self.cumulative_cost_usd, budget
-                    )
-                    .yellow()
-                );
+                self.note_budget_stop(budget);
                 break;
             }
 
@@ -506,14 +527,7 @@ impl QueryEngine {
                     if let Some(budget) = self.config.max_budget_usd
                         && self.cumulative_cost_usd >= budget
                     {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "Budget limit reached: ${:.4} / ${:.4} — stopping.",
-                                self.cumulative_cost_usd, budget
-                            )
-                            .yellow()
-                        );
+                        self.note_budget_stop(budget);
                         break;
                     }
                     if summarise_after_tools {
@@ -767,6 +781,13 @@ impl QueryEngine {
         // stdout/stderr: the TUI's raw-mode viewport, SDK NDJSON, ACP
         // JSON-RPC or `-p --output-format json`. Any print here corrupts it.
         self.quiet = true;
+        // A sub-agent or /spawn handed a spent budget must not send the
+        // one request the per-response check would let through.
+        if let Some(budget) = self.spent_budget() {
+            return Ok(crate::tools::ToolOutput::error(format!(
+                "Not started: the budget of ${budget:.2} is already spent."
+            )));
+        }
         self.client.set_retry_notifier(std::sync::Arc::new(
             |n: &crate::api::retry::RetryNotice| {
                 tracing::warn!("{}", n.message());
@@ -2136,6 +2157,36 @@ mod tests {
             engine.messages.last().unwrap().content[0],
             ContentBlock::ToolResult { .. }
         ));
+    }
+
+    /// /browse, /spawn and sub-agents start with what is left of the
+    /// session budget. With nothing left they still sent one full request
+    /// before the per-response check stopped them.
+    #[tokio::test]
+    async fn a_spent_budget_sends_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, hits) = browse_done_model().await;
+        let config = Config {
+            model: "ollama:test-model".into(),
+            ollama_host: host,
+            cwd: dir.path().to_path_buf(),
+            max_turns: 5,
+            max_budget_usd: Some(0.0),
+            ..Config::default()
+        };
+        let tools: Vec<DynTool> = vec![std::sync::Arc::new(
+            crate::tools::browser_tools::BrowseDoneTool::new(),
+        )];
+        let mut engine =
+            QueryEngine::new_for_browse(config.clone(), tools, "browse".into(), Vec::new())
+                .unwrap();
+        engine.query("goal").await.unwrap();
+        assert_eq!(engine.turns_used(), 0);
+
+        let mut engine = QueryEngine::new(config, Vec::new()).unwrap();
+        let out = engine.query_and_collect("task").await.unwrap();
+        assert!(out.is_error);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Denies every call and reports the run as over, like the loop

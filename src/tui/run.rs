@@ -1083,6 +1083,19 @@ async fn run_loop(
                             turn_tokens.0 += input + cache_read + cache_write;
                             turn_tokens.1 += output;
                             if app.cost_tracker.over_budget() {
+                                // A /browse run is its own task; its engine
+                                // only knows the cap it started with, so a
+                                // lowered /budget would not stop it.
+                                if app.browse_progress_rx.is_some()
+                                    && let Some(cancel) = app.browse_cancel.take()
+                                {
+                                    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    app.entries.push(ChatEntry::system(format!(
+                                        "Budget exceeded (${:.4}) — /browse stopped. Use /budget to raise or clear the limit.",
+                                        app.cost_tracker.total_cost_usd
+                                    )));
+                                    app.scroll_to_bottom();
+                                }
                                 // `/budget` is a cap, not a suggestion: stop the
                                 // tool loop rather than let it keep spending.
                                 if let Some(handle) = app.api_task.take() {
@@ -1363,6 +1376,17 @@ async fn run_loop(
                             if app.is_loading || app.browse_progress_rx.is_some() {
                                 app.entries.push(ChatEntry::system(format!(
                                     "/browse (voice) ignored: a turn or browse is already running. Transcript: {goal_str}"
+                                )));
+                                app.scroll_to_bottom();
+                                match rx.try_recv() {
+                                    Ok(next) => { ev = next; continue; }
+                                    Err(_) => break,
+                                }
+                            }
+                            if app.cost_tracker.over_budget() {
+                                app.entries.push(ChatEntry::system(format!(
+                                    "Budget of ${:.2} reached — /browse (voice) not started. Use /budget to raise or clear it. Transcript: {goal_str}",
+                                    app.cost_tracker.budget_usd.unwrap_or_default()
                                 )));
                                 app.scroll_to_bottom();
                                 match rx.try_recv() {
