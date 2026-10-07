@@ -170,6 +170,27 @@ impl SdkSession {
         self.tools_used_this_turn.clear();
         self.skill_shell_blocked = false;
 
+        // The in-loop checks only stop a turn after paying for one more call;
+        // a session already over its budget must not call the API again.
+        if self.cost_tracker.over_budget() {
+            self.send_budget_exceeded();
+            self.send_notif(SdkNotification::TurnCompleted {
+                session_id: self.session_id.clone(),
+                response: String::new(),
+                structured_output: None,
+                cost_usd: 0.0,
+                total_session_cost_usd: self.cost_tracker.total_cost_usd,
+                tokens: TokenUsage {
+                    input: 0,
+                    output: 0,
+                },
+                model: self.config.model.clone(),
+                tools_used: Vec::new(),
+                duration_ms: turn_start.elapsed().as_millis() as u64,
+            });
+            return Ok(TurnEnd::BudgetExceeded);
+        }
+
         // 2. Retrieve RAG context (silently ignore errors). It goes in the
         // user turn: `system` must stay byte-identical for the whole
         // conversation or replayed thinking-block signatures are rejected.
@@ -390,14 +411,31 @@ impl SdkSession {
 
             // Budget check
             if self.cost_tracker.over_budget() {
-                self.send_notif(SdkNotification::Error {
-                    session_id: self.session_id.clone(),
-                    code: "budget_exceeded".into(),
-                    message: format!(
-                        "Budget limit reached: ${:.4} spent.",
-                        self.cost_tracker.total_cost_usd
-                    ),
-                });
+                self.send_budget_exceeded();
+                // The tools will not run, but every tool_use needs a result
+                // or each later prompt in this session is rejected (400).
+                if response.stop_reason == Some(StopReason::ToolUse) {
+                    let not_run: Vec<ContentBlock> = response
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { id, .. } => Some(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: vec![ToolResultContent::text(
+                                    "Not run: the session budget limit was reached.",
+                                )],
+                                is_error: Some(true),
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                    if !not_run.is_empty() {
+                        self.messages.push(Message {
+                            role: Role::User,
+                            content: not_run,
+                        });
+                    }
+                }
                 end = TurnEnd::BudgetExceeded;
                 break;
             }
@@ -428,14 +466,7 @@ impl SdkSession {
                         });
                     }
                     if self.cost_tracker.over_budget() {
-                        self.send_notif(SdkNotification::Error {
-                            session_id: self.session_id.clone(),
-                            code: "budget_exceeded".into(),
-                            message: format!(
-                                "Budget limit reached: ${:.4} spent.",
-                                self.cost_tracker.total_cost_usd
-                            ),
-                        });
+                        self.send_budget_exceeded();
                         end = TurnEnd::BudgetExceeded;
                         break;
                     }
@@ -500,6 +531,17 @@ impl SdkSession {
         });
 
         Ok(end)
+    }
+
+    fn send_budget_exceeded(&self) {
+        self.send_notif(SdkNotification::Error {
+            session_id: self.session_id.clone(),
+            code: "budget_exceeded".into(),
+            message: format!(
+                "Budget limit reached: ${:.4} spent.",
+                self.cost_tracker.total_cost_usd
+            ),
+        });
     }
 
     /// Replace the history with a summary (snip if that fails). Call only
@@ -1709,6 +1751,80 @@ mod guard_tests {
         let last = bodies[4]["messages"].as_array().unwrap();
         assert_eq!(last.len(), 2, "{last:?}");
         assert_eq!(last[1]["content"][0]["text"], "second");
+    }
+
+    fn session_with_notifs(cfg: Config) -> (SdkSession, mpsc::UnboundedReceiver<SdkNotification>) {
+        let (ntx, nrx) = mpsc::unbounded_channel();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let policy = Policy {
+            allow: vec!["Bash".into()],
+            ..Policy::default()
+        };
+        let bash = Arc::new(FakeBash(AtomicUsize::new(0)));
+        let s = SdkSession::new(
+            cfg,
+            vec![bash],
+            policy,
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        (s, nrx)
+    }
+
+    /// A budget stop on a tool_use response left that tool_use unanswered,
+    /// so every later prompt in the ACP session was rejected with a 400.
+    #[tokio::test]
+    async fn a_budget_stop_answers_pending_tool_calls_and_blocks_later_prompts() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Bash","input":{}})];
+        let (url, seen) = serve(vec![sse(&tool, "tool_use")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.model = "claude-sonnet-5".into();
+        c.max_budget_usd = Some(1e-9);
+        let (mut s, mut nrx) = session_with_notifs(c);
+        let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        client.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(client);
+
+        let end = s.execute_turn("first".into()).await.unwrap();
+        assert!(matches!(end, TurnEnd::BudgetExceeded));
+        match &s.messages.last().unwrap().content[..] {
+            [
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: Some(true),
+                    ..
+                },
+            ] => assert_eq!(tool_use_id, "t1"),
+            other => panic!("tool_use left unanswered: {other:?}"),
+        }
+
+        let history = s.messages.len();
+        let end = s.execute_turn("second".into()).await.unwrap();
+        assert!(matches!(end, TurnEnd::BudgetExceeded));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "an over-budget prompt hit the API"
+        );
+        assert_eq!(s.messages.len(), history);
+        let mut budget_errors = 0;
+        let mut completed = 0;
+        while let Ok(n) = nrx.try_recv() {
+            match n {
+                SdkNotification::Error { code, .. } if code == "budget_exceeded" => {
+                    budget_errors += 1
+                }
+                SdkNotification::TurnCompleted { .. } => completed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((budget_errors, completed), (2, 2));
     }
 
     /// Sub-agent spend never reached the SDK's tracker, so CostUpdated,
