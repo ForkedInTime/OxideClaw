@@ -397,7 +397,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         .push(ChatEntry::system("Saving voice clone…".to_string()));
                     app.scroll_to_bottom();
                     let tx2 = tx.clone();
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                         match crate::voice::save_voice_clone(tier).await {
                             Ok(msg) => {
@@ -410,6 +410,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             }
                         }
                     });
+                    app.voice_transcribe_task = Some(task.abort_handle());
                 } else {
                     // Normal mode — transcribe the recording
                     app.entries
@@ -418,7 +419,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     let tx2 = tx.clone();
                     let api_url = config.voice_api_url.clone();
                     let api_key = crate::voice::voice_api_key();
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                         match crate::voice::transcribe(api_url.as_deref(), api_key.as_deref()).await
                         {
@@ -441,7 +442,15 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                             }
                         }
                     });
+                    app.voice_transcribe_task = Some(task.abort_handle());
                 }
+            } else if app.transcription_pending() {
+                // start_recording deletes and rewrites the WAV it still reads.
+                app.entries.push(ChatEntry::system(
+                    "Still transcribing the last recording; press Ctrl+R again in a moment."
+                        .to_string(),
+                ));
+                app.scroll_to_bottom();
             } else {
                 // Start recording
                 match crate::voice::find_recorder() {

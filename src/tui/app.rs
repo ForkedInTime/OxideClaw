@@ -654,6 +654,10 @@ pub struct App {
     /// Graceful-stop channel for the active recording (sends SIGINT to recorder process)
     pub voice_stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 
+    /// Transcription (or clone save) of the last recording. It reads the one
+    /// shared WAV, so a new recording waits until it is done.
+    pub voice_transcribe_task: Option<tokio::task::AbortHandle>,
+
     /// Stop channel for active TTS playback — send () to interrupt mid-speech.
     pub tts_stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Pending package-manager install command — handled in run_loop (needs terminal access).
@@ -832,6 +836,7 @@ impl App {
             voice_recording: false,
             voice_task: None,
             voice_stop_tx: None,
+            voice_transcribe_task: None,
             tts_stop_tx: None,
             pending_install: None,
             turn_costs: Vec::new(),
@@ -918,6 +923,12 @@ impl App {
             self.finish_loading();
         }
         self.scroll_to_bottom();
+    }
+
+    pub fn transcription_pending(&self) -> bool {
+        self.voice_transcribe_task
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
     }
 
     // ── Input helpers ─────────────────────────────────────────────────────────
@@ -1481,20 +1492,16 @@ impl App {
                 self.entries.push(ChatEntry::system(msg));
                 self.scroll_to_bottom();
             }
+            // The recording state was cleared when Ctrl+R stopped it; clearing
+            // it again here dropped the stop sender of a newer recording, which
+            // killed that recorder mid-dictation.
             AppEvent::VoiceTranscription(text) => {
                 for ch in text.chars() {
                     self.insert_char(ch);
                 }
-                self.voice_recording = false;
-                self.voice_task = None;
-                self.voice_stop_tx = None;
             }
-            AppEvent::VoiceBrowse(_goal) => {
-                // Recording state cleared here; run.rs handles the Browse dispatch.
-                self.voice_recording = false;
-                self.voice_task = None;
-                self.voice_stop_tx = None;
-            }
+            // run.rs handles the Browse dispatch.
+            AppEvent::VoiceBrowse(_goal) => {}
             AppEvent::PluginInstallDone { success, message } => {
                 if success {
                     self.entries.push(ChatEntry::system(message));
@@ -1794,6 +1801,43 @@ mod background_event_tests {
         });
         assert!(!app.is_loading && app.side_task.is_none());
         task.abort();
+    }
+
+    /// Ctrl+R stop → transcription A runs → Ctrl+R starts recording B → A
+    /// finishes: B must keep recording.
+    #[tokio::test]
+    async fn finished_transcription_keeps_a_newer_recording() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        app.voice_recording = true;
+        app.voice_stop_tx = Some(stop_tx);
+        app.apply(AppEvent::VoiceTranscription("hello".into()));
+        app.apply(AppEvent::VoiceBrowse("example.com".into()));
+        assert!(app.voice_recording && app.voice_stop_tx.is_some());
+        assert!(
+            matches!(
+                stop_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "recorder B was signalled to stop"
+        );
+        assert_eq!(app.input.iter().collect::<String>(), "hello");
+    }
+
+    /// A new recording would delete the WAV the transcription still reads.
+    #[tokio::test]
+    async fn transcription_pending_until_its_task_ends() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        assert!(!app.transcription_pending());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = done_rx.await;
+        });
+        app.voice_transcribe_task = Some(task.abort_handle());
+        assert!(app.transcription_pending());
+        done_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert!(!app.transcription_pending());
     }
 
     #[tokio::test]
