@@ -320,6 +320,10 @@ impl Session {
         self.meta.base_commit = None;
         self.meta.timeline.clear();
         self.meta.redo.clear();
+        // A fork is not the import: only the original claims the Claude Code
+        // session (re-runs skip it, `--list` marks it) and its grace period.
+        self.meta.claude_code_session = None;
+        self.meta.imported_at = None;
         self.path = Self::jsonl_path(&self.dir, &id);
         self.id = id;
         self.meta.save_in(&self.dir).await?;
@@ -607,7 +611,7 @@ impl Session {
         // Same treatment as the session files themselves: a direct write
         // truncates the destination first, so an interrupted export leaves the
         // user with an empty or half-written file where their transcript was.
-        atomic_write(dest, out.as_bytes()).await?;
+        atomic_write_shared(dest, out.as_bytes()).await?;
         Ok(dest.to_path_buf())
     }
 
@@ -884,12 +888,35 @@ async fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Atomic file write: write to a sibling temp file, fsync, then rename over
 /// the target. Survives mid-write crashes — the target is either the old
 /// content or the new content, never a truncated splice. On unix the file is
-/// the owner's only (0600), as Claude Code keeps its transcripts.
+/// the owner's only (0600) in a 0700 directory, as Claude Code keeps its
+/// transcripts. For files in the sessions dir.
 async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    write_atomically(path, bytes, true).await
+}
+
+/// [`atomic_write`] for a file the user chose (`/export`): new directories
+/// and a new file get the usual umask-based modes, and a file it replaces
+/// keeps its own.
+async fn atomic_write_shared(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    write_atomically(path, bytes, false).await
+}
+
+async fn write_atomically(path: &std::path::Path, bytes: &[u8], private: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("session path has no parent: {}", path.display()))?;
-    create_private_dir(parent).await?;
+    if private {
+        create_private_dir(parent).await?;
+    } else if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent).await?;
+    }
+    // Replacing a user's file keeps its mode; the temp file would otherwise
+    // bring its own over in the rename.
+    let keep = if private {
+        None
+    } else {
+        fs::metadata(path).await.ok().map(|m| m.permissions())
+    };
 
     let file_name = path
         .file_name()
@@ -904,10 +931,18 @@ async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         let mut options = fs::OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        if private {
+            options.mode(0o600);
+        }
         let mut f = options.open(&tmp).await?;
         f.write_all(bytes).await?;
         f.sync_all().await?;
+    }
+    if let Some(perms) = keep
+        && let Err(e) = fs::set_permissions(&tmp, perms).await
+    {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(e.into());
     }
 
     // tokio::fs::rename is atomic on POSIX and on Windows when paths are on
@@ -1000,6 +1035,39 @@ mod atomic_write_tests {
             names.push(e.file_name().to_string_lossy().to_string());
         }
         assert_eq!(names, vec!["session.meta"]);
+    }
+
+    /// An export goes where the user chose: it keeps the umask's mode, or
+    /// the mode of the file it replaces, and new directories are not made
+    /// owner-only. Session files stay 0600.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_export_keeps_ordinary_modes() {
+        use super::atomic_write_shared;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let umask = {
+            let probe = dir.path().join("probe");
+            std::fs::write(&probe, "").unwrap();
+            0o666 & !mode(&probe)
+        };
+
+        let session = dir.path().join("s.meta");
+        atomic_write(&session, b"x").await.unwrap();
+        assert_eq!(mode(&session), 0o600);
+
+        let export = dir.path().join("docs/new/session.md");
+        atomic_write_shared(&export, b"x").await.unwrap();
+        assert_eq!(mode(&export), 0o666 & !umask);
+        assert_eq!(mode(&dir.path().join("docs/new")), 0o777 & !umask);
+
+        let existing = dir.path().join("shared.md");
+        std::fs::write(&existing, "old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_shared(&existing, b"new").await.unwrap();
+        assert_eq!(mode(&existing), 0o644);
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
     }
 
     #[tokio::test]
@@ -1485,5 +1553,35 @@ mod resolve_tests {
                 .contains("No saved session")
         );
         assert!(r("  ").await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    /// A fork of an imported session claimed the same Claude Code session:
+    /// `--list` marked whichever came last, a re-run skipped a deleted
+    /// import, and the fork got the import's cleanup grace period.
+    #[tokio::test]
+    async fn a_fork_does_not_claim_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::create_in(dir.path(), "orig".into()).await.unwrap();
+        s.meta.claude_code_session = Some("cc-1234".into());
+        s.meta.imported_at = Some(1_700_000_000);
+        s.save_meta().await.unwrap();
+        s.fork(&[]).await.unwrap();
+        assert_ne!(s.id, "orig");
+        assert_eq!(s.meta.claude_code_session, None);
+        assert_eq!(s.meta.imported_at, None);
+        let saved: SessionMeta = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(format!("{}.meta", s.id))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.claude_code_session, None);
+        let orig: SessionMeta =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("orig.meta")).unwrap())
+                .unwrap();
+        assert_eq!(orig.claude_code_session.as_deref(), Some("cc-1234"));
     }
 }

@@ -103,7 +103,7 @@ pub(super) fn cmd_session(args: &str) -> CommandAction {
                 let dir = crate::config::Config::sessions_dir();
                 let dir = dir.display().to_string().replace('\'', "'\\''");
                 CommandAction::Message(format!(
-                    "To delete session, run:\n  rm -rf '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta '{dir}'/{sub_args}*/\n\nThe directory holds file snapshots older versions kept for /rewind. Use /session list to confirm the ID prefix."
+                    "To delete session, run:\n  rm -rf '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta '{dir}'/{sub_args}*.redo '{dir}'/{sub_args}*/\n\nThe .redo file holds the turns /undo took off; the directory holds the file snapshots older versions kept for /rewind. Use /session list to confirm the ID prefix."
                 ))
             }
         }
@@ -325,6 +325,11 @@ mod session_command_tests {
                     "{m}"
                 );
                 assert!(m.contains(&format!("'{}'/abc123*/", dir.display())), "{m}");
+                // Undone turns' prompts and replies live in the .redo file.
+                assert!(
+                    m.contains(&format!("'{}'/abc123*.redo", dir.display())),
+                    "{m}"
+                );
             }
             _ => panic!("/session delete must only print a hint"),
         }

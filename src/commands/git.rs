@@ -493,21 +493,29 @@ pub(super) fn cmd_autocommit(_args: &str) -> CommandAction {
     CommandAction::AutoCommitStatus
 }
 
-/// The turn count of `/undo [N]` and `/redo [N]`: 1 when none is given.
-fn turn_count(args: &str) -> usize {
-    args.trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|n| *n > 0)
-        .unwrap_or(1)
+/// The turn count of `/undo [N]` and `/redo [N]`: 1 when none is given,
+/// `None` for anything but a positive integer. A typo (`/undo all`,
+/// `/undo 0`) must not quietly take a turn back.
+fn turn_count(args: &str) -> Option<usize> {
+    let a = args.trim();
+    if a.is_empty() {
+        return Some(1);
+    }
+    a.parse::<usize>().ok().filter(|n| *n > 0)
 }
 
 pub(super) fn cmd_redo(args: &str) -> CommandAction {
-    CommandAction::Redo(turn_count(args))
+    match turn_count(args) {
+        Some(n) => CommandAction::Redo(n),
+        None => CommandAction::Message("Usage: /redo [N]  (N >= 1)".into()),
+    }
 }
 
 pub(super) fn cmd_undo(args: &str) -> CommandAction {
-    CommandAction::Undo(turn_count(args))
+    match turn_count(args) {
+        Some(n) => CommandAction::Undo(n),
+        None => CommandAction::Message("Usage: /undo [N]  (N >= 1)".into()),
+    }
 }
 
 pub(super) fn cmd_issue(args: &str) -> CommandAction {
@@ -592,7 +600,18 @@ mod prompt_command_tests {
         let run = |line: &str| with_ctx(dir.path(), |c| crate::commands::dispatch(line, c));
         assert!(matches!(run("/undo"), CommandAction::Undo(1)));
         assert!(matches!(run("/undo 3"), CommandAction::Undo(3)));
-        assert!(matches!(run("/undo 0"), CommandAction::Undo(1)));
+        // Anything but a positive count is a usage message, not a change.
+        for bad in [
+            "/undo 0",
+            "/undo foo",
+            "/undo all",
+            "/undo -2",
+            "/undo 1.5",
+            "/redo foo",
+            "/redo 0",
+        ] {
+            assert!(matches!(run(bad), CommandAction::Message(_)), "{bad}");
+        }
         assert!(matches!(run("/redo"), CommandAction::Redo(1)));
         assert!(matches!(run("/redo 2"), CommandAction::Redo(2)));
         assert!(matches!(run("/rewind 2"), CommandAction::Rewind(Some(2))));

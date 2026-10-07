@@ -1855,16 +1855,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("never written"), "{err}");
-        if let Some(dot_claude) = crate::config::Config::claude_code_dir() {
-            let err = import(
-                &claude,
-                Path::new(PROJECT),
-                &dot_claude.join("sessions"),
-                None,
-            )
-            .await
-            .unwrap_err();
-            assert!(err.to_string().contains("never written"), "{err}");
+        // `~/.claude` is a guard root too. Checked on the roots, never by an
+        // import aimed at the developer's real `~/.claude`: a regressed
+        // guard would have written a session into it.
+        let dot_claude = td.path().join("dot_claude");
+        let own = crate::config::ConfigDirChoice {
+            dir: td.path().join("own"),
+            source: crate::config::ConfigDirSource::Xdg,
+        };
+        let roots = never_written_with(&claude, &own, Some(dot_claude.clone()));
+        let target = dot_claude.join("sessions");
+        assert!(
+            roots.iter().any(|r| is_within(&target, r)),
+            "~/.claude must be a never-written root: {roots:?}"
+        );
+        if let Some(real) = crate::config::Config::claude_code_dir() {
+            assert!(
+                never_written(&claude)
+                    .iter()
+                    .any(|r| is_within(&real.join("sessions"), r)),
+                "the real ~/.claude must be a never-written root"
+            );
         }
     }
 }

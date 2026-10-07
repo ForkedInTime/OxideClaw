@@ -135,18 +135,29 @@ fn claude_code_sessions_list_then_import_once() {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let id = "5a1e0000-0000-4000-8000-000000000001";
-    let record = |kind: &str, ts: &str, content: serde_json::Value| {
-        serde_json::json!({
-            "type": kind, "uuid": ts, "sessionId": id, "cwd": project,
-            "timestamp": ts, "isSidechain": false,
-            "message": {"role": kind, "model": "claude-test-1", "content": content}
-        })
-        .to_string()
-    };
+    // Claude Code chains records by `parentUuid`; the import follows that
+    // chain back from the last record.
+    let record =
+        |kind: &str, uuid: &str, parent: Option<&str>, ts: &str, content: serde_json::Value| {
+            serde_json::json!({
+                "type": kind, "uuid": uuid, "parentUuid": parent, "sessionId": id, "cwd": project,
+                "timestamp": ts, "isSidechain": false,
+                "message": {"role": kind, "model": "claude-test-1", "content": content}
+            })
+            .to_string()
+        };
     let transcript = [
-        record("user", "2026-02-01T10:00:00Z", "hello there".into()),
+        record(
+            "user",
+            "u-0001",
+            None,
+            "2026-02-01T10:00:00Z",
+            "hello there".into(),
+        ),
         record(
             "assistant",
+            "u-0002",
+            Some("u-0001"),
             "2026-02-01T10:00:01Z",
             serde_json::json!([{"type": "text", "text": "hi"}]),
         ),
@@ -182,6 +193,22 @@ fn claude_code_sessions_list_then_import_once() {
         .collect();
     assert_eq!(imported.len(), 1);
     assert_eq!(imported[0]["name"], "hello there");
+    // The conversation itself came along: the prompt, then the reply.
+    let history = std::fs::read_to_string(
+        sessions.join(format!("{}.jsonl", imported[0]["id"].as_str().unwrap())),
+    )
+    .unwrap();
+    let messages: Vec<serde_json::Value> = history
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant"], "{history}");
+    assert!(messages[0].to_string().contains("hello there"), "{history}");
+    assert!(messages[1].to_string().contains("\"hi\""), "{history}");
 
     let out = stdout(&h.run(&["config", "import-claude", "--sessions"], &[]));
     assert!(out.contains("imported already"), "{out}");
