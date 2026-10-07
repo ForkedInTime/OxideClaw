@@ -344,16 +344,22 @@ pub async fn load_skills_in(cwd: &Path) -> LoadedSkills {
 /// (a README.md there is not one). `.claude/skills` and `~/.claude/skills`
 /// are Claude Code's; OxideClaw only reads them.
 fn skill_dirs(cwd: &Path, config_dir: &Path, home: Option<&Path>) -> Vec<(PathBuf, bool)> {
-    let mut dirs = vec![
+    let mut candidates = vec![
         (cwd.join(".agents").join("skills"), false),
         (cwd.join(".oxideclaw").join("skills"), true),
         (cwd.join(".claude").join("skills"), true),
         (config_dir.join("skills"), true),
     ];
     if let Some(home) = home {
-        let claude = home.join(".claude").join("skills");
-        if !dirs.iter().any(|(d, _)| *d == claude) {
-            dirs.push((claude, true));
+        candidates.push((home.join(".claude").join("skills"), true));
+    }
+    // Run from $HOME with the default config dir and `.claude/skills`, the
+    // config dir's and `~/.claude/skills` are one directory. Read it once, at
+    // its highest priority, or each invalid skill in it is reported twice.
+    let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+    for (dir, flat) in candidates {
+        if !dirs.iter().any(|(d, _)| *d == dir) {
+            dirs.push((dir, flat));
         }
     }
     dirs
@@ -559,7 +565,7 @@ mod frontmatter_tests {
 #[cfg(test)]
 mod tests {
     use super::{load_skills_at, parse_skill_invocation};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -570,22 +576,30 @@ mod tests {
         format!("---\nname: {name}\ndescription: {description}\n---\n{body}")
     }
 
+    /// `base` joined with each `/`-separated part of `rel`, so the path uses
+    /// the platform separator like the loader's own paths do. A literal
+    /// `join("a/b")` keeps the `/` and never string-matches on Windows.
+    fn at(base: &Path, rel: &str) -> PathBuf {
+        rel.split('/')
+            .fold(base.to_path_buf(), |p, part| p.join(part))
+    }
+
     /// The five skill directories, highest priority first, under one temp dir:
     /// project, config dir and home are siblings.
-    fn locations(root: &Path) -> [std::path::PathBuf; 5] {
+    fn locations(root: &Path) -> [PathBuf; 5] {
         [
-            root.join("proj/.agents/skills"),
-            root.join("proj/.oxideclaw/skills"),
-            root.join("proj/.claude/skills"),
-            root.join("xdg/oxideclaw/skills"),
-            root.join("home/.claude/skills"),
+            at(root, "proj/.agents/skills"),
+            at(root, "proj/.oxideclaw/skills"),
+            at(root, "proj/.claude/skills"),
+            at(root, "xdg/oxideclaw/skills"),
+            at(root, "home/.claude/skills"),
         ]
     }
 
     async fn load(root: &Path) -> super::LoadedSkills {
         load_skills_at(
             &root.join("proj"),
-            &root.join("xdg/oxideclaw"),
+            &at(root, "xdg/oxideclaw"),
             Some(&root.join("home")),
         )
         .await
@@ -707,24 +721,24 @@ mod tests {
     async fn invalid_skills_are_skipped_with_one_warning_naming_each_path() {
         let dir = tempfile::tempdir().unwrap();
         let [agents, _, claude, _, _] = locations(dir.path());
-        write(&agents.join("plain/SKILL.md"), "Just a body");
+        write(&at(&agents, "plain/SKILL.md"), "Just a body");
         write(
-            &agents.join("noname/SKILL.md"),
+            &at(&agents, "noname/SKILL.md"),
             "---\ndescription: d\n---\nbody",
         );
         write(
-            &agents.join("nodesc/SKILL.md"),
+            &at(&agents, "nodesc/SKILL.md"),
             "---\nname: nodesc\n---\nbody",
         );
         write(
-            &agents.join("badyaml/SKILL.md"),
+            &at(&agents, "badyaml/SKILL.md"),
             "---\nname: [oops\n---\nbody",
         );
         write(&claude.join("flat.md"), "---\nname: never-closed\n");
         // Not a skill at all: no warning.
-        write(&agents.join("notes/todo.txt"), "x");
+        write(&at(&agents, "notes/todo.txt"), "x");
         write(
-            &agents.join("good/SKILL.md"),
+            &at(&agents, "good/SKILL.md"),
             &skill_md("good", "Fine", "body"),
         );
 
@@ -747,10 +761,10 @@ mod tests {
         );
         assert_eq!(warning.lines().count(), 6, "{warning}");
         for (path, why) in [
-            (agents.join("plain/SKILL.md"), "no YAML frontmatter"),
-            (agents.join("noname/SKILL.md"), "no `name`"),
-            (agents.join("nodesc/SKILL.md"), "no `description`"),
-            (agents.join("badyaml/SKILL.md"), "malformed frontmatter"),
+            (at(&agents, "plain/SKILL.md"), "no YAML frontmatter"),
+            (at(&agents, "noname/SKILL.md"), "no `name`"),
+            (at(&agents, "nodesc/SKILL.md"), "no `description`"),
+            (at(&agents, "badyaml/SKILL.md"), "malformed frontmatter"),
             (claude.join("flat.md"), "malformed frontmatter"),
         ] {
             let line = warning
@@ -815,6 +829,33 @@ mod tests {
         let loaded =
             load_skills_at(&dir.path().join("proj"), &home.join(".claude"), Some(&home)).await;
         assert_eq!(loaded.skills["x"].description, "X");
+    }
+
+    /// Run from $HOME with the default config dir, `.claude/skills` and the
+    /// config dir's `skills` are one directory. It was read twice, so every
+    /// invalid skill in it was reported twice.
+    #[tokio::test]
+    async fn a_skill_dir_shared_by_cwd_and_config_dir_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config = home.join(".claude");
+        let shared = at(&config, "skills");
+        write(&at(&shared, "broken/SKILL.md"), "no frontmatter");
+        write(&at(&shared, "ok/SKILL.md"), &skill_md("ok", "OK", "b"));
+
+        let dirs = super::skill_dirs(&home, &config, Some(&home));
+        let paths: Vec<_> = dirs.iter().map(|(d, _)| d).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(paths.iter().filter(|d| ***d == shared).count(), 1);
+
+        let loaded = load_skills_at(&home, &config, Some(&home)).await;
+        assert_eq!(loaded.skills["ok"].description, "OK");
+        assert_eq!(loaded.invalid.len(), 1, "{:?}", loaded.invalid);
+        let warning = loaded.warning().unwrap();
+        assert!(
+            warning.starts_with("Skipped 1 invalid skill(s)"),
+            "{warning}"
+        );
     }
 
     #[test]
