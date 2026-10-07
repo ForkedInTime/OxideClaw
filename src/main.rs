@@ -213,7 +213,7 @@ struct Cli {
     #[arg(long)]
     include_hook_events: bool,
 
-    /// Minimal mode: skip hooks, CLAUDE.md discovery, and LSP
+    /// Minimal mode: skip hooks, CLAUDE.md/AGENTS.md discovery, and LSP
     #[arg(long)]
     bare: bool,
 
@@ -737,7 +737,7 @@ async fn run() -> Result<()> {
             deeplink::DeepLinkAction::OpenTui { query, cwd } => {
                 // The link's directory decides which CLAUDE.md, permission
                 // rules and hooks apply, so it goes in before they are read.
-                let config = Config::load_with(cwd.map(std::path::PathBuf::from), None)?;
+                let config = Config::load_with(cwd.map(std::path::PathBuf::from), None, false)?;
                 return tui::run_tui(config, None, Some(query), None).await;
             }
         }
@@ -835,7 +835,7 @@ async fn run() -> Result<()> {
         eprintln!("warning: {w}");
     }
 
-    let mut config = Config::load_with(None, flag_settings())?;
+    let mut config = Config::load_with(None, flag_settings(), cli.bare)?;
 
     // Apply CLI overrides (highest priority)
     if cli.verbose {
@@ -912,9 +912,7 @@ async fn run() -> Result<()> {
         config.extra_dirs.push(abs);
     }
     if cli.bare {
-        config.bare_mode = true;
         config.disable_all_hooks = true;
-        config.claudemd = String::new();
     }
     if cli.disable_slash_commands {
         config.disable_slash_commands = true;

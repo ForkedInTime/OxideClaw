@@ -574,29 +574,27 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        Self::load_with(None, None)
+        Self::load_with(None, None, false)
     }
 
     /// `load` for project `cwd` instead of the process's (a deep link's
-    /// directory), with `--settings` merged over the settings files. Both
-    /// must be known here: everything below is derived from them, and the
-    /// credential helpers run here.
+    /// directory), with `--settings` merged over the settings files, in
+    /// `--bare` mode or not. All three must be known here: everything below
+    /// is derived from them (bare skips CLAUDE.md, AGENTS.md and their
+    /// phase routing), and the credential helpers run here.
     pub fn load_with(
         cwd: Option<PathBuf>,
         flag_settings: Option<crate::settings::Settings>,
+        bare_mode: bool,
     ) -> Result<Self> {
-        let mut cfg = Config::default();
-        if let Some(dir) = cwd {
-            cfg.cwd = dir;
-        }
         // The MCP manager reads servers from the settings files itself, so
         // these reach it the way --mcp-config servers do.
-        if let Some(flag) = &flag_settings {
-            cfg.extra_mcp_servers.extend(flag.mcp_servers.clone());
-        }
-        cfg.flag_settings = flag_settings;
-
-        cfg.load_project();
+        let flag_mcp = flag_settings
+            .as_ref()
+            .map(|f| f.mcp_servers.clone())
+            .unwrap_or_default();
+        let mut cfg = Self::for_project(cwd, flag_settings, bare_mode);
+        cfg.extra_mcp_servers.extend(flag_mcp);
 
         // ── Credential from the environment (not required for Ollama models).
         //
@@ -813,6 +811,25 @@ impl Config {
             flag_settings: old.flag_settings,
             claude_dir_override: old.claude_dir_override,
         };
+    }
+
+    /// A default config for `cwd` (the process's when None) with
+    /// `load_project` applied.
+    fn for_project(
+        cwd: Option<PathBuf>,
+        flag_settings: Option<crate::settings::Settings>,
+        bare_mode: bool,
+    ) -> Self {
+        let mut c = Config {
+            bare_mode,
+            flag_settings,
+            ..Config::default()
+        };
+        if let Some(dir) = cwd {
+            c.cwd = dir;
+        }
+        c.load_project();
+        c
     }
 
     /// Everything Config::load derives from `self.cwd`: settings.json (global
@@ -2590,6 +2607,29 @@ mod flag_settings_retarget_tests {
         assert_eq!(s.sandbox_enabled, Some(true));
         assert_eq!(s.sandbox_mode.as_deref(), Some("bwrap"));
         assert_eq!(s.model.as_deref(), Some("file-model"));
+    }
+
+    /// `--bare` used to be applied after discovery, so AGENTS.md and the
+    /// CLAUDE.md phase-routing directive still reached the session.
+    #[test]
+    fn bare_mode_skips_instruction_files_and_their_phase_routing() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("CLAUDE.md"),
+            "<!-- phase-routing: research=claude-bare-test-model -->",
+        )
+        .unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project agents").unwrap();
+
+        let full = Config::for_project(Some(project.path().to_path_buf()), None, false);
+        assert!(full.agentsmd.contains("project agents"));
+        assert_eq!(full.phase_router.research_model, "claude-bare-test-model");
+
+        let bare = Config::for_project(Some(project.path().to_path_buf()), None, true);
+        assert!(bare.bare_mode);
+        assert!(bare.claudemd.is_empty());
+        assert!(bare.agentsmd.is_empty());
+        assert_ne!(bare.phase_router.research_model, "claude-bare-test-model");
     }
 
     #[test]

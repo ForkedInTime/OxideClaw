@@ -1003,8 +1003,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 .status()
                 .await;
             resume_tty();
-            // Reload CLAUDE.md into config
-            config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
+            // Reload CLAUDE.md into config; --bare never loads it.
+            if !config.bare_mode {
+                config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
+            }
             *system_prompt = config.build_system_prompt();
             app.entries.push(ChatEntry::system(format!(
                 "CLAUDE.md reloaded ({} chars).",
@@ -1134,9 +1136,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 reloaded.push("sandboxMode");
             }
 
-            // Reload CLAUDE.md + AGENTS.md
-            config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
-            config.agentsmd = crate::config::Config::load_agents_md(&config.cwd);
+            // Reload CLAUDE.md + AGENTS.md; --bare never loads them.
+            if !config.bare_mode {
+                config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
+                config.agentsmd = crate::config::Config::load_agents_md(&config.cwd);
+            }
             // Turns send this string, not config; without the rebuild the
             // refreshed files never reached the model until a restart.
             *system_prompt = config.build_system_prompt();
