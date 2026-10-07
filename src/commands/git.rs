@@ -251,9 +251,11 @@ pub(super) fn cmd_commit(args: &str, _ctx: &CommandContext) -> CommandAction {
                 .into(),
         )
     } else {
-        // User provided the message — just run it
+        // User provided the message — just run it. Single-quoted for the
+        // shell: Debug's double quotes let bash run backticks and expand $.
+        let quoted = format!("'{}'", msg.replace('\'', "'\\''"));
         CommandAction::SendPrompt(format!(
-            "Please run: git add -A && git commit -m {msg:?}\n\
+            "Please run: git add -A && git commit -m {quoted}\n\
              Then confirm the commit was successful."
         ))
     }
@@ -614,6 +616,26 @@ mod prompt_command_tests {
         std::fs::write(d.join("a"), "2").unwrap();
         let out = msg(d);
         assert!(out.contains("\n   M a"), "{out}");
+    }
+
+    /// `{msg:?}` produced a double-quoted string, so bash ran backticks and
+    /// expanded `$HOME` inside the commit message.
+    #[test]
+    fn commit_message_survives_the_shell_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = "fix `parse_args` crash for $HOME and it's \"quoted\"";
+        let CommandAction::SendPrompt(prompt) = with_ctx(dir.path(), |c| cmd_commit(msg, c)) else {
+            panic!("expected a prompt");
+        };
+        let quoted = prompt
+            .strip_prefix("Please run: git add -A && git commit -m ")
+            .and_then(|r| r.split('\n').next())
+            .unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), msg);
     }
 
     /// The bare form promised to target the current branch's PR but only
