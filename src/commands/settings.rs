@@ -98,8 +98,11 @@ pub(super) fn cmd_rag(args: &str) -> CommandAction {
         "" => usage(),
         "index" => CommandAction::IndexProject { force: false },
         "status" | "stats" | "info" => CommandAction::RagStatus,
-        "rebuild" | "reindex" | "force" => CommandAction::IndexProject { force: true },
-        "clear" | "reset" | "delete" => CommandAction::RagClear,
+        // Only the documented words: `/rag <query>` is the primary form and
+        // RagClear wipes the index without confirmation, so a one-word search
+        // like `/rag delete` must stay a search.
+        "rebuild" => CommandAction::IndexProject { force: true },
+        "clear" => CommandAction::RagClear,
         // The documented `/rag search <q>` searched for the word "search"
         // too, which matched every `search` module ahead of the real hits.
         _ if first == "search" => {
@@ -505,6 +508,23 @@ mod rag_command_tests {
             }
         }
         assert!(matches!(cmd_rag("search"), CommandAction::Message(_)));
+    }
+
+    /// `reset`/`delete` used to wipe the index and `force`/`reindex` to
+    /// rebuild it: one-word searches must not be destructive aliases.
+    #[test]
+    fn undocumented_words_are_searches_not_index_actions() {
+        for word in ["delete", "reset", "force", "reindex"] {
+            match cmd_rag(word) {
+                CommandAction::RagSearch(q) => assert_eq!(q, word),
+                _ => panic!("/rag {word} should search"),
+            }
+        }
+        assert!(matches!(cmd_rag("clear"), CommandAction::RagClear));
+        assert!(matches!(
+            cmd_rag("rebuild"),
+            CommandAction::IndexProject { force: true }
+        ));
     }
 
     /// README/FEATURES show `/rag search "auth"`; the quotes used to be
