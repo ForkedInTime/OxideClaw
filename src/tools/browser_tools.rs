@@ -467,7 +467,8 @@ impl Tool for BrowserFillTool {
         if let Some(new_url) = browser::actions::current_url(&client).await {
             self.session.lock().await.current_url = new_url;
         }
-        Ok(ToolOutput::success(format!("{result}{dialogs}")))
+        let blocked = blocked_trailer(&self.session).await;
+        Ok(ToolOutput::success(format!("{result}{dialogs}{blocked}")))
     }
 }
 

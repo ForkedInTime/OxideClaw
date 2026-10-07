@@ -437,7 +437,14 @@ fn read_skill_file(path: &Path) -> std::result::Result<String, String> {
     {
         return Err("refused: it is or links to a file on the sensitive-file deny-list".into());
     }
-    std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))
+    // Repo-controlled and read before any /trust: a FIFO would hang startup
+    // and a link to /dev/zero read until out of memory. Regular files only,
+    // capped in size.
+    match crate::settings::read_config_file(path) {
+        Ok(Some(text)) => Ok(text),
+        Ok(None) => Err("unreadable: not found".into()),
+        Err(e) => Err(format!("unreadable: {e}")),
+    }
 }
 
 /// Parse an Agent Skills `SKILL.md`: frontmatter with a `name` usable as a
@@ -715,6 +722,32 @@ mod tests {
         assert_eq!(skills["c"].prompt_template, "Run C");
         assert_eq!(skills["d"].prompt_template, "Do D");
         assert_eq!(skills["b"].invoke("now").unwrap(), "Do B\n\nnow");
+    }
+
+    /// A cloned repo's SKILL.md that is a FIFO hung startup forever; one
+    /// linked to /dev/zero read until out of memory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_files_are_skipped_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let [agents, ..] = locations(dir.path());
+        let zero = at(&agents, "a/SKILL.md");
+        std::fs::create_dir_all(zero.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        let fifo = at(&agents, "b/SKILL.md");
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(10), load(dir.path()))
+            .await
+            .expect("loading skills must not block");
+        let invalid: Vec<_> = loaded.invalid.iter().map(|(p, _)| p.clone()).collect();
+        assert!(invalid.contains(&zero), "{invalid:?}");
+        if made {
+            assert!(invalid.contains(&fifo), "{invalid:?}");
+        }
     }
 
     #[tokio::test]
