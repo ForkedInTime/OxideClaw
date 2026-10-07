@@ -393,7 +393,7 @@ For each distinct area, use AskUserQuestion to confirm:
 1. **Verifier name** — suggest based on detection:
    - Single area: "verifier-playwright", "verifier-cli", "verifier-api"
    - Multiple areas: "verifier-<project>-<type>" (e.g., "verifier-frontend-playwright")
-   - Use lowercase letters, digits and hyphens only: the name becomes the file name and the `/<verifier-name>` command
+   - Use lowercase letters, digits and hyphens only: the name becomes the skill's folder name and the `/<verifier-name>` command
 
 2. **Project-specific questions** based on type (dev server command, URL, ready signal, etc.)
 
@@ -401,7 +401,7 @@ For each distinct area, use AskUserQuestion to confirm:
 
 ## Phase 4: Generate Verifier Skill
 
-Write the skill file to `.claude/skills/<verifier-name>.md` — a single flat file. OxideClaw only loads `*.md` files directly inside `.claude/skills/`, never from subfolders.
+Write the skill to `.agents/skills/<verifier-name>/SKILL.md`, the Agent Skills layout that OxideClaw and other agents load. The folder name must equal the `name` field, and the frontmatter needs both `name` and `description` or the skill is skipped. Put any helper script the verifier needs in that same folder and refer to it by its path relative to the folder.
 
 Use this template:
 
@@ -451,7 +451,7 @@ Allowed tools by type:
 ## Phase 5: Confirm Creation
 
 After writing the skill file(s), inform the user:
-1. Where each skill was created (always `.claude/skills/<verifier-name>.md`)
+1. Where each skill was created (always `.agents/skills/<verifier-name>/SKILL.md`)
 2. How to use them: ask the agent to run the Skill tool with the verifier name (works immediately; DiscoverSkills lists it), or type `/<verifier-name>` after restarting OxideClaw
 3. That they can edit the skills to customize them
 4. That they can run /init-verifiers again to add more verifiers for other areas"#.into()
@@ -657,15 +657,13 @@ mod prompt_command_tests {
         assert!(p.contains("PR 42."), "{p}");
     }
 
-    #[test]
-    fn init_verifiers_writes_a_skill_file_oxideclaw_loads() {
+    #[tokio::test]
+    async fn init_verifiers_writes_a_skill_oxideclaw_loads() {
         let CommandAction::SendPrompt(prompt) = cmd_init_verifiers() else {
             panic!("expected a prompt");
         };
-        // Skills are flat `<dir>/<name>.md` files; a `<name>/SKILL.md`
-        // folder is skipped by load_skills, DiscoverSkills and the Skill tool.
-        assert!(prompt.contains("`.claude/skills/<verifier-name>.md`"));
-        assert!(!prompt.contains("SKILL.md"));
+        assert!(prompt.contains("`.agents/skills/<verifier-name>/SKILL.md`"));
+        assert!(!prompt.contains(".claude/skills"));
         assert!(!prompt.contains("Verify agent"));
 
         let tpl_start = prompt.find("Use this template:\n\n```\n").unwrap()
@@ -674,7 +672,15 @@ mod prompt_command_tests {
         let content = prompt[tpl_start..tpl_start + tpl_len]
             .replace("<verifier-name>", "verifier-cli")
             .replace("<description based on type>", "Verify the CLI");
-        let skill = crate::skills::parse_skill_from_content(&content, "fallback").unwrap();
-        assert_eq!(skill.name, "verifier-cli");
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        let file = proj.join(".agents/skills/verifier-cli/SKILL.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, content).unwrap();
+        let loaded = crate::skills::load_skills_at(&proj, &dir.path().join("cfg"), None).await;
+        assert!(loaded.invalid.is_empty(), "{:?}", loaded.invalid);
+        assert_eq!(loaded.skills["verifier-cli"].description, "Verify the CLI");
+        let body = loaded.skills["verifier-cli"].invoke("").unwrap();
+        assert!(body.contains("You are a verification executor"), "{body}");
     }
 }
