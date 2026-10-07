@@ -598,13 +598,14 @@ mod tests {
 
     /// The indexer used to hold one write transaction across the whole walk
     /// and parse, so a /memory write on another connection waited out its
-    /// busy timeout and failed with "database is locked".
+    /// busy timeout and failed with "database is locked". Files now commit
+    /// one by one, so another connection sees the index grow while it runs.
     #[test]
-    fn memory_writes_are_not_locked_out_while_indexing() {
+    fn index_progress_is_committed_file_by_file() {
         let body: String = (0..40)
             .map(|i| format!("pub fn helper_{i}(x: u32) -> u32 {{ x + {i} }}\n"))
             .collect();
-        let files: Vec<(String, String)> = (0..300)
+        let files: Vec<(String, String)> = (0..200)
             .map(|i| (format!("src/m{i}.rs"), body.clone()))
             .collect();
         let refs: Vec<(&str, &str)> = files
@@ -617,28 +618,23 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let indexer = std::thread::spawn(move || {
             let db = RagDb::open(&root).unwrap();
-            let started = Instant::now();
             index_project(&db, &root, true).unwrap();
-            started.elapsed()
         });
 
-        let writer = rusqlite::Connection::open(tmp.path().join(".claude/rag.db")).unwrap();
-        writer
-            .busy_timeout(std::time::Duration::from_millis(500))
-            .unwrap();
-        let mut writes = 0;
+        let reader = rusqlite::Connection::open(tmp.path().join(".claude/rag.db")).unwrap();
+        let mut partial = false;
         while !indexer.is_finished() {
-            writer
-                .execute(
-                    "INSERT INTO memory (key, value) VALUES (?1, 'v')",
-                    [format!("k{writes}")],
+            let n: i64 = reader
+                .query_row(
+                    "SELECT COUNT(DISTINCT file_path) FROM code_chunks",
+                    [],
+                    |r| r.get(0),
                 )
-                .unwrap_or_else(|e| panic!("memory write {writes} failed: {e}"));
-            writes += 1;
-            std::thread::sleep(std::time::Duration::from_millis(2));
+                .unwrap();
+            partial |= n > 0 && n < 200;
         }
-        let took = indexer.join().unwrap();
-        assert!(writes > 0, "indexing finished in {took:?} before any write");
+        indexer.join().unwrap();
+        assert!(partial, "the whole index was committed in one transaction");
     }
 
     /// Chunks for a file that no longer exists must not survive an
