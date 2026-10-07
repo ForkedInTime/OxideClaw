@@ -39,10 +39,13 @@ pub fn enabled(setting: bool, no_update_check_env: Option<&str>) -> bool {
 }
 
 /// `latest` is a newer stable release than `current`. Pre-releases never
-/// notify, and neither does anything that is not valid semver.
+/// notify, and neither does anything that is not valid semver. Build
+/// metadata is dropped first: semver orders on it, so `0.4.1+build.7` would
+/// otherwise rank above `0.4.1`.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    let core = latest.split('+').next().unwrap_or(latest);
-    if core.contains('-') {
+    let latest = latest.split('+').next().unwrap_or(latest);
+    let current = current.split('+').next().unwrap_or(current);
+    if latest.contains('-') {
         return false;
     }
     self_update::version::bump_is_greater(current, latest).unwrap_or(false)
@@ -165,6 +168,12 @@ mod tests {
         assert!(is_newer("0.5.0", "0.5.0-rc.1"));
 
         assert!(!is_newer("0.4.1", "0.4.1"), "equal");
+        assert!(!is_newer("0.4.1+build.7", "0.4.1"), "equal with build");
+        assert!(
+            !is_newer("0.4.1", "0.4.1+build.7"),
+            "equal, current has build"
+        );
+        assert!(is_newer("0.4.2+build.7", "0.4.1"), "newer with build");
         assert!(!is_newer("0.4.0", "0.4.1"), "older");
         assert!(!is_newer("0.5.0-rc.1", "0.4.1"), "pre-release");
         assert!(
