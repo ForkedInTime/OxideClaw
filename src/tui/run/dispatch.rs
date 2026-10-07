@@ -1285,17 +1285,16 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
-        CommandAction::PluginCommand { plugin, command } => {
+        CommandAction::PluginCommand {
+            plugin,
+            command,
+            args,
+        } => {
             // Plugin slash commands → invoke as a prompt so Claude calls
             // the matching MCP tool (e.g. ctx_doctor → mcp__…__ctx_doctor).
             let is_connected = mcp_statuses.iter().any(|s| s.name == plugin);
             if is_connected {
-                let tool_name = command.replace('-', "_");
-                let prompt = format!(
-                    "Run the `{plugin}` MCP tool `{tool_name}`. \
-                     If the exact name doesn't match, look for the closest \
-                     tool starting with `mcp__` that contains `{tool_name}`."
-                );
+                let prompt = plugin_command_prompt(&plugin, &command, &args);
                 app.entries.push(ChatEntry::user(input.clone()));
                 app.scroll_to_bottom();
                 app.start_loading();
@@ -2708,6 +2707,24 @@ async fn uncommitted_diff(
     Ok((String::from_utf8_lossy(&out.stdout).into_owned(), untracked))
 }
 
+/// The user turn for `/<plugin>:<command> [args]`. The model only sees this
+/// prompt (the raw slash input stays local), so the user's arguments must be
+/// carried in it or the tool gets called with guessed or empty parameters.
+fn plugin_command_prompt(plugin: &str, command: &str, args: &str) -> String {
+    let tool_name = command.replace('-', "_");
+    let mut prompt = format!(
+        "Run the `{plugin}` MCP tool `{tool_name}`. \
+         If the exact name doesn't match, look for the closest \
+         tool starting with `mcp__` that contains `{tool_name}`."
+    );
+    if !args.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nCall it with these arguments from the user: {args}"
+        ));
+    }
+    prompt
+}
+
 /// Commands that send a prompt to the model, mirroring the arms below that
 /// spawn `run_api_task` or the browse loop. /budget is checked against these
 /// before they run, as it is for typed messages.
@@ -2839,14 +2856,16 @@ mod budget_tests {
         assert!(turn(
             CommandAction::PluginCommand {
                 plugin: "ctx".into(),
-                command: "doctor".into()
+                command: "doctor".into(),
+                args: String::new(),
             },
             "/ctx:doctor"
         ));
         assert!(!turn(
             CommandAction::PluginCommand {
                 plugin: "gone".into(),
-                command: "doctor".into()
+                command: "doctor".into(),
+                args: String::new(),
             },
             "/gone:doctor"
         ));
@@ -2860,6 +2879,29 @@ mod budget_tests {
         assert!(budget_blocks(&mut app, "/summary"));
         assert_eq!(app.input.iter().collect::<String>(), "/summary");
         assert!(app.entries.last().unwrap().text.contains("not sending"));
+    }
+
+    /// `/github:search_issues label:bug is:open` used to drop everything
+    /// after the command name; the model never saw the filter.
+    #[test]
+    fn plugin_command_arguments_reach_the_model() {
+        match dispatch_action("/github:search-issues label:bug is:open") {
+            CommandAction::PluginCommand {
+                plugin,
+                command,
+                args,
+            } => {
+                assert_eq!(plugin, "github");
+                assert_eq!(command, "search-issues");
+                assert_eq!(args, "label:bug is:open");
+                let prompt = plugin_command_prompt(&plugin, &command, &args);
+                assert!(prompt.contains("`search_issues`"), "{prompt}");
+                assert!(prompt.contains("label:bug is:open"), "{prompt}");
+            }
+            _ => panic!("expected PluginCommand"),
+        }
+        let bare = plugin_command_prompt("ctx", "doctor", "");
+        assert!(!bare.contains("arguments"), "{bare}");
     }
 
     fn dispatch_action(input: &str) -> CommandAction {

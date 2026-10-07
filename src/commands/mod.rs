@@ -213,8 +213,12 @@ pub enum CommandAction {
     ReloadSettings,
     /// Reload all plugin MCP servers (re-reads settings.json)
     ReloadPlugins,
-    /// Execute a plugin slash command (`<plugin>:<command>`)
-    PluginCommand { plugin: String, command: String },
+    /// Execute a plugin slash command (`<plugin>:<command> [args]`)
+    PluginCommand {
+        plugin: String,
+        command: String,
+        args: String,
+    },
     /// Show interactive model picker (async — needs Ollama query)
     ListModels,
     /// Show interactive voice model picker
@@ -539,6 +543,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
                 CommandAction::PluginCommand {
                     plugin: other[..colon].to_string(),
                     command: other[colon + 1..].to_string(),
+                    args: args.to_string(),
                 }
             } else {
                 CommandAction::Unknown(other.to_string())
