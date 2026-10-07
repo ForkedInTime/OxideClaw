@@ -41,8 +41,8 @@ pub struct FileDiff {
 ///
 /// Handles multi-file diffs. File path is taken from the `b/<path>` side of
 /// the `diff --git` header (the post-image path), matching how git describes
-/// the target tree. Lines that aren't part of a hunk (index / ---  / +++) are
-/// skipped.
+/// the target tree. Lines between a `diff --git` header and its first `@@`
+/// (index / --- / +++ / mode lines) are skipped.
 pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
     let mut files = Vec::new();
     let mut current_path = String::new();
@@ -51,9 +51,13 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
     let mut current_header = String::new();
     let mut additions = 0usize;
     let mut deletions = 0usize;
+    // Inside a hunk `---x` is a removed `--x` line and `+++x` an added `++x`
+    // line, so the file-header shapes only mean "header" before the first @@.
+    let mut in_hunk = false;
 
     for line in diff.lines() {
         if line.starts_with("diff --git") {
+            in_hunk = false;
             // Flush any in-progress hunk, then the in-progress file.
             if !current_path.is_empty() {
                 if !current_lines.is_empty() {
@@ -84,8 +88,9 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
                 });
             }
             current_header = line.to_string();
-        } else if line.starts_with("+++") || line.starts_with("---") || line.starts_with("index ") {
-            // Skip file/index headers — they're not part of any hunk body.
+            in_hunk = true;
+        } else if !in_hunk {
+            // File/index/mode headers — not part of any hunk body.
         } else if let Some(rest) = line.strip_prefix('+') {
             additions += 1;
             current_lines.push(DiffLine {

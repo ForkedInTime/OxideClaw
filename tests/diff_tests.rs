@@ -46,3 +46,34 @@ diff --git a/b.rs b/b.rs
     assert_eq!(files[0].path, "a.rs");
     assert_eq!(files[1].path, "b.rs");
 }
+
+#[test]
+fn hunk_lines_that_look_like_file_headers_are_counted() {
+    use oxideclaw::tui::diff::{DiffLineKind, parse_unified_diff};
+    // Dropping Markdown front matter yields `----` body lines; adding `++i;`
+    // yields `+++i;`. Both are hunk content, not `---`/`+++` file headers.
+    let diff = "\
+diff --git a/a.md b/a.md
+index 1111111..2222222 100644
+--- a/a.md
++++ b/a.md
+@@ -1,3 +1 @@
+----
+-title: x
+----
+diff --git a/b.c b/b.c
+index 3333333..4444444 100644
+--- a/b.c
++++ b/b.c
+@@ -1 +1,2 @@
+ int i;
++++i;
+";
+    let files = parse_unified_diff(diff);
+    assert_eq!(files.len(), 2);
+    assert_eq!((files[0].additions, files[0].deletions), (0, 3));
+    assert_eq!((files[1].additions, files[1].deletions), (1, 0));
+    let added = &files[1].hunks[0].lines[1];
+    assert_eq!(added.kind, DiffLineKind::Added);
+    assert_eq!(added.content, "++i;");
+}
