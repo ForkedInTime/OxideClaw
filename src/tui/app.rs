@@ -369,6 +369,9 @@ pub enum EntryKind {
     ToolCall,
     ToolStream, // Live streaming output from a running tool
     ToolResult,
+    /// A failed tool's output: collapsed like ToolResult, since a broken
+    /// build can be ~1 MB.
+    ToolError,
     Error,
     System,        // Short status messages — dim italic (e.g. "TTS stopped.")
     CommandOutput, // Readable multi-line command output — /doctor, /voice, /help, etc.
@@ -411,6 +414,12 @@ impl ChatEntry {
             text: t.into(),
         }
     }
+    pub fn tool_error(t: impl Into<String>) -> Self {
+        Self {
+            kind: EntryKind::ToolError,
+            text: t.into(),
+        }
+    }
     pub fn system(t: impl Into<String>) -> Self {
         Self {
             kind: EntryKind::System,
@@ -445,6 +454,10 @@ pub struct Overlay {
     pub selectable_ids: Vec<String>,
     /// Currently highlighted item index (0-based) for arrow key navigation.
     pub selected: usize,
+    /// Wrapped row count of each `rendered` line at the cached width, so a
+    /// frame does not re-wrap the whole (possibly huge, e.g. /diff) text.
+    /// Reset to None whenever `rendered` changes.
+    pub row_cache: Option<(u16, Vec<usize>)>,
 }
 
 impl Overlay {
@@ -458,6 +471,7 @@ impl Overlay {
             rendered,
             selectable_ids: Vec::new(),
             selected: 0,
+            row_cache: None,
         }
     }
     /// Create an interactive overlay with selectable items (e.g. session list).
@@ -471,6 +485,7 @@ impl Overlay {
             rendered,
             selectable_ids: ids,
             selected: 0,
+            row_cache: None,
         }
     }
     pub fn scroll_up(&mut self) {
@@ -1428,7 +1443,7 @@ impl App {
             }
             AppEvent::ToolResult { is_error, text } => {
                 if is_error {
-                    self.entries.push(ChatEntry::error(text));
+                    self.entries.push(ChatEntry::tool_error(text));
                 } else {
                     self.entries.push(ChatEntry::tool_result(text));
                 }

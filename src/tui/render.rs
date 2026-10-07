@@ -502,15 +502,21 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                 lines.push(Line::raw(""));
             }
 
-            EntryKind::Error => {
-                // A failed tool's whole output (a broken build can be ~1 MB)
-                // arrives here. A single span drops its newlines into one
-                // run-on paragraph that floods the screen and is re-wrapped
-                // every frame, so keep line breaks and collapse like
-                // ToolResult, with a little more room for the error itself.
+            EntryKind::Error | EntryKind::ToolError => {
+                // Keep line breaks: a single span drops newlines into one
+                // run-on paragraph. Only a failed tool's output (a broken
+                // build can be ~1 MB) is collapsed like ToolResult, with a
+                // little more room for the error itself; other errors (a
+                // missing credential, "Model unchanged: X") are shown whole
+                // because there is no key to expand them.
                 const MAX_LINES: usize = 6;
+                let cap = if matches!(entry.kind, EntryKind::ToolError) {
+                    MAX_LINES
+                } else {
+                    usize::MAX
+                };
                 let total = entry.text.lines().count();
-                for (i, raw) in entry.text.lines().take(MAX_LINES).enumerate() {
+                for (i, raw) in entry.text.lines().take(cap).enumerate() {
                     let prefix = if i == 0 {
                         Span::styled(
                             "✖ ",
@@ -524,9 +530,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                         Span::styled(raw.to_owned(), Style::default().fg(Color::Red)),
                     ]));
                 }
-                if total > MAX_LINES {
+                if total > cap {
                     lines.push(Line::from(Span::styled(
-                        format!("    [▸ {} more lines]", total - MAX_LINES),
+                        format!("    [▸ {} more lines]", total - cap),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -1230,20 +1236,42 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     // the popup takes two rows, and a line-based offset let the selection
     // drift below the bottom edge (where `d` would delete an unseen session)
     // and stopped short of the last rows of a long non-interactive overlay.
-    // Lines are pre-rendered markdown, computed once in Overlay::new().
+    // Lines are pre-rendered markdown, computed once in Overlay::new(); their
+    // wrapped row counts are cached per width, so a frame only clones and
+    // wraps the lines in view (a /diff overlay can be tens of thousands of
+    // lines and is redrawn on every 50 ms heartbeat).
     let width = inner.width.max(1);
-    let rows_of = |lines: &[Line<'static>]| {
-        Paragraph::new(Text::from(lines.to_vec()))
-            .wrap(Wrap { trim: false })
-            .line_count(width)
+    if overlay.row_cache.as_ref().is_none_or(|(w, _)| *w != width) {
+        let rows = overlay
+            .rendered
+            .iter()
+            .map(|l| {
+                Paragraph::new(l.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+                    .max(1)
+            })
+            .collect();
+        overlay.row_cache = Some((width, rows));
+    }
+    let Some((_, rows)) = &overlay.row_cache else {
+        return;
     };
-    let total = rows_of(&overlay.rendered);
+    // starts[i] = first wrapped row of line i; starts[n] = total rows.
+    let mut starts = Vec::with_capacity(rows.len() + 1);
+    let mut acc = 0usize;
+    starts.push(0);
+    for r in rows {
+        acc += r;
+        starts.push(acc);
+    }
+    let total = acc;
     let visible = inner.height as usize;
 
     // Auto-scroll to keep the selected item visible
     if let Some(line_idx) = overlay.rendered.iter().position(is_selected) {
-        let top = rows_of(&overlay.rendered[..line_idx]);
-        let bottom = top + rows_of(&overlay.rendered[line_idx..=line_idx]).max(1);
+        let top = starts[line_idx];
+        let bottom = starts[line_idx + 1];
         if top < overlay.scroll {
             overlay.scroll = top;
         } else if bottom > overlay.scroll + visible {
@@ -1252,12 +1280,17 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     }
 
     overlay.scroll = overlay.scroll.min(total.saturating_sub(visible));
+    if overlay.rendered.is_empty() {
+        return;
+    }
 
-    let display: Vec<Line> = overlay
-        .rendered
-        .iter()
-        .cloned()
-        .map(|mut line| {
+    // The line holding the first visible row, and the offset into it.
+    let first = starts.partition_point(|&s| s <= overlay.scroll) - 1;
+    let end_row = overlay.scroll + visible;
+    let display: Vec<Line> = (first..overlay.rendered.len())
+        .take_while(|&j| starts[j] < end_row)
+        .map(|j| {
+            let mut line = overlay.rendered[j].clone();
             if is_selected(&line) {
                 // Highlight the entire line
                 for span in &mut line.spans {
@@ -1272,11 +1305,12 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
         })
         .collect();
 
-    let scroll = u16::try_from(overlay.scroll).unwrap_or(u16::MAX);
+    // Smaller than one line's row count, so it always fits in u16.
+    let offset = u16::try_from(overlay.scroll - starts[first]).unwrap_or(u16::MAX);
     f.render_widget(
         Paragraph::new(Text::from(display))
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((offset, 0)),
         inner,
     );
 }
@@ -1520,7 +1554,7 @@ mod permission_popup_tests {
         let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
         app.show_welcome = false;
         let body: String = (0..500).map(|i| format!("err-line-{i}\n")).collect();
-        app.entries.push(crate::tui::app::ChatEntry::error(body));
+        app.entries.push(crate::tui::app::ChatEntry::tool_error(body));
         let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
@@ -1543,6 +1577,29 @@ mod permission_popup_tests {
         assert!(screen.contains("err-line-5"), "{screen}");
         assert!(!screen.contains("err-line-6"), "{screen}");
         assert!(screen.contains("[▸ 494 more lines]"), "{screen}");
+    }
+
+    /// Only tool failures collapse: a non-tool error such as a model switch
+    /// with no credential put "Model unchanged: X" behind "[▸ N more lines]"
+    /// with no key to expand it.
+    #[test]
+    fn non_tool_error_is_shown_whole() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.show_welcome = false;
+        let body = format!(
+            "Backend error: no credential\n{}\nModel unchanged: claude-x",
+            (1..=8)
+                .map(|i| format!("{i}. option {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(body.lines().count() >= 10);
+        app.entries.push(crate::tui::app::ChatEntry::error(body));
+        let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = screen_rows(&term).join("\n");
+        assert!(screen.contains("Model unchanged: claude-x"), "{screen}");
+        assert!(!screen.contains("more lines"), "{screen}");
     }
 
     /// The input box was sized by char count, so wide CJK text, a line
@@ -1716,5 +1773,38 @@ mod permission_popup_tests {
         .unwrap();
         let screen = screen_rows(&term).join("\n");
         assert!(screen.contains("END-OF-OVERLAY"), "{screen}");
+    }
+
+    /// Rows past 65535 were unreachable (absolute u16 scroll), and a partly
+    /// scrolled wrapped line must start mid-line, not at its first row.
+    #[test]
+    fn overlay_scrolls_past_u16_rows_and_into_wrapped_lines() {
+        let draw_it = |app: &mut crate::tui::app::App, term: &mut Terminal<TestBackend>| {
+            term.draw(|f| {
+                let area = f.area();
+                draw_overlay(f, area, app, theme_colors("dark"));
+            })
+            .unwrap();
+            screen_rows(term).join("\n")
+        };
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let big: String = (0..70_000).map(|i| format!("row-{i}\n\n")).collect();
+        app.overlay = Some(crate::tui::app::Overlay::new("diff", big));
+        app.overlay.as_mut().unwrap().scroll = usize::MAX;
+        let screen = draw_it(&mut app, &mut term);
+        assert!(screen.contains("row-69999"), "{screen}");
+        let o = app.overlay.as_ref().unwrap();
+        assert!(o.scroll > u16::MAX as usize);
+        assert!(o.row_cache.is_some());
+
+        // One line that wraps to many rows: scroll into its middle.
+        let words: String = (0..400).map(|i| format!("w{i:03} ")).collect();
+        app.overlay = Some(crate::tui::app::Overlay::new("notes", words));
+        app.overlay.as_mut().unwrap().scroll = 5;
+        let screen = draw_it(&mut app, &mut term);
+        // 14 words a row: row 5 starts at w070.
+        assert!(!screen.contains("w069 "), "{screen}");
+        assert!(screen.contains("│w070 "), "{screen}");
     }
 }
