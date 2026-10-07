@@ -10,11 +10,15 @@ on:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
 
-# Read-only by default: the build jobs run third-party actions, pip packages
-# and every crate's build script, none of which should hold a write token.
+# Each job asks for what it needs; the build jobs run third-party actions,
+# pip packages and every crate's build script, so they get a read-only token
+# and no OIDC.
 permissions:
   contents: read
 
+# Flow: build -> release (draft, SHA256SUMS, provenance attestations) ->
+# smoke (run the draft's Linux x64 assets on old and new distros) -> publish.
+# Users and docker.yml only ever see a release whose binaries started.
 jobs:
   build:
     strategy:
@@ -172,8 +176,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write    # gh release create
-      actions: write     # gh workflow run docker.yml
+      contents: write      # create the draft release and upload its assets
+      id-token: write      # OIDC token for the Sigstore signing certificate
+      attestations: write  # store the provenance attestations
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      release_id: ${{ steps.draft.outputs.id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -214,33 +222,173 @@ jobs:
           mv tmp.json manifest.json
           cat manifest.json
 
+      # One file to verify any download against (`sha256sum -c`). The
+      # per-asset .sha256 sidecars stay: install.sh, npm, the Dockerfile and
+      # the packaging script read them. Every sidecar must still match the
+      # binary it travelled with before either is published.
+      - name: Generate SHA256SUMS
+        working-directory: release
+        run: |
+          for sum in *.sha256; do
+            bin=${sum%.sha256}
+            want=$(cut -d' ' -f1 < "$sum" | tr -d '\r')
+            got=$(sha256sum "$bin" | cut -d' ' -f1)
+            if [ "$want" != "$got" ]; then
+              echo "::error::$bin hashes to $got but its sidecar says $want"
+              exit 1
+            fi
+          done
+          sums=$(sha256sum -- *)
+          printf '%s\n' "$sums" > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signed SLSA provenance tying each binary's digest to this workflow
+      # run; `gh attestation verify <file> --repo ForkedInTime/OxideClaw`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            release/oxideclaw-linux-x64
+            release/oxideclaw-linux-arm64
+            release/oxideclaw-linux-x64-musl
+            release/oxideclaw-macos-x64
+            release/oxideclaw-macos-arm64
+            release/oxideclaw-windows-x64.exe
+
       - name: Determine tag
         id: tag
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create GitHub Release
+      # A draft is invisible to users, install.sh and self-update until the
+      # publish job flips it. A full re-run first deletes the draft an earlier
+      # attempt left, so the smoke jobs can only fetch this run's assets.
+      - name: Create draft release
+        id: draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
           # A hyphenated tag (v1.0.0-beta.1) must not become /releases/latest,
           # which install.sh and /upgrade resolve for every stable user.
           EXTRA=()
           if [[ "$TAG" == *-* ]]; then EXTRA=(--prerelease --latest=false); fi
+          drafts() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+              --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id"
+          }
+          for id in $(drafts); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
           # --verify-tag: never create a missing tag at the default branch tip.
           gh release create "$TAG" \
+            --draft \
             --title "OxideClaw $TAG" \
             --generate-notes \
             --verify-tag \
             "${EXTRA[@]}" \
             release/*
-          # A release made with GITHUB_TOKEN triggers no workflows, so start
-          # the image build explicitly; the Dockerfile downloads the musl
-          # asset, which exists only from this point on.
+          id=$(drafts)
+          if [ "$(echo "$id" | wc -w)" != 1 ]; then
+            echo "::error::expected one draft release for $TAG, found: $id"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  # Downloads the draft's own assets (not the workflow artifacts), checks them
+  # against SHA256SUMS and runs them. The gnu build targets glibc 2.28, so
+  # Debian 10 and Rocky 8 (both exactly 2.28) prove the floor; the newer
+  # images catch a regression like the GLIBC_2.39 one. Any failure leaves the
+  # release a draft.
+  smoke:
+    name: smoke (${{ matrix.image }})
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # a draft release is visible only to a token with push access
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            asset: oxideclaw-linux-x64
+          - image: debian:12
+            asset: oxideclaw-linux-x64
+          - image: rockylinux:9
+            asset: oxideclaw-linux-x64
+          - image: debian:10
+            asset: oxideclaw-linux-x64
+          - image: rockylinux:8
+            asset: oxideclaw-linux-x64
+          - image: alpine:3
+            asset: oxideclaw-linux-x64-musl
+    steps:
+      - name: Download ${{ matrix.asset }} from the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          mkdir dl
+          for name in "$ASSET" SHA256SUMS; do
+            id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --jq ".assets[] | select(.name == \"$name\") | .id")
+            if [ -z "$id" ]; then
+              echo "::error::release $RELEASE_ID has no asset $name"
+              exit 1
+            fi
+            gh api -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "dl/$name"
+          done
+          cd dl
+          awk -v n="$ASSET" '$2 == n' SHA256SUMS | sha256sum -c -
+          chmod +x "$ASSET"
+
+      - name: oxideclaw --version on ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          ASSET: ${{ matrix.asset }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          out=$(docker run --rm --network none -v "$PWD/dl:/dl:ro" "$IMAGE" "/dl/$ASSET" --version)
+          echo "$out"
+          if [ "$out" != "oxideclaw ${TAG#v}" ]; then
+            echo "::error::$ASSET on $IMAGE printed '$out', expected 'oxideclaw ${TAG#v}'"
+            exit 1
+          fi
+
+  publish:
+    needs: [release, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # publish the draft
+      actions: write   # dispatch docker.yml
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          # A pre-release (hyphenated tag) stays off /releases/latest.
+          LATEST=true
+          if [[ "$TAG" == *-* ]]; then LATEST=false; fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest="$LATEST" --jq .html_url
+
+      # A release made with GITHUB_TOKEN triggers no workflows, so start the
+      # image build explicitly; the Dockerfile downloads the musl asset,
+      # which is public only from this point on.
+      - name: Build the Docker image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
           gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" \
             -f version="${TAG#v}"

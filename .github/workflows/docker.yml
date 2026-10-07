@@ -1,8 +1,9 @@
 name: Docker image
 
 # Publishes ghcr.io/forkedintime/oxideclaw:<version> (and :latest unless the
-# version is a pre-release such as 1.0.0-beta.1) from the musl release binary. release.yml dispatches it once the release assets are
-# uploaded; it can also be run by hand with a version (e.g. to backfill 0.4.0).
+# version is a pre-release such as 1.0.0-beta.1) from the musl release binary.
+# release.yml dispatches it once the smoke-tested draft is published; it can
+# also be run by hand with a version (e.g. to backfill 0.4.0).
 # A `release: published` trigger would never fire: release.yml publishes with
 # GITHUB_TOKEN, and events caused by that token do not start workflows (only
 # workflow_dispatch / repository_dispatch are exempt).
