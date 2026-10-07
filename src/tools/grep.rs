@@ -292,9 +292,12 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
     }
     args.push(search_arg.to_string_lossy().into_owned());
 
+    // Esc aborts the turn and drops this future; without kill_on_drop a
+    // search over a large tree with few matches keeps walking the disk.
     let output = Command::new("rg")
         .args(&args)
         .current_dir(&rg_cwd)
+        .kill_on_drop(true)
         .output()
         .await?;
 
