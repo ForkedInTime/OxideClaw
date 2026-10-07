@@ -61,8 +61,10 @@ cargo install oxideclaw
 
 **Docker (x86_64, from GitHub Container Registry):**
 ```bash
-docker run --rm -it -e ANTHROPIC_API_KEY -v "$PWD:/work" ghcr.io/forkedintime/oxideclaw
+docker run --rm -it --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -e ANTHROPIC_API_KEY -v "$PWD:/work" ghcr.io/forkedintime/oxideclaw
 ```
+`--user` runs as you, so the agent can edit your bind-mounted files whatever your uid; `HOME=/tmp` gives that uid a writable home for config and sessions.
 
 <details>
 <summary>Other install methods</summary>
