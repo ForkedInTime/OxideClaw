@@ -498,6 +498,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
             // snipped copy so the summary request has a chance to fit.
             let mut snipped = messages.clone();
             crate::compact::snip_compact(&mut snipped, &config.model);
+            if let Some(hook_cfg) = &config.hooks
+                && !config.disable_all_hooks
+            {
+                hooks::run_pre_compact_hooks(hook_cfg, session_id, &config.cwd).await;
+            }
             let bill = |u: &Usage| {
                 task_cost.record_with_cache(
                     &config.model,
@@ -521,6 +526,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             }
                         })
                         .unwrap_or(0);
+                    if let Some(hook_cfg) = &config.hooks
+                        && !config.disable_all_hooks
+                    {
+                        hooks::run_post_compact_hooks(hook_cfg, session_id, &config.cwd).await;
+                    }
                     let _ = tx.send(AppEvent::Compacted {
                         replacement: replacement.clone(),
                         summary_len,
@@ -1479,6 +1489,42 @@ mod loop_guard_tests {
         }
         assert_eq!(failed, None);
         assert!(compacted && done);
+    }
+
+    /// The mid-turn compact never ran the documented preCompact /
+    /// postCompact hooks; only the between-turns auto-compact did.
+    #[tokio::test]
+    async fn prompt_too_long_compact_runs_compact_hooks() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#;
+        let overflow = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
+        let (url, _seen) = serve(vec![overflow, text("summary"), text("answer")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("hooks.log");
+        let hook = |tag: &str| crate::settings::HookEntry {
+            matcher: String::new(),
+            command: format!("echo {tag} >> '{}'", log.display()),
+        };
+        let (mut t, mut rx) = task(url, dir.path(), None);
+        t.config.hooks = Some(crate::settings::HooksConfig {
+            pre_compact: vec![hook("pre")],
+            post_compact: vec![hook("post")],
+            ..Default::default()
+        });
+        run_api_task(t).await;
+
+        let mut compacted = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Compacted { .. } = ev {
+                compacted = true;
+            }
+        }
+        assert!(compacted);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "pre\npost\n");
     }
 
     /// A slash command that starts a turn (/review, a skill, a plugin

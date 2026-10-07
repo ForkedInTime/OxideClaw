@@ -120,6 +120,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             } else {
                 app.entries
                     .push(ChatEntry::system("Compacting conversation…"));
+                // Same hook contract as auto-compact: preCompact/postCompact
+                // fire for every compact cycle, not just the automatic one.
+                if let Some(hook_cfg) = &config.hooks
+                    && !config.disable_all_hooks
+                {
+                    hooks::run_pre_compact_hooks(hook_cfg, &session.id, &config.cwd).await;
+                }
                 app.compacting = true;
                 let c2 = client.clone();
                 // Snip only what is summarised: a failed summary must leave
@@ -147,6 +154,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                     }
                                 })
                                 .unwrap_or(0);
+                            if let Some(hook_cfg) = &cfg.hooks
+                                && !cfg.disable_all_hooks
+                            {
+                                hooks::run_post_compact_hooks(hook_cfg, &sid, &cfg.cwd).await;
+                            }
                             let _ = tx2.send(AppEvent::Compacted {
                                 replacement: r,
                                 summary_len,
