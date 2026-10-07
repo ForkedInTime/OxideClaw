@@ -1,0 +1,7 @@
+# Rust's MSVC targets link the C runtime dynamically by default, so the
+# release exe would import VCRUNTIME140.dll, which a clean Windows install
+# does not ship (it comes with the VC++ Redistributable). Linking the CRT
+# statically makes the exe start anywhere; every C dependency is built by
+# cc/cmake, which follow this flag, so nothing mixes /MD and /MT objects.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

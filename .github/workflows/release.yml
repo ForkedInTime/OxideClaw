@@ -133,6 +133,17 @@ jobs:
         run: |
           Copy-Item "target/${{ matrix.target }}/release/oxideclaw.exe" "${{ matrix.artifact }}"
 
+      # The static CRT comes from .cargo/config.toml; if it is ever lost, the
+      # exe imports VCRUNTIME140.dll and fails to start without the redist.
+      - name: Check static CRT (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Select-String -Path "${{ matrix.artifact }}" -Pattern 'vcruntime140' -SimpleMatch -Quiet) {
+            Write-Output "::error::${{ matrix.artifact }} imports VCRUNTIME140.dll (dynamic CRT)"
+            exit 1
+          }
+
       - name: Generate checksum (unix)
         if: runner.os != 'Windows'
         run: |
