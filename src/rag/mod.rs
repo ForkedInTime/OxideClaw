@@ -359,6 +359,10 @@ pub fn auto_context(index_dir: Option<&Path>, cwd: &Path, user_input: &str) -> S
 /// its tables show it is OxideClaw's, after its memories are copied to
 /// `.claude/memory.db`; anything else at that path is left alone.
 pub(crate) fn retire_legacy_db(project: &Path) {
+    // `~/.claude/rag.db` belongs to Claude Code's directory: never touched.
+    if crate::config::Config::is_claude_code_project(project) {
+        return;
+    }
     let legacy = project.join(".claude").join("rag.db");
     if !legacy.is_file() {
         return;

@@ -757,13 +757,31 @@ async fn run() -> Result<()> {
         colored::control::set_override(false);
     }
 
-    prepare_config_dirs();
+    // Parse first: `--help`, `--version` and a mistyped flag exit here,
+    // before the first-run import or the settings migration touch anything.
+    let cli = Cli::parse();
+
+    // A list-only `config import-claude` promises to change nothing. A
+    // flagged import still migrates first: it writes settings.json into the
+    // config dir, after which the automatic import would never run.
+    let list_only_import = matches!(
+        &cli.command,
+        Some(Commands::Config {
+            subcommand: ConfigSubcommand::ImportClaude {
+                hooks: false,
+                permissions: false,
+                api_key_helper: false,
+                mcp: false,
+            },
+        })
+    );
+    if !list_only_import {
+        prepare_config_dirs();
+    }
 
     // Load .env files before anything else so API keys are available
     // to Config::load() and all downstream code.
     load_dotenv_auto();
-
-    let cli = Cli::parse();
 
     // One-shot commands exit quietly when stdout is piped to `head` instead of
     // panicking on "Broken pipe". Long-lived modes keep Rust's SIG_IGN: they

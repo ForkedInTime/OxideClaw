@@ -1547,7 +1547,8 @@ impl Config {
     /// Claude Code's user directory, `~/.claude`. OxideClaw reads `CLAUDE.md`,
     /// `AGENTS.md`, skills, agents, output styles and workflows from it as an
     /// import format, and copies its own old state out of it once
-    /// (`claude_import`). Nothing ever writes here.
+    /// (`claude_import`). Nothing writes here unless `$OXIDECLAW_CONFIG_DIR`
+    /// names it as the config dir.
     pub fn claude_code_dir() -> Option<PathBuf> {
         dirs::home_dir()
             .filter(|h| h.is_absolute())
@@ -1961,40 +1962,21 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
 /// run from rewriting a value chosen since.
 pub const AUTONOMY_MIGRATION_MARKER: &str = ".autonomy-modes";
 
-/// Where the marker for Claude Code's `~/.claude` goes when that is the
-/// config dir: it is never written, so the data dir, or the cache dir when
-/// the data dir is inside it too.
-const CLAUDE_DIR_AUTONOMY_MARKER: &str = ".autonomy-modes-claude";
-
 /// Before the modes meant what they say, `auto-edit` (the old default) and
 /// `full-auto` both prompted for every edit. Once per config dir, a stored
 /// value of either becomes `ask`, so upgrading switches nobody to
 /// unprompted edits. Returns the line telling the user, if anything changed
-/// or could not be changed. Claude Code's `~/.claude` (named with
-/// `$OXIDECLAW_CONFIG_DIR`) is never written: a legacy value there is left
-/// as it is and reported once.
+/// or could not be changed. A `~/.claude` named with `$OXIDECLAW_CONFIG_DIR`
+/// is treated like any other explicit config dir: OxideClaw already saves
+/// its settings there.
 pub fn migrate_legacy_autonomy(config_dir: &Path) -> Option<String> {
-    let Some(claude) = Config::claude_code_dir().filter(|c| same_dir(config_dir, c)) else {
-        let marker = config_dir.join(AUTONOMY_MIGRATION_MARKER);
-        return migrate_legacy_autonomy_in(config_dir, true, Some(&marker));
-    };
-    let outside = |d: &PathBuf| !d.starts_with(&claude) && !same_dir(d, &claude);
-    let marker = Some(Config::data_dir())
-        .filter(outside)
-        .or_else(|| Config::cache_dir().filter(outside))
-        .map(|d| d.join(CLAUDE_DIR_AUTONOMY_MARKER));
-    migrate_legacy_autonomy_in(config_dir, false, marker.as_deref())
+    let marker = config_dir.join(AUTONOMY_MIGRATION_MARKER);
+    migrate_legacy_autonomy_in(config_dir, &marker)
 }
 
-/// [`migrate_legacy_autonomy`] with the choices made: whether `settings.json`
-/// may be rewritten, and the marker that says it is done (`None`: report
-/// on every run, for want of anywhere to record it).
-fn migrate_legacy_autonomy_in(
-    config_dir: &Path,
-    rewrite: bool,
-    marker: Option<&Path>,
-) -> Option<String> {
-    if marker.is_some_and(Path::exists) {
+/// [`migrate_legacy_autonomy`] with the marker that says it is done.
+fn migrate_legacy_autonomy_in(config_dir: &Path, marker: &Path) -> Option<String> {
+    if marker.exists() {
         return None;
     }
     let path = config_dir.join("settings.json");
@@ -2023,36 +2005,28 @@ fn migrate_legacy_autonomy_in(
         .filter(|a| is_legacy_autonomy(a));
     let mut line = None;
     if let Some(old) = legacy {
-        if !rewrite {
-            line = legacy_autonomy_notice(&old, &path.display().to_string()).map(|l| {
-                format!("{l} (OxideClaw never changes files in Claude Code's ~/.claude.)")
-            });
-        } else {
-            json["autonomy"] = serde_json::Value::String("ask".into());
-            let written = serde_json::to_string_pretty(&json)
-                .map_err(std::io::Error::other)
-                .and_then(|text| write_json_atomic(&path, &text));
-            if let Err(e) = written {
-                return Some(format!(
-                    "Warning: could not update \"autonomy\": \"{old}\" in {}: {e}. It now \
-                     pre-approves edits; set it to \"ask\" to keep being asked.",
-                    path.display()
-                ));
-            }
-            line = Some(format!(
-                "Autonomy: \"{old}\" in {} used to prompt for every edit and now \
-                 pre-approves them, so it was changed to \"ask\", which keeps the prompts. \
-                 Run /autonomy for what each mode does.",
+        json["autonomy"] = serde_json::Value::String("ask".into());
+        let written = serde_json::to_string_pretty(&json)
+            .map_err(std::io::Error::other)
+            .and_then(|text| write_json_atomic(&path, &text));
+        if let Err(e) = written {
+            return Some(format!(
+                "Warning: could not update \"autonomy\": \"{old}\" in {}: {e}. It now \
+                 pre-approves edits; set it to \"ask\" to keep being asked.",
                 path.display()
             ));
         }
+        line = Some(format!(
+            "Autonomy: \"{old}\" in {} used to prompt for every edit and now \
+             pre-approves them, so it was changed to \"ask\", which keeps the prompts. \
+             Run /autonomy for what each mode does.",
+            path.display()
+        ));
     }
-    if let Some(marker) = marker {
-        let _ = marker
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(marker, ""));
-    }
+    let _ = marker
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(marker, ""));
     line
 }
 
@@ -2336,12 +2310,25 @@ pub(crate) fn resolve_config_dir(
         .filter(|x| x.is_absolute())
     {
         Some(xdg) => xdg,
-        None => home.unwrap_or(Path::new(".")).join(".config"),
+        // Never a cwd-relative path: with no home, `./.config/oxideclaw`
+        // would let the repo being worked on supply the global config.
+        None => absolute_home_or_root(home).join(".config"),
     };
     ConfigDirChoice {
         dir: app_dir(&base),
         source,
     }
+}
+
+/// `home` when it is absolute, else the filesystem root: a fallback that
+/// never depends on the working directory.
+fn absolute_home_or_root(home: Option<&Path>) -> &Path {
+    home.filter(|h| h.is_absolute())
+        .unwrap_or(if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        })
 }
 
 /// Same directory (or file), by name or (when both exist) after resolving
@@ -2378,8 +2365,7 @@ fn data_dir_in(
         }
         (Some(xdg), None) => xdg.join(APP_DIR_NAME),
         (None, Some(profile)) => profile.to_path_buf(),
-        (None, None) => home
-            .unwrap_or(Path::new("."))
+        (None, None) => absolute_home_or_root(home)
             .join(".local")
             .join("share")
             .join(APP_DIR_NAME),
@@ -2400,6 +2386,19 @@ mod data_dir_tests {
             Path::new("/")
         };
         root.join(p)
+    }
+
+    /// With no home (or a relative one), the config and data dirs fell
+    /// back to `./.config` and `./.local/share`: the repo OxideClaw was
+    /// started in could supply its global settings.json and .env.
+    #[test]
+    fn no_home_never_means_a_cwd_relative_dir() {
+        for home in [None, Some(Path::new("rel/home"))] {
+            let dir = resolve_config_dir(&|_| None, home).dir;
+            assert!(dir.is_absolute(), "{}", dir.display());
+            let data = data_dir_in(None, home, None, |_| false);
+            assert!(data.is_absolute(), "{}", data.display());
+        }
     }
 
     /// The code index lives under `$XDG_CACHE_HOME/oxideclaw`, else
@@ -3696,37 +3695,23 @@ mod autonomy_migration_tests {
         assert!(!bad.path().join(AUTONOMY_MIGRATION_MARKER).exists());
     }
 
-    /// Claude Code's `~/.claude` (an `$OXIDECLAW_CONFIG_DIR` that names it)
-    /// is never written, but a legacy value there must still be reported,
-    /// once, with the marker kept outside it.
+    /// A `~/.claude` named with `$OXIDECLAW_CONFIG_DIR` was only reported:
+    /// the stored legacy mode kept pre-approving, though OxideClaw saves its
+    /// settings there anyway. Every config dir is migrated the same way.
     #[test]
-    fn a_legacy_value_in_a_dir_we_may_not_write_is_reported_once() {
+    fn a_legacy_value_is_rewritten_in_any_explicit_config_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-        let text = r#"{"autonomy": "full-auto"}"#;
-        std::fs::write(&path, text).unwrap();
-        let marker = data.path().join("state").join(CLAUDE_DIR_AUTONOMY_MARKER);
-        let line = migrate_legacy_autonomy_in(dir.path(), false, Some(&marker)).expect("reported");
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), r#"{"autonomy": "full-auto"}"#).unwrap();
+        let line = migrate_legacy_autonomy(&claude).expect("the user is told");
         assert!(
-            line.contains("full-auto") && line.contains("~/.claude") && line.contains("\"ask\""),
+            line.contains("full-auto") && line.contains("\"ask\"") && !line.contains("never"),
             "{line}"
         );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            text,
-            "never written"
-        );
-        assert!(!dir.path().join(AUTONOMY_MIGRATION_MARKER).exists());
-        assert!(marker.exists());
-        assert_eq!(
-            migrate_legacy_autonomy_in(dir.path(), false, Some(&marker)),
-            None
-        );
-        // Nowhere to record it: reported every run.
-        for _ in 0..2 {
-            assert!(migrate_legacy_autonomy_in(dir.path(), false, None).is_some());
-        }
+        assert_eq!(autonomy_in(&claude), "ask");
+        assert!(claude.join(AUTONOMY_MIGRATION_MARKER).exists());
+        assert_eq!(migrate_legacy_autonomy(&claude), None);
     }
 
     /// A `--settings` file is never rewritten; one carrying the old default

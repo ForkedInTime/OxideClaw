@@ -103,6 +103,11 @@ impl MemoryStore {
     /// never adds `.claude/memory.db` to a project that has none. Writes
     /// (`/memory add`, auto-capture) go through `open`.
     pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
+        // Run from $HOME, `.claude` is Claude Code's: neither retire an old
+        // rag.db there nor read its memory.db into the prompt.
+        if crate::config::Config::is_claude_code_project(cwd) {
+            return Ok(None);
+        }
         // Free when there is no rag.db. Another tool's rag.db, or an old
         // index with no memories, leaves no memory.db behind.
         crate::rag::retire_legacy_db(cwd);
@@ -578,6 +583,19 @@ mod tests {
 
     // Tests for private helper functions only.
     // Public API tests live in tests/memory_tests.rs.
+
+    /// From $HOME, `open_existing` (run for every system prompt) retired a
+    /// `~/.claude/rag.db` into `~/.claude/memory.db`: Claude Code's
+    /// directory, which nothing may write.
+    #[test]
+    fn the_home_directory_has_no_project_memory() {
+        let Some(home) = dirs::home_dir().filter(|h| h.is_absolute()) else {
+            return;
+        };
+        assert!(crate::config::Config::is_claude_code_project(&home));
+        assert!(MemoryStore::open_existing(&home).unwrap().is_none());
+        assert!(MemoryStore::open(&home).is_err());
+    }
 
     #[test]
     fn test_format_unix_date() {

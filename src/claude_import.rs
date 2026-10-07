@@ -259,6 +259,8 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
         ("memory.md", config),
         ("plugins.json", config),
         ("local-mcp", config),
+        // /teleport export wrote here before the config dir moved.
+        ("teleport.json", config),
     ] {
         let (src, dst) = (claude.join(name), dest_dir.join(name));
         if !src.exists() || dst.exists() {
@@ -811,6 +813,7 @@ mod tests {
             r#"{"ctx-plugin": {"spec": "ctx-plugin", "marketplace": false}}"#,
         );
         write(&claude.join("local-mcp/proj.json"), r#"{"mcpServers": {}}"#);
+        write(&claude.join("teleport.json"), r#"{"messages": []}"#);
         // OxideClaw sessions, and Claude Code's own files beside them.
         write(&claude.join("sessions/abc.meta"), r#"{"id": "abc"}"#);
         write(&claude.join("sessions/abc.jsonl"), "{}\n");
@@ -869,6 +872,10 @@ mod tests {
         );
         assert!(config.join("plugins.json").is_file());
         assert!(config.join("local-mcp/proj.json").is_file());
+        assert!(
+            config.join("teleport.json").is_file(),
+            "a /teleport export from before the move still imports"
+        );
         assert!(
             !config.join("CLAUDE.md").exists(),
             "read in place, not copied"

@@ -1010,15 +1010,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let claude_md = crate::config::Config::config_dir().join("CLAUDE.md");
             // Create the file if it doesn't exist. It replaces Claude Code's
             // ~/.claude/CLAUDE.md as the global file, so start from a copy.
-            if !claude_md.exists() {
+            let created_seed: Option<String> = if !claude_md.exists() {
                 if let Some(parent) = claude_md.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let seed = crate::config::Config::claude_code_dir()
                     .and_then(|d| std::fs::read_to_string(d.join("CLAUDE.md")).ok())
                     .unwrap_or_else(|| "# CLAUDE.md\n\n".to_string());
-                let _ = std::fs::write(&claude_md, seed);
-            }
+                std::fs::write(&claude_md, &seed).ok().map(|()| seed)
+            } else {
+                None
+            };
+            // The editor never ran or failed: an untouched seed would shadow
+            // ~/.claude/CLAUDE.md from now on, so remove it.
+            let discard_seed = || discard_untouched_seed(&claude_md, created_seed.as_deref());
             let editor = editor_command(std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
             // Suspend raw mode, run editor, restore
             suspend_tty();
@@ -1032,6 +1037,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 Ok(s) if s.success() => {}
                 // sh's "command not found": the editor never ran.
                 Ok(s) if cfg!(unix) && s.code() == Some(127) => {
+                    discard_seed();
                     app.entries.push(ChatEntry::error(format!(
                         "Could not launch editor '{editor}': command not found. \
                          Set $VISUAL or $EDITOR."
@@ -1040,6 +1046,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     return Ok(());
                 }
                 Ok(s) => {
+                    discard_seed();
                     app.entries.push(ChatEntry::error(format!(
                         "Editor '{editor}' exited with {s}; CLAUDE.md not reloaded."
                     )));
@@ -1047,6 +1054,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     return Ok(());
                 }
                 Err(e) => {
+                    discard_seed();
                     app.entries.push(ChatEntry::error(format!(
                         "Could not launch editor '{editor}': {e}. Set $VISUAL or $EDITOR."
                     )));
@@ -2826,6 +2834,18 @@ fn editor_command(visual: Option<String>, editor: Option<String>) -> String {
         .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "nano" }.to_string())
 }
 
+/// Remove `path` when this /memory run created it from `seed` and it still
+/// holds exactly that: the editor never saved, and a frozen copy of
+/// `~/.claude/CLAUDE.md` would shadow the original from then on. Edits a
+/// user saved before the editor failed are kept.
+fn discard_untouched_seed(path: &std::path::Path, seed: Option<&str>) {
+    if let Some(seed) = seed
+        && std::fs::read_to_string(path).ok().as_deref() == Some(seed)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Run `editor` on `path`. The variable is a command line, not a program
 /// name (`code --wait`, `emacsclient -t`): spawned verbatim it failed with
 /// ENOENT. Unix goes through the shell like git does; Windows splits on
@@ -2954,6 +2974,27 @@ mod tests {
 #[cfg(test)]
 mod editor_tests {
     use super::*;
+
+    #[test]
+    fn an_untouched_seed_is_removed_and_an_edited_one_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(&path, "seed").unwrap();
+        discard_untouched_seed(&path, Some("seed"));
+        assert!(
+            !path.exists(),
+            "an untouched seed must not shadow ~/.claude"
+        );
+
+        std::fs::write(&path, "seed plus the user's edit").unwrap();
+        discard_untouched_seed(&path, Some("seed"));
+        assert!(path.exists(), "saved edits are kept");
+
+        // A file that existed before this run is never removed.
+        std::fs::write(&path, "seed").unwrap();
+        discard_untouched_seed(&path, None);
+        assert!(path.exists());
+    }
 
     #[test]
     fn blank_visual_falls_through_to_editor() {
