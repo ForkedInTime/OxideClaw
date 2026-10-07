@@ -137,9 +137,11 @@ pub async fn spawn_agent(
     config: &Config,
     registry: &SpawnRegistry,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    budget_left: Option<f64>,
 ) -> Result<String> {
     let cwd = config.cwd.clone();
     check_capacity(registry)?;
+    let max_budget_usd = spawn_budget(config.max_budget_usd, budget_left)?;
 
     // Validate git repo
     let git_check = Command::new("git")
@@ -222,6 +224,7 @@ pub async fn spawn_agent(
     // Build config for the spawned agent
     let mut agent_config = config.clone();
     agent_config.cwd = worktree_path.clone();
+    agent_config.max_budget_usd = max_budget_usd;
 
     // System prompt addition for the spawned agent
     let spawn_context = format!(
@@ -246,9 +249,11 @@ pub async fn spawn_agent(
     let desc = description.clone();
     let wt_path = worktree_path.clone();
     let orig_cwd = cwd.clone();
+    let (usage_tx, usage_rx) = mpsc::unbounded_channel();
+    forward_usage(usage_rx, event_tx.clone());
 
     tokio::spawn(async move {
-        let result = run_spawned_agent(agent_config, &desc, cancel_rx).await;
+        let result = run_spawned_agent(agent_config, &desc, cancel_rx, usage_tx).await;
 
         // Collect the diff (committed + uncommitted changes since base)
         let diff = Command::new("git")
@@ -304,18 +309,53 @@ pub async fn spawn_agent(
     Ok(id)
 }
 
+/// The spend cap for a spawned agent: the tighter of `--max-budget-usd` and
+/// what `/budget` has left, since the TUI's budget check never sees the
+/// agent's own tool loop. Refuses outright when the budget is already spent.
+fn spawn_budget(engine_cap: Option<f64>, budget_left: Option<f64>) -> Result<Option<f64>> {
+    match budget_left {
+        Some(left) if left <= 0.0 => {
+            anyhow::bail!("Budget exceeded — use /budget to raise or clear the limit.")
+        }
+        Some(left) => Ok(Some(engine_cap.map_or(left, |cap| cap.min(left)))),
+        None => Ok(engine_cap),
+    }
+}
+
+/// Report the agent's spend to the TUI like the session's own, so /cost, the
+/// status bar and /budget include it. Ends when the engine drops its sink.
+fn forward_usage(
+    mut usage_rx: mpsc::UnboundedReceiver<(String, crate::api::types::Usage)>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some((model, u)) = usage_rx.recv().await {
+            let _ = event_tx.send(AppEvent::Usage {
+                model,
+                input: u.input_tokens,
+                output: u.output_tokens,
+                cache_read: u.cache_read_input_tokens,
+                cache_write: u.cache_creation_input_tokens,
+            });
+        }
+    });
+}
+
 /// Run the actual agent loop. Returns the final summary text.
 async fn run_spawned_agent(
     config: Config,
     task: &str,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    usage_sink: crate::tools::UsageSink,
 ) -> Result<String> {
     let tools = default_tools(crate::net_policy::NetPolicy::from_config(&config));
     // The user asked for an autonomous background agent: no prompts. Settings
     // deny rules still hold (PermissionState checks them before bypass).
     let gate =
         crate::permissions::PermissionGate::bypass_with_deny(&config.permissions_deny, &config.cwd);
-    let mut engine = QueryEngine::new(config, tools)?.with_permission_gate(gate);
+    let mut engine = QueryEngine::new(config, tools)?
+        .with_permission_gate(gate)
+        .with_usage_sink(Some(usage_sink));
 
     // Race the agent against the cancel signal
     tokio::select! {
@@ -756,6 +796,46 @@ mod tests {
         assert!(spawn_slug("Refactor Auth!", "a1b2").starts_with("spawn-refactor-auth"));
         assert_eq!(spawn_slug("", "a1b2"), "spawn-a1b2");
         assert_eq!(spawn_slug("!!!", "a1b2"), "spawn-a1b2");
+    }
+
+    #[test]
+    fn spawn_budget_takes_the_tighter_cap_and_refuses_when_spent() {
+        assert_eq!(spawn_budget(None, None).unwrap(), None);
+        assert_eq!(spawn_budget(Some(3.0), None).unwrap(), Some(3.0));
+        assert_eq!(spawn_budget(None, Some(1.5)).unwrap(), Some(1.5));
+        assert_eq!(spawn_budget(Some(3.0), Some(1.5)).unwrap(), Some(1.5));
+        assert_eq!(spawn_budget(Some(0.5), Some(1.5)).unwrap(), Some(0.5));
+        assert!(spawn_budget(None, Some(0.0)).is_err());
+    }
+
+    #[tokio::test]
+    async fn spawned_agent_spend_reaches_the_tui_cost_tracker() {
+        let (usage_tx, usage_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        forward_usage(usage_rx, event_tx);
+        let usage = crate::api::types::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+        };
+        usage_tx.send(("claude-sonnet-4-6".into(), usage)).unwrap();
+        drop(usage_tx);
+        match event_rx.recv().await {
+            Some(AppEvent::Usage {
+                model,
+                input,
+                output,
+                cache_read,
+                cache_write,
+            }) => {
+                assert_eq!(model, "claude-sonnet-4-6");
+                assert_eq!((input, output, cache_read, cache_write), (10, 20, 4, 3));
+            }
+            _ => panic!("expected AppEvent::Usage"),
+        }
+        // The forwarder exits once the engine's sink is gone.
+        assert!(event_rx.recv().await.is_none());
     }
 
     #[test]

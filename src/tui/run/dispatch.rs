@@ -1816,12 +1816,23 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
         }
         CommandAction::SpawnAgent(task) => {
+            if app.cost_tracker.over_budget() {
+                app.entries.push(ChatEntry::system(format!(
+                    "Budget exceeded (${:.4}) — not spawning. Use /budget to raise or clear the limit.",
+                    app.cost_tracker.total_cost_usd
+                )));
+                app.scroll_to_bottom();
+                return Ok(());
+            }
             let tx2 = tx.clone();
             let cfg = config.clone();
             let reg = spawn_registry.clone();
             let task2 = task.clone();
+            let budget_left = app.cost_tracker.remaining();
             tokio::spawn(async move {
-                match crate::spawn::spawn_agent(task2.clone(), &cfg, &reg, tx2.clone()).await {
+                match crate::spawn::spawn_agent(task2.clone(), &cfg, &reg, tx2.clone(), budget_left)
+                    .await
+                {
                     Ok(id) => {
                         let _ = tx2.send(AppEvent::SystemMessage(
                             format!("Spawned agent [{id}]: {task2}\nRuns in the background with no approval prompts (settings deny rules still apply). Use /spawn list to check status."),
