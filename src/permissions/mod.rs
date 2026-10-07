@@ -40,8 +40,8 @@ pub fn offers_always_allow(tool_name: &str) -> bool {
 /// gated the same way. It was previously absent, so on any machine with `pwsh`
 /// installed the model could run shell commands with no approval prompt at all.
 ///
-/// `MultiEdit` was absent too, so it edited any file with no prompt and
-/// ignored `deny: ["Edit"]`.
+/// `MultiEdit` was absent too, so it edited any file with no prompt. A bare
+/// `deny: ["Edit"]` covers it, Write and NotebookEdit (see `rule_matches`).
 ///
 /// `ExitPlanMode` is here so leaving plan mode is the user's call: the model
 /// asking is the plan being proposed, and the prompt is its approval.
@@ -307,7 +307,7 @@ fn path_field(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a parenthesised rule for `rule_tool` speaks for `tool_name`.
+/// Whether a rule for `rule_tool` speaks for `tool_name`.
 /// As in Claude Code, a `Read(...)` rule guards every tool that reads a
 /// file and an `Edit(...)` rule every tool that writes one; otherwise
 /// `deny: ["Read(./.env)"]` is dodged by `Grep` with `path: ".env"`.
@@ -460,7 +460,13 @@ fn rule_matches(
     deny: bool,
 ) -> RuleMatch {
     let Some((rule_tool, rest)) = rule.split_once('(') else {
-        return RuleMatch::from_bool(name_rule_matches(rule, tool_name));
+        // A bare `deny: ["Edit"]` must stop Write and NotebookEdit too, or a
+        // read-only session is one tool name away from writing under a
+        // pre-approving mode. Allow stays exact: "always allow Edit" is
+        // stored as a bare name and must not pre-approve Write.
+        return RuleMatch::from_bool(
+            name_rule_matches(rule, tool_name) || (deny && rule_covers(rule, tool_name)),
+        );
     };
     if !rule_covers(rule_tool, tool_name) {
         return RuleMatch::NoMatch;
@@ -782,7 +788,12 @@ fn multi_edit_matches(
 ) -> RuleMatch {
     // A parenthesised MultiEdit rule is an Edit rule over each file.
     let rule = match rule.split_once('(') {
-        None => return RuleMatch::from_bool(rule.eq_ignore_ascii_case("MultiEdit")),
+        None => {
+            return RuleMatch::from_bool(
+                rule.eq_ignore_ascii_case("MultiEdit")
+                    || (any && rule.eq_ignore_ascii_case("Edit")),
+            );
+        }
         Some((tool, rest)) if tool.eq_ignore_ascii_case("MultiEdit") => format!("Edit({rest}"),
         Some(_) => rule.to_string(),
     };
@@ -1768,6 +1779,59 @@ mod tests {
             "Read([)",
         ] {
             assert!(!rule_is_supported(bad), "{bad}");
+        }
+    }
+
+    /// A bare `deny: ["Edit"]` blocked only Edit, so a pre-approving mode
+    /// let Write, MultiEdit and NotebookEdit change files, and a bare
+    /// `deny: ["Read"]` let Grep print them.
+    #[test]
+    fn bare_deny_rules_cover_the_tool_family() {
+        use serde_json::json;
+        let calls = [
+            (
+                "Write",
+                json!({ "file_path": "/proj/a.rs", "content": "x" }),
+            ),
+            (
+                "MultiEdit",
+                json!({ "edits": [{ "file_path": "/proj/a.rs", "old_string": "a", "new_string": "b" }] }),
+            ),
+            (
+                "NotebookEdit",
+                json!({ "notebook_path": "/proj/a.ipynb", "new_source": "x" }),
+            ),
+        ];
+        for bypass in [true, false] {
+            let st =
+                PermissionState::new(bypass, &[], &["Edit".into()]).with_cwd(Path::new("/proj"));
+            for (tool, input) in &calls {
+                assert!(
+                    matches!(st.check_with_input(tool, Some(input)), CheckResult::Deny),
+                    "{tool} (bypass {bypass})"
+                );
+            }
+        }
+        let st = PermissionState::new(true, &[], &["Read".into()]).with_cwd(Path::new("/proj"));
+        for (tool, input) in [
+            ("Grep", json!({ "pattern": "x" })),
+            ("Glob", json!({ "pattern": "**" })),
+            ("NotebookRead", json!({ "notebook_path": "/proj/a.ipynb" })),
+            ("LSP", json!({ "file_path": "/proj/a.rs" })),
+        ] {
+            assert!(
+                matches!(st.check_with_input(tool, Some(&input)), CheckResult::Deny),
+                "{tool}"
+            );
+        }
+        // "Always allow Edit" grants Edit only.
+        let st = PermissionState::new(false, &[], &[]).with_cwd(Path::new("/proj"));
+        st.record_always_allow("Edit");
+        for (tool, input) in &calls {
+            assert!(
+                matches!(st.check_with_input(tool, Some(input)), CheckResult::Ask),
+                "{tool}"
+            );
         }
     }
 

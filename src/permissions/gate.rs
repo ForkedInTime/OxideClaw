@@ -709,6 +709,26 @@ mod tests {
         }
     }
 
+    /// A bare `deny: ["Edit"]` (a read-only session) stopped only Edit, so
+    /// auto-edit pre-approved Write and MultiEdit of in-project files.
+    #[tokio::test]
+    async fn bare_edit_deny_holds_for_every_writing_tool_under_auto_edit() {
+        let proj = tempfile::tempdir().unwrap();
+        let g = PermissionGate::new(
+            PermissionState::new(false, &[], &["Edit".into()]).with_cwd(proj.path()),
+            Autonomy::AutoEdit,
+            None,
+        );
+        for (tool, input) in [
+            ("Write", json!({"file_path": "src/a.rs", "content": "x"})),
+            ("MultiEdit", json!({"edits": [{"file_path": "src/a.rs"}]})),
+            ("NotebookEdit", json!({"notebook_path": "nb.ipynb"})),
+        ] {
+            let out = g.decide(tool, &input).await;
+            assert!(matches!(out, GateOutcome::Denied(_)), "{tool}: {out:?}");
+        }
+    }
+
     #[tokio::test]
     async fn auto_edit_pre_approves_nothing_when_the_project_is_home() {
         let Some(home) = dirs::home_dir() else {
