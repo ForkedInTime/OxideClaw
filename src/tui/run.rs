@@ -425,6 +425,18 @@ fn switch_model(
     Ok(msg)
 }
 
+/// Client for a turn the router sent to `routed`. The session client only
+/// serves config.model's backend: an Anthropic client posts `ollama:llama3`
+/// or `groq:...` to api.anthropic.com verbatim, so those tiers need their own.
+fn routed_client(config: &Config, client: &ApiBackend, routed: &str) -> Result<ApiBackend> {
+    let non_anthropic =
+        |m: &str| crate::api::is_ollama_model(m) || crate::api::is_openai_compat_model(m);
+    if routed == config.model || (!non_anthropic(routed) && !non_anthropic(&config.model)) {
+        return Ok(client.clone());
+    }
+    backend_for_model(config, routed)
+}
+
 async fn run_loop(
     mut config: Config,
     resume_id: Option<String>,
@@ -2005,5 +2017,24 @@ mod switch_model_tests {
         assert_eq!(app.model, "ollama:qwen");
         assert!(matches!(client, ApiBackend::Ollama(_)));
         assert_eq!(system_prompt, "unchanged");
+    }
+
+    /// The router reused the session's Anthropic client for every tier, so
+    /// `/router low ollama:llama3` (the usage example) posted "ollama:llama3"
+    /// to api.anthropic.com and each low-complexity turn failed.
+    #[test]
+    fn router_tier_on_another_backend_gets_its_own_client() {
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            ..Config::default()
+        };
+        let client = backend_for_model(&config, &config.model).unwrap();
+
+        let routed = routed_client(&config, &client, "ollama:llama3").unwrap();
+        assert!(matches!(routed, ApiBackend::Ollama(_)));
+
+        let same = routed_client(&config, &client, "claude-haiku-4-5").unwrap();
+        assert!(matches!(same, ApiBackend::Anthropic(_)));
     }
 }

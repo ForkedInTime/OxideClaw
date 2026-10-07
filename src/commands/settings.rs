@@ -130,7 +130,7 @@ pub(super) fn cmd_budget(args: &str) -> CommandAction {
 
 pub(super) fn cmd_router(args: &str) -> CommandAction {
     let args = args.trim();
-    match args {
+    let action = match args {
         "" | "status" => CommandAction::RouterStatus,
         "on" | "enable" => CommandAction::RouterSet(true),
         "off" | "disable" => CommandAction::RouterSet(false),
@@ -183,6 +183,14 @@ pub(super) fn cmd_router(args: &str) -> CommandAction {
              \n\n  Example: /router low ollama:llama3"
                 .into(),
         ),
+    };
+    // Tier models go to the API verbatim, so "haiku" must become a real id.
+    match action {
+        CommandAction::RouterSetTier { tier, model } => CommandAction::RouterSetTier {
+            tier,
+            model: super::resolve_model_alias(&model),
+        },
+        other => other,
     }
 }
 
@@ -472,5 +480,31 @@ mod rag_command_tests {
             }
         }
         assert!(matches!(cmd_rag("search"), CommandAction::Message(_)));
+    }
+}
+
+#[cfg(test)]
+mod router_command_tests {
+    use super::{CommandAction, cmd_router};
+
+    /// Tier models are sent to the API verbatim: `/router low haiku` used to
+    /// post model "haiku" and fail every low-complexity turn.
+    #[test]
+    fn tier_aliases_resolve_to_model_ids() {
+        for (args, tier_want, model_want) in [
+            ("low haiku", "low", "claude-haiku-4-5"),
+            ("medium sonnet", "medium", "claude-sonnet-5"),
+            ("high opus", "high", "claude-opus-5"),
+            ("super-high opus", "super-high", "claude-opus-5"),
+            ("low ollama:llama3", "low", "ollama:llama3"),
+        ] {
+            match cmd_router(args) {
+                CommandAction::RouterSetTier { tier, model } => {
+                    assert_eq!(tier, tier_want, "{args:?}");
+                    assert_eq!(model, model_want, "{args:?}");
+                }
+                _ => panic!("{args:?}: expected a tier change"),
+            }
+        }
     }
 }

@@ -849,10 +849,12 @@ impl Config {
         // Smart model router settings
         self.router_enabled = settings.router_enabled.unwrap_or(false);
         self.router_budget = settings.router_budget;
-        self.router_low_model = settings.router_low_model;
-        self.router_medium_model = settings.router_medium_model;
-        self.router_high_model = settings.router_high_model;
-        self.router_super_high_model = settings.router_super_high_model;
+        // Tier models go to the API verbatim, so "haiku" must become a real id.
+        let tier = |m: Option<String>| m.map(|m| crate::commands::resolve_model_alias(&m));
+        self.router_low_model = tier(settings.router_low_model);
+        self.router_medium_model = tier(settings.router_medium_model);
+        self.router_high_model = tier(settings.router_high_model);
+        self.router_super_high_model = tier(settings.router_super_high_model);
         if let Some(a) = settings.autonomy {
             self.autonomy = a;
         }

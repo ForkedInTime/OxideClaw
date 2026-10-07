@@ -685,7 +685,6 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 });
             }
 
-            let c2 = client.clone();
             let tvec = tools.to_vec();
             let msgs = messages.clone();
             let mut cfg = config.clone();
@@ -724,6 +723,17 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     cfg.model = routed_model;
                 }
             }
+            let c2 = match routed_client(config, client, &cfg.model) {
+                Ok(c) => c,
+                Err(e) => {
+                    app.entries.push(ChatEntry::error(format!(
+                        "Router: cannot use {}: {e}\n\nThis turn uses {}.",
+                        cfg.model, config.model
+                    )));
+                    cfg.model = config.model.clone();
+                    client.clone()
+                }
+            };
 
             let tx2 = tx.clone();
             // Inject brief mode instruction into system prompt if enabled
