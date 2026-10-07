@@ -366,6 +366,23 @@ fn draw_banner_right(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
 
 // ── Chat messages ─────────────────────────────────────────────────────────────
 
+/// A view of `lines` that borrows their text, for measuring wrap height
+/// without copying the whole history every frame.
+fn borrowed_text<'a>(lines: &'a [Line<'_>]) -> Text<'a> {
+    lines
+        .iter()
+        .map(|l| Line {
+            style: l.style,
+            alignment: l.alignment,
+            spans: l
+                .spans
+                .iter()
+                .map(|s| Span::styled(s.content.as_ref(), s.style))
+                .collect(),
+        })
+        .collect()
+}
+
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     if area.height == 0 {
         return;
@@ -639,8 +656,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     }
 
     // Scroll math — use ratatui's own line_count() so wrap matches exactly
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let total = para.line_count(area.width);
+    let total = Paragraph::new(borrowed_text(&lines))
+        .wrap(Wrap { trim: false })
+        .line_count(area.width);
     let visible = area.height as usize;
     let max_scroll = total.saturating_sub(visible);
 
@@ -653,7 +671,28 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
         }
     }
 
-    f.render_widget(para.scroll((app.scroll as u16, 0)), area);
+    // ratatui counts rows in u16, up to offset + height: past 65,535
+    // wrapped rows `as u16` wrapped around and showed the top of the history
+    // instead of the live reply. Drop whole lines above the viewport (each
+    // Line wraps on its own, so heights add up) until the rest fits.
+    let limit = (u16::MAX - area.height) as usize;
+    let mut offset = app.scroll;
+    let mut skip = 0;
+    while offset > limit && skip < lines.len() {
+        let rows = Paragraph::new(borrowed_text(&lines[skip..=skip]))
+            .wrap(Wrap { trim: false })
+            .line_count(area.width);
+        if rows > offset {
+            break;
+        }
+        offset -= rows;
+        skip += 1;
+    }
+    lines.drain(..skip);
+    let para = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((offset.min(limit) as u16, 0));
+    f.render_widget(para, area);
 
     // Scroll indicator badge
     if !app.follow_bottom && total > visible {
@@ -1417,6 +1456,36 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
 mod permission_popup_tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// The chat offset was cast `as u16`, so past 65,535 wrapped rows it
+    /// wrapped around and the view jumped to early history, hiding the
+    /// bottom of the chat and the live reply.
+    #[test]
+    fn chat_scrolls_correctly_past_65535_rows() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        // Two rows each ("● entry N" and a blank): 80,000 rows in all.
+        app.entries = (0..40_000)
+            .map(|i| crate::tui::app::ChatEntry::assistant(format!("entry {i}")))
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut draw_rows = |app: &mut crate::tui::app::App| {
+            term.draw(|f| {
+                let area = f.area();
+                draw_chat(f, area, app, theme_colors("dark"));
+            })
+            .unwrap();
+            screen_rows(&term)
+        };
+
+        let rows = draw_rows(&mut app);
+        assert!(rows.iter().any(|r| r.contains("entry 39999")), "{rows:#?}");
+
+        app.follow_bottom = false;
+        app.scroll = 70_000;
+        let rows = draw_rows(&mut app);
+        assert!(rows[0].contains("entry 35000"), "{rows:#?}");
+        assert_eq!(app.scroll, 70_000, "the offset itself is unchanged");
+    }
 
     fn render_permission(app: &mut crate::tui::app::App, w: u16, h: u16) -> (String, String) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
