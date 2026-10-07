@@ -339,7 +339,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
         (
             "lesson 3 — skills",
             "Skills (prompt templates)",
-            "Skills are reusable prompt templates stored in ~/.config/oxideclaw/skills/\n\
+            "Skills are reusable instructions you run as /<name> commands.\n\
              \n\
              **Built-in skills**\n\
              - /commit   — write a conventional git commit\n\
@@ -349,14 +349,20 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              - /test     — write tests\n\
              \n\
              **Create your own**\n\
-             Make a .md file in ~/.config/oxideclaw/skills/:\n\
+             Make .agents/skills/my-skill/SKILL.md in your project (or\n\
+             ~/.config/oxideclaw/skills/my-skill/SKILL.md for every project):\n\
              ```\n\
-             # My Skill\n\
-             What it does\n\
              ---\n\
-             Prompt template. Use {{ARGS}} for user arguments.\n\
+             name: my-skill\n\
+             description: What it does\n\
+             ---\n\
+             Instructions. Use {{ARGS}} for user arguments.\n\
              ```\n\
              Then invoke it with /my-skill some arguments\n\
+             \n\
+             Flat .md skills in .claude/skills/, ~/.config/oxideclaw/skills/ or\n\
+             ~/.claude/skills/ still load.\n\
+             /skills lists every loaded skill.\n\
              \n\
              Type /powerup 4 for the next lesson.",
         ),
