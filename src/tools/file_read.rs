@@ -73,13 +73,31 @@ impl Tool for FileReadTool {
             )));
         }
 
-        // Check file size
         let meta = fs::metadata(&path).await?;
-        if meta.len() > MAX_FILE_BYTES {
+        // Devices and FIFOs report length 0: /dev/zero would be read until the
+        // process runs out of memory, and a FIFO would block the tool forever.
+        if !meta.is_file() {
             return Ok(ToolOutput::error(format!(
-                "File too large ({} bytes). Use offset/limit to read sections.",
-                meta.len()
+                "Not a regular file: {} (directories, devices, FIFOs and sockets cannot be read)",
+                path.display()
             )));
+        }
+
+        if meta.len() > MAX_FILE_BYTES {
+            if input.offset.is_none() && input.limit.is_none() {
+                return Ok(ToolOutput::error(format!(
+                    "File too large to read whole ({} bytes, limit {MAX_FILE_BYTES}). \
+                     Pass offset/limit to read a section.",
+                    meta.len()
+                )));
+            }
+            // The section is streamed so a huge file never sits in memory.
+            let offset = input.offset.unwrap_or(1).saturating_sub(1);
+            let limit = input.limit.unwrap_or(MAX_LINES_DEFAULT).max(1);
+            return read_section(&path, offset, limit, meta.len())
+                .await
+                .map(ToolOutput::success)
+                .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e));
         }
 
         let content = fs::read_to_string(&path)
@@ -126,10 +144,93 @@ impl Tool for FileReadTool {
 
         if output.is_empty() {
             output = "(empty file)".to_string();
+        } else if end < total_lines {
+            // Without this the model treats the default 2000-line cap as the
+            // whole file and edits or reasons from a partial view.
+            output.push_str(&format!(
+                "\n... (showing lines {}-{end} of {total_lines}; use offset/limit to read more)\n",
+                offset + 1
+            ));
         }
 
         Ok(ToolOutput::success(output))
     }
+}
+
+/// Stream `limit` lines starting at 0-indexed line `offset` from a file too
+/// large to load whole, formatted like the in-memory path. Output is capped
+/// at `MAX_FILE_BYTES` so a file with one enormous line cannot exhaust memory.
+async fn read_section(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    file_len: u64,
+) -> std::io::Result<String> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut reader = tokio::io::BufReader::with_capacity(256 * 1024, fs::File::open(path).await?);
+    let budget = MAX_FILE_BYTES as usize;
+    let mut output = String::new();
+    let mut line_no = 0usize;
+    let mut capped = false;
+    let mut line = Vec::new();
+
+    'lines: while line_no < offset + limit {
+        line.clear();
+        let keep = line_no >= offset;
+        let mut saw_bytes = false;
+        loop {
+            let buf = reader.fill_buf().await?;
+            if buf.is_empty() {
+                if !saw_bytes {
+                    break 'lines;
+                }
+                break;
+            }
+            saw_bytes = true;
+            let (chunk, used, eol) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (&buf[..i], i + 1, true),
+                None => (buf, buf.len(), false),
+            };
+            if keep {
+                let room = budget.saturating_sub(output.len() + line.len());
+                if chunk.len() > room {
+                    capped = true;
+                }
+                line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            reader.consume(used);
+            if eol {
+                break;
+            }
+        }
+        line_no += 1;
+        if keep {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            output.push_str(&format!("{line_no}\t{}\n", String::from_utf8_lossy(&line)));
+            if capped {
+                break;
+            }
+        }
+    }
+
+    if output.is_empty() {
+        return Ok(format!(
+            "(no lines at offset {}: the file has {line_no} lines)",
+            offset + 1
+        ));
+    }
+    let more = capped || !reader.fill_buf().await?.is_empty();
+    if more {
+        output.push_str(&format!(
+            "\n... (showing lines {}-{line_no}; the file is {file_len} bytes and continues; \
+             use offset/limit to read more)\n",
+            offset + 1
+        ));
+    }
+    Ok(output)
 }
 
 /// Lexically clean a path by resolving `.` and `..` components WITHOUT
@@ -182,4 +283,90 @@ pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf> {
         );
     }
     Ok(cleaned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(o: &ToolOutput) -> String {
+        o.content
+            .iter()
+            .map(|c| match c {
+                crate::api::types::ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect()
+    }
+
+    async fn read(ctx: &ToolContext, input: serde_json::Value) -> ToolOutput {
+        FileReadTool.execute(input, ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_line_cap_says_the_file_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=2500).map(|i| format!("l{i}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        let out = text(&read(&ctx, json!({"file_path": "big.txt"})).await);
+        assert!(out.contains("2000\tl2000\n"), "{out}");
+        assert!(!out.contains("l2001"), "{out}");
+        assert!(out.contains("showing lines 1-2000 of 2500"), "{out}");
+
+        let tail = text(&read(&ctx, json!({"file_path": "big.txt", "offset": 2001})).await);
+        assert!(tail.contains("2500\tl2500"), "{tail}");
+        assert!(!tail.contains("showing lines"), "{tail}");
+    }
+
+    #[tokio::test]
+    async fn non_regular_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let out = read(&ctx, json!({"file_path": "sub"})).await;
+        assert!(out.is_error && text(&out).contains("Not a regular file"));
+
+        // A device reports length 0; /dev/zero would be read until OOM.
+        #[cfg(unix)]
+        {
+            let out = read(&ctx, json!({"file_path": "/dev/null"})).await;
+            assert!(out.is_error && text(&out).contains("Not a regular file"));
+        }
+    }
+
+    #[tokio::test]
+    async fn files_over_the_size_cap_can_be_read_by_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        let mut n = 0;
+        while body.len() as u64 <= MAX_FILE_BYTES {
+            n += 1;
+            body.push_str(&format!("row {n}\r\n"));
+        }
+        std::fs::write(dir.path().join("huge.log"), &body).unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        let whole = read(&ctx, json!({"file_path": "huge.log"})).await;
+        assert!(whole.is_error, "{}", text(&whole));
+        assert!(text(&whole).contains("offset/limit"));
+
+        let mid = read(
+            &ctx,
+            json!({"file_path": "huge.log", "offset": 800_000, "limit": 2}),
+        )
+        .await;
+        let mid = text(&mid);
+        assert!(
+            mid.starts_with("800000\trow 800000\n800001\trow 800001\n"),
+            "{mid}"
+        );
+        assert!(mid.contains("continues"), "{mid}");
+
+        let last = text(&read(&ctx, json!({"file_path": "huge.log", "offset": n})).await);
+        assert_eq!(last, format!("{n}\trow {n}\n"));
+
+        let past = text(&read(&ctx, json!({"file_path": "huge.log", "offset": n + 5})).await);
+        assert!(past.contains(&format!("the file has {n} lines")), "{past}");
+    }
 }
