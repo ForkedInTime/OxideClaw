@@ -866,6 +866,12 @@ impl App {
 
     /// Update the model and its cached short form together.
     pub fn set_model(&mut self, model: String) {
+        // The router's high tier defaults to the active model; left alone it
+        // kept routing hard prompts to the startup model after /model. A tier
+        // pinned to something else (routerHighModel, /router high) stays.
+        if self.router.high_model == self.model {
+            self.router.high_model = model.clone();
+        }
         self.model_short = pretty_model_name(&model);
         self.model = model;
     }
@@ -1902,5 +1908,31 @@ mod background_event_tests {
         app.voice_stop_tx = Some(stop_tx);
         app.apply(AppEvent::RecordingFailed("Recording failed: no mic".into()));
         assert!(app.voice_recording && app.voice_stop_tx.is_some());
+    }
+}
+
+#[cfg(test)]
+mod set_model_router_tests {
+    use super::*;
+
+    /// /model left the router's high tier on the startup model, so every
+    /// high-complexity prompt still went to (and was billed as) the old one.
+    #[test]
+    fn high_tier_follows_model_switch() {
+        let mut app = App::new("claude-opus-5", std::path::Path::new("/tmp"));
+        app.set_model("claude-sonnet-5".into());
+        assert_eq!(app.router.high_model, "claude-sonnet-5");
+        assert_eq!(
+            app.router.model_for(crate::router::Complexity::High),
+            "claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn pinned_high_tier_survives_model_switch() {
+        let mut app = App::new("claude-opus-5", std::path::Path::new("/tmp"));
+        app.router.high_model = "claude-opus-4-6".into();
+        app.set_model("claude-sonnet-5".into());
+        assert_eq!(app.router.high_model, "claude-opus-4-6");
     }
 }
