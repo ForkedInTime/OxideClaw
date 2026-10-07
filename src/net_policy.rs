@@ -20,10 +20,14 @@
 //!
 //! The check happens on the **resolved addresses**, not the hostname, and a
 //! direct connection is pinned to exactly those addresses so a DNS answer
-//! cannot change between the check and the connect. Public destinations go
-//! through the proxy `HTTP(S)_PROXY` names, if any, which resolves the host
-//! itself; private ones never do. Redirects are followed by hand so every
-//! hop goes through the same check.
+//! cannot change between the check and the connect. With a proxy in the
+//! environment (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, minus
+//! `NO_PROXY`) the name is still resolved and checked here first; public
+//! destinations then go through the proxy, which resolves the host again
+//! itself, and private ones (when allowed) connect directly. A name that
+//! does not resolve here goes to the proxy only if it looks public: the
+//! proxy is treated as trusted egress for those. Redirects are followed by
+//! hand so every hop goes through the same check.
 
 use anyhow::{Result, anyhow, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -114,39 +118,113 @@ impl NetPolicy {
     /// Scheme + host + DNS check. Returns every address the host resolved
     /// to, all of which passed `check_ip`, so the caller can pin them.
     pub async fn resolve(&self, url: &Url) -> Result<Vec<SocketAddr>> {
-        if !matches!(url.scheme(), "http" | "https") {
-            bail!(
-                "only http/https URLs can be fetched (got {}:)",
-                url.scheme()
-            );
-        }
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| anyhow!("URL has no port: {url}"))?;
-        let addrs: Vec<SocketAddr> = match url.host() {
-            Some(Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), port)],
-            Some(Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), port)],
-            Some(Host::Domain(name)) => tokio::net::lookup_host((name, port))
-                .await
-                .map_err(|e| anyhow!("could not resolve {name}: {e}"))?
-                .collect(),
-            None => bail!("URL has no host: {url}"),
-        };
-        if addrs.is_empty() {
-            bail!(
-                "{} did not resolve to any address",
-                url.host_str().unwrap_or("host")
-            );
-        }
-        // Every answer must pass: a mixed public/private answer is the
-        // classic rebinding shape, and the connector may pick any of them.
-        for a in &addrs {
+        self.resolve_with(url, &lookup_system).await
+    }
+
+    /// `resolve` with the name lookup done by `lookup`.
+    async fn resolve_with<L, F>(&self, url: &Url, lookup: &L) -> Result<Vec<SocketAddr>>
+    where
+        L: Fn(String, u16) -> F,
+        F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    {
+        let addrs = addresses(url, lookup).await??;
+        self.check_addrs(url, &addrs)?;
+        Ok(addrs)
+    }
+
+    /// Every answer must pass: a mixed public/private answer is the classic
+    /// rebinding shape, and the connector may pick any of them.
+    fn check_addrs(&self, url: &Url, addrs: &[SocketAddr]) -> Result<()> {
+        for a in addrs {
             self.check_ip(a.ip())
                 .map_err(|e| anyhow!("{}: {e}", url.host_str().unwrap_or("host")))?;
         }
-        Ok(addrs)
+        Ok(())
+    }
+
+    /// Reject a hostname that did not resolve here and would be handed to
+    /// a proxy to resolve. Its addresses cannot be checked, so only names
+    /// that look public pass: cloud metadata names never do, and
+    /// local-network names (`localhost`, single-label, `.internal`,
+    /// `.local`, `.lan`, ...) only when private destinations are allowed.
+    fn check_unresolved_name(&self, name: &str) -> Result<()> {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        if METADATA_NAMES.contains(&name.as_str()) {
+            bail!("{name} is a cloud metadata endpoint and is never fetched");
+        }
+        let local = !name.contains('.')
+            || LOCAL_SUFFIXES
+                .iter()
+                .any(|s| name.strip_suffix(s).is_some_and(|r| r.ends_with('.')));
+        if local && !self.allow_private {
+            bail!(
+                "{name} did not resolve here and looks like a local-network name; set allowPrivateNetworkFetch: true to let the proxy resolve it"
+            );
+        }
+        Ok(())
     }
 }
+
+/// Look `host` up with the system resolver.
+async fn lookup_system(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    Ok(tokio::net::lookup_host((host.as_str(), port))
+        .await?
+        .collect())
+}
+
+/// The addresses `url` points at. The outer error is a URL the policy
+/// refuses outright (scheme, no host or port); the inner one is a name the
+/// lookup could not resolve, which a proxy may still be able to.
+async fn addresses<L, F>(url: &Url, lookup: &L) -> Result<Result<Vec<SocketAddr>>>
+where
+    L: Fn(String, u16) -> F,
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!(
+            "only http/https URLs can be fetched (got {}:)",
+            url.scheme()
+        );
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("URL has no port: {url}"))?;
+    Ok(match url.host() {
+        Some(Host::Ipv4(ip)) => Ok(vec![SocketAddr::new(ip.into(), port)]),
+        Some(Host::Ipv6(ip)) => Ok(vec![SocketAddr::new(ip.into(), port)]),
+        Some(Host::Domain(name)) => match lookup(name.to_string(), port).await {
+            Ok(a) if a.is_empty() => Err(anyhow!("{name} did not resolve to any address")),
+            Ok(a) => Ok(a),
+            Err(e) => Err(anyhow!("could not resolve {name}: {e}")),
+        },
+        None => bail!("URL has no host: {url}"),
+    })
+}
+
+/// Cloud metadata hostnames: refused even when they cannot be resolved
+/// here and a proxy would resolve them.
+const METADATA_NAMES: [&str; 5] = [
+    "metadata",
+    "metadata.google.internal",
+    "metadata.goog",
+    "instance-data",
+    "instance-data.ec2.internal",
+];
+
+/// Suffixes of names that only exist on a local network (special-use and
+/// de-facto private TLDs).
+const LOCAL_SUFFIXES: [&str; 10] = [
+    "localhost",
+    "local",
+    "localdomain",
+    "internal",
+    "intranet",
+    "lan",
+    "home",
+    "home.arpa",
+    "corp",
+    "private",
+];
 
 /// 100.64.0.0/10 (RFC 6598, carrier-grade NAT). Treated as private.
 fn is_cgnat(ip: Ipv4Addr) -> bool {
@@ -174,20 +252,31 @@ pub async fn fetch(
     max_bytes: usize,
     timeout: std::time::Duration,
 ) -> Result<Fetched> {
-    fetch_with_env(url, policy, max_bytes, timeout, |k| {
-        std::env::var(k).ok().filter(|v| !v.trim().is_empty())
-    })
+    fetch_with_env(
+        url,
+        policy,
+        max_bytes,
+        timeout,
+        |k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()),
+        &lookup_system,
+    )
     .await
 }
 
-/// `fetch` with the proxy variables read through `env`.
-async fn fetch_with_env(
+/// `fetch` with the proxy variables read through `env` and names resolved
+/// by `lookup`.
+async fn fetch_with_env<L, F>(
     url: &str,
     policy: &NetPolicy,
     max_bytes: usize,
     timeout: std::time::Duration,
     env: impl Fn(&str) -> Option<String>,
-) -> Result<Fetched> {
+    lookup: &L,
+) -> Result<Fetched>
+where
+    L: Fn(String, u16) -> F,
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
     let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL {url:?}: {e}"))?;
     for _ in 0..=MAX_REDIRECTS {
         let host = current
@@ -212,7 +301,7 @@ async fn fetch_with_env(
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .user_agent(USER_AGENT);
-        let client = match route(policy, &current, chain).await? {
+        let client = match route(policy, &current, chain, lookup).await? {
             Route::Direct(addrs) => builder.resolve_to_addrs(&host, &addrs),
             Route::Upstream(proxy) => builder.proxy(reqwest::Proxy::all(proxy.as_str())?),
         }
@@ -510,37 +599,44 @@ enum Route<P> {
 }
 
 /// Route a connection to `url` under `policy`, given the proxy (NO_PROXY
-/// already applied) the environment names for it. The policy check always
-/// runs first. Public destinations then go through the proxy; loopback/LAN
-/// targets (allowed by the policy) connect directly. A name that does not
-/// resolve here may still resolve at the proxy (a network whose only way
-/// out is that proxy): the hostname checks applied, but the address pin
-/// cannot, since the proxy does its own DNS.
-async fn route<P>(policy: &NetPolicy, url: &Url, chain: Option<P>) -> Result<Route<P>> {
-    match policy.resolve(url).await {
-        Ok(addrs) => Ok(match chain {
-            Some(up)
-                if addrs
-                    .iter()
-                    .all(|a| NetPolicy::STRICT.check_ip(a.ip()).is_ok()) =>
-            {
-                Route::Upstream(up)
-            }
-            _ => Route::Direct(addrs),
-        }),
-        Err(e) => {
-            let unresolvable = matches!(url.scheme(), "http" | "https")
-                && match (url.host(), url.port_or_known_default()) {
-                    (Some(Host::Domain(d)), Some(port)) => {
-                        tokio::net::lookup_host((d, port)).await.is_err()
-                    }
-                    _ => false,
-                };
-            match chain {
-                Some(up) if unresolvable => Ok(Route::Upstream(up)),
-                _ => Err(e),
-            }
+/// already applied) the environment names for it. The name is resolved and
+/// checked here first, proxy or not. Public destinations then go through
+/// the proxy; loopback/LAN targets (allowed by the policy) connect
+/// directly. A name that does not resolve here may still resolve at the
+/// proxy (split-horizon DNS, or a network whose only way out is that
+/// proxy): it goes there only if it looks public (`check_unresolved_name`),
+/// and the address pin cannot apply, since the proxy does its own DNS.
+async fn route<P, L, F>(
+    policy: &NetPolicy,
+    url: &Url,
+    chain: Option<P>,
+    lookup: &L,
+) -> Result<Route<P>>
+where
+    L: Fn(String, u16) -> F,
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    match addresses(url, lookup).await? {
+        Ok(addrs) => {
+            policy.check_addrs(url, &addrs)?;
+            Ok(match chain {
+                Some(up)
+                    if addrs
+                        .iter()
+                        .all(|a| NetPolicy::STRICT.check_ip(a.ip()).is_ok()) =>
+                {
+                    Route::Upstream(up)
+                }
+                _ => Route::Direct(addrs),
+            })
         }
+        Err(e) => match (chain, url.host()) {
+            (Some(up), Some(Host::Domain(name))) => {
+                policy.check_unresolved_name(name)?;
+                Ok(Route::Upstream(up))
+            }
+            _ => Err(e),
+        },
     }
 }
 
@@ -622,7 +718,7 @@ async fn proxy_one(
     let port = url.port_or_known_default().unwrap_or(80);
     // NO_PROXY hosts connect directly, after the same check.
     let chain = upstream.filter(|u| !u.bypasses(&host));
-    let route = match route(&policy, &url, chain).await {
+    let route = match route(&policy, &url, chain, &lookup_system).await {
         Ok(r) => r,
         Err(e) => {
             let _ = client
@@ -1281,14 +1377,15 @@ mod tests {
         for url in [
             "http://oxideclaw-proxy-only.invalid/page",
             "http://93.184.215.14/x",
+            "http://public.example/y",
         ] {
-            let got = fetch_with_env(url, &NetPolicy::STRICT, 1024, t, &env)
+            let got = fetch_with_env(url, &NetPolicy::STRICT, 1024, t, &env, &fake_dns)
                 .await
                 .unwrap();
             assert_eq!(got.body, b"via-proxy", "{url}");
         }
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
         assert!(
             seen[0].starts_with("GET http://oxideclaw-proxy-only.invalid/page HTTP/1.1\r\n"),
             "{}",
@@ -1306,6 +1403,13 @@ mod tests {
             "{}",
             seen[1]
         );
+        // Resolved here to a public address, then named to the proxy (which
+        // resolves it again): never rewritten to the checked address.
+        assert!(
+            seen[2].starts_with("GET http://public.example/y "),
+            "{}",
+            seen[2]
+        );
     }
 
     #[tokio::test]
@@ -1319,7 +1423,7 @@ mod tests {
         let t = std::time::Duration::from_secs(10);
         let (base, hits) = scripted_server(vec![ok("local")]).await;
 
-        let err = fetch_with_env(&base, &NetPolicy::STRICT, 1024, t, &env)
+        let err = fetch_with_env(&base, &NetPolicy::STRICT, 1024, t, &env, &fake_dns)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("private"), "{err}");
@@ -1329,12 +1433,13 @@ mod tests {
             1024,
             t,
             &env,
+            &fake_dns,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("metadata"), "{err}");
 
-        let got = fetch_with_env(&base, &NetPolicy::LOCAL_OK, 1024, t, &env)
+        let got = fetch_with_env(&base, &NetPolicy::LOCAL_OK, 1024, t, &env, &fake_dns)
             .await
             .unwrap();
         assert_eq!(got.body, b"local");
@@ -1373,5 +1478,197 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "nothing may reach the proxy"
         );
+    }
+
+    /// Stand-in DNS: fixed answers, everything else NXDOMAIN.
+    async fn fake_dns(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        let ip = match host.as_str() {
+            "imds.example" => "169.254.169.254",
+            "lan.example" => "10.1.2.3",
+            "public.example" => "93.184.215.14",
+            "dev.example" => "127.0.0.1",
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                ));
+            }
+        };
+        Ok(vec![SocketAddr::new(ip.parse().unwrap(), port)])
+    }
+
+    /// With HTTP(S)_PROXY set, reqwest used to hand the hostname straight
+    /// to the proxy, so a name pointing at the metadata service or the LAN
+    /// was fetched through it. It is now resolved and checked here first.
+    #[tokio::test]
+    async fn proxied_fetch_refuses_names_that_resolve_to_metadata_or_lan() {
+        let (up, seen) = fake_upstream("HTTP/1.1 200 OK\r\n\r\nfrom-proxy").await;
+        let proxy = format!("http://127.0.0.1:{}", up.port);
+        let env = vars(&[
+            ("HTTP_PROXY", proxy.as_str()),
+            ("HTTPS_PROXY", proxy.as_str()),
+        ]);
+        let t = std::time::Duration::from_secs(10);
+
+        for policy in [NetPolicy::STRICT, NetPolicy::LOCAL_OK] {
+            for url in [
+                "http://imds.example/latest/meta-data/",
+                "https://imds.example/latest/meta-data/",
+            ] {
+                let err = fetch_with_env(url, &policy, 1024, t, &env, &fake_dns)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("metadata"), "{url}: {err}");
+            }
+        }
+        let err = fetch_with_env(
+            "http://lan.example/",
+            &NetPolicy::STRICT,
+            1024,
+            t,
+            &env,
+            &fake_dns,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("private"), "{err}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the proxy"
+        );
+
+        // Allowed, a LAN name connects directly to the checked address and
+        // never through the proxy.
+        let url = Url::parse("http://lan.example:8080/").unwrap();
+        match route(&NetPolicy::LOCAL_OK, &url, Some(proxy), &fake_dns)
+            .await
+            .unwrap()
+        {
+            Route::Direct(addrs) => assert_eq!(addrs, vec!["10.1.2.3:8080".parse().unwrap()]),
+            Route::Upstream(p) => panic!("LAN host sent to the proxy {p}"),
+        }
+    }
+
+    /// A name that does not resolve here can only be checked by its shape:
+    /// public-looking names go to the proxy (trusted egress), metadata
+    /// names never do, local-network names only with private allowed.
+    #[tokio::test]
+    async fn unresolvable_names_reach_the_proxy_only_when_they_look_public() {
+        let up = || Some("http://proxy:3128");
+        let route_of = async |policy: NetPolicy, u: &str| {
+            route(&policy, &Url::parse(u).unwrap(), up(), &fake_dns).await
+        };
+        for policy in [NetPolicy::STRICT, NetPolicy::LOCAL_OK] {
+            for u in [
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "https://METADATA.google.internal./",
+                "http://metadata/",
+                "http://instance-data/latest/",
+                "http://metadata.goog/",
+            ] {
+                let err = route_of(policy, u).await.err().expect(u);
+                assert!(err.to_string().contains("metadata"), "{u}: {err}");
+            }
+            assert!(matches!(
+                route_of(policy, "https://proxy-only.example.com/").await,
+                Ok(Route::Upstream(_))
+            ));
+        }
+        for u in [
+            "http://intranet/",
+            "http://localhost./",
+            "http://app.localhost/",
+            "http://printer.local/",
+            "http://git.corp/",
+            "http://db.internal:5432/",
+            "http://nas.home.arpa/",
+        ] {
+            let err = route_of(NetPolicy::STRICT, u).await.err().expect(u);
+            assert!(
+                err.to_string().contains("allowPrivateNetworkFetch"),
+                "{u}: {err}"
+            );
+            assert!(
+                matches!(
+                    route_of(NetPolicy::LOCAL_OK, u).await,
+                    Ok(Route::Upstream(_))
+                ),
+                "{u}"
+            );
+        }
+        // Without a proxy nothing changes: an unresolvable name fails.
+        let url = Url::parse("https://proxy-only.example.com/").unwrap();
+        let err = route(&NetPolicy::STRICT, &url, None::<()>, &fake_dns)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("could not resolve"), "{err}");
+    }
+
+    /// NO_PROXY hosts skip the proxy and get the normal pinned connection:
+    /// the name only resolves through the injected lookup, so reaching the
+    /// server proves the connection used the checked address.
+    #[tokio::test]
+    async fn no_proxy_hosts_connect_directly_to_the_checked_address() {
+        let (up, seen) = fake_upstream("HTTP/1.1 200 OK\r\n\r\nfrom-proxy").await;
+        let proxy = format!("http://127.0.0.1:{}", up.port);
+        let env = vars(&[("HTTP_PROXY", proxy.as_str()), ("NO_PROXY", "dev.example")]);
+        let t = std::time::Duration::from_secs(10);
+        let (base, hits) = scripted_server(vec![ok("local")]).await;
+        let url = base.replace("127.0.0.1", "dev.example");
+
+        let err = fetch_with_env(&url, &NetPolicy::STRICT, 1024, t, &env, &fake_dns)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("private"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let got = fetch_with_env(&url, &NetPolicy::LOCAL_OK, 1024, t, &env, &fake_dns)
+            .await
+            .unwrap();
+        assert_eq!(got.body, b"local");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the proxy"
+        );
+    }
+
+    /// A redirect served through the proxy is checked like the first hop.
+    #[tokio::test]
+    async fn proxied_redirects_to_metadata_are_refused() {
+        let t = std::time::Duration::from_secs(10);
+        for (answer, needle) in [
+            (
+                "HTTP/1.1 302 Found\r\nlocation: http://imds.example/latest/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "169.254.169.254",
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nlocation: http://metadata.google.internal/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "metadata.google.internal",
+            ),
+        ] {
+            let (up, seen) = fake_upstream(answer).await;
+            let proxy = format!("http://127.0.0.1:{}", up.port);
+            let env = vars(&[("HTTP_PROXY", proxy.as_str())]);
+            let err = fetch_with_env(
+                "http://public.example/",
+                &NetPolicy::LOCAL_OK,
+                1024,
+                t,
+                &env,
+                &fake_dns,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "only the first hop goes out: {seen:?}");
+            assert!(
+                seen[0].starts_with("GET http://public.example/ "),
+                "{}",
+                seen[0]
+            );
+        }
     }
 }
