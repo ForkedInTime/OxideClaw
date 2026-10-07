@@ -66,6 +66,16 @@ docker run --rm -it --user "$(id -u):$(id -g)" -e HOME=/tmp \
 ```
 `--user` runs as you, so the agent can edit your bind-mounted files whatever your uid; `HOME=/tmp` gives that uid a writable home for config and sessions.
 
+**Verify a download** (releases after v0.4.0 carry `SHA256SUMS` and signed build provenance):
+```bash
+base=https://github.com/ForkedInTime/OxideClaw/releases/latest/download
+curl -fsSLO "$base/oxideclaw-linux-x64"
+curl -fsSLO "$base/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS          # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+gh attestation verify oxideclaw-linux-x64 --repo ForkedInTime/OxideClaw
+```
+`SHA256SUMS` catches a corrupted download; `gh attestation verify` checks the Sigstore-signed provenance that ties the file's digest to this repository's release workflow, so a binary uploaded by hand or altered later fails. Swap in your platform's asset name.
+
 <details>
 <summary>Other install methods</summary>
 
@@ -82,9 +92,11 @@ curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install
 ```
 
 Pre-built binaries attached to every [release](https://github.com/ForkedInTime/OxideClaw/releases):
-- Linux: `x86_64-linux-gnu`, `aarch64-linux-gnu` (glibc 2.28+: Ubuntu 20.04, Debian 10, RHEL 8 or newer), `x86_64-linux-musl` (static, any distro)
+- Linux: `x86_64-linux-gnu`, `aarch64-linux-gnu` (glibc 2.28+: Ubuntu 20.04, Debian 10, RHEL 8 or newer), `x86_64-linux-musl` (static, any distro, including glibc older than 2.28)
 - macOS: `x86_64-apple-darwin` (Intel), `aarch64-apple-darwin` (Apple Silicon)
 - Windows: `oxideclaw-windows-x64.exe`
+
+Every release stays a draft until the x86_64 gnu binary has run on Debian 10 and Rocky Linux 8 (both glibc 2.28), Ubuntu 22.04, Debian 12 and Rocky Linux 9, and the musl binary on Alpine.
 </details>
 
 **Linux / macOS:**
