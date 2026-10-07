@@ -35,7 +35,7 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 ### PHASE 2 (shipping now)
 - **Auto-fix loop (2026-04-10)** — Post-edit lint + tests + feedback-driven retries replace the old rollback revert. Anti-cheat protected. `autoFixLoop` in settings.json, `autoRollback` alias kept for backward compat. Aider has the same loop; ours detects lint and test runners with zero config.
 - **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn snapshots on private git refs in your own repo (`refs/oxideclaw/sessions/<id>`): no commits on your branches, hidden from default `log`/`branch`/`status`, HEAD and index never moved. They do show in `git log --all` and are pushed by `--mirror`. New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. `/redo` after `/undo`, like OpenCode and Kilo; Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI have no redo.
-8. **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `oxideclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
+- **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `oxideclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
 
 ### NEXT UP
 1. **Trust gate + config namespace** — Repo code (lint/test runners) runs only in `/trust`ed projects; config moves to its own directory.
@@ -45,7 +45,7 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 5. **Task-success benchmark** — Measure finished tasks, not just startup time.
 
 ### THE PITCH
-"A ~19 MB static Rust binary that indexes your repo, caps your spend, and works offline with Ollama. No account, no gateway, no telemetry: your keys go straight to your provider."
+"A ~19 MB Rust binary that indexes your repo, caps your spend, and works offline with Ollama. No account, no gateway, no telemetry: your keys go straight to your provider."
 
 ## Our Advantages Over Other Rust Ports (updated 2026-10-07)
 

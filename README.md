@@ -133,7 +133,7 @@ How it compares with the agents people actually run. Competitor cells were check
 | `/budget` hard stop you can set mid-session | ◐ `--max-budget-usd`, print mode only | ❌ | ◐ billing-level limits | ❌ | ❌ | **✅ any provider, counts sub-agents** |
 | Replies spoken locally in a voice you record | ❌ | ◐ realtime voice, cloud, preset voices | ❌ | ❌ | ❌ | **✅ optional add-on (XTTS v2, Python)** |
 | Auto model routing | ❌ | — | ✅ Auto | — | ❌ | **◐ opt-in, keyword heuristic, Claude tiers by default** |
-| Auto-fix loop (lint + tests + retry after edits) | ◐ | — | — | — | ✅ | **✅ runners detected with zero config** |
+| Auto-fix loop (lint + tests + retry after edits) | ◐ | — | — | — | ✅ | **✅ runners detected with zero config; trusted projects only** |
 | `/undo` | ✅ `/rewind` (alias `/undo`) | — | ✅ | ✅ | ✅ reverts its own commit | **✅ private git refs, no commits on your branches** |
 | `/redo` after `/undo` | ❌ | ❌ | ❌ | ✅ | ❌ | **✅** |
 | Parallel agents in git worktrees | ✅ | ✅ on by default | ✅ | — | — | **✅ `spawn`, up to 8** |
@@ -205,9 +205,9 @@ Nine CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click
 
 Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July 7` navigates, fills forms, scrolls, reads results, and speaks the answer. 50-step hard cap (configurable), destructive-action approval gate (pauses at payment / delete / OAuth / free-trial-autobill), stagnation detector (escalating nudges when the model is stuck). `oxideclaw browse "<goal>"` runs the same loop headless from scripts or CI, streaming progress as NDJSON and ending with a JSON result. `/voice` with prefixes `browse | browser | web | go to | open | shop for | book | order` drives it hands-free with milestone TTS at start, gate trip, and end.
 
-### 🦀 &nbsp; Single 19 MB static binary
+### 🦀 &nbsp; Single ~19 MB binary
 
-No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw update` verifies them. Once a day the TUI asks GitHub in the background whether a newer release exists and, if so, says so in one dim line; `"updateCheck": false` in settings.json or `OXIDECLAW_NO_UPDATE_CHECK=1` turns that off.
+The core agent needs no runtime and no post-install scripts. `scp` it to a server and run. The Linux musl build is fully static; the gnu builds need glibc 2.28+. The optional voice add-on needs Python. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw update` verifies them. Once a day the TUI asks GitHub in the background whether a newer release exists and, if so, says so in one dim line; `"updateCheck": false` in settings.json or `OXIDECLAW_NO_UPDATE_CHECK=1` turns that off.
 
 ### 🪝 &nbsp; Lifecycle hooks
 

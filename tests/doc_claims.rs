@@ -55,6 +55,26 @@ const RETRACTED: &[(&str, &str)] = &[
         "the shortest /voice clone tier records 10 s",
     ),
     ("Piper", "there is no Piper TTS backend"),
+    (
+        "Haiku / Ollama",
+        "the router's default tiers are Claude models, none of them Ollama",
+    ),
+    (
+        "shown in `/cost`",
+        "routing savings are shown by `/router`, not `/cost`",
+    ),
+    (
+        "Single 19 MB static binary",
+        "only the musl build is static; the gnu builds need glibc 2.28+",
+    ),
+    (
+        "No dependencies.",
+        "the gnu builds need glibc and the voice add-on needs Python",
+    ),
+    (
+        "runs even in projects you have not",
+        "auto-fix runs the repo's lint and test commands only in /trust-ed projects",
+    ),
 ];
 
 #[test]
@@ -120,4 +140,72 @@ fn comparison_table_names_the_major_agents_and_three_unique_rows() {
         ]
     );
     assert!(README.contains("Only the first three rows are OxideClaw's alone"));
+}
+
+/// Auto-fix runs the repo's own lint and test commands only in `/trust`-ed
+/// projects: with the shipped defaults an untrusted project runs nothing,
+/// not even the runner probe, and the README says so.
+#[test]
+fn autofix_is_gated_on_trust_and_readme_says_so() {
+    let config = oxideclaw::config::Config::default();
+    assert_eq!(config.autonomy, "auto-edit");
+    assert!(oxideclaw::autofix::should_trigger(
+        &config.auto_fix,
+        &config.autonomy
+    ));
+    assert!(!config.project_trusted);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+    let untrusted = oxideclaw::autofix::Containment {
+        trusted: config.project_trusted,
+        ..Default::default()
+    };
+    let action = oxideclaw::autofix::run_auto_fix_check(
+        dir.path(),
+        &config.auto_fix,
+        &config.autonomy,
+        0,
+        &untrusted,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert!(
+        matches!(action, oxideclaw::autofix::AutoFixAction::Untrusted),
+        "{action:?}"
+    );
+    assert!(README.contains(
+        "In trusted projects, every edit triggers a lint and test cycle. Untrusted projects skip it until you run /trust."
+    ));
+    assert!(README.contains("**✅ runners detected with zero config; trusted projects only**"));
+}
+
+/// The router table lists the real default tiers, once, and nothing else.
+#[test]
+fn features_router_table_matches_router_defaults() {
+    let router = oxideclaw::router::RouterConfig::default();
+    let section: &str = FEATURES
+        .split("## Smart Model Router")
+        .nth(1)
+        .and_then(|s| s.split("\n---\n").next())
+        .expect("FEATURES.md has a Smart Model Router section");
+    let rows: Vec<&str> = section.lines().filter(|l| l.starts_with('|')).collect();
+    assert_eq!(rows.len(), 6, "header, separator and four tiers: {rows:#?}");
+    for (tier, model) in [
+        ("Low", router.low_model.as_str()),
+        ("Medium", router.medium_model.as_str()),
+        ("Super-high", router.super_high_model.as_str()),
+    ] {
+        let prefix = format!("| {tier} | `{model}` |");
+        assert!(
+            rows.iter().any(|r| r.starts_with(&prefix)),
+            "FEATURES.md router table lacks {prefix}"
+        );
+    }
+    assert!(
+        router.high_model.is_empty(),
+        "high tier is the current model"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("| High | your current model |"))
+    );
 }
