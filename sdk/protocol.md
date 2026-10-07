@@ -51,7 +51,6 @@ Start a new conversation and execute the first prompt.
   "model": "claude-sonnet-5",
   "max_turns": 10,
   "max_budget_usd": 5.0,
-  "record": true,
   "policy": {
     "allow": ["Read", "Glob", "Grep"],
     "auto_approve": ["Edit", "Write"],
@@ -60,7 +59,6 @@ Start a new conversation and execute the first prompt.
     "approval_timeout_seconds": 60
   },
   "capabilities": {
-    "show_diff": true,
     "open_browser": false,
     "play_audio": false,
     "interactive_approval": true,
@@ -78,7 +76,7 @@ Start a new conversation and execute the first prompt.
 | `model` | no | from config | Model name (e.g. `claude-sonnet-5`, `ollama:llama3`) |
 | `max_turns` | no | 50 | Max agentic loop iterations |
 | `max_budget_usd` | no | unlimited | Budget cap |
-| `record` | no | false | Save session to disk |
+| `record` | no | | Reserved and currently ignored: SDK sessions are not saved to disk |
 | `policy` | no | ask all | Tool approval policy |
 | `capabilities` | no | see below | Host environment capabilities |
 
@@ -460,7 +458,6 @@ The `capabilities` object tells the agent what the host environment supports:
 
 ```json
 {
-  "show_diff": true,
   "open_browser": false,
   "play_audio": false,
   "interactive_approval": true,
@@ -471,7 +468,7 @@ The `capabilities` object tells the agent what the host environment supports:
 
 | Field | Default | Effect |
 |-------|---------|--------|
-| `show_diff` | `true` | If false, agent describes changes in text |
+| `show_diff` | `true` | Reserved and currently ignored |
 | `open_browser` | `true` | If false, agent provides URLs as text |
 | `play_audio` | `false` | If true, agent may use voice features |
 | `interactive_approval` | `true` | If false, unlisted tools are denied instead of asked |

@@ -55,6 +55,8 @@ impl Default for Policy {
 /// Host capabilities — tells the agent what the environment supports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Reserved and not acted on (see sdk/protocol.md); kept so hosts that
+    /// send it still deserialize.
     #[serde(default = "default_true")]
     pub show_diff: bool,
     #[serde(default = "default_true")]
@@ -154,6 +156,7 @@ pub enum SdkRequest {
         max_turns: Option<u32>,
         #[serde(default)]
         max_budget_usd: Option<f64>,
+        /// Reserved and not acted on: SDK sessions are never saved to disk.
         #[serde(default)]
         record: Option<bool>,
         #[serde(default)]
