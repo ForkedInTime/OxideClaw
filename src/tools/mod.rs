@@ -463,6 +463,71 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
 }
 
 #[cfg(all(test, unix))]
+mod write_escape_tests {
+    use super::{Tool, ToolContext};
+    use std::os::unix::fs::symlink;
+
+    /// atomic_write follows a symlink to its target, so a repo-shipped
+    /// `docs/notes.md -> ~/.bashrc` let an approved project edit rewrite a
+    /// file outside the project.
+    #[tokio::test]
+    async fn writes_through_a_link_out_of_the_project_are_refused() {
+        let proj = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("bashrc");
+        std::fs::write(&target, "orig\n").unwrap();
+        std::fs::create_dir(proj.path().join("docs")).unwrap();
+        symlink(&target, proj.path().join("docs/notes.md")).unwrap();
+        symlink(outside.path(), proj.path().join("ext")).unwrap();
+        std::fs::write(proj.path().join("AGENTS.md"), "a\n").unwrap();
+        symlink("AGENTS.md", proj.path().join("CLAUDE.md")).unwrap();
+        let ctx = ToolContext::new(proj.path().to_path_buf());
+
+        for (tool, input) in [
+            (
+                Box::new(super::file_write::FileWriteTool) as Box<dyn Tool>,
+                serde_json::json!({"file_path": "docs/notes.md", "content": "pwned"}),
+            ),
+            (
+                Box::new(super::file_edit::FileEditTool),
+                serde_json::json!({"file_path": "docs/notes.md", "old_string": "orig", "new_string": "pwned"}),
+            ),
+            (
+                Box::new(super::file_write::FileWriteTool),
+                serde_json::json!({"file_path": "ext/bashrc", "content": "pwned"}),
+            ),
+        ] {
+            let out = tool.execute(input, &ctx).await.unwrap();
+            assert!(out.is_error, "{:?}", out.content);
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "orig\n");
+
+        // A link inside the project is still written through.
+        let out = super::file_write::FileWriteTool
+            .execute(
+                serde_json::json!({"file_path": "CLAUDE.md", "content": "b\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap(),
+            "b\n"
+        );
+        // So is a file outside the project named by its own path.
+        let out = super::file_write::FileWriteTool
+            .execute(
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "direct"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod atomic_write_tests {
     use super::atomic_write;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -626,6 +691,32 @@ pub fn resolve_for_sensitivity_check(path: &std::path::Path) -> std::path::PathB
         return real;
     }
     path.to_path_buf()
+}
+
+/// Refuses a write that would land outside the project through a symlink:
+/// a link named by the path (`docs/notes.md -> ~/.bashrc`), or a linked
+/// directory on the way to a path inside the project (`docs -> /etc`).
+/// Permission rules and the approval prompt see the name, not where it
+/// leads, and `/undo` cannot revert a write outside the repository. Editing
+/// the real path directly still works, with its own approval.
+pub fn check_write_escape(path: &std::path::Path, cwd: &std::path::Path) -> Option<ToolOutput> {
+    let real = resolve_for_sensitivity_check(path);
+    let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if real.starts_with(&root) {
+        return None;
+    }
+    let is_link = path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    let names_project_file = path.starts_with(cwd) || path.starts_with(&root);
+    if !is_link && !names_project_file {
+        return None;
+    }
+    Some(ToolOutput::error(format!(
+        "{} resolves through a symlink to {}, outside the project; edit that path directly so it can be approved.",
+        path.display(),
+        real.display()
+    )))
 }
 
 /// [`check_sensitive_path`] applied to both the supplied path and its symlink

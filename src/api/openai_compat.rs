@@ -1155,14 +1155,21 @@ mod max_tokens_tests {
     /// `max_tokens`. Only deepseek-chat (default 4k) still gets a cap.
     #[tokio::test]
     async fn default_cap_is_not_sent() {
-        for model in ["groq:llama-3.3-70b", "oai:o4-mini", "deepseek:deepseek-reasoner"] {
+        for model in [
+            "groq:llama-3.3-70b",
+            "oai:o4-mini",
+            "deepseek:deepseek-reasoner",
+        ] {
             let (url, body) = capture_one_body().await;
             let mut req = request(model);
             req.explicit_max_tokens = false;
             let _ = client(url).messages_stream(req, |_| {}).await;
             let body = body.await.unwrap();
             assert!(body.get("max_tokens").is_none(), "{model}: {body}");
-            assert!(body.get("max_completion_tokens").is_none(), "{model}: {body}");
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "{model}: {body}"
+            );
         }
         let (url, body) = capture_one_body().await;
         let mut req = request("ollama:qwen3");

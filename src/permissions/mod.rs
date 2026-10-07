@@ -417,10 +417,11 @@ fn rule_matches(
     // `~/./.ssh/id_rsa`, and a relative `.env` is the project's `.env`.
     let path = normalize_lexically(&cwd.join(raw).to_string_lossy());
     let home = dirs::home_dir().unwrap_or_default();
-    if path_rule_hit(inner, &path, cwd, &home, deny) {
+    let lexical_hit = path_rule_hit(inner, &path, cwd, &home, deny);
+    if lexical_hit && deny {
         return RuleMatch::Match;
     }
-    if !deny {
+    if !lexical_hit && !deny {
         return RuleMatch::NoMatch;
     }
     // A repository can ship `notes.md -> .env`: the tool follows the link,
@@ -431,6 +432,17 @@ fn rule_matches(
     );
     let real_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let real_home = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+    if !deny {
+        // An allow rule must cover the real destination too, or
+        // `Edit(./docs/**)` would auto-approve `docs/notes.md -> ~/.bashrc`.
+        let hit = real == path
+            || [cwd, real_cwd.as_path()].into_iter().any(|c| {
+                [home.as_path(), real_home.as_path()]
+                    .into_iter()
+                    .any(|h| path_rule_hit(inner, &real, c, h, deny))
+            });
+        return RuleMatch::from_bool(hit);
+    }
     for p in [&path, &real] {
         for c in [cwd, real_cwd.as_path()] {
             for h in [home.as_path(), real_home.as_path()] {
@@ -1367,6 +1379,38 @@ mod tests {
             st.check_with_input("Read", Some(&json!({ "file_path": real }))),
             CheckResult::Deny
         ));
+    }
+
+    /// An allow rule matched only the lexical path, so `Edit(./docs/**)`
+    /// auto-approved a write through `docs/notes.md -> ~/.bashrc`.
+    #[cfg(unix)]
+    #[test]
+    fn allow_rules_must_cover_the_symlink_target() {
+        use serde_json::json;
+        let proj = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/real.md"), "ok").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("bashrc"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("bashrc"), root.join("docs/notes.md"))
+            .unwrap();
+        std::os::unix::fs::symlink("real.md", root.join("docs/alias.md")).unwrap();
+
+        let allow = vec!["Edit(./docs/**)".to_string()];
+        let check = |cwd: &std::path::Path, f: &str| {
+            PermissionState::new(false, &allow, &[])
+                .with_cwd(cwd)
+                .check_with_input("Edit", Some(&json!({ "file_path": f })))
+        };
+        assert!(matches!(check(&root, "docs/real.md"), CheckResult::Allow));
+        assert!(matches!(check(&root, "docs/alias.md"), CheckResult::Allow));
+        assert!(!matches!(check(&root, "docs/notes.md"), CheckResult::Allow));
+
+        // The project opened through a symlink still matches its own files.
+        let via = outside.path().join("via");
+        std::os::unix::fs::symlink(&root, &via).unwrap();
+        assert!(matches!(check(&via, "docs/real.md"), CheckResult::Allow));
     }
 
     #[test]

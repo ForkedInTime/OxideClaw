@@ -116,7 +116,9 @@ impl Tool for MultiEditTool {
             };
             let label = format!("[{}/{}] {}", i + 1, input.edits.len(), path.display());
 
-            if let Some(err) = super::check_protected_path(&path) {
+            if let Some(err) = super::check_protected_path(&path)
+                .or_else(|| super::check_write_escape(&path, &ctx.cwd))
+            {
                 let msg = err
                     .content
                     .iter()

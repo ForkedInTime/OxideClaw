@@ -50,7 +50,9 @@ impl Tool for FileWriteTool {
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
 
-        if let Some(err) = super::check_protected_path(&path) {
+        if let Some(err) = super::check_protected_path(&path)
+            .or_else(|| super::check_write_escape(&path, &ctx.cwd))
+        {
             return Ok(err);
         }
         if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Write) {

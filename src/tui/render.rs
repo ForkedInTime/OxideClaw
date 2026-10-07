@@ -1554,7 +1554,8 @@ mod permission_popup_tests {
         let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
         app.show_welcome = false;
         let body: String = (0..500).map(|i| format!("err-line-{i}\n")).collect();
-        app.entries.push(crate::tui::app::ChatEntry::tool_error(body));
+        app.entries
+            .push(crate::tui::app::ChatEntry::tool_error(body));
         let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
