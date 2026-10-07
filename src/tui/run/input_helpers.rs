@@ -85,42 +85,6 @@ pub(super) fn handle_vim_normal(key: crossterm::event::KeyEvent, app: &mut App) 
 // ── Image attachment helper ───────────────────────────────────────────────────
 
 /// Read an image file and return it as a ContentBlock::Image (base64).
-/// Try to write `content` to the system clipboard via wl-copy (Wayland) or xclip (X11).
-/// Returns true if a clipboard tool was found and succeeded.
-pub(super) async fn try_clipboard_write(content: &str) -> bool {
-    use std::process::Stdio;
-    // Try wl-copy first (Wayland)
-    if let Ok(mut child) = tokio::process::Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .spawn()
-    {
-        if let Some(stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let mut s = stdin;
-            let _ = s.write_all(content.as_bytes()).await;
-        }
-        if child.wait().await.map(|s| s.success()).unwrap_or(false) {
-            return true;
-        }
-    }
-    // Fall back to xclip (X11)
-    if let Ok(mut child) = tokio::process::Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(Stdio::piped())
-        .spawn()
-    {
-        if let Some(stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let mut s = stdin;
-            let _ = s.write_all(content.as_bytes()).await;
-        }
-        if child.wait().await.map(|s| s.success()).unwrap_or(false) {
-            return true;
-        }
-    }
-    false
-}
-
 pub(super) fn attach_image(path: &str) -> AResult<ContentBlock> {
     // Re-checked here: the file may have changed since /image accepted it.
     crate::commands::check_image_file(std::path::Path::new(path)).map_err(anyhow::Error::msg)?;

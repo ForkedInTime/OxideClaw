@@ -37,20 +37,31 @@ fn pipe_to(cmd: &str, args: &[&str], text: &str) -> std::io::Result<std::process
     child.wait()
 }
 
+/// What to install when no clipboard tool worked.
+pub const CLIPBOARD_INSTALL_HINT: &str =
+    "Install one of: wl-clipboard (Wayland), xclip or xsel (X11), pbcopy (macOS), clip.exe (WSL).";
+
+/// Put `text` on the system clipboard with the first tool that succeeds.
+/// Blocking; /copy and /share clip both go through here so neither is
+/// limited to the Linux tools.
+pub fn copy_to_clipboard(text: &str) -> bool {
+    copy_with(CLIPBOARD_TOOLS, text)
+}
+
+fn copy_with(tools: &[(&str, &[&str])], text: &str) -> bool {
+    tools
+        .iter()
+        .any(|(cmd, args)| pipe_to(cmd, args, text).is_ok_and(|s| s.success()))
+}
+
 /// Write text to the system clipboard. Tries all known clipboard tools across platforms.
 pub fn clipboard_write(text: &str) -> CommandAction {
-    let ok = CLIPBOARD_TOOLS
-        .iter()
-        .any(|(cmd, args)| pipe_to(cmd, args, text).is_ok_and(|s| s.success()));
-
-    if ok {
+    if copy_to_clipboard(text) {
         CommandAction::Message("Copied to clipboard.".into())
     } else {
-        CommandAction::Message(
-            "Could not copy to clipboard.\n\
-             Install one of: wl-clipboard (Wayland), xclip or xsel (X11), pbcopy (macOS), clip.exe (WSL)."
-            .into()
-        )
+        CommandAction::Message(format!(
+            "Could not copy to clipboard.\n{CLIPBOARD_INSTALL_HINT}"
+        ))
     }
 }
 
@@ -209,7 +220,7 @@ pub(super) fn cmd_share(args: &str) -> CommandAction {
         _ => CommandAction::Message(
             "Share session\n\n\
              /share          — export session to a markdown file in the current directory\n\
-             /share clip     — copy session markdown to clipboard (requires xclip or wl-copy)"
+             /share clip     — copy session markdown to clipboard (wl-copy, xclip, xsel, pbcopy or clip.exe)"
                 .into(),
         ),
     }
@@ -219,7 +230,28 @@ pub(super) fn cmd_share(args: &str) -> CommandAction {
 
 #[cfg(test)]
 mod session_command_tests {
-    use super::{CLIPBOARD_TOOLS, CommandAction, cmd_session, pipe_to};
+    use super::{CLIPBOARD_TOOLS, CommandAction, cmd_session, copy_with, pipe_to};
+
+    /// /share clip only knew wl-copy and xclip, so it always failed on
+    /// macOS and Windows; it now shares this list and its fallthrough.
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_falls_through_to_a_working_tool() {
+        let names: Vec<&str> = CLIPBOARD_TOOLS.iter().map(|(c, _)| *c).collect();
+        assert!(names.contains(&"pbcopy") && names.contains(&"clip.exe"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clip.txt");
+        let script = format!("cat > '{}'", out.display());
+        let tools: &[(&str, &[&str])] = &[
+            ("definitely-not-a-clipboard-xyz", &[]),
+            ("false", &[]),
+            ("sh", &["-c", &script]),
+        ];
+        assert!(copy_with(tools, "session"));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "session");
+        assert!(!copy_with(&tools[..2], "session"));
+    }
 
     /// /copy passed the reply to wl-copy as an argument, so a Markdown
     /// bullet list ("- item") was parsed as an option and the copy failed.

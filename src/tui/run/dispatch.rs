@@ -944,12 +944,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         )));
                     }
                     Ok(content) => {
-                        // Try wl-copy (Wayland) then xclip (X11)
-                        let copied = try_clipboard_write(&content).await;
+                        let copied = tokio::task::spawn_blocking(move || {
+                            crate::commands::copy_to_clipboard(&content)
+                        })
+                        .await
+                        .unwrap_or(false);
                         let msg = if copied {
                             "Session copied to clipboard.".to_string()
                         } else {
-                            "Clipboard tools not found. Install wl-copy or xclip.".to_string()
+                            format!(
+                                "Could not copy to clipboard.\n{}",
+                                crate::commands::CLIPBOARD_INSTALL_HINT
+                            )
                         };
                         let _ = tx2.send(AppEvent::SystemMessage(msg));
                     }
