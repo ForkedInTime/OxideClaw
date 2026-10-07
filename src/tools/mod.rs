@@ -174,6 +174,11 @@ pub async fn snapshot_file(ctx: &ToolContext, path: &std::path::Path) {
         return;
     }
     let dest = snap_dir.join(&flat_name);
+    // A name that is not a plain file name would make join() escape snap_dir
+    // (an absolute Windows path replaces it outright, so dest == path).
+    if dest.parent() != Some(snap_dir.as_path()) {
+        return;
+    }
     // The first snapshot of a turn is the state /rewind must return to; a
     // second edit in the same turn would otherwise overwrite it.
     if dest.exists() {
@@ -182,37 +187,82 @@ pub async fn snapshot_file(ctx: &ToolContext, path: &std::path::Path) {
     let _ = tokio::fs::copy(path, &dest).await;
 }
 
-/// Reversible flat file name for a snapshot of `path`: `/` → `_`, with
+/// Reversible flat file name for a snapshot of `path`: separators → `_`, with
 /// literal `%` and `_` escaped. (Mapping only `/` → `_` restored
 /// `src/query_engine.rs` to `src/query/engine.rs`.)
 pub fn snapshot_name(path: &std::path::Path) -> String {
-    path.display()
-        .to_string()
-        .replace('%', "%25")
-        .replace('_', "%5F")
-        .replace('/', "_")
-        .trim_start_matches('_')
-        .to_string()
+    flatten_path(&path.to_string_lossy(), cfg!(windows))
 }
 
 /// Inverse of [`snapshot_name`].
 pub fn snapshot_path(flat: &str) -> std::path::PathBuf {
-    let path = flat
-        .split('_')
-        .map(|part| part.replace("%5F", "_").replace("%25", "%"))
-        .collect::<Vec<_>>()
-        .join("/");
-    std::path::PathBuf::from(format!("/{path}"))
+    std::path::PathBuf::from(unflatten_path(flat, cfg!(windows)))
+}
+
+/// On Windows both `\` and `/` separate, the drive colon is not a legal file
+/// name character, and canonicalize() adds a `\\?\` prefix whose `?` is not
+/// either. Unix names keep `\` and `:` as is, so existing local-mcp file
+/// names stay the same.
+fn flatten_path(path: &str, windows: bool) -> String {
+    let mut path = path.replace('%', "%25").replace('_', "%5F");
+    if !windows {
+        return path.replace('/', "_").trim_start_matches('_').to_string();
+    }
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        path = format!(r"\\{unc}");
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        path = rest.to_string();
+    }
+    // Leading separators are kept: they mark a UNC path.
+    path.replace(':', "%3A").replace(['\\', '/'], "_")
+}
+
+fn unflatten_path(flat: &str, windows: bool) -> String {
+    let parts = flat.split('_').map(|part| {
+        part.replace("%5F", "_")
+            .replace("%3A", ":")
+            .replace("%25", "%")
+    });
+    if windows {
+        parts.collect::<Vec<_>>().join("\\")
+    } else {
+        format!("/{}", parts.collect::<Vec<_>>().join("/"))
+    }
 }
 
 #[cfg(test)]
 mod snapshot_name_tests {
+    use super::{flatten_path, unflatten_path};
+
     #[test]
     fn names_round_trip_paths_with_underscores() {
         for p in ["/home/u/src/query_engine.rs", "/a/100%_done/b_c", "/x/y.rs"] {
             let path = std::path::Path::new(p);
             assert_eq!(super::snapshot_path(&super::snapshot_name(path)), path);
         }
+    }
+
+    #[test]
+    fn windows_names_are_flat_and_round_trip() {
+        for (p, back) in [
+            (r"C:\Users\u\my_proj\a.rs", r"C:\Users\u\my_proj\a.rs"),
+            (r"C:/Users/u/100%/a.rs", r"C:\Users\u\100%\a.rs"),
+            (r"\\?\C:\Users\u\proj", r"C:\Users\u\proj"),
+            (r"\\?\UNC\srv\share\a.rs", r"\\srv\share\a.rs"),
+            (r"\\srv\share\a.rs", r"\\srv\share\a.rs"),
+        ] {
+            let flat = flatten_path(p, true);
+            assert!(
+                !flat.contains(['\\', '/', ':', '?']),
+                "{p} -> {flat} is not a plain file name"
+            );
+            assert_eq!(unflatten_path(&flat, true), back, "{p} -> {flat}");
+        }
+    }
+
+    #[test]
+    fn unix_names_are_unchanged() {
+        assert_eq!(flatten_path("/home/u/a:b\\c_d", false), "home_u_a:b\\c%5Fd");
     }
 }
 
