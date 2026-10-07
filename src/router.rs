@@ -96,16 +96,36 @@ impl Classifier {
 
 /// Tiers found unusable (no credential, host not reachable) or usable,
 /// by model, for the rest of the session. Shared by every clone of the
-/// router, so each skipped tier is announced once.
-#[derive(Debug, Clone, Default)]
-pub struct TierHealth(Arc<Mutex<HashMap<String, Result<(), String>>>>);
+/// router, so each skipped tier is announced once. A usable OpenAI-compatible
+/// tier keeps its client: the client carries session state (the Responses
+/// reasoning store, summaries or tools found unsupported), which a client
+/// built fresh every prompt would lose.
+#[derive(Clone, Default)]
+pub struct TierHealth(Arc<Mutex<HashMap<String, Result<Option<ApiBackend>, String>>>>);
+
+impl std::fmt::Debug for TierHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let verdicts: Vec<(String, Result<(), String>)> = match self.0.lock() {
+            Ok(m) => m
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_ref().map(|_| ()).map_err(Clone::clone)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        f.debug_tuple("TierHealth").field(&verdicts).finish()
+    }
+}
 
 impl TierHealth {
-    fn get(&self, model: &str) -> Option<Result<(), String>> {
+    fn get(&self, model: &str) -> Option<Result<Option<ApiBackend>, String>> {
         self.0.lock().ok()?.get(model).cloned()
     }
 
     pub(crate) fn set(&self, model: &str, health: Result<(), String>) {
+        self.store(model, health.map(|()| None));
+    }
+
+    fn store(&self, model: &str, health: Result<Option<ApiBackend>, String>) {
         if let Ok(mut m) = self.0.lock() {
             m.insert(model.to_string(), health);
         }
@@ -126,7 +146,7 @@ impl TierHealth {
         };
         let mut v: Vec<(String, String)> = m
             .iter()
-            .filter_map(|(k, h)| h.clone().err().map(|why| (k.clone(), why)))
+            .filter_map(|(k, h)| h.as_ref().err().map(|why| (k.clone(), why.clone())))
             .collect();
         v.sort();
         v
@@ -865,7 +885,12 @@ impl RouterConfig {
         let model = self.model_for(tier);
         match self.health.get(model) {
             Some(Err(_)) => return None,
-            Some(Ok(())) => return client_for(config, session, model).ok(),
+            Some(Ok(Some(client))) => return Some(client),
+            Some(Ok(None)) => {
+                let client = client_for(config, session, model).ok()?;
+                self.health.store(model, Ok(cacheable(&client)));
+                return Some(client);
+            }
             None => {}
         }
         let checked = match client_for(config, session, model) {
@@ -877,7 +902,7 @@ impl RouterConfig {
         };
         match checked {
             Ok(client) => {
-                self.health.set(model, Ok(()));
+                self.health.store(model, Ok(cacheable(&client)));
                 Some(client)
             }
             Err(why) => {
@@ -889,6 +914,13 @@ impl RouterConfig {
             }
         }
     }
+}
+
+/// The client to keep for later prompts: an OpenAI-compatible one, built for
+/// this tier and holding its session state. The session's own Anthropic or
+/// Ollama client is taken afresh each time, so a changed login reaches it.
+fn cacheable(client: &ApiBackend) -> Option<ApiBackend> {
+    matches!(client, ApiBackend::OpenAiCompat(_)).then(|| client.clone())
 }
 
 /// Whether a request of `context_tokens` leaves the model room to work:
@@ -1380,6 +1412,38 @@ mod tests {
             vec!["claude-haiku-4-5".to_string()]
         );
         assert!(r.tiers_off_machine("claude-sonnet-5").is_empty());
+    }
+
+    /// A routed OpenAI-compatible tier got a fresh client every prompt, so
+    /// its refused-summary flag and reasoning store were lost each time.
+    /// The first usable client is kept and handed out again.
+    #[tokio::test]
+    async fn an_openai_compatible_tier_keeps_its_client() {
+        let (config, mut router) = ollama_setup("http://127.0.0.1:9", "small", "mid", "big");
+        router.low_model = "lmstudio:m".into();
+        router.health.set("lmstudio:m", Ok(()));
+        let session = session(&config);
+        let mut notices = Vec::new();
+        assert!(matches!(router.health.get("lmstudio:m"), Some(Ok(None))));
+        let first = router
+            .usable(&config, &session, Complexity::Low, &mut notices)
+            .await;
+        assert!(matches!(first, Some(ApiBackend::OpenAiCompat(_))));
+        assert!(
+            matches!(
+                router.health.get("lmstudio:m"),
+                Some(Ok(Some(ApiBackend::OpenAiCompat(_))))
+            ),
+            "kept for the next prompt"
+        );
+        // The session's own Ollama client is not kept.
+        router.health.set("ollama:mid", Ok(()));
+        let mid = router
+            .usable(&config, &session, Complexity::Medium, &mut notices)
+            .await;
+        assert!(matches!(mid, Some(ApiBackend::Ollama(_))));
+        assert!(matches!(router.health.get("ollama:mid"), Some(Ok(None))));
+        assert!(notices.is_empty(), "{notices:?}");
     }
 
     /// The classifier gets 3 s in use; past its timeout the heuristic

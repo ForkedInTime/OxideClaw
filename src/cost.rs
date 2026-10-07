@@ -215,6 +215,12 @@ fn openai_price(id: &str) -> ModelPrice {
         estimated: true,
         ..p
     };
+    // 1.05M-window models: a prompt over 272K input tokens bills at 2x
+    // input and 1.5x output.
+    let long = |p: ModelPrice| ModelPrice {
+        long_context: Some((272_000, p.input * 2.0, p.output * 1.5)),
+        ..p
+    };
     let tier = |t: &str| id.contains(&format!("-{t}"));
     if let Some((major, minor)) = crate::api::openai_compat::responses::gpt_version(id)
         && major >= 5
@@ -224,8 +230,8 @@ fn openai_price(id: &str) -> ModelPrice {
             match v {
                 (5, 0) | (5, 1) => price(15.0, 120.0, 1.0),
                 (5, 2) | (5, 3) => price(21.0, 168.0, 1.0),
-                (5, 4) | (5, 5) => price(30.0, 180.0, 1.0),
-                _ => estimated(price(30.0, 180.0, 1.0)),
+                (5, 4) | (5, 5) => long(price(30.0, 180.0, 1.0)),
+                _ => estimated(long(price(30.0, 180.0, 1.0))),
             }
         } else if tier("nano") {
             match v {
@@ -244,10 +250,10 @@ fn openai_price(id: &str) -> ModelPrice {
             match v {
                 (5, 0) | (5, 1) => price(1.25, 10.0, 0.1),
                 (5, 2) | (5, 3) => price(1.75, 14.0, 0.1),
-                (5, 4) => price(2.50, 15.0, 0.1),
-                (5, 5) => price(5.0, 30.0, 0.1),
+                (5, 4) => long(price(2.50, 15.0, 0.1)),
+                (5, 5) => long(price(5.0, 30.0, 0.1)),
                 // Later tiers run from $0.20 to $10 in (GPT-6 Astra).
-                _ => estimated(price(10.0, 50.0, 0.1)),
+                _ => estimated(long(price(10.0, 50.0, 0.1))),
             }
         };
     }
@@ -794,6 +800,40 @@ mod price_table_tests {
         }
     }
 
+    /// GPT-5.4 and 5.5 (1.05M window) bill a prompt over 272K input tokens
+    /// at 2x input and 1.5x output; at list rates a long session was
+    /// under-billed by up to 2x and `/budget` stopped late.
+    #[test]
+    fn gpt_5_4_and_5_5_long_prompts_bill_at_the_long_context_rate() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let m = 1_000_000;
+        for (model, want) in [
+            ("oai:gpt-5.4", 0.3 * 5.0 + 22.5),
+            ("oai:gpt-5.4-pro", 0.3 * 60.0 + 270.0),
+            ("oai:gpt-5.5", 0.3 * 10.0 + 45.0),
+            ("oai:gpt-5.5-pro", 0.3 * 60.0 + 270.0),
+        ] {
+            let got = model_price(model).cost(300_000, m, 0, 0);
+            assert!(close(got, want), "{model}: {got} != {want}");
+        }
+        // Exactly 272K is still the base rate.
+        let got = model_price("oai:gpt-5.4").cost(272_000, m, 0, 0);
+        assert!(close(got, 0.272 * 2.5 + 15.0), "{got}");
+        // Cached input counts toward the threshold.
+        let got = model_price("oai:gpt-5.4").cost(100_000, 0, 200_000, 0);
+        assert!(close(got, 0.1 * 5.0 + 0.2 * 0.5), "{got}");
+        // Unknown later versions err early, mini/nano and 5.0-5.3 do not.
+        assert!(model_price("oai:gpt-5.9").long_context.is_some());
+        for model in [
+            "oai:gpt-5.4-mini",
+            "oai:gpt-5.4-nano",
+            "oai:gpt-5.2",
+            "oai:gpt-5",
+        ] {
+            assert!(model_price(model).long_context.is_none(), "{model}");
+        }
+    }
+
     /// OpenAI list prices per family: variants before their base id, and
     /// each family's own cached-input share. `oai:gpt-5` was billed at
     /// GPT-4o rates (2x input, 5x cache reads) and the `-pro` models at a
@@ -837,7 +877,8 @@ mod price_table_tests {
                 p.input,
                 p.output
             );
-            let got = p.cost(0, 0, m, 0);
+            // 100K cached tokens: under GPT-5.4's long-context threshold.
+            let got = p.cost(0, 0, m / 10, 0) * 10.0;
             assert!(close(got, cached), "{model} cache read: {got}");
             assert!(!p.estimated, "{model} is a list price");
         }
