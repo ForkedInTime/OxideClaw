@@ -101,7 +101,7 @@ impl Tool for GrepTool {
                 "-C": { "type": "number", "description": "Lines before and after each match" },
                 "-i": { "type": "boolean", "description": "Case insensitive search" },
                 "-n": { "type": "boolean", "description": "Show line numbers" },
-                "head_limit": { "type": "number", "description": "Limit output to first N results" },
+                "head_limit": { "type": "number", "description": "Limit output to first N results (0 = unlimited)" },
                 "multiline": { "type": "boolean", "description": "Enable multiline matching" }
             },
             "required": ["pattern"]
@@ -307,7 +307,9 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
     let failed = !output.status.success() && output.status.code() != Some(1);
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
 
-    if let Some(limit) = input.head_limit {
+    // 0 is the common "unlimited" convention; taking 0 lines turned real
+    // matches into "No matches found."
+    if let Some(limit) = input.head_limit.filter(|&l| l > 0) {
         let lines: Vec<&str> = text.lines().take(limit).collect();
         text = lines.join("\n");
     }
@@ -475,7 +477,7 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
         _ => matched_files.join("\n"),
     };
 
-    if let Some(limit) = input.head_limit {
+    if let Some(limit) = input.head_limit.filter(|&l| l > 0) {
         let lines: Vec<&str> = output.lines().take(limit).collect();
         output = lines.join("\n");
     }
@@ -693,6 +695,22 @@ mod search_scope_tests {
         }
         for t in both(&ctx, json!({"pattern": "useState", "path": "build"})).await {
             assert!(t.contains("out.js"), "{t}");
+        }
+    }
+
+    /// head_limit 0 kept zero lines, so real matches read as "No matches
+    /// found." on both backends.
+    #[tokio::test]
+    async fn head_limit_zero_means_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "needle\n");
+        write(dir.path(), "b.rs", "needle\n");
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        for t in both(&ctx, json!({"pattern": "needle", "head_limit": 0})).await {
+            assert!(t.contains("a.rs") && t.contains("b.rs"), "{t}");
+        }
+        for t in both(&ctx, json!({"pattern": "needle", "head_limit": 1})).await {
+            assert_eq!(t.lines().count(), 1, "{t}");
         }
     }
 
