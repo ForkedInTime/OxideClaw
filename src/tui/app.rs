@@ -1385,7 +1385,11 @@ impl App {
                 }
             }
             AppEvent::ThinkingBlock(text) => {
-                self.flush_streaming();
+                // Thinking only arrives once the response is complete, after
+                // its answer has streamed live. Leave that answer in
+                // `streaming` (drawn below the entries) so the reasoning
+                // lands above the text it produced; the next ToolCall, Done
+                // or TurnFailed flushes it.
                 self.entries.push(ChatEntry::thinking(text));
                 self.scroll_to_bottom();
             }
@@ -1839,6 +1843,42 @@ mod trim_entries_tests {
 #[cfg(test)]
 mod background_event_tests {
     use super::*;
+
+    /// ThinkingBlock flushed the streamed answer first, so with
+    /// showThinkingSummaries on every turn read answer-then-reasoning.
+    #[test]
+    fn thinking_is_shown_above_the_answer_it_produced() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.apply(AppEvent::TextChunk("the ".into()));
+        app.apply(AppEvent::TextChunk("answer".into()));
+        app.apply(AppEvent::ThinkingBlock("first thought".into()));
+        app.apply(AppEvent::ThinkingBlock("second thought".into()));
+        app.apply(AppEvent::ToolCall {
+            name: "Read".into(),
+            args: "{}".into(),
+        });
+        let tail: Vec<String> = app.entries[app.entries.len() - 4..]
+            .iter()
+            .map(|e| {
+                let kind = match e.kind {
+                    EntryKind::Thinking => "thinking",
+                    EntryKind::Assistant => "assistant",
+                    EntryKind::ToolCall => "tool",
+                    _ => "other",
+                };
+                format!("{kind}: {}", e.text)
+            })
+            .collect();
+        assert_eq!(
+            tail[..3],
+            [
+                "thinking: first thought",
+                "thinking: second thought",
+                "assistant: the answer"
+            ]
+        );
+        assert!(tail[3].starts_with("tool: "), "{tail:?}");
+    }
 
     /// An app mid-turn: loading, with a live API task to cancel.
     fn app_in_turn() -> (App, tokio::task::JoinHandle<()>) {
