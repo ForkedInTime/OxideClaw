@@ -37,7 +37,10 @@ impl Tool for TeamCreateTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "name": { "type": "string" },
+                            "name": {
+                                "type": "string",
+                                "description": "Teammate name ([A-Za-z0-9_-])"
+                            },
                             "role": { "type": "string" }
                         },
                         "required": ["name"]
@@ -82,6 +85,9 @@ impl Tool for TeamCreateTool {
         }
 
         let members: Vec<Value> = input["members"].as_array().cloned().unwrap_or_default();
+        if let Some(err) = invalid_member(&members) {
+            return Ok(ToolOutput::error(err));
+        }
 
         let description = input["description"].as_str().unwrap_or("");
 
@@ -107,6 +113,18 @@ impl Tool for TeamCreateTool {
         });
         Ok(ToolOutput::success(result.to_string()))
     }
+}
+
+/// SendMessage broadcasts use each member name as a mailbox path component,
+/// so a name that `to` would refuse must not reach the team file either.
+fn invalid_member(members: &[Value]) -> Option<String> {
+    members.iter().find_map(|m| match m["name"].as_str() {
+        Some(n) if crate::tools::send_message::valid_team_ident(n) => None,
+        Some(n) => Some(format!(
+            "member name {n:?} must contain only ASCII alphanumerics, hyphens, or underscores"
+        )),
+        None => Some("every member needs a string \"name\"".to_string()),
+    })
 }
 
 #[async_trait]
@@ -179,5 +197,33 @@ impl Tool for TeamDeleteTool {
             "message": format!("Team '{}' deleted", name)
         });
         Ok(ToolOutput::success(result.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_names_must_be_mailbox_idents() {
+        assert_eq!(
+            invalid_member(&[
+                json!({"name": "alice", "role": "dev"}),
+                json!({"name": "b-2"})
+            ]),
+            None
+        );
+        for bad in [
+            json!({"name": "/tmp/evil"}),
+            json!({"name": "../.."}),
+            json!({"name": "code reviewer"}),
+            json!({"role": "nameless"}),
+            json!({"name": 7}),
+        ] {
+            assert!(
+                invalid_member(&[json!({"name": "ok"}), bad.clone()]).is_some(),
+                "{bad} must be refused"
+            );
+        }
     }
 }

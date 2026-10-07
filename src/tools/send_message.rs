@@ -148,24 +148,15 @@ impl Tool for SendMessageTool {
                     .join(format!("{}.json", team_name))
             });
 
-            let members = if let Some(path) = team_file_path.as_ref().filter(|p| p.exists()) {
-                let data = std::fs::read_to_string(path).unwrap_or_default();
-                let json: Value = serde_json::from_str(&data).unwrap_or_default();
-                json["members"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m["name"].as_str())
-                            .filter(|name| *name != sender_name.as_str())
-                            .map(|s| s.to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            };
+            let (members, skipped) =
+                if let Some(path) = team_file_path.as_ref().filter(|p| p.exists()) {
+                    let data = std::fs::read_to_string(path).unwrap_or_default();
+                    broadcast_recipients(&data, &sender_name)
+                } else {
+                    (vec![], vec![])
+                };
 
-            if members.is_empty() {
+            if members.is_empty() && skipped.is_empty() {
                 return Ok(ToolOutput::success(
                     "{\"success\":true,\"message\":\"No teammates to broadcast to\",\"recipients\":[]}",
                 ));
@@ -182,10 +173,23 @@ impl Tool for SendMessageTool {
                 )?;
             }
 
+            let mut message = format!(
+                "Message broadcast to {} teammate(s): {}",
+                members.len(),
+                members.join(", ")
+            );
+            if !skipped.is_empty() {
+                message.push_str(&format!(
+                    ". Skipped {} member name(s) that are not valid mailbox names ([A-Za-z0-9_-]): {}",
+                    skipped.len(),
+                    skipped.join(", ")
+                ));
+            }
             let result = json!({
                 "success": true,
-                "message": format!("Message broadcast to {} teammate(s): {}", members.len(), members.join(", ")),
-                "recipients": members
+                "message": message,
+                "recipients": members,
+                "skipped": skipped
             });
             return Ok(ToolOutput::success(result.to_string()));
         }
@@ -339,6 +343,23 @@ impl Tool for SendMessageTool {
     }
 }
 
+/// Teammates to broadcast to from a team file, minus the sender, split into
+/// usable names and names refused as mailbox path components. A team file
+/// is plain JSON on disk, so its member names are as untrusted as `to`.
+fn broadcast_recipients(team_json: &str, sender: &str) -> (Vec<String>, Vec<String>) {
+    let json: Value = serde_json::from_str(team_json).unwrap_or_default();
+    json["members"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str())
+                .filter(|name| *name != sender)
+                .map(str::to_string)
+                .partition(|name| valid_team_ident(name))
+        })
+        .unwrap_or_default()
+}
+
 fn write_mailbox_message(
     team: &str,
     recipient: &str,
@@ -347,6 +368,11 @@ fn write_mailbox_message(
     summary: Option<&str>,
     timestamp: &str,
 ) -> Result<()> {
+    // Both become path components; an absolute or `..` name would put the
+    // mailbox anywhere the user can write.
+    if !valid_team_ident(team) || !valid_team_ident(recipient) {
+        anyhow::bail!("invalid mailbox path component: {team}/{recipient}");
+    }
     let mailbox_dir = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".claude")
@@ -414,6 +440,40 @@ mod ident_tests {
             "*",
         ] {
             assert!(!valid_team_ident(n), "{n:?} must be refused");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+
+    /// Member names came from the team file unchecked, so `/abs/dir` or
+    /// `../..` put a mailbox outside ~/.claude/mailboxes.
+    #[test]
+    fn broadcast_skips_member_names_that_are_not_mailbox_idents() {
+        let team = r#"{"members":[{"name":"alice"},{"name":"/tmp/evil"},
+            {"name":"../../x"},{"name":"team-lead"},{"role":"no name"},{"name":"bob_2"}]}"#;
+        let (ok, skipped) = broadcast_recipients(team, "team-lead");
+        assert_eq!(ok, vec!["alice", "bob_2"]);
+        assert_eq!(skipped, vec!["/tmp/evil", "../../x"]);
+    }
+
+    /// The check sits in the writer itself, before any path is built, so
+    /// no caller can reach the filesystem with a bad component.
+    #[test]
+    fn mailbox_writer_refuses_path_components() {
+        for (team, recipient) in [
+            ("default", "/tmp/evil"),
+            ("default", "../../x"),
+            ("default", ""),
+            ("../t", "alice"),
+            ("/abs", "alice"),
+        ] {
+            assert!(
+                write_mailbox_message(team, recipient, "me", "hi", None, "t").is_err(),
+                "{team}/{recipient} must be refused"
+            );
         }
     }
 }
