@@ -581,7 +581,9 @@ pub fn kill_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
 
 /// Merge a completed agent's worktree changes into the current branch.
 pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf) -> Result<String> {
-    let (branch, wt_path) = {
+    // `id` may be a prefix; the registry is keyed by the full id, so the
+    // commit message and the final remove must use the resolved one.
+    let (id, desc, branch, wt_path) = {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let agent = find_agent(&reg, id)?;
         if agent.status != SpawnStatus::Completed {
@@ -591,7 +593,12 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
                 agent.status
             );
         }
-        (agent.branch.clone(), agent.worktree_path.clone())
+        (
+            agent.id.clone(),
+            agent.description.clone(),
+            agent.branch.clone(),
+            agent.worktree_path.clone(),
+        )
     };
 
     // Commit all changes in the worktree first
@@ -609,12 +616,7 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
             .output()
             .await?;
 
-        let commit_msg = format!("spawn: {}", {
-            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-            reg.get(id)
-                .map(|a| a.description.clone())
-                .unwrap_or_default()
-        });
+        let commit_msg = format!("spawn: {desc}");
 
         let commit = Command::new("git")
             .args(["commit", "-m", &commit_msg])
@@ -668,7 +670,7 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
 
     // Update registry
     if let Ok(mut reg) = registry.lock() {
-        reg.remove(id);
+        reg.remove(&id);
     }
 
     Ok(format!(
@@ -682,7 +684,7 @@ pub async fn discard_agent(
     id: &str,
     main_cwd: &PathBuf,
 ) -> Result<String> {
-    let (branch, wt_path, desc) = {
+    let (id, branch, wt_path, desc) = {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let agent = find_agent(&reg, id)?;
         if agent.status == SpawnStatus::Running {
@@ -693,6 +695,7 @@ pub async fn discard_agent(
             );
         }
         (
+            agent.id.clone(),
             agent.branch.clone(),
             agent.worktree_path.clone(),
             agent.description.clone(),
@@ -716,7 +719,7 @@ pub async fn discard_agent(
 
     // Remove from registry
     if let Ok(mut reg) = registry.lock() {
-        reg.remove(id);
+        reg.remove(&id);
     }
 
     Ok(format!(
@@ -1094,6 +1097,66 @@ mod tests {
     /// A conflicting merge must not leave the user's checkout mid-merge, and
     /// must not throw away the worktree, branch and registry entry the user
     /// would need to resolve it by hand.
+    /// main repo with one commit, plus a worktree on `branch` holding an
+    /// uncommitted new file.
+    async fn repo_with_agent_worktree(tmp: &std::path::Path, branch: &str) -> (PathBuf, PathBuf) {
+        let main = tmp.join("repo");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]).await;
+        git(&main, &["config", "user.email", "t@t"]).await;
+        git(&main, &["config", "user.name", "t"]).await;
+        git(&main, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(main.join("a.txt"), "base\n").unwrap();
+        git(&main, &["add", "-A"]).await;
+        git(&main, &["commit", "-q", "-m", "base"]).await;
+        let wt = tmp.join(format!("repo-{branch}"));
+        let wt_s = wt.to_str().unwrap().to_string();
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", branch, &wt_s, "HEAD"],
+        )
+        .await;
+        std::fs::write(wt.join("new.txt"), "agent\n").unwrap();
+        (main, wt)
+    }
+
+    /// `/spawn merge a1b2` (an id prefix) committed as "spawn: " and left
+    /// the merged agent in the registry, still listed with a deleted branch.
+    #[tokio::test]
+    async fn merge_by_id_prefix_uses_the_full_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = repo_with_agent_worktree(tmp.path(), "spawn-a1b2c3d4").await;
+        let mut agent = entry("a1b2c3d4", SpawnStatus::Completed);
+        agent.description = "refactor auth".into();
+        agent.worktree_path = wt;
+        agent.original_cwd = main.clone();
+        let reg = registry_with(vec![agent]);
+
+        merge_agent(&reg, "a1b2", &main).await.unwrap();
+        assert_eq!(
+            git(&main, &["log", "-1", "--format=%s"]).await.trim(),
+            "spawn: refactor auth"
+        );
+        assert!(reg.lock().unwrap().is_empty(), "merged agent still listed");
+    }
+
+    #[tokio::test]
+    async fn discard_by_id_prefix_removes_the_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = repo_with_agent_worktree(tmp.path(), "spawn-a1b2c3d4").await;
+        let mut agent = entry("a1b2c3d4", SpawnStatus::Completed);
+        agent.worktree_path = wt;
+        agent.original_cwd = main.clone();
+        let reg = registry_with(vec![agent]);
+
+        let msg = discard_agent(&reg, "a1b2", &main).await.unwrap();
+        assert!(msg.contains("[a1b2c3d4]"), "{msg}");
+        assert!(
+            reg.lock().unwrap().is_empty(),
+            "discarded agent still listed"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_merge_aborts_cleanly_and_keeps_the_agents_work() {
         let tmp = tempfile::tempdir().unwrap();
