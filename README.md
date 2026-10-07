@@ -134,7 +134,7 @@ How it compares with the agents people actually run. Competitor cells were check
 | Replies spoken locally in a voice you record | ❌ | ◐ realtime voice, cloud, preset voices | ❌ | ❌ | ❌ | **✅ optional add-on (XTTS v2, Python)** |
 | Auto model routing | ❌ | — | ✅ Auto | — | ❌ | **◐ opt-in, keyword heuristic, Claude tiers by default** |
 | Auto-fix loop (lint + tests + retry after edits) | ◐ | — | — | — | ✅ | **✅ runners detected with zero config; trusted projects only** |
-| `/undo` | ✅ `/rewind` (alias `/undo`) | — | ✅ | ✅ | ✅ reverts its own commit | **✅ private git refs, no commits on your branches** |
+| `/undo` | ✅ `/rewind` (alias `/undo`) | — | ✅ | ✅ | ✅ reverts its own commit | **✅ files and conversation together, on private git refs** |
 | `/redo` after `/undo` | ❌ | ❌ | ❌ | ✅ | ❌ | **✅** |
 | Parallel agents in git worktrees | ✅ | ✅ on by default | ✅ | — | — | **✅ `spawn`, up to 8** |
 | Autonomous browser agent (`/browse <goal>`) | ✅ Chrome extension, claude.ai plan required | — | — | ◐ v2 desktop app only | ❌ | **✅ any provider, 50-step cap, approval gate** |
@@ -189,9 +189,9 @@ Voice is an optional add-on that needs Python + Coqui. XTTS v2 weights are licen
 
 In trusted projects, every edit triggers a lint and test cycle. Untrusted projects skip it until you run /trust. The cycle uses the project's own runner (clippy, ESLint, ruff, `go vet`; `cargo test`, `npm test`, pytest, `go test`) when it is installed, or your `lintCommand`/`testCommand`, and runs inside the same sandbox as the Bash tool when you have one enabled. Those commands execute the project's code (`build.rs`, `conftest.py`, npm scripts), which is why trust comes first. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — OxideClaw fixes forward.
 
-### ↩️ &nbsp; `/undo` and `/redo` on shadow refs
+### ↩️ &nbsp; `/undo`, `/redo` and `/rewind`: one timeline
 
-Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`: per-turn snapshots on private git refs in your own repo, with no commits on your branches, hidden from default `log`/`branch`/`status`, and HEAD and index never moved. (They do show in `git log --all`, and `git push --mirror` would push them.) Use the `/undo` picker or skip straight to a turn with `/undo 3`; files the undone turns created are removed and come back on `/redo`. The session base keeps the uncommitted work you started with, and edits you make between turns are saved to `refs/oxideclaw/recovery/<session>` before an `/undo` or `/redo` overwrites them. `/redo` works like OpenCode's and Kilo's; Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI have no redo.
+Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`: per-turn snapshots on private git refs in your own repo, with no commits on your branches, hidden from default `log`/`branch`/`status`, and HEAD and index never moved. (They do show in `git log --all`, and `git push --mirror` would push them.) `/undo` takes back the last turn and `/undo 3` the last three: their file changes are reverted and the turns leave the conversation (and the saved session), so the model no longer sees them. `/redo [N]` puts them back in order, files and conversation, until your next prompt. `/rewind` opens a picker of turns and undoes everything after the one you choose. Files the undone turns created are removed and come back on `/redo`, and the session base keeps the uncommitted work you started with. If you edited a file by hand that the undo would overwrite, it refuses and changes nothing. Outside a git repository, or with auto-commit off, the three commands move the conversation only and say so. `/redo` works like OpenCode's and Kilo's; Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI have no redo.
 
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 
@@ -258,7 +258,7 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 /budget $5              # cap the bill
 /voice                  # voice I/O + TTS picker
 /spawn <task>           # parallel agent in a git worktree
-/undo                   # step back to any previous turn
+/undo                   # take back the last turn: files and conversation
 ```
 
 No API key yet? If Ollama is running locally (or at `OLLAMA_HOST`) and you have not picked a model, `oxideclaw` and `oxideclaw -p` start on one of your pulled Ollama models, preferring one that supports tools, and say which.

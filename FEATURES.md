@@ -119,6 +119,10 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `/session list` | List saved sessions |
 | `/export` | Export current session to markdown (sessions save automatically) |
 | `/session delete <id-prefix>` | Print the `rm` command that deletes a session's files |
+| `/undo [N]` | Take back the last N turns (default 1): files and conversation |
+| `/redo [N]` | Put back the last N undone turns (default 1) |
+| `/rewind [N]` | Pick a turn to go back to; `/rewind N` is `/undo N` |
+| `/autocommit` | Show the per-turn snapshot state |
 
 ### Voice & TTS
 
@@ -341,7 +345,12 @@ Sessions save automatically; resume, search, and export them.
 /session             # interactive session browser with previews
 /session list        # list saved sessions
 /export              # export the current session to markdown
+/undo 2              # take back the last two turns, files and conversation
 ```
+
+### Undo timeline
+
+`/undo`, `/redo` and `/rewind` move one timeline of turns, a turn being a prompt and everything the agent did for it. `/undo N` reverts the files of the last N turns and removes those turns from the conversation and the saved session, so the model no longer sees them; `/redo N` re-applies both, oldest first, and any new prompt clears what could be redone. `/rewind` lists the turns and undoes everything after the one you pick. Files come from per-turn snapshots on private refs (`refs/oxideclaw/sessions/<id>`); an undo that would overwrite a file changed since the last snapshot is refused with the file names and changes nothing. Outside a git repository, or with `autoCommit.enabled: false`, only the conversation moves and a one-line notice says so. Turns from before the timeline (a session saved by an older version, or the summary `/compact` leaves) can be undone too, conversation only. Undo and redo state is saved with the session, so it survives `/resume`.
 
 Sessions are stored in `~/.local/share/oxideclaw/sessions/` by default (`$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set). See [Where files live](#where-files-live).
 
