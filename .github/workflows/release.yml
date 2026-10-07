@@ -61,9 +61,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
+      # A manual dispatch runs on whatever branch was picked in the UI; build
+      # the requested tag, not that branch's HEAD.
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -214,9 +217,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
+          # --verify-tag: never create a missing tag at the default branch tip.
           gh release create "$TAG" \
             --title "OxideClaw $TAG" \
             --generate-notes \
+            --verify-tag \
             release/*
           # A release made with GITHUB_TOKEN triggers no workflows, so start
           # the image build explicitly; the Dockerfile downloads the musl
