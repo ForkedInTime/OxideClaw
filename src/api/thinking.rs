@@ -31,6 +31,9 @@ pub enum ThinkingConfig {
         budget_tokens: u32,
     },
     Disabled,
+    /// Sonnet 5.5's "off": no thinking except between tool calls. Takes no
+    /// other field.
+    BetweenTools,
 }
 
 impl Serialize for ThinkingConfig {
@@ -54,6 +57,11 @@ impl Serialize for ThinkingConfig {
             ThinkingConfig::Disabled => {
                 let mut st = s.serialize_struct("ThinkingConfig", 1)?;
                 st.serialize_field("type", "disabled")?;
+                st.end()
+            }
+            ThinkingConfig::BetweenTools => {
+                let mut st = s.serialize_struct("ThinkingConfig", 1)?;
+                st.serialize_field("type", "between_tools")?;
                 st.end()
             }
         }
@@ -139,7 +147,8 @@ pub fn supports_adaptive_thinking(model: &str) -> bool {
 
 /// Models that reject an explicit `{"type":"disabled"}` with a 400: thinking
 /// is always on for Fable/Mythos, and cannot be switched off on Opus 5.5+ or
-/// Sonnet 5.5+. For these, "off" means omitting the field.
+/// Sonnet 5.5+. For these, "off" means omitting the field, or
+/// `between_tools` on Sonnet 5.5.
 pub fn rejects_disabled_thinking(model: &str) -> bool {
     let model = canonical(model);
     let Some((_, family)) = family_of(&model) else {
@@ -166,6 +175,14 @@ pub fn binds_thinking_to_conversation(model: &str) -> bool {
         "opus" | "sonnet" => version.is_some_and(|v| v >= (5, 5)),
         _ => false,
     }
+}
+
+/// Sonnet 5.5 rejects `disabled` but turns thinking off with
+/// `{"type":"between_tools"}`, accepted only at effort `high` or below.
+fn has_between_tools_off(model: &str) -> bool {
+    let model = canonical(model);
+    family_of(&model).is_some_and(|(_, f)| f == "sonnet")
+        && model_version(&model).is_some_and(|v| v >= (5, 5))
 }
 
 /// Opus 5 accepts `{"type":"disabled"}` only at effort `high` or below; at
@@ -235,6 +252,9 @@ pub fn thinking_for(
         let high_effort = effort
             .map(|e| e.trim().to_ascii_lowercase())
             .is_some_and(|e| e == "max" || e == "xhigh");
+        if !high_effort && has_between_tools_off(&model) {
+            return Some(ThinkingConfig::BetweenTools);
+        }
         if (high_effort && disabled_needs_low_effort(&model)) || rejects_disabled_thinking(&model) {
             return api_default;
         }
@@ -439,6 +459,10 @@ mod tests {
             r#"{"type":"enabled","budget_tokens":2048}"#
         );
         assert_eq!(json(&ThinkingConfig::Disabled), r#"{"type":"disabled"}"#);
+        assert_eq!(
+            json(&ThinkingConfig::BetweenTools),
+            r#"{"type":"between_tools"}"#
+        );
     }
 
     #[test]
@@ -528,7 +552,6 @@ mod tests {
             "claude-fable-5",
             "claude-mythos-5-1",
             "claude-opus-5-5",
-            "claude-sonnet-5-5",
             "fable",
         ] {
             assert_eq!(thinking_for(m, Some(0), 64_000, None, false), None, "{m}");
@@ -542,6 +565,48 @@ mod tests {
             thinking_for("claude-opus-5", Some(0), 64_000, None, false),
             Some(ThinkingConfig::Disabled)
         );
+    }
+
+    /// Sonnet 5.5 400s on `disabled`; `between_tools` is its off switch,
+    /// legal only at effort high or below (and its default is high).
+    #[test]
+    fn sonnet_5_5_turns_thinking_off_with_between_tools() {
+        for e in [
+            None,
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some(" HIGH "),
+        ] {
+            for show in [false, true] {
+                assert_eq!(
+                    thinking_for("claude-sonnet-5-5", Some(0), 64_000, e, show),
+                    Some(ThinkingConfig::BetweenTools),
+                    "{e:?} {show}"
+                );
+            }
+        }
+        for e in ["xhigh", "max"] {
+            assert_eq!(
+                thinking_for("claude-sonnet-5-5", Some(0), 64_000, Some(e), false),
+                None,
+                "{e}"
+            );
+        }
+        assert_eq!(
+            thinking_for("claude-sonnet-5-5", Some(4_096), 64_000, None, false),
+            Some(ThinkingConfig::Adaptive { summarized: false })
+        );
+        // Opus 5.5 has no off switch at all; Sonnet 5 still takes disabled.
+        assert_eq!(
+            thinking_for("claude-opus-5-5", Some(0), 64_000, Some("low"), false),
+            None
+        );
+        assert_eq!(
+            thinking_for("claude-sonnet-5", Some(0), 64_000, None, false),
+            Some(ThinkingConfig::Disabled)
+        );
+        assert!(thinking_betas(Some(&ThinkingConfig::BetweenTools)).is_empty());
     }
 
     /// Opus 5 rejects `disabled` at xhigh/max effort with a 400.
