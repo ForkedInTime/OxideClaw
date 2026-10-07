@@ -1229,18 +1229,28 @@ impl LspDiagnostics {
             Ok(line) if line == plain => Launch::Program(group.exe.clone()),
             Ok(line) => Launch::Shell(line),
         };
-        let client = match tokio::time::timeout_at(
+        let start = tokio::time::timeout_at(
             deadline,
             self.pool
                 .client_for(command, &group.args, &self.root, &launch),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return give_up(format!("did not start: {e}")),
-            Err(_) => {
-                return give_up(format!("did not answer within {}", seconds(config.timeout)));
+        );
+        // Esc and quit set `cancel`. Dropping the start releases the pool's
+        // lock (the LSP tool and the exit path's shutdown wait on it) and
+        // kills the half-started server; the next check starts it again.
+        let cancelled = async {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
+        };
+        let client = tokio::select! {
+            r = start => match r {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return give_up(format!("did not start: {e}")),
+                Err(_) => {
+                    return give_up(format!("did not answer within {}", seconds(config.timeout)));
+                }
+            },
+            () = cancelled => return ServerReport::default(),
         };
 
         let mut synced = Vec::new();
@@ -1287,9 +1297,19 @@ impl LspDiagnostics {
         let mut report = ServerReport::default();
         let mut silent = 0;
         for ((path, baseline), published) in files.into_iter().zip(published) {
-            let problems = published.map(|diags| {
-                let after = std::fs::read_to_string(path).ok();
-                new_problems(&diags, baseline.as_ref(), after.as_deref(), config.warnings)
+            let problems = published.map(|r| {
+                // A set the server published for an older text is read
+                // against that text: its line numbers belong to it.
+                let text = match r.stale_text {
+                    Some(stale) => Some(stale),
+                    None => std::fs::read_to_string(path).ok(),
+                };
+                new_problems(
+                    &r.diagnostics,
+                    baseline.as_ref(),
+                    text.as_deref(),
+                    config.warnings,
+                )
             });
             silent += usize::from(problems.is_none());
             report.files.push((path.clone(), problems));
@@ -2646,7 +2666,8 @@ mod lsp_check_tests {
     /// `mode`: `ok`, `hang` (never answers `initialize`), `same` (publishes
     /// only when a document's diagnostics change, like rust-analyzer),
     /// `silent` (never publishes), `deaf` (stops reading its input after
-    /// `initialized`).
+    /// `initialized`), `lag` (publishes for `didOpen` only, like a server
+    /// still analysing every later change).
     fn fake_server(bin: &Path, log: &Path, mode: &str) {
         use std::os::unix::fs::PermissionsExt;
         let script = format!(
@@ -2697,7 +2718,9 @@ while True:
                 if word in l:
                     c = l.index(word)
                     diags.append({{"range": {{"start": {{"line": i, "character": c}}, "end": {{"line": i, "character": c + 3}}}}, "severity": sev, "message": "bad " + l.strip()}})
-        if MODE == "silent" or (MODE == "same" and last.get(doc["uri"]) == diags):
+        if MODE == "lag" and method == "textDocument/didChange":
+            log("lagging")
+        elif MODE == "silent" or (MODE == "same" and last.get(doc["uri"]) == diags):
             log("unchanged")
         else:
             held.append({{"uri": doc["uri"], "version": doc["version"], "diagnostics": diags}})
@@ -2770,6 +2793,16 @@ while True:
             config: &AutoFixConfig,
             containment: &Containment,
         ) -> AutoFixAction {
+            self.check_cancellable(files, config, containment, &NOT_CANCELLED)
+        }
+
+        fn check_cancellable(
+            &self,
+            files: Vec<(PathBuf, Option<LspBaseline>)>,
+            config: &AutoFixConfig,
+            containment: &Containment,
+            cancel: &AtomicBool,
+        ) -> AutoFixAction {
             let lsp = LspDiagnostics {
                 pool: self.pool.clone(),
                 root: self.project.path().to_path_buf(),
@@ -2783,7 +2816,7 @@ while True:
                 Autonomy::AutoEdit,
                 0,
                 containment,
-                &NOT_CANCELLED,
+                cancel,
                 Some(&lsp),
             )
         }
@@ -2930,6 +2963,41 @@ while True:
         assert_eq!(f.log().matches("start").count(), 1);
     }
 
+    /// Esc (or quit) while a server is starting returns at once and frees
+    /// the pool: the exit path's shutdown waited on its lock for up to the
+    /// whole cap. The server is not given up on: it was not its fault.
+    #[test]
+    fn esc_during_a_server_start_returns_at_once() {
+        let f = fixture("hang");
+        let file = f.file("app.py");
+        std::fs::write(&file, "y = ERR\n").unwrap();
+        let mut cfg = config();
+        cfg.lsp.timeout = Duration::from_secs(20);
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let action = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            f.check_cancellable(vec![(file, None)], &cfg, &trusted(), &cancel)
+        });
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "took {took:?}: {action:?}");
+        let quit = std::time::Instant::now();
+        f.rt.block_on(f.pool.shutdown());
+        assert!(
+            quit.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            quit.elapsed()
+        );
+        assert!(!f.pool.gave_up(
+            "pyright-langserver",
+            &["--stdio".to_string()],
+            f.project.path()
+        ));
+    }
+
     /// The feedback stays bounded however many errors a file has.
     #[test]
     fn errors_are_capped_at_thirty_lines() {
@@ -3014,6 +3082,76 @@ while True:
             &["--stdio".to_string()],
             f.project.path()
         ));
+    }
+
+    /// A server still analysing a change leaves its last set in place. That
+    /// set's line numbers belong to the text it was published for: read
+    /// against the new text (lines inserted above, the error fixed), the
+    /// fixed error came back as new, on a line that no longer had it.
+    #[test]
+    fn a_stale_set_is_read_against_the_text_it_was_published_for() {
+        let f = fixture("lag");
+        let file = f.file("app.py");
+        std::fs::write(
+            &file, "x = 1
+",
+        )
+        .unwrap();
+        let before = f.baseline(&file);
+        std::fs::write(
+            &file,
+            "x = 1
+y = ERR
+",
+        )
+        .unwrap();
+        let action = f.check(vec![(file.clone(), Some(before))], &config(), &trusted());
+        let AutoFixAction::Retry { feedback, .. } = &action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(feedback.contains("app.py:2:5 bad y = ERR"), "{feedback}");
+
+        // The retry fixes it and adds imports above; the server has not
+        // published for that text by the time the check stops waiting.
+        let before = f.baseline(&file);
+        assert_eq!(before.diagnostics.as_ref().map(Vec::len), Some(1));
+        std::fs::write(
+            &file,
+            "import a
+import b
+x = 1
+y = 2
+",
+        )
+        .unwrap();
+        let action = f.check(vec![(file.clone(), Some(before))], &config(), &trusted());
+        assert!(
+            matches!(&action, AutoFixAction::Continue { status: Some(s) }
+                if s == "[auto-fix] checks passed"),
+            "{action:?}"
+        );
+        // The set is for the first text, which is gone after a further
+        // change: nothing is said about it rather than misplace it.
+        let before = f.baseline(&file);
+        std::fs::write(
+            &file,
+            "import a
+import b
+import c
+x = 1
+y = 2
+",
+        )
+        .unwrap();
+        let action = f.check(vec![(file, Some(before))], &config(), &trusted());
+        let AutoFixAction::Continue { status } = &action else {
+            panic!("expected no retry: {action:?}");
+        };
+        assert!(
+            !status.as_deref().unwrap_or_default().contains("ERR"),
+            "{action:?}"
+        );
+        assert_eq!(f.log().matches("lagging").count(), 2, "{}", f.log());
     }
 
     /// A live server that says nothing by the cap (a slow cold start) is

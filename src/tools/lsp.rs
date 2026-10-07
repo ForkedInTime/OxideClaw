@@ -59,12 +59,23 @@ impl LspPool {
         let key = cache_key(command, args, root);
         let mut cache = self.clients.lock().await;
         if let Some(c) = cache.get(&key) {
+            // A sandboxed caller needs a server started under that exact
+            // sandbox line: one started before `/sandbox enable` (or before
+            // its network was turned off) runs project code unconfined.
+            // Unsandboxed callers take whatever runs.
+            let fits = match launch {
+                Launch::Shell(line) => c.sandbox_line.as_deref() == Some(line.as_str()),
+                Launch::Plain | Launch::Program(_) => true,
+            };
             // A server that crashed or was killed would otherwise fail every
             // later call (EPIPE) until OxideClaw restarts: start a new one.
-            if !c.dead.load(Ordering::SeqCst) {
+            if !c.dead.load(Ordering::SeqCst) && fits {
                 return Ok(Arc::clone(c));
             }
-            cache.remove(&key);
+            if let Some(stale) = cache.remove(&key) {
+                stale.mark_dead();
+                tokio::spawn(async move { stale.shutdown().await });
+            }
         }
         let client = LspClient::connect(command, args, root, launch).await?;
         client.initialize(command, root).await?;
@@ -445,6 +456,24 @@ struct Published {
     diagnostics: Vec<Value>,
 }
 
+/// What was last sent for one open document.
+struct DocState {
+    version: i64,
+    text: String,
+    /// The version and text sent before it.
+    previous: Option<(i64, String)>,
+}
+
+/// Diagnostics a server published for a synced document.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Reported {
+    pub(crate) diagnostics: Vec<Value>,
+    /// `None` when they are for the text just synced. Otherwise the server
+    /// has not caught up yet and they are its last set, for this older text:
+    /// their line numbers belong to it, not to the file as it is now.
+    pub(crate) stale_text: Option<String>,
+}
+
 /// A document sent to the server by `sync_document`.
 pub(crate) struct Synced {
     path: PathBuf,
@@ -465,8 +494,12 @@ pub(crate) struct LspClient {
     published: Arc<std::sync::Mutex<HashMap<PathBuf, Published>>>,
     /// The latest publish sequence number; closes when the server exits.
     publish_seq: watch::Receiver<u64>,
-    /// Open documents and the version last sent for each.
-    documents: Mutex<HashMap<String, i64>>,
+    /// Open documents: the version and text last sent for each, and the
+    /// one before, so a set published for that older text is read against it.
+    documents: Mutex<HashMap<String, DocState>>,
+    /// The sandbox line the server was started with (`Launch::Shell`), or
+    /// `None` when it was started unsandboxed.
+    sandbox_line: Option<String>,
     /// Owns the language server. `kill_on_drop` means the server lives
     /// exactly as long as this client — previously the handle was dropped at
     /// the end of `connect`, which killed the server before `initialize`.
@@ -636,10 +669,17 @@ impl LspClient {
                             _ => Value::Null,
                         };
                         let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                        // Written off the reader: `send_raw` holds stdin for a
+                        // whole (possibly multi-MB) write, and a server that
+                        // stops reading until this answer arrives would fill
+                        // its stdout while the reader waited for the lock.
                         if let Ok(f) = frame(&reply) {
-                            let mut w = reply_to.lock().await;
-                            let _ = w.write_all(f.as_bytes()).await;
-                            let _ = w.flush().await;
+                            let w = reply_to.clone();
+                            tokio::spawn(async move {
+                                let mut w = w.lock().await;
+                                let _ = w.write_all(f.as_bytes()).await;
+                                let _ = w.flush().await;
+                            });
                         }
                     }
                     (Some("textDocument/publishDiagnostics"), None) => {
@@ -696,6 +736,10 @@ impl LspClient {
             published,
             publish_seq,
             documents: Mutex::default(),
+            sandbox_line: match launch {
+                Launch::Shell(line) => Some(line.clone()),
+                Launch::Plain | Launch::Program(_) => None,
+            },
             child: std::sync::Mutex::new(Some(child)),
         })
     }
@@ -798,8 +842,9 @@ impl LspClient {
         let uri = path_to_uri(path);
         let mut docs = self.documents.lock().await;
         let seq = *self.publish_seq.borrow();
-        let version = match docs.get(&uri) {
-            Some(v) => {
+        let previous = docs.remove(&uri).map(|d| (d.version, d.text));
+        let version = match &previous {
+            Some((v, _)) => {
                 let version = v + 1;
                 self.notify(
                     "textDocument/didChange",
@@ -828,7 +873,14 @@ impl LspClient {
                 1
             }
         };
-        docs.insert(uri, version);
+        docs.insert(
+            uri,
+            DocState {
+                version,
+                text,
+                previous,
+            },
+        );
         Ok(Synced {
             path: path.to_path_buf(),
             version,
@@ -868,16 +920,17 @@ impl LspClient {
     /// `cancel` is set. Servers such as rust-analyzer publish only when a
     /// document's diagnostics change, so a document the server has reported
     /// on before counts as unchanged once the server has published nothing
-    /// for `settle`. Returns each document's diagnostics by then (its last
-    /// published set when nothing new came), `None` for one the server has
-    /// never reported on.
+    /// for `settle`. Returns each document's diagnostics by then: its last
+    /// published set when nothing new came, marked with the older text it
+    /// was published for; `None` for one the server has never reported on,
+    /// or whose last set is for a text no longer kept.
     pub(crate) async fn wait_for_diagnostics(
         &self,
         synced: &[Synced],
         settle: Duration,
         deadline: Instant,
         cancel: &AtomicBool,
-    ) -> Vec<Option<Vec<Value>>> {
+    ) -> Vec<Option<Reported>> {
         let mut seq = self.publish_seq.clone();
         seq.borrow_and_update();
         let mut settled_at: Option<Instant> = None;
@@ -913,11 +966,35 @@ impl LspClient {
                 Err(_) => {}
             }
         }
+        let docs = self.documents.lock().await;
         synced
             .iter()
             .map(|s| {
-                self.fresh(s)
-                    .or_else(|| self.published_for(&s.path).map(|p| p.diagnostics))
+                if let Some(diagnostics) = self.fresh(s) {
+                    return Some(Reported {
+                        diagnostics,
+                        stale_text: None,
+                    });
+                }
+                let p = self.published_for(&s.path)?;
+                // A set without a version, published before this sync, is
+                // about the text the server had: the one sent before.
+                let for_version = p.version.unwrap_or(s.version - 1);
+                let doc = docs.get(&path_to_uri(&s.path))?;
+                let stale_text = if for_version == doc.version {
+                    None
+                } else {
+                    match &doc.previous {
+                        Some((v, text)) if *v == for_version => Some(text.clone()),
+                        // Its text is gone: say nothing rather than read
+                        // its line numbers against the wrong text.
+                        _ => return None,
+                    }
+                };
+                Some(Reported {
+                    diagnostics: p.diagnostics,
+                    stale_text,
+                })
             })
             .collect()
     }
@@ -1376,6 +1453,63 @@ mod cache_tests {
         );
         let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(starts, 2, "server spawned {starts} times");
+    }
+
+    /// A server started unsandboxed (before `/sandbox enable`) must not be
+    /// handed to a caller that asks for a sandboxed one: it is replaced.
+    /// A sandboxed server serves unsandboxed callers too.
+    #[tokio::test]
+    async fn a_sandboxed_launch_replaces_an_unsandboxed_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("starts");
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        let script = format!(
+            "echo x >> '{}'; read -r _l; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; sleep 5",
+            counter.display(),
+            body.len(),
+            body
+        );
+        let tool = LSPTool::default();
+        let args = vec!["-c".to_string(), script.clone()];
+        let plain = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
+        let line = format!("sh -c {}", crate::sandbox::shell_quote(&script));
+        let shell = Launch::Shell(line.clone());
+        let boxed = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &shell)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&plain, &boxed),
+            "the unsandboxed server was reused"
+        );
+        assert!(plain.is_dead(), "the unsandboxed server is retired");
+        assert_eq!(boxed.sandbox_line.as_deref(), Some(line.as_str()));
+        let again = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &shell)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&boxed, &again));
+        let other = Launch::Shell(format!("{line} "));
+        let rewrapped = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &other)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&boxed, &rewrapped), "a different sandbox line");
+        let unboxed = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&rewrapped, &unboxed));
+        let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(starts, 3, "server spawned {starts} times");
     }
 
     /// Two queries against the same root must reuse one server process.

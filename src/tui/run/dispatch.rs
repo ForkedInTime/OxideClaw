@@ -10,6 +10,14 @@ const SKILL_SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "Agent", "TeamCreate"
 /// The tool list for a `/skill` turn. A prompt note alone left Bash both
 /// advertised and executable, so with `Bash(*)` allowed or in bypass mode a
 /// skill still ran shell commands with the flag on.
+/// Shut the session's language servers down; the next use starts them again
+/// under the current trust and sandbox.
+fn stop_language_servers(tools: &[DynTool]) {
+    if let Some(pool) = crate::tools::lsp_pool(tools) {
+        tokio::spawn(async move { pool.shutdown().await });
+    }
+}
+
 fn skill_turn_tools(tools: &[DynTool], disable_shell: bool) -> Vec<DynTool> {
     tools
         .iter()
@@ -1059,7 +1067,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let mut reloaded = Vec::new();
             // Trust may have changed since startup, and it gates the
             // project's autoFixLoop block; rebuild both together.
+            let was_trusted = config.project_trusted;
             config.project_trusted = settings.project_trusted;
+            if was_trusted && !config.project_trusted {
+                stop_language_servers(tools);
+            }
             config.apply_auto_fix_settings(settings.auto_fix.as_ref());
             if settings.auto_fix.is_some() {
                 reloaded.push("autoFixLoop");
@@ -2096,7 +2108,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // Auto-fix reads trust and its settings per edit, so a change
             // applies at once, including the project's own autoFixLoop block.
             let router_before = config.router_fingerprint();
+            let was_trusted = config.project_trusted;
             config.refresh_trust();
+            // Language servers run project code (build scripts, plugins):
+            // ones started while the project was trusted stop with it.
+            if was_trusted && !config.project_trusted {
+                stop_language_servers(tools);
+            }
             // The project's router tiers are trust-gated: a revoked
             // project's tiers must stop getting prompts now. Rebuild only
             // when they moved, so `/router on|off` and `/router <tier>`
