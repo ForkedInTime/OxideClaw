@@ -421,6 +421,41 @@ fn make_terminal(vp_h: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     }
 }
 
+/// make_terminal for use once the EventStream exists. Inline asks the
+/// terminal for the cursor position, which needs crossterm's global reader
+/// lock, and EventStream's waker thread holds that lock until the next input
+/// arrives. A recreation not triggered by input (the background "Codebase
+/// indexed" message dropping the welcome banner) froze the UI for 2 s and
+/// fell back to Fullscreen. Every in-loop caller first parks the cursor at
+/// the top-left of a blank screen, which is where Inline would put the
+/// viewport anyway, so a Fixed rect there needs no query.
+fn make_top_terminal(
+    cols: u16,
+    rows: u16,
+    vp_h: u16,
+) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    let area = ratatui::layout::Rect::new(0, 0, cols, vp_h.min(rows));
+    Ok(Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )?)
+}
+
+/// Push `lines` screen rows into scrollback and leave the cursor at the
+/// top-left of the now-blank screen. Used when the viewport changes height
+/// without a clear: the old frame (e.g. the welcome banner) stays reachable
+/// by scrolling back, as it did when Inline appended lines, and cannot show
+/// through blank cells of the new frame.
+fn scroll_off_screen(out: &mut impl io::Write, rows: u16, lines: u16) -> io::Result<()> {
+    crossterm::queue!(out, crossterm::cursor::MoveTo(0, rows.saturating_sub(1)))?;
+    // Raw mode: LF moves down a row and scrolls at the bottom margin.
+    out.write_all("\n".repeat(lines as usize).as_bytes())?;
+    crossterm::queue!(out, crossterm::cursor::MoveTo(0, 0))?;
+    out.flush()
+}
+
 // ── Plugin install async task ─────────────────────────────────────────────────
 
 /// Build the client for `model`. ClaudeClient accepts an empty key and only
@@ -809,7 +844,7 @@ async fn run_loop(
                 crossterm::cursor::MoveTo(0, 0),
             );
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
-            terminal = make_terminal(needed)?;
+            terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
             current_vp_h = needed;
 
             let msg = if success {
@@ -830,7 +865,7 @@ async fn run_loop(
                 crossterm::cursor::MoveTo(0, 0),
             )?;
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
-            terminal = make_terminal(needed)?;
+            terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
             current_vp_h = needed;
         }
 
@@ -1099,8 +1134,10 @@ async fn run_loop(
         {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             if needed != current_vp_h {
+                let old_bottom = terminal.get_frame().area().bottom();
                 drop(terminal);
-                terminal = make_terminal(needed)?;
+                scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom)?;
+                terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
                 current_vp_h = needed;
             }
         }
@@ -1572,7 +1609,7 @@ async fn run_loop(
                             crossterm::cursor::MoveTo(0, 0),
                         )?;
                         let needed = viewport_height(&app, cols, rows);
-                        terminal = make_terminal(needed)?;
+                        terminal = make_top_terminal(cols, rows, needed)?;
                         current_vp_h = needed;
                     }
                     _ => {}
@@ -1871,6 +1908,39 @@ mod tty_handoff_tests {
         let back = String::from_utf8(back).unwrap();
         assert!(back.contains("\x1b[?2004h"), "{back:?}");
         assert!(back.contains("\x1b[?1003h"), "{back:?}");
+    }
+}
+
+/// In-loop viewport recreation queried the cursor position while the
+/// EventStream thread held crossterm's reader lock: a 2 s stall, then a
+/// silent Fullscreen fallback.
+#[cfg(all(test, unix))]
+mod viewport_recreate_tests {
+    use super::*;
+
+    #[test]
+    fn top_terminal_is_built_without_querying_the_terminal() {
+        // No tty here: any size or cursor query would error or time out.
+        let start = std::time::Instant::now();
+        let mut t = make_top_terminal(80, 24, 40).unwrap();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            t.get_frame().area(),
+            ratatui::layout::Rect::new(0, 0, 80, 24)
+        );
+        let mut t = make_top_terminal(80, 24, 15).unwrap();
+        assert_eq!(
+            t.get_frame().area(),
+            ratatui::layout::Rect::new(0, 0, 80, 15)
+        );
+    }
+
+    #[test]
+    fn scroll_off_pushes_old_frame_out_and_homes_cursor() {
+        let mut out = Vec::new();
+        scroll_off_screen(&mut out, 24, 20).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out, format!("\x1b[24;1H{}\x1b[1;1H", "\n".repeat(20)));
     }
 }
 
