@@ -304,6 +304,7 @@ impl SdkSession {
                     .config
                     .explicit_max_tokens_for(&self.config.model)
                     .is_some(),
+                cache_history: false,
             };
 
             // Stream the response — callback sends MessageDelta notifications

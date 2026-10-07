@@ -248,11 +248,12 @@ impl ClaudeClient {
     ) -> Result<reqwest::Response> {
         let betas = self.beta_header(&request.betas);
         let betas = betas.as_deref();
+        let body = request_body(request)?;
+        let body = &body;
         let attempt = |secret: String| {
             retry::send_with_retry(
                 move || {
-                    let mut builder =
-                        self.auth_header(self.client.post(url).json(request), &secret);
+                    let mut builder = self.auth_header(self.client.post(url).json(body), &secret);
                     if let Some(b) = betas {
                         builder = builder.header("anthropic-beta", b);
                     }
@@ -884,6 +885,28 @@ impl ApiBackend {
     }
 }
 
+/// The JSON body for `request`. With `cache_history` the last block of the
+/// final message becomes the third cache breakpoint (tools and system hold
+/// the others; the API allows four). Thinking blocks reject cache_control,
+/// so the mark goes on the last block that is not one.
+fn request_body(request: &MessagesRequest) -> Result<serde_json::Value> {
+    let mut body = serde_json::to_value(request)?;
+    if request.cache_history
+        && let Some(block) = body["messages"]
+            .as_array_mut()
+            .and_then(|m| m.last_mut())
+            .and_then(|m| m["content"].as_array_mut())
+            .and_then(|c| {
+                c.iter_mut()
+                    .rev()
+                    .find(|b| !matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
+            })
+    {
+        block["cache_control"] = serde_json::to_value(CacheControl::ephemeral())?;
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod redacted_thinking_tests {
     use super::*;
@@ -902,6 +925,8 @@ mod redacted_thinking_tests {
             output_config: None,
             betas: vec![],
             session_id: None,
+            explicit_max_tokens: false,
+            cache_history: false,
         }
     }
 
@@ -957,6 +982,115 @@ mod redacted_thinking_tests {
             body["messages"][1]["content"][0],
             json!({"type": "redacted_thinking", "data": "ENCRYPTED"})
         );
+    }
+}
+
+/// promptCache marked only tools and system, so every tool-loop round paid
+/// full input price for the whole conversation.
+#[cfg(test)]
+mod cache_history_tests {
+    use super::*;
+    use crate::query_engine::scripted_api_tests::{serve, sse};
+    use serde_json::json;
+
+    fn history() -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Read".into(),
+                    input: json!({}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: vec![ToolResultContent::text("ok")],
+                        is_error: None,
+                    },
+                    ContentBlock::Text {
+                        text: "and then?".into(),
+                    },
+                ],
+            },
+        ]
+    }
+
+    fn marks(body: &serde_json::Value) -> Vec<(usize, usize)> {
+        let mut found = vec![];
+        for (i, m) in body["messages"].as_array().unwrap().iter().enumerate() {
+            for (j, b) in m["content"].as_array().unwrap().iter().enumerate() {
+                if b.get("cache_control").is_some() {
+                    found.push((i, j));
+                }
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn cache_history_marks_the_end_of_the_conversation() {
+        let (url, seen) = serve(vec![sse(&[], "end_turn"), sse(&[], "end_turn")]).await;
+        let mut c = ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        let mut req = request(history());
+        req.cache_history = true;
+        c.messages_stream(req.clone(), |_| {}).await.unwrap();
+        req.cache_history = false;
+        c.messages_stream(req, |_| {}).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        let on: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(marks(&on), vec![(2, 1)]);
+        assert_eq!(
+            on["messages"][2]["content"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        let off: serde_json::Value = serde_json::from_str(&seen[1]).unwrap();
+        assert!(marks(&off).is_empty());
+    }
+
+    #[test]
+    fn cache_mark_skips_trailing_thinking() {
+        let mut msgs = history();
+        msgs.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text { text: "hm".into() },
+                ContentBlock::Thinking {
+                    thinking: "t".into(),
+                    signature: "s".into(),
+                },
+            ],
+        });
+        let mut req = request(msgs);
+        req.cache_history = true;
+        let body = request_body(&req).unwrap();
+        assert_eq!(marks(&body), vec![(3, 0)]);
+    }
+
+    fn request(messages: Vec<Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-haiku-4-5".into(),
+            max_tokens: 16,
+            messages,
+            system: Default::default(),
+            tools: vec![],
+            stream: None,
+            thinking: None,
+            output_config: None,
+            betas: vec![],
+            session_id: None,
+            explicit_max_tokens: false,
+            cache_history: false,
+        }
     }
 }
 
@@ -1120,6 +1254,7 @@ mod credential_tests {
             betas: vec![],
             session_id: None,
             explicit_max_tokens: false,
+            cache_history: false,
         }
     }
 

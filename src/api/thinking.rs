@@ -847,6 +847,7 @@ mod tests {
             betas: vec![],
             session_id: None,
             explicit_max_tokens: false,
+            cache_history: false,
         };
         let body = json(&req);
         assert!(!body.contains("output_config"), "{body}");
@@ -896,6 +897,7 @@ mod tests {
                 betas,
                 session_id: None,
                 explicit_max_tokens: false,
+                cache_history: false,
             };
             let resp = client
                 .messages(req)

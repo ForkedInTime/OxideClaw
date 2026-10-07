@@ -376,6 +376,7 @@ pub async fn summarize_compact(
         betas: vec![],
         session_id: None,
         explicit_max_tokens: config.explicit_max_tokens_for(&config.model).is_some(),
+        cache_history: false,
     };
 
     let mut summary_text = String::new();

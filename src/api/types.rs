@@ -149,6 +149,12 @@ pub struct MessagesRequest {
     /// that reject `max_tokens`).
     #[serde(skip)]
     pub explicit_max_tokens: bool,
+    /// promptCache: also put a cache breakpoint on the end of the history,
+    /// so each tool-loop round reads the conversation so far from cache
+    /// instead of paying full input price for it. Applied when the Anthropic
+    /// client builds the body; other backends ignore it.
+    #[serde(skip)]
+    pub cache_history: bool,
 }
 
 /// Tool definition sent to the API

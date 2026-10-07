@@ -709,6 +709,7 @@ mod tests {
             betas: vec![],
             session_id: None,
             explicit_max_tokens: false,
+            cache_history: false,
         }
     }
 

@@ -200,7 +200,8 @@ pub struct Config {
     /// Display thinking summaries in the chat UI. Off by default per v2.1.89 upstream change.
     pub show_thinking_summaries: bool,
 
-    /// Enable Anthropic prompt caching on system prompt and tool definitions.
+    /// Enable Anthropic prompt caching on the tool definitions, the system
+    /// prompt and the conversation history.
     pub prompt_cache: bool,
 
     /// Hooks configuration from settings.json

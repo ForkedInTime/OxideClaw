@@ -1188,6 +1188,7 @@ mod max_tokens_tests {
             betas: vec![],
             session_id: None,
             explicit_max_tokens: true,
+            cache_history: false,
         }
     }
 
