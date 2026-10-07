@@ -47,6 +47,9 @@ pub struct ApprovalGate {
     button_set: RegexSet,
     form_set: RegexSet,
     price_re: Regex,
+    /// Labels of controls that commit something, for which any price in the
+    /// page's text counts (see `before_tool`).
+    commit_re: Regex,
     extra_patterns: Vec<Regex>,
 }
 
@@ -126,6 +129,9 @@ fn form_field_patterns() -> Vec<String> {
 
 const PRICE_PATTERN: &str = r"[\$€£]\s*(\d+\.\d{2}|\d+,\d{2})";
 
+/// Labels of controls that move a purchase, sign-up or form along.
+const COMMIT_PATTERN: &str = r"(?i)\b(continue|proceed|next step|submit|confirm|complete|finish|check ?out|buy|pay|purchase|order|subscribe|upgrade|donate|book|reserve|rent|renew|enroll?|sign ?up|register|join|start|activate|transfer|send)\b";
+
 // --- Implementation ------------------------------------------------------------
 
 impl Default for ApprovalGate {
@@ -153,6 +159,7 @@ impl ApprovalGate {
             form_set: RegexSet::new(form_field_patterns())
                 .expect("built-in form patterns must compile"),
             price_re: Regex::new(PRICE_PATTERN).expect("price pattern must compile"),
+            commit_re: Regex::new(COMMIT_PATTERN).expect("commit pattern must compile"),
             extra_patterns: extras,
         }
     }
@@ -466,43 +473,46 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         // `target_text` is what we match against `button_patterns`. For refs,
         // resolve to the element's accessible name via the browser session's
         // ref-name map; otherwise fall back to the identifier.
-        let (mut target_text, cached_text, client) =
-            if let Some(session_arc) = &self.browser_session {
-                let session = session_arc.lock().await;
-                let name = session
-                    .resolve_ref_name(&ref_or_selector)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| ref_or_selector.clone());
-                (
-                    name,
-                    session.last_page_text.clone(),
-                    session.client().ok().cloned(),
-                )
-            } else {
-                (ref_or_selector.clone(), String::new(), None)
-            };
+        let (mut target_text, cached, client) = if let Some(session_arc) = &self.browser_session {
+            let session = session_arc.lock().await;
+            let name = session
+                .resolve_ref_name(&ref_or_selector)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| ref_or_selector.clone());
+            (
+                name,
+                crate::browser::snapshot::PageFacts {
+                    text: session.last_page_text.clone(),
+                    names: session.last_page_names.clone(),
+                },
+                session.client().ok().cloned(),
+            )
+        } else {
+            (ref_or_selector.clone(), Default::default(), None)
+        };
         // Prices come from the page's DOM as it is now, not from the last
         // snapshot: a fill, key press or script may have changed it since
         // (a total appearing, a redirect to checkout). Bounded like
         // live_url; on failure the last snapshot's text is used.
-        let page_text = match &client {
+        let page = match &client {
             Some(c) => match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                crate::browser::snapshot::read_page_text(c),
+                crate::browser::snapshot::read_page_facts(c),
             )
             .await
             {
-                Ok(Ok(text)) => {
+                Ok(Ok(facts)) => {
                     if let Some(s) = &self.browser_session {
-                        s.lock().await.last_page_text = text.clone();
+                        let mut s = s.lock().await;
+                        s.last_page_text = facts.text.clone();
+                        s.last_page_names = facts.names.clone();
                     }
-                    text
+                    facts
                 }
-                _ => cached_text,
+                _ => cached,
             },
-            None => cached_text,
+            None => cached,
         };
-        let visible_prices = self.gate.visible_prices_in(&page_text);
         // Enter/Space press whatever has focus, which the input does not
         // name. Ask the page, bounded like live_url; on failure keep the old
         // behaviour rather than wedge the loop.
@@ -516,6 +526,16 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         {
             target_text = label;
         }
+        // A price anywhere in the page's text (a results list, a "free
+        // shipping over $35.00" banner) says nothing about a link or a search
+        // box, and counting it prompted at every step of an ordinary shopping
+        // or search run. It counts for activating a control that commits
+        // something (Continue, Pay, Subscribe); element names count always.
+        let commits = (tool_name == "browser_click" || is_activating_key)
+            && self.gate.commit_re.is_match(&target_text);
+        let visible_prices =
+            self.gate
+                .visible_prices_in(if commits { &page.text } else { &page.names });
         // A click and a key press on the same control are one action: a
         // denied "Delete account" click must not get a fresh counter when
         // retried as Tab + Enter.
@@ -1108,6 +1128,70 @@ mod price_signal_tests {
         )
         .await;
         assert!(reasons.is_empty(), "{reasons:?}");
+    }
+
+    /// A results page with prices in its text: the gate read every text
+    /// node on the page and prompted for every click, fill and Enter, so a
+    /// "find the cheapest headphones" run asked at each step (and two
+    /// denials ended it). Opening a result or typing a search is not gated;
+    /// a control that commits something still is.
+    #[tokio::test]
+    async fn prices_elsewhere_on_the_page_do_not_gate_ordinary_steps() {
+        let page = |label: &str, role: &str| {
+            json!([
+                {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": "Results"}},
+                {"nodeId": "2", "parentId": "1", "role": {"value": "StaticText"},
+                 "name": {"value": "Free shipping on orders over $35.00"}},
+                {"nodeId": "3", "parentId": "1", "backendDOMNodeId": 1,
+                 "role": {"value": role}, "name": {"value": label}},
+                {"nodeId": "4", "parentId": "1", "role": {"value": "StaticText"},
+                 "name": {"value": "$299.99"}},
+                {"nodeId": "5", "parentId": "1", "role": {"value": "StaticText"},
+                 "name": {"value": "$49.99"}},
+            ])
+        };
+        let link = "Sony WH-1000XM5 Wireless Headphones";
+        let reasons = prompts_on_page(
+            page(link, "link"),
+            "",
+            "browser_click",
+            json!({"ref": "@e1"}),
+            link,
+        )
+        .await;
+        assert!(reasons.is_empty(), "{reasons:?}");
+        let reasons = prompts_on_page(
+            page("Search", "searchbox"),
+            "",
+            "browser_fill",
+            json!({"ref": "@e1", "value": "headphones"}),
+            "Search",
+        )
+        .await;
+        assert!(reasons.is_empty(), "{reasons:?}");
+
+        let checkout = "Proceed to checkout";
+        let reasons = prompts_on_page(
+            page(checkout, "button"),
+            "",
+            "browser_click",
+            json!({"ref": "@e1"}),
+            checkout,
+        )
+        .await;
+        assert_eq!(reasons, vec!["visible_price: $35.00".to_string()]);
+
+        // A price in an element's own name still counts, as before.
+        let priced = "Add to cart $19.99";
+        let reasons = prompts_on_page(
+            page(priced, "button"),
+            "",
+            "browser_click",
+            json!({"ref": "@e1"}),
+            priced,
+        )
+        .await;
+        assert_eq!(reasons, vec!["visible_price: $19.99".to_string()]);
     }
 
     /// browser_navigate recorded the requested URL, so after a redirect to

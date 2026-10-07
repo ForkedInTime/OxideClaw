@@ -117,14 +117,44 @@ impl NetPolicy {
         Ok(())
     }
 
-    /// `check_ip` for a connection to `addr`, where a loopback `ip:port`
-    /// in `grants` also passes. Grants only lift the private tier, so
-    /// link-local and metadata addresses never pass.
-    pub fn check_addr(&self, addr: SocketAddr, grants: Option<&LoopbackGrants>) -> Result<()> {
+    /// `check_ip` for a connection to `addr`, which `host` (the URL's host)
+    /// resolved to. A loopback destination also passes when `grants` covers
+    /// `host` at that port ([`LoopbackGrants::covers`]). Grants only lift
+    /// the private tier, so link-local and metadata addresses never pass.
+    pub fn check_addr(
+        &self,
+        host: &str,
+        addr: SocketAddr,
+        grants: Option<&LoopbackGrants>,
+    ) -> Result<()> {
         match self.check_ip(addr.ip()) {
-            Err(_) if grants.is_some_and(|g| g.covers(addr)) => Ok(()),
+            Err(_) if grants.is_some_and(|g| g.covers(host, addr)) => Ok(()),
             r => r,
         }
+    }
+
+    /// The CDP browser's check of `addrs`, what `url` resolved to: the
+    /// always-denied tier and (without the setting) the LAN fail; loopback
+    /// addresses refused only for want of a grant come back.
+    fn loopback_need(
+        &self,
+        url: &Url,
+        addrs: &[SocketAddr],
+        grants: &LoopbackGrants,
+    ) -> Result<Vec<SocketAddr>> {
+        let host = url.host_str().unwrap_or("host");
+        // The always-denied tier first: no grant can lift it.
+        NetPolicy::LOCAL_OK.check_addrs(url, addrs, None)?;
+        let mut need = Vec::new();
+        for a in addrs {
+            if let Err(e) = self.check_addr(host, *a, Some(grants)) {
+                if !is_loopback(a.ip()) {
+                    return Err(anyhow!("{host}: {e}"));
+                }
+                need.push(*a);
+            }
+        }
+        Ok(need)
     }
 
     /// The CDP browser is about to open `url`; check it the way its policy
@@ -167,18 +197,7 @@ impl NetPolicy {
                 };
             }
         };
-        // The always-denied tier first: no grant can lift it.
-        NetPolicy::LOCAL_OK.check_addrs(url, &addrs, None)?;
-        let mut need = Vec::new();
-        for a in addrs {
-            if let Err(e) = self.check_addr(a, Some(grants)) {
-                if !is_loopback(a.ip()) {
-                    return Err(anyhow!("{host}: {e}"));
-                }
-                need.push(a);
-            }
-        }
-        Ok(need)
+        self.loopback_need(url, &addrs, grants)
     }
 
     /// Scheme + host + DNS check. Returns every address the host resolved
@@ -206,9 +225,10 @@ impl NetPolicy {
         addrs: &[SocketAddr],
         grants: Option<&LoopbackGrants>,
     ) -> Result<()> {
+        let host = url.host_str().unwrap_or("host");
         for a in addrs {
-            self.check_addr(*a, grants)
-                .map_err(|e| anyhow!("{}: {e}", url.host_str().unwrap_or("host")))?;
+            self.check_addr(host, *a, grants)
+                .map_err(|e| anyhow!("{host}: {e}"))?;
         }
         Ok(())
     }
@@ -238,35 +258,104 @@ impl NetPolicy {
     }
 }
 
-/// Loopback `ip:port` destinations the user let the CDP browser reach this
-/// session, when `allowPrivateNetworkFetch` is off. `browser_navigate` asks
-/// once per service and records the answer here; the browser's policy proxy
-/// reads the same set, so the grant also covers that service's redirects and
+/// Loopback services the user let the CDP browser reach this session, when
+/// `allowPrivateNetworkFetch` is off. `browser_navigate` asks once per
+/// `host:port` and records the answer here; the browser's policy proxy reads
+/// the same grants, so they also cover that service's redirects and
 /// subresources, and nothing else on loopback.
+///
+/// A grant is for the name the user approved, not for whatever resolves to
+/// the same address: the proxy resolves every connection afresh, so keyed on
+/// `127.0.0.1:3000` any page could rebind its own name onto an approved dev
+/// server and read it same-origin.
 #[derive(Debug, Clone, Default)]
-pub struct LoopbackGrants(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>);
+pub struct LoopbackGrants(std::sync::Arc<std::sync::Mutex<GrantState>>);
+
+#[derive(Debug, Default)]
+struct GrantState {
+    /// Approved `(host, port)`, host as [`host_key`] spells it.
+    hosts: std::collections::HashSet<(String, u16)>,
+    /// What the approved names resolved to. An IP literal for one of these
+    /// passes too: no DNS answer is involved, so nothing can rebind it.
+    addrs: std::collections::HashSet<SocketAddr>,
+    /// Loopback `host:port` the proxy refused for want of a grant, not yet
+    /// reported to the model.
+    blocked: std::collections::BTreeSet<String>,
+}
+
+/// Most refused loopback services held for one report.
+const MAX_BLOCKED: usize = 16;
 
 impl LoopbackGrants {
-    /// Allow the loopback addresses among `addrs`; any other is ignored.
-    pub fn grant(&self, addrs: &[SocketAddr]) {
-        let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        set.extend(
-            addrs
-                .iter()
-                .filter(|a| is_loopback(a.ip()))
-                .map(|a| canonical(*a)),
-        );
+    fn state(&self) -> std::sync::MutexGuard<'_, GrantState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `addr` is a loopback address the user allowed.
-    pub fn covers(&self, addr: SocketAddr) -> bool {
-        is_loopback(addr.ip())
-            && self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&canonical(addr))
+    /// Allow `url`'s host and port, which resolved to `addrs`. Only the
+    /// loopback ones among `addrs` count; with none, nothing is granted.
+    pub fn grant(&self, url: &Url, addrs: &[SocketAddr]) {
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return;
+        };
+        let loopback: Vec<SocketAddr> = addrs
+            .iter()
+            .filter(|a| is_loopback(a.ip()))
+            .map(|a| canonical(*a))
+            .collect();
+        if loopback.is_empty() {
+            return;
+        }
+        let mut s = self.state();
+        s.hosts.insert((host_key(host), port));
+        s.addrs.extend(loopback);
+        s.blocked.remove(&format!("{host}:{port}"));
     }
+
+    /// A connection to `addr`, which `host` resolved to, is one the user
+    /// allowed: `addr` is loopback, and `host` is an approved name at that
+    /// port or an IP literal of an approved service.
+    pub fn covers(&self, host: &str, addr: SocketAddr) -> bool {
+        if !is_loopback(addr.ip()) {
+            return false;
+        }
+        let s = self.state();
+        s.hosts.contains(&(host_key(host), addr.port()))
+            || (ip_literal(host).is_some() && s.addrs.contains(&canonical(addr)))
+    }
+
+    /// The browser's proxy refused `url` only because its loopback service
+    /// was never approved; keep it for [`LoopbackGrants::take_blocked`].
+    fn record_blocked(&self, url: &Url) {
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return;
+        };
+        let mut s = self.state();
+        if s.blocked.len() < MAX_BLOCKED {
+            s.blocked.insert(format!("{host}:{port}"));
+        }
+    }
+
+    /// The loopback `host:port` the browser was refused for want of a grant
+    /// since the last call (a page's script or subresources asking for a
+    /// service the user never approved), so the model can be told.
+    pub fn take_blocked(&self) -> Vec<String> {
+        std::mem::take(&mut self.state().blocked)
+            .into_iter()
+            .collect()
+    }
+}
+
+/// A host as grants compare it: lower-case, without a trailing dot.
+fn host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// `host` (as `Url::host_str` spells it, IPv6 bracketed) is an IP literal.
+fn ip_literal(host: &str) -> Option<IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
 }
 
 /// `addr` with an IPv4-mapped IPv6 address written as the IPv4 one.
@@ -761,7 +850,19 @@ where
 {
     match addresses(url, lookup).await? {
         Ok(addrs) => {
-            policy.check_addrs(url, &addrs, grants)?;
+            if let Err(e) = policy.check_addrs(url, &addrs, grants) {
+                // Refused only for want of a grant: a page's request to a
+                // local service nobody approved. Recorded so the model can
+                // be told, since the page itself just breaks.
+                if let Some(g) = grants
+                    && policy
+                        .loopback_need(url, &addrs, g)
+                        .is_ok_and(|n| !n.is_empty())
+                {
+                    g.record_blocked(url);
+                }
+                return Err(e);
+            }
             Ok(match chain {
                 Some(up)
                     if addrs
@@ -783,10 +884,34 @@ where
     }
 }
 
+/// A name lookup the proxy can hold: the system resolver, or a test's.
+type Lookup =
+    fn(
+        String,
+        u16,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
+fn lookup_system_boxed(
+    host: String,
+    port: u16,
+) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+    Box::pin(lookup_system(host, port))
+}
+
 async fn spawn_policy_proxy_with(
     policy: NetPolicy,
     grants: LoopbackGrants,
     upstream: Option<Upstream>,
+) -> Result<PolicyProxy> {
+    spawn_policy_proxy_dns(policy, grants, upstream, lookup_system_boxed).await
+}
+
+/// [`spawn_policy_proxy_with`] resolving names with `lookup`.
+async fn spawn_policy_proxy_dns(
+    policy: NetPolicy,
+    grants: LoopbackGrants,
+    upstream: Option<Upstream>,
+    lookup: Lookup,
 ) -> Result<PolicyProxy> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
@@ -797,7 +922,13 @@ async fn spawn_policy_proxy_with(
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((sock, _)) => {
-                        conns.spawn(proxy_one(sock, policy, grants.clone(), upstream.clone()));
+                        conns.spawn(proxy_one(
+                            sock,
+                            policy,
+                            grants.clone(),
+                            upstream.clone(),
+                            lookup,
+                        ));
                     }
                     Err(_) => break,
                 },
@@ -813,6 +944,7 @@ async fn proxy_one(
     policy: NetPolicy,
     grants: LoopbackGrants,
     upstream: Option<Upstream>,
+    lookup: Lookup,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -863,7 +995,7 @@ async fn proxy_one(
     let port = url.port_or_known_default().unwrap_or(80);
     // NO_PROXY hosts connect directly, after the same check.
     let chain = upstream.filter(|u| !u.bypasses(&host));
-    let route = match route(&policy, Some(&grants), &url, chain, &lookup_system).await {
+    let route = match route(&policy, Some(&grants), &url, chain, &lookup).await {
         Ok(r) => r,
         Err(e) => {
             let _ = client
@@ -1886,7 +2018,7 @@ mod tests {
         assert!(got.starts_with("HTTP/1.1 403"), "{got}");
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-        grants.grant(&[authority.parse().unwrap()]);
+        grants.grant(&Url::parse(&base).unwrap(), &[authority.parse().unwrap()]);
         let got = via_proxy(&proxy, &get(&base)).await;
         assert!(got.ends_with("dev server"), "{got}");
         let got = via_proxy(
@@ -1911,7 +2043,10 @@ mod tests {
         let (base, _) =
             scripted_server(vec![redirect("http://169.254.169.254/latest/meta-data/")]).await;
         let grants = LoopbackGrants::default();
-        grants.grant(&[base.trim_start_matches("http://").parse().unwrap()]);
+        grants.grant(
+            &Url::parse(&base).unwrap(),
+            &[base.trim_start_matches("http://").parse().unwrap()],
+        );
         for policy in [NetPolicy::STRICT, NetPolicy::LOCAL_OK] {
             let proxy = spawn_policy_proxy_with(policy, grants.clone(), None)
                 .await
@@ -1929,36 +2064,104 @@ mod tests {
     #[test]
     fn grants_cover_only_the_granted_loopback_address() {
         let grants = LoopbackGrants::default();
-        grants.grant(&[
-            "127.0.0.1:3000".parse().unwrap(),
-            "169.254.169.254:80".parse().unwrap(),
-            "10.0.0.5:80".parse().unwrap(),
-        ]);
+        grants.grant(
+            &Url::parse("http://LocalHost:3000/").unwrap(),
+            &[
+                "127.0.0.1:3000".parse().unwrap(),
+                "169.254.169.254:3000".parse().unwrap(),
+                "10.0.0.5:3000".parse().unwrap(),
+            ],
+        );
         let p = NetPolicy::STRICT;
+        let ok = |host: &str, addr: &str| p.check_addr(host, addr.parse().unwrap(), Some(&grants));
+        assert!(ok("localhost", "127.0.0.1:3000").is_ok());
+        assert!(ok("localhost.", "127.0.0.1:3000").is_ok());
+        // IP literals of the approved service: nothing to rebind.
+        assert!(ok("127.0.0.1", "127.0.0.1:3000").is_ok());
+        assert!(ok("[::ffff:127.0.0.1]", "[::ffff:127.0.0.1]:3000").is_ok());
+        assert!(ok("localhost", "127.0.0.1:3001").is_err());
+        assert!(ok("127.0.0.1", "127.0.0.1:3001").is_err());
         assert!(
-            p.check_addr("127.0.0.1:3000".parse().unwrap(), Some(&grants))
-                .is_ok()
-        );
-        assert!(
-            p.check_addr("[::ffff:127.0.0.1]:3000".parse().unwrap(), Some(&grants))
-                .is_ok()
-        );
-        assert!(
-            p.check_addr("127.0.0.1:3001".parse().unwrap(), Some(&grants))
+            p.check_addr("localhost", "127.0.0.1:3000".parse().unwrap(), None)
                 .is_err()
         );
-        assert!(
-            p.check_addr("127.0.0.1:3000".parse().unwrap(), None)
-                .is_err()
+        assert!(ok("localhost", "169.254.169.254:3000").is_err());
+        assert!(ok("localhost", "10.0.0.5:3000").is_err());
+        // A grant needs a loopback answer.
+        let lan = LoopbackGrants::default();
+        lan.grant(
+            &Url::parse("http://lan.example:80/").unwrap(),
+            &["10.0.0.5:80".parse().unwrap()],
         );
-        assert!(
-            p.check_addr("169.254.169.254:80".parse().unwrap(), Some(&grants))
-                .is_err()
+        assert!(!lan.covers("lan.example", "127.0.0.1:80".parse().unwrap()));
+    }
+
+    /// Stand-in DNS where a second name resolves to the same loopback
+    /// address as `localhost`: an attacker's name rebound onto it.
+    fn rebinding_dns(
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+        Box::pin(async move {
+            match host.as_str() {
+                "localhost" | "attacker.example" => {
+                    Ok(vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)])
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                )),
+            }
+        })
+    }
+
+    /// Grants were keyed on the resolved `ip:port`, and the proxy resolves
+    /// every connection afresh, so once `localhost:3000` was approved any
+    /// page could serve itself from `attacker.example:3000`, rebind that
+    /// name to 127.0.0.1 and read the dev server same-origin. Only the
+    /// approved name (and the service's IP literal) pass now; the refused
+    /// name is recorded for the model.
+    #[tokio::test]
+    async fn another_name_resolving_to_a_granted_service_is_refused() {
+        let (base, hits) = scripted_server(vec![ok("dev server")]).await;
+        let port = Url::parse(&base).unwrap().port().unwrap();
+        let grants = LoopbackGrants::default();
+        grants.grant(
+            &Url::parse(&format!("http://localhost:{port}/")).unwrap(),
+            &[SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)],
         );
-        assert!(
-            p.check_addr("10.0.0.5:80".parse().unwrap(), Some(&grants))
-                .is_err()
+        let proxy = spawn_policy_proxy_dns(NetPolicy::STRICT, grants.clone(), None, rebinding_dns)
+            .await
+            .unwrap();
+        let get = |host: &str| format!("GET http://{host}:{port}/ HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        let got = via_proxy(&proxy, &get("attacker.example")).await;
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        let got = via_proxy(
+            &proxy,
+            &format!("CONNECT attacker.example:{port} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        )
+        .await;
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            grants.take_blocked(),
+            vec![format!("attacker.example:{port}")]
         );
+        assert!(grants.take_blocked().is_empty(), "reported once");
+
+        for host in ["localhost", "127.0.0.1"] {
+            let got = via_proxy(&proxy, &get(host)).await;
+            assert!(got.ends_with("dev server"), "{host}: {got}");
+        }
+        // Refusals for other reasons are not "ask the user" material.
+        let got = via_proxy(
+            &proxy,
+            "GET http://169.254.169.254/ HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        assert!(grants.take_blocked().is_empty());
     }
 
     /// The preflight refused every name it could not resolve, though the

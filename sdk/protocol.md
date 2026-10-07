@@ -481,7 +481,7 @@ The `policy` object on `session/start` controls tool approval:
 | `allow` | Executes silently | None |
 | *(unlisted)* | `ask` if interactive, `deny` if not | Depends |
 
-Without `allowPrivateNetworkFetch`, the browser asks before it opens a loopback service. That question arrives as `tool/approval_needed` for the pseudo-tool `browser_loopback`, with `args` `{"url": ..., "target": "localhost:3000"}`; approving it lets the browser reach that `host:port` for the rest of the session. List `browser_loopback` under `allow` to approve every loopback service, or under `deny` to refuse them. In a `browse/start` run the same question is a `browse/approval_needed` with `tool_name: "browser_loopback"`.
+Without `allowPrivateNetworkFetch`, the browser asks before it opens a loopback service. That question arrives as `tool/approval_needed` for the pseudo-tool `browser_loopback`, with `args` `{"url": ..., "target": "localhost:3000", "addresses": ["127.0.0.1:3000"]}` (`addresses`: what the name resolved to); approving it lets the browser reach that `host:port` for the rest of the session. The grant is for that name: another name that resolves to the same address is refused. Its `tool_use_id` is `browser-loopback-<approval_id>`, which matches no assistant tool call, and a `tool/completed` with that id and `success` set to the answer follows, so a client that tracks approvals by tool call can close it. List `browser_loopback` under `allow` to approve every loopback service, or under `deny` to refuse them. In a `browse/start` run the same question is a `browse/approval_needed` with `tool_name: "browser_loopback"`.
 
 ---
 

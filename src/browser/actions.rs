@@ -66,12 +66,17 @@ pub async fn preflight_navigation_url(
     policy.check_browser_url(&parsed, grants).await
 }
 
-/// Refuse to read a page that has moved to a blocked destination, and blank
-/// it. Chrome follows redirects, link clicks, meta refresh and script
-/// navigation without asking, so the preflight on the requested URL says
-/// nothing about where the page is now. A launched Chrome cannot even load
-/// such a page (its traffic goes through the policy proxy); this is what
-/// covers a Chrome attached through `browserCdpEndpoint`, which has no proxy.
+/// Refuse to read a page that has moved to a refused destination. Chrome
+/// follows redirects, link clicks, meta refresh and script navigation
+/// without asking, so the preflight on the requested URL says nothing about
+/// where the page is now. A launched Chrome cannot even load such a page
+/// (its traffic goes through the policy proxy); this is what covers a Chrome
+/// attached through `browserCdpEndpoint`, which has no proxy.
+///
+/// Only a page on a never-reachable address (link-local, cloud metadata) is
+/// blanked. An attached Chrome is the user's own, and a loopback or LAN page
+/// in it (the dev app they had open, an intranet tab) may hold their
+/// unsaved work, so it is left alone and only not read.
 pub async fn ensure_page_allowed(
     client: &CdpClient,
     policy: NetPolicy,
@@ -80,30 +85,53 @@ pub async fn ensure_page_allowed(
     let Some(href) = current_url(client).await else {
         return Ok(());
     };
-    if let Err(e) = landed_url_verdict(&href, policy, grants).await {
-        let _ = client
-            .send("Page.navigate", json!({"url": "about:blank"}))
-            .await;
-        bail!(
-            "the page moved to a blocked destination ({e}); the browser was reset to about:blank"
-        );
+    match landed_url_verdict(&href, policy, grants).await {
+        Landed::Allowed => Ok(()),
+        Landed::Denied(e) => {
+            let _ = client
+                .send("Page.navigate", json!({"url": "about:blank"}))
+                .await;
+            bail!(
+                "the page moved to a blocked destination ({e}); the browser was reset to about:blank"
+            )
+        }
+        Landed::Loopback(origin) => bail!(
+            "the page is at {origin}, a service on this machine the user has not let the \
+             browser reach, so it was not read. To use it, call browser_navigate with \
+             {origin}/ and the user will be asked."
+        ),
+        Landed::Private(origin, e) => bail!(
+            "the page is at {origin}, on the local network ({e}), so it was not read. \
+             Only the user can allow this, with allowPrivateNetworkFetch: true."
+        ),
     }
-    Ok(())
+}
+
+/// Where a page's live location stands under the browser's policy.
+#[derive(Debug)]
+enum Landed {
+    Allowed,
+    /// Link-local, metadata or reserved: never reachable. Blank the page.
+    Denied(anyhow::Error),
+    /// A loopback service not granted (its origin): the user can be asked.
+    Loopback(String),
+    /// The LAN without `allowPrivateNetworkFetch` (origin, reason).
+    Private(String, anyhow::Error),
 }
 
 /// Policy verdict on a page's live location. Only addresses that resolve and
 /// fail the policy count: a host this machine cannot resolve (a Chrome in a
 /// container sees other DNS) is not evidence of anything, and Chrome's own
 /// schemes (about:, chrome-error:, data:) have no destination.
-async fn landed_url_verdict(href: &str, policy: NetPolicy, grants: &LoopbackGrants) -> Result<()> {
+async fn landed_url_verdict(href: &str, policy: NetPolicy, grants: &LoopbackGrants) -> Landed {
     let Ok(url) = url::Url::parse(href) else {
-        return Ok(());
+        return Landed::Allowed;
     };
     if !matches!(url.scheme(), "http" | "https") {
-        return Ok(());
+        return Landed::Allowed;
     }
-    let Some(port) = url.port_or_known_default() else {
-        return Ok(());
+    let (Some(port), Some(host)) = (url.port_or_known_default(), url.host_str()) else {
+        return Landed::Allowed;
     };
     let ips: Vec<std::net::IpAddr> = match url.host() {
         Some(url::Host::Ipv4(ip)) => vec![ip.into()],
@@ -114,12 +142,31 @@ async fn landed_url_verdict(href: &str, policy: NetPolicy, grants: &LoopbackGran
         },
         None => Vec::new(),
     };
-    for ip in ips {
-        policy
-            .check_addr(std::net::SocketAddr::new(ip, port), Some(grants))
-            .map_err(|e| anyhow::anyhow!("{}: {e}", url.host_str().unwrap_or("host")))?;
+    let addrs: Vec<std::net::SocketAddr> = ips
+        .into_iter()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .collect();
+    // The never-reachable tier first, whatever else the name resolves to.
+    for a in &addrs {
+        if let Err(e) = NetPolicy::LOCAL_OK.check_ip(a.ip()) {
+            return Landed::Denied(anyhow::anyhow!("{host}: {e}"));
+        }
     }
-    Ok(())
+    let origin = format!("{}://{host}:{port}", url.scheme());
+    let mut loopback = false;
+    for a in &addrs {
+        if let Err(e) = policy.check_addr(host, *a, Some(grants)) {
+            if !crate::net_policy::is_loopback(a.ip()) {
+                return Landed::Private(origin, e);
+            }
+            loopback = true;
+        }
+    }
+    if loopback {
+        Landed::Loopback(origin)
+    } else {
+        Landed::Allowed
+    }
 }
 
 /// Navigate to a URL. Returns the title and, when the browser reports one,
@@ -697,7 +744,7 @@ mod preflight_tests {
             .await
             .unwrap();
         assert_eq!(need, vec!["127.0.0.1:3000".parse().unwrap()]);
-        grants.grant(&need);
+        grants.grant(&url::Url::parse(url).unwrap(), &need);
         assert!(
             preflight_navigation_url(url, NetPolicy::STRICT, &grants)
                 .await
@@ -826,11 +873,13 @@ mod landed_url_tests {
         assert_eq!(*navs.lock().unwrap(), vec!["about:blank".to_string()]);
     }
 
-    /// An attached Chrome (no proxy) that wandered onto a loopback service
-    /// the user never granted is blanked under the strict policy; a granted
-    /// one stays readable.
+    /// An attached Chrome (no proxy) on a loopback service the user never
+    /// granted, or on the LAN without the setting, is not read, but no
+    /// longer blanked: it is the user's own tab, perhaps with unsaved work.
+    /// For loopback the model is pointed at browser_navigate, which asks.
+    /// A granted one stays readable.
     #[tokio::test]
-    async fn an_ungranted_loopback_page_is_blanked_under_the_strict_policy() {
+    async fn an_ungranted_local_page_is_refused_without_being_blanked() {
         let grants = LoopbackGrants::default();
         let (ws, navs) = fake_cdp("http://127.0.0.1:6379/").await;
         let client = CdpClient::connect(&ws).await.unwrap();
@@ -838,10 +887,23 @@ mod landed_url_tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("127.0.0.1"), "{err}");
-        assert_eq!(*navs.lock().unwrap(), vec!["about:blank".to_string()]);
+        assert!(err.contains("http://127.0.0.1:6379"), "{err}");
+        assert!(err.contains("browser_navigate"), "{err}");
+        assert!(navs.lock().unwrap().is_empty(), "blanked: {err}");
 
-        grants.grant(&["127.0.0.1:6379".parse().unwrap()]);
+        let (ws, navs) = fake_cdp("http://192.168.1.10/admin").await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let err = ensure_page_allowed(&client, NetPolicy::STRICT, &grants)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowPrivateNetworkFetch"), "{err}");
+        assert!(navs.lock().unwrap().is_empty(), "blanked: {err}");
+
+        grants.grant(
+            &url::Url::parse("http://127.0.0.1:6379/").unwrap(),
+            &["127.0.0.1:6379".parse().unwrap()],
+        );
         let (ws, navs) = fake_cdp("http://127.0.0.1:6379/").await;
         let client = CdpClient::connect(&ws).await.unwrap();
         ensure_page_allowed(&client, NetPolicy::STRICT, &grants)

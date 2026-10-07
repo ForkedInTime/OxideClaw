@@ -1174,7 +1174,7 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
 
     // The legend is drawn pinned to the bottom row, so it stays visible even
     // when the command is taller than the screen.
-    let legend = Line::from(vec![
+    let mut legend = vec![
         Span::styled("  [", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "y",
@@ -1183,19 +1183,27 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("] allow   [", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "a",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("] always   [", Style::default().fg(Color::DarkGray)),
+    ];
+    // Same rule as the key handler: no "always" where it would not hold.
+    if crate::permissions::offers_always_allow(&perm.tool_name) {
+        legend.extend([
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("] always   [", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    legend.extend([
         Span::styled(
             "n",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         Span::styled("] deny", Style::default().fg(Color::DarkGray)),
     ]);
+    let legend = Line::from(legend);
 
     let legend_h = 1.min(inner.height);
     let body = Rect {
@@ -1571,6 +1579,23 @@ mod permission_popup_tests {
         assert!(flat.contains("build-artifacts-TAIL"), "{screen}");
         assert!(screen.contains("] deny"), "{screen}");
         assert!(app.pending_permission.unwrap().fully_shown);
+    }
+
+    /// "Always" on the browser's loopback question approved only that one
+    /// host:port, and the next port asked again: it is not offered there.
+    #[test]
+    fn the_loopback_question_offers_no_always() {
+        let mut app = app_with_command("x");
+        let (screen, _) = render_permission(&mut app, 100, 20);
+        assert!(screen.contains("] always"), "{screen}");
+        app.pending_permission.as_mut().unwrap().tool_name =
+            crate::tools::browser_tools::LOOPBACK_QUESTION.into();
+        let (screen, _) = render_permission(&mut app, 100, 20);
+        assert!(!screen.contains("always"), "{screen}");
+        assert!(
+            screen.contains("] allow") && screen.contains("] deny"),
+            "{screen}"
+        );
     }
 
     /// Word wrapping moves whole path tokens down a row, so a char-count

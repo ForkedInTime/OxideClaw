@@ -26,6 +26,13 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// The prompt for `tool_name` offers "always allow". The browser's loopback
+/// question does not: its answer covers one `host:port`, so an "always"
+/// would read as more than it grants.
+pub fn offers_always_allow(tool_name: &str) -> bool {
+    tool_name != crate::tools::browser_tools::LOOPBACK_QUESTION
+}
+
 /// Tools that require explicit permission before execution.
 /// Mirrors the hasPermissionsToUseTool logic in permissions.ts.
 ///

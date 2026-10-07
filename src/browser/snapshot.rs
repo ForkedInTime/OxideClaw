@@ -93,6 +93,18 @@ pub struct Snapshot {
     /// node on the page, without the model's budget. The gate's visible-price
     /// signal reads this, never anything the model wrote.
     pub page_text: String,
+    /// Only the element names of `page_text`: what the gate's price signal
+    /// reads for an action that commits nothing (a link, a search box).
+    pub name_text: String,
+}
+
+/// What the approval gate reads of the live page.
+#[derive(Debug, Default, Clone)]
+pub struct PageFacts {
+    /// [`Snapshot::page_text`].
+    pub text: String,
+    /// [`Snapshot::name_text`].
+    pub names: String,
 }
 
 /// One line of the snapshot before text selection.
@@ -107,7 +119,7 @@ enum Item {
 }
 
 /// Collapse every run of whitespace (newlines included) to one space.
-fn collapse_ws(s: &str) -> String {
+pub fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -145,6 +157,7 @@ pub fn parse_snapshot(nodes: &serde_json::Value) -> Snapshot {
     let mut parents: HashMap<&str, &str> = HashMap::new();
     let mut facts: Vec<String> = Vec::new();
     let mut seen_facts: HashSet<String> = HashSet::new();
+    let mut name_facts: Vec<String> = Vec::new();
     let mut ref_counter = 1u32;
 
     for node in arr {
@@ -212,7 +225,9 @@ pub fn parse_snapshot(nodes: &serde_json::Value) -> Snapshot {
             if !ax_id.is_empty() {
                 emitted.insert(ax_id, name.clone());
             }
-            element_names.insert(name.clone());
+            if element_names.insert(name.clone()) {
+                name_facts.push(name.clone());
+            }
             if seen_facts.insert(name.clone()) {
                 facts.push(name.clone());
             }
@@ -296,11 +311,15 @@ pub fn parse_snapshot(nodes: &serde_json::Value) -> Snapshot {
     }
     snap.tree = lines.join("\n");
 
-    let mut page_text = facts.join("\n");
-    if let Some((i, _)) = page_text.char_indices().nth(PAGE_TEXT_CAP) {
-        page_text.truncate(i);
-    }
-    snap.page_text = page_text;
+    let capped = |lines: Vec<String>| {
+        let mut s = lines.join("\n");
+        if let Some((i, _)) = s.char_indices().nth(PAGE_TEXT_CAP) {
+            s.truncate(i);
+        }
+        s
+    };
+    snap.page_text = capped(facts);
+    snap.name_text = capped(name_facts);
     snap
 }
 
@@ -319,16 +338,20 @@ pub async fn take_snapshot(client: &super::cdp::CdpClient) -> anyhow::Result<Sna
     Ok(parse_snapshot(&result["nodes"]))
 }
 
-/// The page's text as the DOM has it now ([`Snapshot::page_text`]), for the
+/// The page's text and element names as the DOM has them now, for the
 /// approval gate. Errors when Chrome returns no node list.
-pub async fn read_page_text(client: &super::cdp::CdpClient) -> anyhow::Result<String> {
+pub async fn read_page_facts(client: &super::cdp::CdpClient) -> anyhow::Result<PageFacts> {
     let result = client
         .send("Accessibility.getFullAXTree", serde_json::json!({}))
         .await?;
     if !result["nodes"].is_array() {
         anyhow::bail!("no accessibility tree");
     }
-    Ok(parse_snapshot(&result["nodes"]).page_text)
+    let snap = parse_snapshot(&result["nodes"]);
+    Ok(PageFacts {
+        text: snap.page_text,
+        names: snap.name_text,
+    })
 }
 
 /// Wrap page-derived text for a tool result. Everything a page controls

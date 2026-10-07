@@ -135,7 +135,13 @@ impl crate::permissions::PermissionAsker for SdkPolicyAsker {
         // children never consume each other's replies as stale.
         let mut rx = self.approval_rx.lock().await;
         let approval_id = uuid::Uuid::new_v4().to_string();
-        let tool_use_id = format!("subagent-{approval_id}");
+        // The browser's loopback question is not a sub-agent's tool call.
+        let loopback = tool_name == crate::tools::browser_tools::LOOPBACK_QUESTION;
+        let tool_use_id = if loopback {
+            format!("browser-loopback-{approval_id}")
+        } else {
+            format!("subagent-{approval_id}")
+        };
         self.approval_tx
             .send(crate::sdk::protocol::SdkNotification::ToolApprovalNeeded {
                 session_id: self.session_id.clone(),
@@ -161,10 +167,10 @@ impl crate::permissions::PermissionAsker for SdkPolicyAsker {
                 tool: tool_name.to_string(),
                 tool_use_id,
                 success: ok,
-                output_summary: if ok {
-                    "Approved for sub-agent.".into()
-                } else {
-                    "Denied.".into()
+                output_summary: match (ok, loopback) {
+                    (true, true) => "Approved: the browser may reach this local service.".into(),
+                    (true, false) => "Approved for sub-agent.".into(),
+                    (false, _) => "Denied.".into(),
                 },
                 duration_ms: 0,
             });
@@ -174,5 +180,71 @@ impl crate::permissions::PermissionAsker for SdkPolicyAsker {
         } else {
             Some(PermissionDecision::Deny)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::{PermissionAsker, PermissionDecision};
+    use crate::sdk::protocol::SdkNotification;
+    use std::sync::Arc;
+
+    /// The browser's loopback question went out under a made-up
+    /// "subagent-" call id and was closed with "Approved for sub-agent.",
+    /// which described something that never happened.
+    #[tokio::test]
+    async fn the_loopback_question_is_not_reported_as_a_sub_agent_call() {
+        let (tx, mut notes) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let asker = SdkPolicyAsker {
+            policy: Arc::new(PolicyEngine::new(Policy::default(), true)),
+            session_id: "s".into(),
+            approval_tx: tx,
+            approval_rx: Arc::new(tokio::sync::Mutex::new(reply_rx)),
+            cancel: Arc::default(),
+        };
+        let host = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(n) = notes.recv().await {
+                match n {
+                    SdkNotification::ToolApprovalNeeded {
+                        approval_id,
+                        tool_use_id,
+                        ..
+                    } => {
+                        seen.push(tool_use_id);
+                        let _ = reply_tx.send((approval_id, None));
+                    }
+                    SdkNotification::ToolCompleted {
+                        tool_use_id,
+                        output_summary,
+                        success,
+                        ..
+                    } => {
+                        seen.push(format!("{tool_use_id} {success} {output_summary}"));
+                    }
+                    _ => {}
+                }
+            }
+            seen
+        });
+        let got = asker
+            .ask(
+                crate::tools::browser_tools::LOOPBACK_QUESTION,
+                "q",
+                &serde_json::json!({"url": "http://localhost:3000/"}),
+            )
+            .await;
+        assert_eq!(got, Some(PermissionDecision::Allow));
+        drop(asker);
+        let seen = host.await.unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("browser-loopback-"), "{seen:?}");
+        assert!(
+            seen[1].starts_with(&format!("{} true ", seen[0])),
+            "{seen:?}"
+        );
+        assert!(!seen[1].contains("sub-agent"), "{seen:?}");
     }
 }

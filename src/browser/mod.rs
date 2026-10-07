@@ -50,6 +50,8 @@ pub struct BrowserSession {
     /// The page's text and element names from the last snapshot (DOM facts,
     /// not the model's view), for the approval gate's visible-price signal.
     pub last_page_text: String,
+    /// Only the element names of `last_page_text`.
+    pub last_page_names: String,
     /// Current page title
     pub current_title: String,
     /// Captured console messages (Runtime.consoleAPICalled + Runtime.exceptionThrown).
@@ -212,6 +214,7 @@ impl BrowserSession {
         self.current_url.clear();
         self.current_title.clear();
         self.last_page_text.clear();
+        self.last_page_names.clear();
     }
 
     /// Drain and return all console messages captured since the last call.

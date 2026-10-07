@@ -232,6 +232,8 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         // y/a only once render has shown every row of the command; until
         // then the arrows scroll the dialog and n/Esc still deny.
         let shown = perm.fully_shown;
+        // Not offered (or drawn) for a question an "always" would overstate.
+        let always = crate::permissions::offers_always_allow(&perm.tool_name);
         match key.code {
             KeyCode::Up => perm.scroll = perm.scroll.saturating_sub(1),
             KeyCode::Down => perm.scroll = perm.scroll.saturating_add(1),
@@ -242,7 +244,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     let _ = p.reply.send(PermissionDecision::Allow);
                 }
             }
-            Char('a') | Char('A') if shown => {
+            Char('a') | Char('A') if shown && always => {
                 if let Some(p) = app.pending_permission.take() {
                     perm_state.record_always_allow(&p.tool_name);
                     let _ = p.reply.send(PermissionDecision::AlwaysAllow);
