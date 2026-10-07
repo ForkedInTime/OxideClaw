@@ -10,9 +10,10 @@ on:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
 
+# Read-only by default: the build jobs run third-party actions, pip packages
+# and every crate's build script, none of which should hold a write token.
 permissions:
-  contents: write    # needed to create GitHub Releases and upload assets
-  actions: write     # needed to dispatch docker.yml after the release
+  contents: read
 
 jobs:
   build:
@@ -62,6 +63,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -154,9 +157,14 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write    # gh release create
+      actions: write     # gh workflow run docker.yml
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # gh authenticates with GH_TOKEN
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
