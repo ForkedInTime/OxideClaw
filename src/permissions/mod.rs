@@ -127,21 +127,8 @@ impl PermissionState {
         // Deny list first — an explicit `permissions.deny` holds even under
         // `--dangerously-skip-permissions`; bypass skips *prompts*, it does
         // not override a rule the user wrote down.
-        // A MultiEdit is N Edits: a deny rule hits if it covers any file,
-        // an allow rule only if it covers every file.
-        let hits = |rule: &str, any: bool| {
-            if tool_name == "MultiEdit" {
-                multi_edit_matches(rule, input, &cwd, any)
-            } else {
-                rule_matches(rule, tool_name, input, &cwd, any)
-            }
-        };
-        // A deny rule this tool cannot parse blocks the tool: failing open
-        // would hand `Read(./.env)`-style secrets to the model unannounced.
-        for rule in &inner.deny_list {
-            if hits(rule, true) != RuleMatch::NoMatch {
-                return CheckResult::Deny;
-            }
+        if denied(&inner, tool_name, input, &cwd) {
+            return CheckResult::Deny;
         }
 
         if inner.bypass {
@@ -166,12 +153,38 @@ impl PermissionState {
 
         // Check always-allowed — also supports prefix rules
         for rule in &inner.always_allowed {
-            if hits(rule, false) == RuleMatch::Match {
+            if rule_hits(rule, tool_name, input, &cwd, false) == RuleMatch::Match {
                 return CheckResult::Allow;
             }
         }
 
         CheckResult::Ask
+    }
+
+    /// Whether a `permissions.deny` rule refuses this call.
+    pub fn matches_deny(&self, tool_name: &str, input: &serde_json::Value) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = inner
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        denied(&inner, tool_name, Some(input), &cwd)
+    }
+
+    /// Whether a deny rule judges `tool_name` by its command
+    /// (`Bash(git push:*)`), as opposed to refusing the tool outright.
+    pub fn has_command_deny_rule(&self, tool_name: &str) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.deny_list.iter().any(|rule| {
+            rule.split_once('(')
+                .is_some_and(|(tool, _)| tool.eq_ignore_ascii_case(tool_name))
+        })
+    }
+
+    /// Whether `--dangerously-skip-permissions` is in force.
+    pub fn bypass(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).bypass
     }
 
     /// The files `permissions.deny` keeps from `tool_name` (Grep, Glob)
@@ -240,6 +253,31 @@ impl PermissionState {
             .unwrap_or_else(|e| e.into_inner())
             .always_allowed
             .insert(tool_name.to_string());
+    }
+}
+
+/// A deny rule this tool cannot parse blocks the tool: failing open would
+/// hand `Read(./.env)`-style secrets to the model unannounced.
+fn denied(inner: &Inner, tool_name: &str, input: Option<&serde_json::Value>, cwd: &Path) -> bool {
+    inner
+        .deny_list
+        .iter()
+        .any(|rule| rule_hits(rule, tool_name, input, cwd, true) != RuleMatch::NoMatch)
+}
+
+/// `rule` against one call. A MultiEdit is N Edits: a deny rule (`any`)
+/// hits if it covers any file, an allow rule only if it covers every file.
+fn rule_hits(
+    rule: &str,
+    tool_name: &str,
+    input: Option<&serde_json::Value>,
+    cwd: &Path,
+    any: bool,
+) -> RuleMatch {
+    if tool_name == "MultiEdit" {
+        multi_edit_matches(rule, input, cwd, any)
+    } else {
+        rule_matches(rule, tool_name, input, cwd, any)
     }
 }
 
@@ -828,6 +866,10 @@ pub enum CheckResult {
     Ask,
     /// Tool is permanently denied (via settings.permissions.deny)
     Deny,
+    /// A command with a quote, bracket or heredoc that does not close, so
+    /// the deny rules for its tool could not be checked against what runs.
+    /// It needs a prompt; where none is shown it is refused.
+    Unverified,
 }
 
 /// How the shell that runs a command string reads quotes and escapes.
@@ -972,15 +1014,31 @@ pub fn check_compound_command_as(
         return CheckResult::Ask;
     }
 
+    // Deny rules must also see what the split cannot: `(git push)`,
+    // `GIT_TRACE=1 git push`, `echo $(git push)`, `bash -c 'git push'`.
+    // Under full-auto and --dangerously-skip-permissions they are the only
+    // guard left.
+    let candidates = deny_candidates(full_command, grammar, 0);
+    if candidates
+        .iter()
+        .flatten()
+        .any(|c| state.matches_deny(tool_name, &serde_json::json!({ "command": c })))
+    {
+        return CheckResult::Deny;
+    }
+
     let mut any_ask = false;
     for sub in &subs {
         let fake_input = serde_json::json!({ "command": *sub });
         let result = state.check_with_input(tool_name, Some(&fake_input));
         match result {
             CheckResult::Deny => return CheckResult::Deny,
-            CheckResult::Ask => any_ask = true,
+            CheckResult::Ask | CheckResult::Unverified => any_ask = true,
             CheckResult::Allow => {}
         }
+    }
+    if candidates.is_none() && state.has_command_deny_rule(tool_name) {
+        return CheckResult::Unverified;
     }
     if any_ask {
         return CheckResult::Ask;
@@ -1016,6 +1074,319 @@ fn defeats_prefix_rules(cmd: &str, grammar: ShellGrammar) -> bool {
         .iter()
         .chain(ps)
         .any(|t| cmd.contains(t))
+}
+
+/// Words that run the rest of the command line as a command: shell keywords
+/// and command wrappers.
+const COMMAND_PREFIXES: &[&str] = &[
+    "!", "if", "then", "else", "elif", "do", "while", "until", "time", "env", "command", "builtin",
+    "exec", "nohup", "nice", "timeout", "sudo", "doas", "xargs",
+];
+
+/// Wrapper options that take the next word as their value (`env -u NAME`,
+/// `sudo -u user`, `nice -n 10`, `timeout -s KILL 5`).
+const PREFIX_VALUE_FLAGS: &[&str] = &[
+    "-u", "-g", "-C", "-n", "-s", "-k", "--unset", "--chdir", "--user", "--group", "--signal",
+];
+
+/// Every command a deny rule must see in `cmd`, beyond its top-level
+/// sub-commands: each one again without leading `NAME=value` assignments,
+/// keywords and wrappers (`if`, `!`, `env`, `exec`, `nohup`, ...), the
+/// bodies of `$(…)`, backticks, `<(…)`, `( … )` and `{ … }`, and the script
+/// of `bash -c '…'` or `eval`. `None` when a quote, bracket or heredoc does
+/// not close, or nesting runs too deep: what would run is then unknown.
+fn deny_candidates(cmd: &str, grammar: ShellGrammar, depth: usize) -> Option<Vec<String>> {
+    if depth > 8 {
+        return None;
+    }
+    let (bodies, text) = nested_bodies(cmd, grammar)?;
+    let mut out = Vec::new();
+    for piece in split_compound_command(&text, grammar) {
+        let mut rest = piece;
+        let mut wrapped = false;
+        out.push(rest.to_string());
+        loop {
+            let (word, mut tail) = first_word(rest, grammar);
+            if word.is_empty() {
+                break;
+            }
+            if let Some(script) = shell_script_arg(word, tail, grammar) {
+                let inner = ShellGrammar::of_shell(word);
+                out.extend(deny_candidates(&script, inner, depth + 1)?);
+            } else if word == "eval" {
+                let script = words(tail, grammar)
+                    .iter()
+                    .map(|w| unquote(w, grammar))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.extend(deny_candidates(&script, grammar, depth + 1)?);
+            }
+            let prefix = COMMAND_PREFIXES.contains(&word);
+            let option = wrapped
+                && (word.starts_with('-') || word.starts_with(|c: char| c.is_ascii_digit()));
+            if !(prefix || option || is_assignment(word)) {
+                break;
+            }
+            wrapped |= prefix && !matches!(word, "!" | "if" | "then" | "else" | "elif" | "do");
+            if option && PREFIX_VALUE_FLAGS.contains(&word) {
+                tail = first_word(tail, grammar).1;
+            }
+            rest = tail.trim_start();
+            out.push(rest.to_string());
+        }
+    }
+    for body in bodies {
+        out.extend(deny_candidates(body, grammar, depth + 1)?);
+    }
+    Some(out)
+}
+
+/// The script of `bash -c '<script>'` (any POSIX shell, fish, or
+/// `pwsh -Command`), unquoted.
+fn shell_script_arg(shell: &str, args: &str, grammar: ShellGrammar) -> Option<String> {
+    let name = crate::tools::bash::shell_file_name(shell).to_ascii_lowercase();
+    if !matches!(
+        name.as_str(),
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "mksh"
+            | "yash"
+            | "fish"
+            | "pwsh"
+            | "powershell"
+    ) {
+        return None;
+    }
+    let ps = matches!(name.as_str(), "pwsh" | "powershell");
+    let ws = words(args, grammar);
+    let at = ws.iter().position(|w| {
+        let w = w.to_ascii_lowercase();
+        if ps {
+            // PowerShell takes any unambiguous prefix of `-Command`.
+            w == "-c" || (w.len() >= 4 && "-command".starts_with(&w))
+        } else {
+            w.strip_prefix('-')
+                .is_some_and(|f| f.contains('c') && f.chars().all(|c| c.is_ascii_alphabetic()))
+        }
+    })?;
+    ws.get(at + 1).map(|s| unquote(s, grammar))
+}
+
+/// `NAME=value` or `NAME+=value`.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The first shell word of `s` (quotes kept) and the text after it.
+fn first_word(s: &str, grammar: ShellGrammar) -> (&str, &str) {
+    let s = s.trim_start();
+    let (mut in_single, mut in_double) = (false, false);
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match grammar.quote(c) {
+            Some('\'') if !in_double => in_single = !in_single,
+            Some('"') if !in_single => in_double = !in_double,
+            _ if c == grammar.escape() && !in_single => {
+                chars.next();
+            }
+            _ if c.is_whitespace() && !in_single && !in_double => return (&s[..i], &s[i..]),
+            _ => {}
+        }
+    }
+    (s, "")
+}
+
+fn words(mut s: &str, grammar: ShellGrammar) -> Vec<&str> {
+    let mut out = Vec::new();
+    loop {
+        let (w, rest) = first_word(s, grammar);
+        if w.is_empty() {
+            return out;
+        }
+        out.push(w);
+        s = rest;
+    }
+}
+
+/// A shell word with its quoting removed.
+fn unquote(word: &str, grammar: ShellGrammar) -> String {
+    let (mut in_single, mut in_double) = (false, false);
+    let mut out = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match grammar.quote(c) {
+            Some('\'') if !in_double => in_single = !in_single,
+            Some('"') if !in_single => in_double = !in_double,
+            _ if c == grammar.escape() && !in_single => out.extend(chars.next()),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The text of every `$(…)`, `<(…)`, `( … )`, `{ … }` and backtick span in
+/// `cmd` (PowerShell: `(…)`, `$(…)`, `@(…)`, `{…}`), outermost first;
+/// nested ones are found when a body is scanned in turn. Single-quoted text,
+/// comments and quoted heredocs are data. Also `cmd` with its heredoc
+/// bodies cut out, so their lines are not split into commands. `None` when
+/// one does not close.
+fn nested_bodies(cmd: &str, grammar: ShellGrammar) -> Option<(Vec<&str>, String)> {
+    let mut bodies = Vec::new();
+    let mut heredocs = Vec::new();
+    scan_bodies(cmd, 0, None, grammar, &mut bodies, &mut heredocs)?;
+    let mut text = String::with_capacity(cmd.len());
+    let mut at = 0;
+    for r in heredocs {
+        text.push_str(&cmd[at..r.start]);
+        at = r.end;
+    }
+    text.push_str(&cmd[at..]);
+    Some((bodies, text))
+}
+
+/// Scan `cmd` from byte `i` up to the unquoted `close` (or the end when
+/// `None`), pushing the bodies met on the way and the byte ranges of heredoc
+/// bodies, in order. Returns where it stopped.
+fn scan_bodies<'a>(
+    cmd: &'a str,
+    mut i: usize,
+    close: Option<char>,
+    grammar: ShellGrammar,
+    out: &mut Vec<&'a str>,
+    heredoc_ranges: &mut Vec<std::ops::Range<usize>>,
+) -> Option<usize> {
+    let posix = grammar != ShellGrammar::PowerShell;
+    let (mut in_single, mut in_double) = (false, false);
+    // Heredocs opened on the current line: (delimiter, quoted, `<<-`).
+    let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
+    let mut prev: Option<char> = None;
+    while let Some(c) = cmd[i..].chars().next() {
+        let next = i + c.len_utf8();
+        let quote = grammar.quote(c);
+        if quote == Some('\'') && !in_double {
+            in_single = !in_single;
+        } else if quote == Some('"') && !in_single {
+            in_double = !in_double;
+        } else if in_single {
+        } else if c == grammar.escape() {
+            i = next + cmd[next..].chars().next().map_or(0, char::len_utf8);
+            prev = None;
+            continue;
+        } else if !in_double && Some(c) == close {
+            return Some(i);
+        } else if matches!(c, '(' | '{') && (!in_double || prev == Some('$')) {
+            // `$(` and `${` expand inside double quotes too; a bare `(` or
+            // `{` there is text.
+            let closer = if c == '(' { ')' } else { '}' };
+            let end = scan_bodies(cmd, next, Some(closer), grammar, out, heredoc_ranges)?;
+            out.push(&cmd[next..end]);
+            i = end + 1;
+            prev = Some(closer);
+            continue;
+        } else if c == '`' && posix {
+            let end = next + find_closing_backtick(&cmd[next..])?;
+            out.push(&cmd[next..end]);
+            i = end + 1;
+            prev = Some('`');
+            continue;
+        } else if c == '#' && !in_double && grammar == ShellGrammar::PowerShell && prev == Some('<')
+        {
+            i = next + cmd[next..].find("#>")? + 2;
+            prev = None;
+            continue;
+        } else if c == '#'
+            && !in_double
+            && prev.is_none_or(|p| p.is_whitespace() || matches!(p, ';' | '|' | '&' | '('))
+        {
+            i = cmd[i..].find('\n').map_or(cmd.len(), |n| i + n);
+            prev = None;
+            continue;
+        } else if c == '<'
+            && posix
+            && !in_double
+            && cmd[next..].starts_with('<')
+            && !cmd[next + 1..].starts_with('<')
+        {
+            let mut rest = &cmd[next + 1..];
+            let strip_tabs = rest.starts_with('-');
+            if strip_tabs {
+                rest = &rest[1..];
+            }
+            let rest = rest.trim_start_matches([' ', '\t']);
+            let len = rest
+                .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
+                .unwrap_or(rest.len());
+            let word = &rest[..len];
+            let delim: String = word.chars().filter(|c| !"'\"\\".contains(*c)).collect();
+            if delim.is_empty() {
+                return None;
+            }
+            let quoted = delim.len() != word.len();
+            heredocs.push((delim, quoted, strip_tabs));
+            i = cmd.len() - rest.len() + len;
+            prev = None;
+            continue;
+        } else if c == '\n' && !in_double && !heredocs.is_empty() {
+            let mut j = next;
+            for (delim, quoted, strip_tabs) in heredocs.drain(..) {
+                let start = j;
+                let mut body_end = cmd.len();
+                while j < cmd.len() {
+                    let line_end = cmd[j..].find('\n').map_or(cmd.len(), |n| j + n);
+                    let line = &cmd[j..line_end];
+                    let line = if strip_tabs {
+                        line.trim_start_matches('\t')
+                    } else {
+                        line
+                    };
+                    let line_start = j;
+                    j = (line_end + 1).min(cmd.len());
+                    if line == delim {
+                        body_end = line_start;
+                        break;
+                    }
+                }
+                // An unquoted heredoc runs its `$(…)` and backticks.
+                let body = &cmd[start..body_end];
+                if !quoted && (body.contains("$(") || body.contains('`')) {
+                    return None;
+                }
+                heredoc_ranges.push(start..j);
+            }
+            i = j;
+            prev = Some('\n');
+            continue;
+        }
+        prev = Some(c);
+        i = next;
+    }
+    if close.is_some() || in_single || in_double {
+        return None;
+    }
+    Some(i)
+}
+
+/// Byte offset of the backtick that ends a POSIX backtick substitution.
+fn find_closing_backtick(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '`' => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Build a human-readable description of a tool call for the permission dialog.
@@ -1542,6 +1913,71 @@ mod tests {
             |p: &str| read.check_with_input("Read", Some(&serde_json::json!({ "file_path": p })));
         assert!(matches!(r("/home/u/.ssh/id_rsa"), CheckResult::Deny));
         assert!(matches!(r("/home/u/.sshx"), CheckResult::Allow));
+    }
+
+    /// Deny rules matched only top-level sub-commands, so a subshell, an
+    /// assignment prefix or a substitution ran the denied command under
+    /// full-auto and --dangerously-skip-permissions.
+    #[test]
+    fn deny_rules_see_nested_and_prefixed_commands() {
+        let st = PermissionState::new(true, &[], &["Bash(git push:*)".into()]);
+        let check = |c: &str| check_compound_command(&st, "Bash", c);
+        for cmd in [
+            "(git push -f)",
+            "{ git push; }",
+            "GIT_TRACE=1 git push --force",
+            "echo `git push`",
+            "echo $(git push)",
+            "echo \"$(git push)\"",
+            "bash -c 'git push'",
+            "sh -lc \"git push origin\"",
+            "eval git push",
+            "eval 'git push'",
+            "env -u HOME GIT_TRACE=1 git push",
+            "if true; then git push; fi",
+            "! git push",
+            "nohup git push &",
+            "time git push",
+            "cat <(git push)",
+            "f() { git push; }; f",
+            "x=$(echo $(git push))",
+            "echo $(cat <<E\n'\nE\ngit push)",
+        ] {
+            assert!(matches!(check(cmd), CheckResult::Deny), "{cmd:?}");
+        }
+        for cmd in [
+            "git commit -m \"$(cat <<'EOF'\nfix: don't git push here\nEOF\n)\"",
+            "echo '$(git push)'",
+            "echo git push",
+            "git status",
+            "awk '{print \"git push\"}' f",
+            "cat <<'EOF'\n$(git push)\nEOF",
+            "echo ${HOME} # it's fine",
+        ] {
+            assert!(matches!(check(cmd), CheckResult::Allow), "{cmd:?}");
+        }
+        let pwsh = PermissionState::new(true, &[], &["PowerShell(Remove-Item:*)".into()]);
+        assert!(matches!(
+            check_compound_command(&pwsh, "PowerShell", "Get-ChildItem (Remove-Item ~)"),
+            CheckResult::Deny
+        ));
+    }
+
+    /// When the command cannot be read to the end, what runs is unknown: it
+    /// is not allowed by a rule, and only a command deny rule makes it so.
+    #[test]
+    fn unreadable_commands_are_unverified_only_under_a_command_deny_rule() {
+        let cmd = "echo $(cat <<E\n$(git push)\nE\n)";
+        let st = PermissionState::new(false, &["Bash".into()], &["Bash(git push:*)".into()]);
+        assert!(matches!(
+            check_compound_command(&st, "Bash", cmd),
+            CheckResult::Unverified
+        ));
+        let st = PermissionState::new(false, &["Bash".into()], &["Read(./.env)".into()]);
+        assert!(matches!(
+            check_compound_command(&st, "Bash", cmd),
+            CheckResult::Allow
+        ));
     }
 
     fn at_proj(allow: &[&str], deny: &[&str]) -> PermissionState {

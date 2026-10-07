@@ -216,10 +216,23 @@ impl PermissionGate {
         // deny rule refuses outright in every mode instead of becoming one
         // more routine approval.
         let verdict = self.autonomy.verdict(tool_name, input, work_cwd);
+        // Nothing pre-approves a command the deny rules could not be checked
+        // against; where no prompt is shown it is refused.
+        if matches!(check, CheckResult::Unverified)
+            && (self.state.bypass() || verdict == Verdict::PreApproved)
+        {
+            return GateOutcome::Denied(format!(
+                "Permission denied: {tool_name}: the command has a quote, bracket or heredoc \
+                 that does not close, so it cannot be checked against your permissions.deny \
+                 rules, and no prompt is shown in this mode to confirm it. Close it or split \
+                 the command."
+            ));
+        }
         // `suggest` turned an allowed edit into a prompt: no rule or flag
         // can let it through without one.
         let forced_prompt = matches!((&check, verdict), (CheckResult::Allow, Verdict::Prompt));
         let check = match (check, verdict) {
+            (CheckResult::Unverified, _) => CheckResult::Ask,
             (CheckResult::Allow, Verdict::Prompt) => CheckResult::Ask,
             (CheckResult::Ask, Verdict::PreApproved) => CheckResult::Allow,
             (CheckResult::Allow, _) if self.ask_every_tool => CheckResult::Ask,
@@ -229,7 +242,7 @@ impl PermissionGate {
         match check {
             CheckResult::Allow => GateOutcome::Allowed,
             CheckResult::Deny => GateOutcome::Denied(format!("Permission denied: {tool_name}")),
-            CheckResult::Ask => match &self.asker {
+            CheckResult::Ask | CheckResult::Unverified => match &self.asker {
                 // Only name remedies that grant permission: a bare
                 // --allowed-tools name filters the tool list but never
                 // authorises a call; an --allowed-tools rule does.
@@ -763,6 +776,51 @@ mod tests {
             gate("pwsh").decide("Bash", &cmd).await,
             GateOutcome::Denied(_)
         ));
+    }
+
+    /// Under full-auto and bypass, deny rules are the only guard on a
+    /// command; a subshell or `VAR=x` prefix slipped past them.
+    #[tokio::test]
+    async fn deny_rules_hold_for_nested_commands_in_every_mode() {
+        let deny = ["Bash(git push:*)".to_string()];
+        let unreadable = json!({"command": "echo $(cat <<E\n$(git push)\nE\n)"});
+        let bypass = PermissionGate::bypass_with_deny(&deny, std::path::Path::new("/proj"));
+        for cmd in [
+            "(git push --force)",
+            "GIT_TRACE=1 git push",
+            "echo $(git push)",
+        ] {
+            assert!(
+                matches!(
+                    bypass.decide("Bash", &json!({ "command": cmd })).await,
+                    GateOutcome::Denied(_)
+                ),
+                "{cmd:?}"
+            );
+        }
+        let out = bypass.decide("Bash", &unreadable).await;
+        assert!(
+            matches!(out, GateOutcome::Denied(ref m) if m.contains("does not close")),
+            "{out:?}"
+        );
+        let full_auto = PermissionGate::new(
+            PermissionState::new(false, &[], &deny).with_cwd(std::path::Path::new("/proj")),
+            Autonomy::FullAuto,
+            None,
+        );
+        assert!(matches!(
+            full_auto.decide("Bash", &unreadable).await,
+            GateOutcome::Denied(_)
+        ));
+        // Where a prompt is shown, it asks, even with Bash allowed outright.
+        let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+        let ask = PermissionGate::new(
+            PermissionState::new(false, &["Bash".into()], &deny),
+            Autonomy::Ask,
+            Some(asker.clone() as Arc<dyn PermissionAsker>),
+        );
+        assert_eq!(ask.decide("Bash", &unreadable).await, GateOutcome::Allowed);
+        assert_eq!(asker.asked().len(), 1);
     }
 
     #[tokio::test]
