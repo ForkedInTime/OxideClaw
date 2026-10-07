@@ -159,9 +159,22 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 
 | Command | Description |
 |---------|-------------|
-| `/mcp` | List MCP plugins |
-| `/mcp add <name> <command\|url> [args...]` | Add MCP plugin (stdio command or HTTP URL) |
+| `/mcp` | List connected MCP servers, their scope, and project servers waiting for `/trust` |
+| `/mcp add [--scope local\|project\|user] <name> <command\|url> [args...]` | Add an MCP server (stdio command or HTTP URL), local scope by default |
+| `/mcp remove [--scope <s>] <name>` | Remove a server; `--scope` is needed when the name is in more than one scope |
+| `/mcp get <name>` | Show a server's config in every scope that defines it |
+| `/mcp enable\|disable <name>` | Toggle the entry that starts |
 | `/mcp tools` | List tools per MCP server |
+
+**MCP scopes.** `oxideclaw mcp add` and `/mcp add` keep a server in one of three scopes; `mcp list`, `mcp get` and `mcp remove` show and take the scope.
+
+| Scope | Where | Who sees it | Starts |
+|-------|-------|-------------|--------|
+| `local` (default) | `local-mcp/<project path>.json` in the config dir, keyed by the project's canonical path, mode 0600 | You, in this project only | Always: it is your own config |
+| `project` | `.mcp.json` in the repo (`mcpServers` in `.claude/settings.json` count too) | Everyone with the repo; usually committed | Only after `/trust` |
+| `user` | `mcpServers` in the config dir's `settings.json` | You, in every project | Always |
+
+A name in several scopes starts from the highest one that loads: local, then project, then user. `--scope project` refuses literal `-e` values (and `add-json` headers), since the file is shared and committed: keep the secret in the local scope, or write a reference such as `-e GITHUB_TOKEN='${GITHUB_TOKEN}'` (or `"Authorization": "Bearer ${TOKEN}"`) that each user's environment fills in at startup. `--force` writes a literal value anyway.
 
 ---
 
