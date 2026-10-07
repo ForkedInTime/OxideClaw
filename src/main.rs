@@ -1189,43 +1189,23 @@ async fn run() -> Result<()> {
 
     // --print mode: non-interactive, no TUI
     if cli.print {
-        // --input-format=stream-json: read prompt from JSON-line events on stdin
-        let prompt = if config.input_format.as_deref() == Some("stream-json") {
-            use std::io::BufRead;
-            let mut result = String::new();
-            let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let line = line.unwrap_or_default();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line)
-                    && event.get("type").and_then(|v| v.as_str()) == Some("user")
-                    && let Some(text) = event
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| {
-                            arr.iter()
-                                .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                        })
-                        .and_then(|b| b.get("text"))
-                        .and_then(|t| t.as_str())
-                {
-                    result = text.to_string();
-                }
+        // --input-format=stream-json: every user event on stdin is a turn
+        let prompts = if config.input_format.as_deref() == Some("stream-json") {
+            let mut msgs = stream_json_user_messages(std::io::stdin().lock());
+            if msgs.is_empty() && !cli.prompt.is_empty() {
+                msgs.push(cli.prompt.join(" "));
             }
-            if result.is_empty() && !cli.prompt.is_empty() {
-                cli.prompt.join(" ")
-            } else {
-                result
+            if msgs.is_empty() {
+                eprintln!("Error: --input-format stream-json: no user message on stdin");
+                std::process::exit(1);
             }
+            msgs
         } else {
             if cli.prompt.is_empty() {
                 eprintln!("Error: --print requires a prompt argument");
                 std::process::exit(1);
             }
-            cli.prompt.join(" ")
+            vec![cli.prompt.join(" ")]
         };
 
         let mut tools = crate::mcp::tools_for_config(&config).await;
@@ -1273,28 +1253,34 @@ async fn run() -> Result<()> {
         if cli.include_hook_events {
             engine.set_include_hook_events(true);
         }
-        let prompt = match &config.hooks {
-            Some(h) if !config.disable_all_hooks => {
-                let r = crate::hooks::run_user_prompt_hooks(h, &prompt, "print-mode", &config.cwd)
-                    .await;
-                if !r.should_continue {
-                    anyhow::bail!(
-                        "Prompt not sent — blocked by a userPromptSubmit hook: {}",
-                        r.stop_reason.unwrap_or_default()
-                    );
-                }
-                match r.additional_context {
-                    Some(extra) => {
-                        format!("{prompt}\n\n<additional_context>{extra}</additional_context>")
+        // A hook blocking a later message still leaves the earlier turns to save.
+        let mut outcome = Ok(());
+        for prompt in prompts {
+            let prompt = match &config.hooks {
+                Some(h) if !config.disable_all_hooks => {
+                    let r =
+                        crate::hooks::run_user_prompt_hooks(h, &prompt, "print-mode", &config.cwd)
+                            .await;
+                    if !r.should_continue {
+                        outcome = Err(anyhow::anyhow!(
+                            "Prompt not sent — blocked by a userPromptSubmit hook: {}",
+                            r.stop_reason.unwrap_or_default()
+                        ));
+                        break;
                     }
-                    None => prompt,
+                    match r.additional_context {
+                        Some(extra) => {
+                            format!("{prompt}\n\n<additional_context>{extra}</additional_context>")
+                        }
+                        None => prompt,
+                    }
                 }
+                _ => prompt,
+            };
+            match until_signal(engine.query(prompt)).await {
+                Some(r) => r?,
+                None => return Ok(()),
             }
-            _ => prompt,
-        };
-        match until_signal(engine.query(prompt)).await {
-            Some(r) => r?,
-            None => return Ok(()),
         }
         // Overwrite, not append: compaction may have rewritten the history.
         if let Some(s) = resumed
@@ -1302,7 +1288,7 @@ async fn run() -> Result<()> {
         {
             s.overwrite(engine.history()).await?;
         }
-        return Ok(());
+        return outcome;
     }
 
     // --fork-session: generate a new UUID instead of reusing the original
@@ -1849,6 +1835,37 @@ mod self_update_tests {
     }
 }
 
+/// The text of every `{"type":"user"}` event in `--input-format stream-json`
+/// input, in order. `content` may be a plain string or an array of blocks,
+/// as in the Messages API; an array's text blocks are joined.
+fn stream_json_user_messages(input: impl std::io::BufRead) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in input.lines() {
+        let Ok(line) = line else { break };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let text = match event.get("message").and_then(|m| m.get("content")) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        // An empty text block is a 400 from the API.
+        if !text.trim().is_empty() {
+            out.push(text);
+        }
+    }
+    out
+}
+
 /// Flags kept so Claude Code command lines still parse, but which OxideClaw
 /// does not implement. Running anyway is right; doing it silently is not, since
 /// the user believes they are in a worktree or that project settings are off.
@@ -1971,6 +1988,27 @@ mod cli_parse_tests {
             warns(&["--allow-dangerously-skip-permissions"])[0]
                 .contains("--allow-dangerously-skip-permissions")
         );
+    }
+
+    /// Only the last user event was kept, and string `content` (valid in the
+    /// Messages API) was skipped, leaving an empty prompt.
+    #[test]
+    fn stream_json_input_keeps_every_user_message() {
+        let input = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"first"}}"#,
+            "\n\n",
+            r#"{"type":"system","subtype":"init"}"#,
+            "\nnot json\n",
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"a"},{"type":"image"},{"type":"text","text":"b"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":""}}"#,
+            "\n",
+        );
+        assert_eq!(
+            super::stream_json_user_messages(input.as_bytes()),
+            vec!["first", "a\nb"]
+        );
+        assert!(super::stream_json_user_messages(&b""[..]).is_empty());
     }
 
     /// The flag split values on spaces, so ordinary pretty JSON became

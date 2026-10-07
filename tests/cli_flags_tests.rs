@@ -8,9 +8,11 @@
 
 #![cfg(unix)]
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -63,6 +65,72 @@ fn run(env: &Env, args: &[&str], extra_env: &[(&str, String)], stdin: &str) -> O
     child.wait_with_output().unwrap()
 }
 
+/// OpenAI-compatible endpoint that answers every request with `reply` and
+/// records each request body.
+fn serve(reply: serde_json::Value) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen = bodies.clone();
+    let body = format!("data: {reply}\n\ndata: [DONE]\n\n");
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            let request_body = loop {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let len = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= split + 4 + len {
+                        break Some(text[split + 4..].to_string());
+                    }
+                }
+            };
+            let Some(request_body) = request_body else {
+                continue;
+            };
+            seen.lock().unwrap().push(request_body);
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (port, bodies)
+}
+
+fn text_reply(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "c", "object": "chat.completion.chunk", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }]
+    })
+}
+
+fn openai_env(port: u16) -> Vec<(&'static str, String)> {
+    vec![
+        ("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}/v1")),
+        ("OPENAI_API_KEY", "test".to_string()),
+    ]
+}
+
 fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
@@ -103,4 +171,50 @@ fn browse_uses_top_level_model_and_settings() {
         "{}",
         stderr(&out)
     );
+}
+
+/// Only the last user event was sent, and string `content` was skipped.
+#[test]
+fn stream_json_input_sends_every_user_message() {
+    let e = env();
+    let (port, bodies) = serve(text_reply("ok"));
+    let stdin = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"first question"}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second question"}]}}"#,
+        "\n",
+    );
+    let out = run(
+        &e,
+        &[
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--model",
+            "openai-compat:test",
+        ],
+        &openai_env(port),
+        stdin,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(bodies[0].contains("first question"), "{}", bodies[0]);
+    assert!(!bodies[0].contains("second question"));
+    assert!(bodies[1].contains("first question") && bodies[1].contains("second question"));
+
+    let out = run(
+        &e,
+        &[
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--model",
+            "openai-compat:test",
+        ],
+        &openai_env(port),
+        "{\"type\":\"system\"}\n",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("no user message"), "{}", stderr(&out));
 }
