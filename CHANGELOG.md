@@ -167,6 +167,101 @@ Second QA pass (2026-10-06).
   instead of taking over the terminal. The Docker image includes bash, and
   the Linux gnu binaries start on Ubuntu 22.04, Debian 12 and RHEL 9.
 
+### Fixed
+
+Follow-up QA pass (medium-severity findings, 2026-10-07).
+
+- **Cost and `/budget`.** `/spawn` agents, `/browse`, voice browse and
+  compaction summaries now count toward `/cost` and `/budget`; a spawned
+  agent or browse run is capped at what is left of the budget, and nothing
+  (slash commands that send prompts included) sends a request once it is
+  spent. LM Studio models are free, and `/stats` shows the real session
+  cost.
+- **Requests and models.** Thinking turns no longer run out of output
+  before the answer (Claude 4.5+ default to 32k output tokens when
+  `maxTokens` is unset); thinking off with max effort on Opus 5 no longer
+  400s; `showThinkingSummaries` shows reasoning again. `-p`, sub-agents, SDK
+  and ACP honour `--thinking`, `--effort`, `--betas` and `--fallback-model`,
+  and retry overloads. A dropped connection mid-stream is retried, a
+  provider error mid-stream is reported instead of a truncated reply, and
+  SSE keepalives no longer trip the stall timer. `/model` accepts Opus 5.5,
+  Sonnet 5.5 and Opus 4.7/4.8, and switching to an unusable backend no
+  longer saves it. Router tiers follow `/model` and no longer send Ollama or
+  OpenAI-compatible models to Anthropic. OpenAI-compatible and Ollama models
+  get the output cap and `/image` attachments, Mistral accepts histories
+  from other models, and context overflows there auto-compact. Long SDK/ACP
+  sessions and Opus 5.5/Fable 5.1 sessions auto-compact correctly.
+- **Credentials and settings.** `apiKeyHelper` works from a group-writable
+  `settings.json` on private-group systems, says why when it is ignored,
+  and is re-run on a 401. `--settings` applies every key (and is an error
+  when unreadable); project `hooks`, `autoFixLoop`, `autoCommit` and
+  `phaseRouter` merge with the global ones; the documented notification
+  hook runs. A blank key or a Windows BOM in `.env` no longer hides the real
+  key. SDK/ACP sessions and deep links use their own project's CLAUDE.md,
+  AGENTS.md and settings.
+- **CLI.** `oxideclaw "<prompt>"` opens the TUI and sends it; `-p` continues
+  the session named by `--continue` / `--resume` / `--session`; `--session`
+  takes short IDs and names, and `--session-id` starts a new session.
+  `--worktree`, `--tmux` and `--setting-sources` warn instead of being
+  silently ignored. `--mcp-config` accepts JSON with spaces and files, and
+  `mcp add -t http` adds an HTTP server. Ctrl-C in `-p`, `--headless` and
+  `acp` kills running Bash commands.
+- **SDK, ACP and MCP.** A non-UTF-8 input line no longer kills the server,
+  malformed requests get an error reply, every `session/update` arrives
+  before the prompt response, timed-out permission prompts are closed, a
+  "never" approval timeout no longer aborts the sidecar, and
+  `session/cancel` stops a running tool. MCP: `${VAR}` placeholders are
+  expanded, `npx` servers start on Windows, a stalled HTTP response times
+  out, server requests are answered, a dead stdio server fails fast, and
+  tools with the same sanitized name stay distinct.
+- **Tools.** Bash runs bash (not a fish/nu/tcsh login shell or the
+  sandbox's dash), and sudo/ssh/git password prompts fail fast instead of
+  hanging. Glob expands `{a,b}`, handles `[slug]` paths, works under
+  `build/` or `node_modules/`, and no longer hangs on symlink cycles. Grep
+  searches dotfiles and vendor directories you name, reports rg errors, and
+  its no-ripgrep fallback honours context and multiline options. Read
+  reports truncation and reads parts of large files; Write/Edit update a
+  symlink's target and refuse read-only files; WebSearch returns its
+  sources. LSP restarts a crashed server, MemoryWrite append keeps files
+  with non-UTF-8 bytes, `/rewind` snapshots work on Windows, plan mode lets
+  read-only sub-agents research, and guard hooks see the full tool input.
+  `/rag index` and `/rag search "q"` do what the docs say, and the indexer
+  skips oversized files.
+- **Auto-fix, auto-commit and `/watch`.** The lint/test check runs after
+  MultiEdit, stops on Esc, and no longer stalls on a backgrounded process.
+  Snapshots no longer miss an edit made right after a commit, `/undo`
+  removes files the undone turns created, and recording continues after a
+  resumed session's ref was pruned. `/watch` saves are no longer swallowed by
+  editor swap files or `.git` writes.
+- **`/browse` and the browser.** Chrome launches as root and Brave, Edge and
+  Windows browsers are found; `browser_press_key` sends real keys,
+  `browser_fill` picks `<select>` options, hash-route navigation and
+  full-page screenshots work. Loop-detector nudges reach the model, a
+  spoken "yes" approves a voice-mode gate, `oxideclaw browse` exits after
+  Ctrl-C at an approval, and a failed start no longer leaves a spinner or
+  prints over the TUI.
+- **Voice.** XTTS replies play at the right rate and are not cut off after
+  30 s on CPU; a session with TTS on starts the server at launch, and
+  `/voice speak off` and quitting stop it. whisper.cpp input works and
+  local failures fall back to the API; the picker's default speaker is used;
+  an abandoned clone, a refused `/voice speak on`, a voice error or a
+  finished transcription no longer clobber other state.
+- **TUI.** Esc cancels turns, `/browse` and TTS in vim mode, and really
+  cancels `/plugin install` and `/upgrade`. Multi-line pastes keep their
+  lines; sudo and `$EDITOR` handoffs no longer receive escape bytes; the
+  input box grows for CJK/emoji and wrapped text; AskUser and pickers keep
+  the cursor and selection visible; failed tool output keeps its line
+  breaks. `/help` lists `/budget`, `/router`, `/index`, `/rag` and other
+  hidden commands; `/diff` shows staged and new files; `/lint` sees failing
+  JS/Python checks; `/init-verifiers` writes loadable skills; `/spawn`
+  review shows new files and its hints name real commands.
+- **Sessions, plugins and packaging.** `cleanupPeriodDays` no longer deletes
+  active or resumed sessions and `/session clear` no longer deletes every
+  session unasked. Marketplace plugin installs run the cloned plugin and
+  pnpm fallbacks start. bwrap runs projects under `/tmp` and finds `awk`,
+  CA certificates and `~/.cargo` tools. The Docker image is rebuilt on every
+  release. FEATURES.md documents the real OpenAI-compatible provider setup.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added
