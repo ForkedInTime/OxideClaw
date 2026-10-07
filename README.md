@@ -7,14 +7,14 @@
   <a href="https://github.com/ForkedInTime/OxideClaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ForkedInTime/OxideClaw/ci.yml?style=flat-square&label=CI&color=B23616" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-B23616?style=flat-square" alt="License"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2024_edition-F08A3E?style=flat-square&logo=rust" alt="Rust"></a>
-  <a href="https://github.com/ForkedInTime/OxideClaw/stargazers"><img src="https://img.shields.io/github/stars/ForkedInTime/OxideClaw?style=flat-square&color=F08A3E" alt="Stars"></a>
 </p>
 
-<h3 align="center">OxideClaw is a single-binary coding agent that indexes your repo, routes each task to the cheapest capable model, fixes its own lint and test failures, and answers in your own voice.</h3>
+<h3 align="center">OxideClaw is a provider-neutral coding agent that indexes your repo, caps your spend, and works offline with Ollama.</h3>
 
 <p align="center">
-  Claude, Ollama, and 9 OpenAI-compatible providers. One 19 MB static binary, 3 ms cold start.<br>
-  No Node. No Python. No <code>node_modules</code>. No flickering TUI.<br>
+  Claude, Ollama, and 9 OpenAI-compatible providers. One ~19 MB binary; the Linux musl build is fully static.<br>
+  No account, no gateway, no telemetry: your keys go straight to your provider.<br>
+  Optional local voice-cloning add-on (Python; XTTS weights are non-commercial).<br>
   <sub>Rust is iron oxide. The claw stays.</sub>
 </p>
 
@@ -120,34 +120,33 @@ oxideclaw
 
 ## Why OxideClaw?
 
-OxideClaw is a coding agent, not a port. It talks to Claude, Ollama, and 9 OpenAI-compatible providers, and it builds the things only a native binary makes practical: an on-disk index of your codebase, a router that sends each task to the cheapest model that can handle it, agents that run in parallel git worktrees, a lint-and-test loop that fixes its own mistakes, and spoken answers in your own voice.
+OxideClaw is a coding agent, not a port. It talks to Claude, Ollama, and 9 OpenAI-compatible providers, and `/model` switches between them mid-session. Three things no other agent ships together: a code index that builds itself (tree-sitter + SQLite FTS5, no embeddings, no account), a `/budget` hard stop you can set mid-session that counts sub-agents, and replies spoken locally in a voice you record (an optional add-on). The rest (worktree agents, an auto-fix loop, `/undo` + `/redo`, a browser agent, MCP, ACP) is what good agents ship, and OxideClaw has it too.
 
-How it compares with the agents people actually run. Every cell was checked against the project's public README and source on 2026-09-11; Claude Code's browser and AGENTS.md cells were re-checked against its docs on 2026-10-05.
-✅ documented · ❌ not offered · — not documented by the project.
+How it compares with the agents people actually run. Competitor cells were checked against each project's docs, README or source on 2026-10-06.
+✅ yes · ◐ partial · ❌ no · — not checked.
 
-| | Claude Code | Codewhale | jcode | claurst | **OxideClaw** |
-|---|---|---|---|---|---|
-| Runtime | JavaScript (Bun-bundled binary) | Rust | Rust | Rust | **Rust, one static binary** |
-| License | Proprietary | MIT | MIT | GPL-3.0 | **Apache-2.0** |
-| Zero-setup codebase index (tree-sitter + FTS5/BM25) | ❌ | — | — | — | **✅ 8 languages** |
-| Auto model routing | ❌ | ✅ DeepSeek tiers | — | — | **✅ any provider, by task complexity, `/budget` cap** |
-| Auto-fix loop (lint + tests + retry after every edit) | ❌ | — | — | — | **✅** |
-| Spoken replies in a cloned voice | ❌ | ✅ cloud TTS tool (MiMo), on request | — | ❌ | **✅ local XTTS v2, every reply** |
-| `/redo` after `/undo` | — | — | — | — | **✅** |
-| `/undo` | ✅ `/rewind` | ✅ `/undo`, `/restore` | — | — | **✅ hidden git refs, clean `git log`** |
-| Autonomous browser agent (`/browse <goal>`) | ✅ Chrome extension, claude.ai plan required | — | — | — | **✅ any provider, 50-step cap, approval gate** |
-| Parallel agents in git worktrees | ✅ | ✅ | ✅ swarm, no worktrees | ✅ | **✅ `spawn`, up to 8** |
-| Voice input (Whisper) | ✅ | — | ✅ | ✅ | **✅** |
-| Browser automation in the binary | via Chrome extension | ✅ | ✅ | — | **✅ 9 CDP tools** |
-| Ollama with native tool calling | ✅ via Ollama's Anthropic-compatible API (`ANTHROPIC_BASE_URL`) | ✅ | ✅ | ✅ | **✅** |
-| OpenAI-compatible providers | ❌ | ✅ | ✅ | ✅ | **✅ 9 providers** |
-| Lifecycle hooks | ✅ | ✅ | — | ✅ | **✅ 8 events** |
-| MCP servers | ✅ | ✅ | ✅ | ✅ | **✅** |
-| Editor integration (Agent Client Protocol) | via adapter | — | — | ✅ | **✅ `oxideclaw acp`** |
-| Sandboxed shell (bwrap / firejail) | ✅ | ✅ | — | — | **✅** |
-| CLAUDE.md + AGENTS.md | ✅ both | — | — | ✅ | **✅ both, `/reload`** |
+| | Claude Code | Codex CLI | Copilot CLI | OpenCode | Aider | **OxideClaw** |
+|---|---|---|---|---|---|---|
+| Runtime | JavaScript (Bun-bundled binary) | Rust | JavaScript (Node.js) | TypeScript (Bun) | Python | **Rust, one binary** |
+| License | Proprietary | Apache-2.0 | Proprietary | MIT | Apache-2.0 | **Apache-2.0** |
+| Code index built in, on by default, local, no embeddings | ❌ | ❌ | ◐ trigram grep index | ❌ | ◐ tree-sitter repo map, no search index | **✅ tree-sitter + FTS5/BM25, 8 languages** |
+| `/budget` hard stop you can set mid-session | ◐ `--max-budget-usd`, print mode only | ❌ | ◐ billing-level limits | ❌ | ❌ | **✅ any provider, counts sub-agents** |
+| Replies spoken locally in a voice you record | ❌ | ◐ realtime voice, cloud, preset voices | ❌ | ❌ | ❌ | **✅ optional add-on (XTTS v2, Python)** |
+| Auto model routing | ❌ | — | ✅ Auto | — | ❌ | **◐ opt-in, keyword heuristic, Claude tiers by default** |
+| Auto-fix loop (lint + tests + retry after edits) | ◐ | — | — | — | ✅ | **✅ runners detected with zero config** |
+| `/undo` | ✅ `/rewind` (alias `/undo`) | — | ✅ | ✅ | ✅ reverts its own commit | **✅ private git refs, no commits on your branches** |
+| `/redo` after `/undo` | ❌ | ❌ | ❌ | ✅ | ❌ | **✅** |
+| Parallel agents in git worktrees | ✅ | ✅ on by default | ✅ | — | — | **✅ `spawn`, up to 8** |
+| Autonomous browser agent (`/browse <goal>`) | ✅ Chrome extension, claude.ai plan required | — | — | ◐ v2 desktop app only | ❌ | **✅ any provider, 50-step cap, approval gate** |
+| Voice input | ✅ | ◐ realtime, cloud | ✅ local | — | ✅ `/voice` | **✅ Whisper** |
+| Ollama with native tool calling | ◐ via Ollama's Anthropic-compatible API | — | ✅ BYOK or offline | ✅ | ◐ edit formats, no tool calls | **✅ no shim, no login** |
+| OpenAI-compatible providers | ❌ | ◐ Responses API only | ✅ BYOK | ✅ 75+ providers | ✅ | **✅ 9 providers** |
+| MCP servers | ✅ | ✅ | ✅ | ✅ | ❌ | **✅ `2024-11-05` spec** |
+| Editor integration (Agent Client Protocol) | via adapter | — | ✅ | ✅ | — | **✅ `oxideclaw acp`** |
+| Sandboxed shell | ✅ Seatbelt / bwrap | ✅ every OS | — | — | — | **◐ Linux only (bwrap / firejail)** |
+| AGENTS.md | ✅ | ✅ | ✅ | ✅ | ◐ via `read:` config | **✅ plus CLAUDE.md, `/reload`** |
 
-The first five rows are where OxideClaw stands apart. The rest is table stakes, and OxideClaw has it too.
+Only the first three rows are OxideClaw's alone, and only as worded there. Every other row is shared, and on some of them OxideClaw is the partial one.
 
 ---
 
@@ -166,9 +165,11 @@ RAG search: 'TOCTOU' — 1 results
   src/session/mod.rs:247-258 (function `load_messages`, rust)
 ```
 
-### 💰 &nbsp; Smart model router + live cost dashboard
+### 💰 &nbsp; Live cost dashboard, `/budget` hard stop, optional router
 
-Turn on the router with `/router on` (or `"routerEnabled": true` in settings.json) and simple edits go to Haiku or Ollama while architecture questions go to Opus; it is off by default, so every turn uses your configured model until you enable it. Every token is priced in real time. Cap the bill with `/budget $5` — OxideClaw warns at 80% and stops the loop when the budget is exceeded.
+Every token is priced in real time. Cap the bill with `/budget $5` at any point in a session (or `routerBudget` in settings.json): OxideClaw warns at 80% and stops the loop when the budget is exceeded, counting sub-agents and background agents against the same cap.
+
+The smart router is optional and off by default. `/router on` sends each prompt to a tier picked by a keyword and length heuristic; the default tiers are Claude models (Haiku, Sonnet, your current model, Opus), and `/router low <model>` points a tier at any provider, Ollama included.
 
 ### 🎭 &nbsp; Parallel agents in git worktrees
 
@@ -180,7 +181,9 @@ Turn on the router with `/router on` (or `"routerEnabled": true` in settings.jso
 
 ### 🎤 &nbsp; Voice I/O with XTTS v2 cloning
 
-Push-to-talk speech input (Whisper). TTS responses in any voice, including a clone of your own after a 6-second sample. Runs locally through XTTS v2, so your voice never leaves the machine. **No other coding agent speaks every reply, locally, in your own voice.**
+Push-to-talk speech input (Whisper). Spoken replies in any voice, including a clone of your own: `/voice clone` records a 10-second, 60-second or 5-minute sample. XTTS v2 runs locally, so your voice never leaves the machine; long replies are trimmed to 200 words. **The only coding agent with a built-in record-your-voice flow that speaks every reply locally.**
+
+Voice is an optional add-on that needs Python + Coqui. XTTS v2 weights are licensed under CPML (non-commercial use only).
 
 ### ♻️ &nbsp; Auto-fix loop
 
@@ -188,11 +191,11 @@ In trusted projects, every edit triggers a lint and test cycle. Untrusted projec
 
 ### ↩️ &nbsp; `/undo` and `/redo` on shadow refs
 
-Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`. Invisible to `git log`, `git branch`, `git status`. Never pushed. Use the `/undo` picker or skip straight to a turn with `/undo 3`; files the undone turns created are removed and come back on `/redo`. The session base keeps the uncommitted work you started with, and edits you make between turns are saved to `refs/oxideclaw/recovery/<session>` before an `/undo` or `/redo` overwrites them. **Other tools with undo pollute your history. OxideClaw doesn't.**
+Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sessions/<id>/<n>`: per-turn snapshots on private git refs in your own repo, with no commits on your branches, hidden from default `log`/`branch`/`status`, and HEAD and index never moved. (They do show in `git log --all`, and `git push --mirror` would push them.) Use the `/undo` picker or skip straight to a turn with `/undo 3`; files the undone turns created are removed and come back on `/redo`. The session base keeps the uncommitted work you started with, and edits you make between turns are saved to `refs/oxideclaw/recovery/<session>` before an `/undo` or `/redo` overwrites them. `/redo` works like OpenCode's and Kilo's; Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI have no redo.
 
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 
-Full tool use via Ollama's OpenAI-compatible endpoint, so local models can read, edit, and run things. Models without native tool support are detected on first use and drop to text-only chat (no file or command access) from then on.
+Native Ollama tool calling, with no Anthropic-compat shim and no login. Tool calls go over Ollama's own OpenAI-compatible endpoint, so local models can read, edit, and run things. A model without tool support is detected on its first request and drops to text-only chat (no file or command access) for the rest of the session.
 
 ### 🌐 &nbsp; Built-in browser automation — no extra server
 
@@ -226,9 +229,9 @@ Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the too
 
 Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; set `"sandboxAllowNetwork": false` to cut the network), or a `strict` mode that is only a best-effort denylist of catastrophic commands with no filesystem or network isolation (the only mode on macOS/Windows). Approvals last for the session: `[a]lways` trusts the whole tool (for Bash, every shell command) until you quit; use `permissions.allow` rules such as `Bash(git:*)` for narrower trust.
 
-### 📁 &nbsp; Respects your config like a native tool
+### 📁 &nbsp; Config, CLAUDE.md and AGENTS.md
 
-XDG Base Directory support, opt-in: set `$XDG_CONFIG_HOME` or `$XDG_DATA_HOME` and config or sessions move to `…/oxideclaw`; otherwise they stay in `~/.claude`. Reads **both** `CLAUDE.md` and `AGENTS.md` (3,518 upvotes on the Claude Code repo). Hot-reload with `/reload` — no restart.
+Settings live in `~/.claude/settings.json` by default, the directory Claude Code also uses. `$CLAUDE_CONFIG_DIR` moves it; with `$XDG_CONFIG_HOME` set, `$XDG_CONFIG_HOME/oxideclaw` is used when it already exists or there is no `~/.claude`. Sessions go under `$XDG_DATA_HOME/oxideclaw` when that is set (sessions already in the config directory stay there), and the code index lives in `$XDG_CACHE_HOME/oxideclaw`. Reads **both** `CLAUDE.md` and `AGENTS.md`. Hot-reload with `/reload` — no restart.
 
 See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ slash commands, every config knob).
 

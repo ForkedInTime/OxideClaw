@@ -209,7 +209,9 @@ Uses Whisper for speech-to-text. Press `Ctrl+R` to start/stop recording.
 
 ### Text-to-Speech
 
-Powered by XTTS v2. Supports voice cloning — speak in your own voice. GPU-accelerated when CUDA is available, falls back to CPU.
+Powered by XTTS v2. Supports voice cloning — speak in your own voice. GPU-accelerated when CUDA is available, falls back to CPU. Spoken replies are trimmed to 200 words.
+
+Voice is an optional add-on that needs Python + Coqui. XTTS v2 weights are licensed under CPML (non-commercial use only).
 
 Run `/doctor` to check if your TTS setup is working, or `/voice test` to hear a quick sample.
 
@@ -268,14 +270,18 @@ Older versions kept the index in `<project>/.claude/rag.db`. On first use that f
 
 ## Smart Model Router
 
-Routes each interactive (TUI) turn to the most cost-effective model based on complexity analysis. The router is **off by default**: until you enable it, every turn uses your configured model. Enable it with `/router on` for the session, or `"routerEnabled": true` in settings.json.
+Optional and off by default. Turn it on for the session with `/router on` (or `"routerEnabled": true` in settings.json); `/router` shows the tiers and the estimated savings so far, `/router off` turns it off. It runs in the interactive TUI only.
 
-| Complexity | Routed To (default) | Example |
+Each prompt is scored by a keyword and length heuristic (signal words such as debug, refactor or audit, prompt length, code blocks, file paths) and sent to the model for its tier:
+
+| Complexity | Default model | Example |
 |-----------|-----------|---------|
 | Low | `claude-haiku-4-5` | "What does this function do?" |
 | Medium | `claude-sonnet-5` | "Refactor this module" |
-| High | your configured model | "Debug this race condition" |
-| Super-high | `claude-opus-5` | "Audit the entire codebase" |
+| High | your current model | "Debug this race condition" |
+| Super-high | `claude-opus-5` | Whole-codebase analysis |
+
+The defaults are Claude models. Point a tier at any provider, Ollama included, with `/router low <model>` (also `medium`, `high`, `super-high`) or the `routerLowModel`, `routerMediumModel`, `routerHighModel` and `routerSuperHighModel` settings.
 
 ```
 /router              # show status and tier models (also /router status)
@@ -286,7 +292,7 @@ Routes each interactive (TUI) turn to the most cost-effective model based on com
 /router super-high <model>
 ```
 
-The router analyzes prompt length, keyword signals (debug, refactor, audit), and context to classify complexity. Cost savings are tracked and shown in `/cost`. The `router*` keys in the [settings table](#settings-file) set the same options at startup.
+The `router*` keys in the [settings table](#settings-file) set the same options at startup.
 
 ---
 
@@ -318,7 +324,7 @@ Sessions save automatically; resume, search, and export them.
 /export              # export the current session to markdown
 ```
 
-Sessions are stored in the data directory's `sessions/` folder: `~/.claude/sessions/` by default, or `$XDG_DATA_HOME/oxideclaw/sessions/` when `XDG_DATA_HOME` is set (see [XDG Base Directories](#xdg-base-directories)). `/status` prints the resolved path.
+Sessions are stored in `~/.claude/sessions/` by default (the `sessions/` folder of the config directory), or in `$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set and either `$XDG_DATA_HOME/oxideclaw/` exists or the config directory has no `sessions/` folder. See [Where files live](#where-files-live).
 
 ---
 
@@ -442,7 +448,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 
 ### Settings File
 
-`settings.json` in the config directory: `~/.claude/settings.json` by default, `$XDG_CONFIG_HOME/oxideclaw/settings.json` when `XDG_CONFIG_HOME` is set (see [XDG Base Directories](#xdg-base-directories)), or `$CLAUDE_CONFIG_DIR/settings.json`. `/status` prints the config directory in use:
+`~/.claude/settings.json` by default (see [Where files live](#where-files-live)), plus `<project>/.claude/settings.json` per project. `/status` prints the config directory in use:
 
 ```json
 {
@@ -482,17 +488,17 @@ Auto-loaded from (in order):
 
 Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, ...) are read; `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not, so export those in your shell. `OLLAMA_HOST` and `ANTHROPIC_MODEL` decide where your prompts are sent, so `$CWD/.env` may set them only in a folder you have `/trust`ed; otherwise they are ignored with a note.
 
-### XDG Base Directories
+### Where files live
 
-XDG config and data paths are opt-in: they are used only when the matching variable is set. Otherwise config and data live in `~/.claude/`, shared with Claude Code. The cache follows `$XDG_CACHE_HOME` and defaults to `~/.cache/oxideclaw/`.
+| Purpose | Default | Override |
+|---------|---------|----------|
+| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md`) | `~/.claude/` (the same directory Claude Code uses) | `$CLAUDE_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` when `$XDG_CONFIG_HOME` is set and that directory exists or `~/.claude` does not |
+| Sessions | `<config dir>/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set and `$XDG_DATA_HOME/oxideclaw/` exists or `<config dir>/sessions/` does not |
+| Code index (cache) | `~/.cache/oxideclaw/rag/` | `$XDG_CACHE_HOME/oxideclaw/rag/` |
+| Cache: code index (`rag/`) and the update-check answer | `~/.cache/oxideclaw/` | `$XDG_CACHE_HOME/oxideclaw/` (an absolute path; a relative one is ignored) |
+| Project memories (`/memory`) | `<project>/.claude/memory.db`, created on first use | — |
 
-| Purpose | When the variable is set | Default (variable unset) |
-|---------|--------------------------|--------------------------|
-| Config (`settings.json`, MCP, output styles) | `$XDG_CONFIG_HOME/oxideclaw/`, if it exists or `~/.claude/` does not | `~/.claude/` |
-| Data (sessions, XTTS server files) | `$XDG_DATA_HOME/oxideclaw/`, if it exists or `<config dir>/sessions/` does not | the config directory |
-| Cache (update check) | `$XDG_CACHE_HOME/oxideclaw/` | `~/.cache/oxideclaw/` |
-
-`$CLAUDE_CONFIG_DIR` overrides the config directory outright. To move an existing `~/.claude/` setup to XDG paths, create `$XDG_CONFIG_HOME/oxideclaw/` (and `$XDG_DATA_HOME/oxideclaw/`) and copy your files in; `/status` shows which directories are in use.
+To move an existing `~/.claude/` setup to XDG paths, create `$XDG_CONFIG_HOME/oxideclaw/` (and `$XDG_DATA_HOME/oxideclaw/`) and copy your files in; `/status` shows which directories are in use.
 
 ---
 
@@ -525,10 +531,10 @@ XDG config and data paths are opt-in: they are used only when the matching varia
 | `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |
 | `OXIDECLAW_NO_UPDATE_CHECK` | `1` turns off the TUI's daily update check (same as `"updateCheck": false`). Shell only. |
 | `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |
-| `CLAUDE_CONFIG_DIR` | Config directory, overriding `~/.claude` and `XDG_CONFIG_HOME` |
-| `XDG_CONFIG_HOME` | Opt-in config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
-| `XDG_DATA_HOME` | Opt-in data directory base (`$XDG_DATA_HOME/oxideclaw`) |
-| `XDG_CACHE_HOME` | Cache directory base (`$XDG_CACHE_HOME/oxideclaw`, default `~/.cache/oxideclaw`); holds the update-check cache |
+| `CLAUDE_CONFIG_DIR` | Config directory (default `~/.claude`) |
+| `XDG_CONFIG_HOME` | Config directory base, under the rule in [Where files live](#where-files-live) |
+| `XDG_DATA_HOME` | Sessions directory base, under the rule in [Where files live](#where-files-live) |
+| `XDG_CACHE_HOME` | Cache directory base (code index, update-check answer) |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | CA certificates to trust in place of the OS certificate store (e.g. a TLS-inspecting corporate proxy's root). HTTPS trusts the bundled Mozilla roots plus the OS store by default |
 
 ---
@@ -546,8 +552,8 @@ src/
 ├── rag/              # tree-sitter AST + SQLite FTS5 indexing
 ├── mcp/              # MCP plugin client
 ├── session/          # Save/resume/search/export sessions
-├── voice.rs          # Recording + Whisper STT + Piper/XTTS TTS
-├── router.rs         # Smart model routing by complexity
+├── voice.rs          # Recording + Whisper STT + XTTS v2 TTS
+├── router.rs         # Optional model routing by a complexity heuristic
 ├── cost.rs           # Token/cost tracking + budget enforcement
 ├── sandbox.rs        # bwrap / firejail / strict
 └── config.rs         # Settings, CLAUDE.md/AGENTS.md injection
