@@ -969,6 +969,25 @@ pub fn apply_tool_filters(tools: &mut Vec<DynTool>, config: &crate::config::Conf
                 .any(|d| d.eq_ignore_ascii_case(t.name()))
         });
     }
+    refresh_tool_search(tools);
+}
+
+/// Rebuild ToolSearch's snapshot from `tools` as it now stands. The snapshot
+/// is a copy taken at construction, which happened before MCP tools were
+/// appended and before the filters ran, so it missed every MCP tool and
+/// advertised filtered-out ones.
+pub fn refresh_tool_search(tools: &mut Vec<DynTool>) {
+    let Some(pos) = tools.iter().position(|t| t.name() == "ToolSearch") else {
+        return;
+    };
+    tools.remove(pos);
+    let snapshot = tools
+        .iter()
+        .map(|t| (t.name().to_string(), t.description().to_string()))
+        .collect();
+    tools.push(Arc::new(tool_search::ToolSearchTool {
+        tools_snapshot: snapshot,
+    }));
 }
 
 /// The cwd for the next tool call: the active worktree if EnterWorktree put
@@ -1161,6 +1180,7 @@ pub fn all_tools_with_state_and_mcp(
             clients: mcp_clients,
         }));
     }
+    refresh_tool_search(&mut tools);
 
     (tools, shared)
 }
@@ -1489,6 +1509,67 @@ mod sensitive_path_tests {
             check_sensitive_path(&p("/proj/not_id_ed25519.txt"), SensitiveOp::Write).is_none(),
             "substring match must not block unrelated files"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_search_snapshot_tests {
+    use super::*;
+
+    struct FakeMcp;
+
+    #[async_trait]
+    impl Tool for FakeMcp {
+        fn name(&self) -> &str {
+            "mcp__jira__create_issue"
+        }
+        fn description(&self) -> &str {
+            "Create a Jira issue"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+            Ok(ToolOutput::success(""))
+        }
+    }
+
+    async fn search(tools: &[DynTool], query: &str) -> String {
+        let ts = tools.iter().find(|t| t.name() == "ToolSearch").unwrap();
+        let out = ts
+            .execute(
+                serde_json::json!({"query": query, "max_results": 20}),
+                &ToolContext::new(std::env::temp_dir()),
+            )
+            .await
+            .unwrap();
+        out.content
+            .iter()
+            .map(|c| {
+                let ToolResultContent::Text { text } = c;
+                text.as_str()
+            })
+            .collect()
+    }
+
+    /// The snapshot was taken before MCP tools were appended and before the
+    /// filters ran: MCP tools never matched and removed tools still did.
+    #[tokio::test]
+    async fn tool_search_sees_mcp_tools_and_not_filtered_ones() {
+        let mut cfg = crate::config::Config::default();
+        cfg.disallowed_tools = vec!["NotebookEdit".into()];
+        let (mut tools, _) = all_tools_with_state_and_mcp(&cfg, vec![Arc::new(FakeMcp)], vec![]);
+        assert!(
+            search(&tools, "jira")
+                .await
+                .contains("mcp__jira__create_issue")
+        );
+
+        apply_tool_filters(&mut tools, &cfg);
+        assert!(tools.iter().any(|t| t.name() == "ToolSearch"));
+        let found = search(&tools, "notebook").await;
+        assert!(!found.contains("NotebookEdit:"), "{found}");
+        assert!(found.contains("NotebookRead:"), "{found}");
     }
 }
 
