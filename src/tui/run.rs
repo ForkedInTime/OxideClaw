@@ -378,6 +378,53 @@ fn make_terminal(vp_h: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 // ── Plugin install async task ─────────────────────────────────────────────────
 
+/// Build the client for `model`. ClaudeClient accepts an empty key and only
+/// fails on the first request, so an Anthropic model without a credential is
+/// refused here, at startup and on /model alike.
+fn backend_for_model(config: &Config, model: &str) -> Result<ApiBackend> {
+    let is_non_anthropic =
+        crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
+    if !is_non_anthropic && config.api_key.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No Anthropic credential found.\n\
+                 OxideClaw checks, in order:\n\
+                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
+                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
+                   3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
+                   4. ant auth login         shared with Claude Code and the official SDKs\n\
+                 To use a local model instead: --model ollama:<name>\n\
+                 Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
+        ));
+    }
+    ApiBackend::new_with_auth(
+        model,
+        &config.api_key,
+        config.auth_is_oauth,
+        &config.ollama_host,
+    )
+}
+
+/// /model and the model picker. The client is built first: switching
+/// anyway left the old client serving the new model name, and the saved
+/// setting made every later launch exit on the same backend error.
+fn switch_model(
+    model: String,
+    config: &mut Config,
+    app: &mut App,
+    client: &mut ApiBackend,
+    system_prompt: &mut String,
+) -> Result<String> {
+    let new_client = backend_for_model(config, &model)
+        .map_err(|e| anyhow::anyhow!("{e}\n\nModel unchanged: {}", config.model))?;
+    let msg = format!("Model changed\n\n  {} → {}", config.model, model);
+    *client = new_client;
+    config.model = model.clone();
+    app.set_model(model.clone());
+    let _ = crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
+    *system_prompt = config.build_system_prompt();
+    Ok(msg)
+}
+
 async fn run_loop(
     mut config: Config,
     resume_id: Option<String>,
@@ -397,28 +444,7 @@ async fn run_loop(
     let mut last_term_cols = init_cols;
     let mut last_term_rows = init_rows; // cached — updated only on Resize events
     let mut system_prompt = config.build_system_prompt();
-    // Validate Anthropic API key only when the initial model is Anthropic.
-    // Ollama + OpenAI-compat providers manage their own credentials elsewhere.
-    let is_non_anthropic = crate::api::is_ollama_model(&config.model)
-        || crate::api::is_openai_compat_model(&config.model);
-    if !is_non_anthropic && config.api_key.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No Anthropic credential found.\n\
-                 OxideClaw checks, in order:\n\
-                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
-                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
-                   3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. ant auth login         shared with Claude Code and the official SDKs\n\
-                 To use a local model instead: --model ollama:<name>\n\
-                 Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
-        ));
-    }
-    let mut client: ApiBackend = ApiBackend::new_with_auth(
-        &config.model,
-        &config.api_key,
-        config.auth_is_oauth,
-        &config.ollama_host,
-    )?;
+    let mut client: ApiBackend = backend_for_model(&config, &config.model)?;
 
     // Start MCP servers (failures are logged and skipped — never fatal)
     let mcp_manager = McpManager::start_for_config(&config).await;
@@ -853,28 +879,18 @@ async fn run_loop(
 
         // Handle pending model switch from interactive model picker
         if let Some(model) = app.pending_model.take() {
-            let msg = format!("Model changed\n\n  {} → {}", config.model, model);
-            config.model = model.clone();
-            app.set_model(model.clone());
-            let _ =
-                crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
-            system_prompt.clear();
-            system_prompt.push_str(&config.build_system_prompt());
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
+            match switch_model(
+                model,
+                &mut config,
+                &mut app,
+                &mut client,
+                &mut system_prompt,
             ) {
-                Ok(new_client) => {
-                    client = new_client;
-                }
-                Err(e) => {
-                    app.entries
-                        .push(ChatEntry::error(format!("Backend error: {e}")));
-                }
+                Ok(msg) => app.entries.push(ChatEntry::system(msg)),
+                Err(e) => app
+                    .entries
+                    .push(ChatEntry::error(format!("Backend error: {e}"))),
             }
-            app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
 
@@ -1953,5 +1969,41 @@ mod rewind_persistence_tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(on_disk, messages);
+    }
+}
+
+#[cfg(test)]
+mod switch_model_tests {
+    use super::*;
+
+    /// /model to a Claude model with no Anthropic credential used to switch
+    /// anyway and save it, so the next launch refused to start.
+    #[test]
+    fn unbuildable_model_leaves_model_and_client_unchanged() {
+        let mut config = Config {
+            model: "ollama:qwen".into(),
+            api_key: String::new(),
+            ..Config::default()
+        };
+        let mut app = App::new("ollama:qwen", std::path::Path::new("/tmp"));
+        let mut client = backend_for_model(&config, &config.model).unwrap();
+        let mut system_prompt = "unchanged".to_string();
+
+        let err = switch_model(
+            "claude-sonnet-4-6".into(),
+            &mut config,
+            &mut app,
+            &mut client,
+            &mut system_prompt,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("No Anthropic credential"), "{err}");
+        assert!(err.contains("Model unchanged: ollama:qwen"), "{err}");
+        assert_eq!(config.model, "ollama:qwen");
+        assert_eq!(app.model, "ollama:qwen");
+        assert!(matches!(client, ApiBackend::Ollama(_)));
+        assert_eq!(system_prompt, "unchanged");
     }
 }

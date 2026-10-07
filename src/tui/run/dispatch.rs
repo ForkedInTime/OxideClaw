@@ -166,28 +166,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.overlay = Some(Overlay::new("vim", msg));
         }
         CommandAction::SetModel(model) => {
-            let msg = format!("Model changed\n\n  {} → {}", config.model, model);
-            config.model = model.clone();
-            app.set_model(model.clone());
-            let _ =
-                crate::config::Config::save_user_setting("model", serde_json::Value::String(model));
-            *system_prompt = config.build_system_prompt();
-            // Re-create backend when switching between Anthropic ↔ Ollama
-            match ApiBackend::new_with_auth(
-                &config.model,
-                &config.api_key,
-                config.auth_is_oauth,
-                &config.ollama_host,
-            ) {
-                Ok(new_client) => {
-                    *client = new_client;
-                }
-                Err(e) => {
-                    app.entries
-                        .push(ChatEntry::error(format!("Backend error: {e}")));
-                }
+            match switch_model(model, config, app, client, system_prompt) {
+                Ok(msg) => app.overlay = Some(Overlay::new("model", msg)),
+                Err(e) => app
+                    .entries
+                    .push(ChatEntry::error(format!("Backend error: {e}"))),
             }
-            app.overlay = Some(Overlay::new("model", msg));
         }
         CommandAction::ListModels => {
             // Build combined Anthropic + Ollama interactive model picker
@@ -1099,22 +1083,21 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 &mut config.settings_model,
                 &config.model,
             ) {
-                config.model = model.clone();
-                app.set_model(model);
                 // The backend family (Anthropic / Ollama / OpenAI-compat) is
-                // fixed when the client is built.
-                match ApiBackend::new_with_auth(
-                    &config.model,
-                    &config.api_key,
-                    config.auth_is_oauth,
-                    &config.ollama_host,
-                ) {
-                    Ok(new_client) => *client = new_client,
-                    Err(e) => app
-                        .entries
-                        .push(ChatEntry::error(format!("Backend error: {e}"))),
+                // fixed when the client is built; build first so a model the
+                // client cannot serve leaves the current one in place.
+                match backend_for_model(config, &model) {
+                    Ok(new_client) => {
+                        *client = new_client;
+                        config.model = model.clone();
+                        app.set_model(model);
+                        reloaded.push("model");
+                    }
+                    Err(e) => app.entries.push(ChatEntry::error(format!(
+                        "Backend error: {e}\n\nModel unchanged: {}",
+                        config.model
+                    ))),
                 }
-                reloaded.push("model");
             }
             if let Some(ref theme) = settings.theme {
                 config.theme = Some(theme.clone());
