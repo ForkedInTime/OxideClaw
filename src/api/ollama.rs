@@ -682,11 +682,14 @@ mod tests {
             probe_ollama(&url, Duration::from_millis(800)).await,
             OllamaProbe::Unreachable
         );
-        assert!(
-            start.elapsed() < Duration::from_millis(800),
-            "{:?}",
-            start.elapsed()
-        );
+        // Windows retries a refused loopback SYN for ~1-2 s, so there the
+        // budget is what bounds it; elsewhere a refusal returns at once.
+        let limit = if cfg!(windows) {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_millis(800)
+        };
+        assert!(start.elapsed() < limit, "{:?}", start.elapsed());
     }
 
     #[tokio::test]

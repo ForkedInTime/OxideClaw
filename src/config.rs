@@ -1746,8 +1746,9 @@ pub fn read_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 /// How long startup may spend asking a local Ollama for a model when there
-/// is no Anthropic credential. A connection refused returns at once; this
-/// bounds a host that accepts and then says nothing.
+/// is no Anthropic credential. On Unix a refused connection returns at once;
+/// Windows retries a refused SYN for a second or two, and a host that accepts
+/// and then says nothing can hang forever. This budget bounds both.
 const OLLAMA_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// `OLLAMA_HOST` in the form Ollama itself documents (`0.0.0.0:11434`,
@@ -1923,19 +1924,31 @@ mod data_dir_tests {
     use super::{cache_dir_in, compute_data_dir};
     use std::path::{Path, PathBuf};
 
+    /// A path that is absolute on every platform (`/x` has no drive on
+    /// Windows, so it is not absolute there).
+    fn abs(p: &str) -> PathBuf {
+        let root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        root.join(p)
+    }
+
     /// The code index lives under `$XDG_CACHE_HOME/oxideclaw`, else
     /// `~/.cache/oxideclaw`; a relative `$XDG_CACHE_HOME` is not honoured.
     #[test]
     fn cache_dir_is_xdg_cache_home_else_dot_cache() {
-        let home = Path::new("/home/u");
+        let home = abs("home/u");
+        let xdg = abs("xdg/cache");
         assert_eq!(
-            cache_dir_in(Some("/xdg/cache"), Some(home)),
-            Some(PathBuf::from("/xdg/cache/oxideclaw"))
+            cache_dir_in(xdg.to_str(), Some(&home)),
+            Some(xdg.join("oxideclaw"))
         );
         for unset in [None, Some(""), Some("rel/cache")] {
             assert_eq!(
-                cache_dir_in(unset, Some(home)),
-                Some(PathBuf::from("/home/u/.cache/oxideclaw")),
+                cache_dir_in(unset, Some(&home)),
+                Some(home.join(".cache").join("oxideclaw")),
                 "{unset:?}"
             );
         }
@@ -1945,9 +1958,10 @@ mod data_dir_tests {
     /// there is no cache dir at all, rather than `./.cache` in the project.
     #[test]
     fn no_home_and_no_xdg_cache_home_means_no_cache_dir() {
+        let xdg = abs("xdg/cache");
         assert_eq!(
-            cache_dir_in(Some("/xdg/cache"), None),
-            Some(PathBuf::from("/xdg/cache/oxideclaw"))
+            cache_dir_in(xdg.to_str(), None),
+            Some(xdg.join("oxideclaw"))
         );
         for xdg in [None, Some(""), Some("rel/cache")] {
             assert_eq!(cache_dir_in(xdg, None), None, "{xdg:?}");
@@ -2751,11 +2765,24 @@ mod flag_settings_retarget_tests {
         .unwrap();
         std::fs::write(project.path().join("AGENTS.md"), "project agents").unwrap();
 
-        let full = Config::for_project(Some(project.path().to_path_buf()), None, false);
+        // A temp config dir: the developer's own ~/.claude (or XDG dir) must
+        // neither feed the result nor be touched by it.
+        let home = tempfile::tempdir().unwrap();
+        let load = |bare_mode| {
+            let mut c = Config {
+                cwd: project.path().into(),
+                claude_dir_override: Some(home.path().into()),
+                bare_mode,
+                ..Config::default()
+            };
+            c.load_project();
+            c
+        };
+        let full = load(false);
         assert!(full.agentsmd.contains("project agents"));
         assert_eq!(full.phase_router.research_model, "claude-bare-test-model");
 
-        let bare = Config::for_project(Some(project.path().to_path_buf()), None, true);
+        let bare = load(true);
         assert!(bare.bare_mode);
         assert!(bare.claudemd.is_empty());
         assert!(bare.agentsmd.is_empty());
@@ -2931,7 +2958,14 @@ mod keyless_ollama_tests {
         let before = c.model.clone();
         let start = std::time::Instant::now();
         assert_eq!(c.fall_back_to_local_ollama(false).await.unwrap(), None);
-        assert!(start.elapsed() < std::time::Duration::from_millis(800));
+        // Windows retries a refused loopback SYN for ~1-2 s, so the budget is
+        // what bounds it there.
+        let limit = if cfg!(windows) {
+            super::OLLAMA_PROBE_BUDGET + std::time::Duration::from_millis(700)
+        } else {
+            std::time::Duration::from_millis(800)
+        };
+        assert!(start.elapsed() < limit, "{:?}", start.elapsed());
         assert_eq!(c.model, before);
     }
 
