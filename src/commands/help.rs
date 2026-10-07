@@ -510,7 +510,10 @@ pub(super) fn cmd_notifications(args: &str, ctx: &CommandContext) -> CommandActi
 
 pub(super) fn cmd_release_notes(_args: &str) -> CommandAction {
     CommandAction::Message(
-        "Release Notes — OxideClaw v0.1.0\n\n\
+        concat!(
+            "Release Notes — OxideClaw v",
+            env!("CARGO_PKG_VERSION"),
+            "\n\n\
          Features:\n\
            • Voice input (/voice) — audio capture via arecord/sox/ffmpeg\n\
              + transcription via local whisper CLI or OpenAI-compatible API\n\
@@ -527,7 +530,8 @@ pub(super) fn cmd_release_notes(_args: &str) -> CommandAction {
            • Themes (/theme) — dark, light, solarized\n\n\
          See CHANGELOG.md for full history.\n\
          See https://github.com/ForkedInTime/OxideClaw/releases for downloads."
-            .into(),
+        )
+        .into(),
     )
 }
 
@@ -586,5 +590,65 @@ mod help_listing_tests {
         ] {
             assert!(listed.contains(&cmd), "{cmd} missing from /help");
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_text_tests {
+    use super::*;
+
+    #[test]
+    fn release_notes_name_the_running_version() {
+        let CommandAction::Message(m) = cmd_release_notes("") else {
+            panic!("expected a message");
+        };
+        let want = format!("OxideClaw v{}\n", env!("CARGO_PKG_VERSION"));
+        assert!(m.contains(&want), "{m}");
+    }
+
+    /// The voice lesson taught `/voice on`, `/voice tts on` and Ctrl+Space,
+    /// none of which do anything.
+    #[test]
+    fn the_voice_lesson_teaches_commands_that_exist() {
+        let CommandAction::Message(lesson) = cmd_powerup("6") else {
+            panic!("expected a message");
+        };
+        assert!(lesson.contains("Ctrl+R") && !lesson.contains("Ctrl+Space"));
+        let config = Config::default();
+        let skills = HashMap::new();
+        let todo = TodoState::default();
+        let ctx = CommandContext {
+            config: &config,
+            tokens_in: 0,
+            context_window: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cost_summary: String::new(),
+            cache_write_tokens: 0,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: &[],
+            brief_mode: false,
+            btw_note: None,
+        };
+        let mut taught = 0;
+        for line in lesson.lines() {
+            let Some(rest) = line.trim().strip_prefix("- /voice ") else {
+                continue;
+            };
+            let arg = rest.split(" — ").next().unwrap().trim();
+            taught += 1;
+            // Unknown arguments fall through to the status text.
+            assert!(
+                !matches!(cmd_voice(arg, &ctx), CommandAction::Message(_)),
+                "/voice {arg} is not a command"
+            );
+        }
+        assert_eq!(taught, 3);
     }
 }

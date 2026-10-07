@@ -1,7 +1,7 @@
 /// Render — matches oxideclaw's visual style exactly.
 ///
 /// Welcome screen:
-///   ─ oxideclaw v0.1.0 ──────────────────────────────────────────
+///   ─ oxideclaw v<version> ──────────────────────────────────────────
 ///   │  Welcome back, yetipaw!   │  Tips for getting started         │
 ///   │  [logo]                   │  ──────────────────────────────   │
 ///   │  ● sonnet-4-6 · label     │  Recent activity                  │

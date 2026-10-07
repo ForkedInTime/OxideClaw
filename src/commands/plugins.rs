@@ -406,11 +406,11 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
             "Voice features (requires XTTS v2 + whisper/openai):\n\
              \n\
              **Voice input** — transcribes your speech to text\n\
-             - /voice on    — enable (requires a mic + whisper)\n\
-             - Hold Ctrl+Space to record while voice is on\n\
+             - /voice enable — enable (requires a mic + whisper)\n\
+             - Press Ctrl+R to start/stop recording while voice is on\n\
              \n\
              **Text-to-speech** — speaks replies in a custom voice (record anyone)\n\
-             - /voice tts on   — enable TTS (requires XTTS v2)\n\
+             - /voice speak on — enable TTS (requires XTTS v2)\n\
              - /voice clone    — record any voice as the TTS speaker\n\
              - /doctor         — check if XTTS v2 is configured\n\
              \n\
