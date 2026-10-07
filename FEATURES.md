@@ -19,6 +19,7 @@ Everything available in OxideClaw, organized by category.
 - [Auto-fix Loop](#auto-fix-loop)
 - [Hooks](#hooks)
 - [Sandboxing](#sandboxing)
+- [Autonomy Modes](#autonomy-modes)
 - [Configuration](#configuration)
 - [Keyboard Shortcuts](#keyboard-shortcuts)
 - [Environment Variables](#environment-variables)
@@ -152,6 +153,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 |---------|-------------|
 | `/reload` | Hot-reload settings, CLAUDE.md, AGENTS.md |
 | `/config` | Show current configuration |
+| `/autonomy [mode]` | Show or switch the [autonomy mode](#autonomy-modes) for this session |
 
 ### Tools & MCP
 
@@ -384,7 +386,7 @@ Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, unknown session, 
 
 In trusted projects, every edit triggers a lint and test cycle. Untrusted projects skip it until you run /trust.
 
-After a turn's `Write`, `Edit` or `MultiEdit` calls in the interactive TUI (`-p`, the SDK and ACP do not run auto-fix), OxideClaw runs the project's linter and then its tests: an auto-detected runner (clippy / `cargo test`, ESLint / `npm test`, ruff / pytest, `go vet` / `go test`) when it is installed, or `autoFixLoop.lintCommand` / `autoFixLoop.testCommand` from your settings. Failures go back to the model for up to `autoFixLoop.maxRetries` (default 3) retries. `autoFixLoop.trigger` is `autonomous` (default: only in `auto-edit` and `full-auto` autonomy), `always` or `off`.
+After a turn's `Write`, `Edit` or `MultiEdit` calls in the interactive TUI (`-p`, the SDK and ACP do not run auto-fix), OxideClaw runs the project's linter and then its tests: an auto-detected runner (clippy / `cargo test`, ESLint / `npm test`, ruff / pytest, `go vet` / `go test`) when it is installed, or `autoFixLoop.lintCommand` / `autoFixLoop.testCommand` from your settings. Failures go back to the model for up to `autoFixLoop.maxRetries` (default 3) retries. `autoFixLoop.trigger` is `autonomous` (default: in every [autonomy mode](#autonomy-modes) but `suggest`), `always` or `off`.
 
 Lint and test commands run the project's own code (`build.rs`, `conftest.py`, npm scripts, Makefiles), so nothing runs in a folder that is not in your `trustedProjects` list; the first skipped edit of a session says so once. `/trust` takes effect from the next edit, including the project's own `autoFixLoop` settings. In a trusted folder the commands run under the same sandbox as the Bash tool when one is enabled (`/sandbox enable`), and a command the sandbox refuses is skipped, never run unsandboxed. Under bwrap or firejail, a check that fails because of the sandbox itself (no network for a download, a tool it does not expose) is skipped with a note instead of being sent to the model as a broken edit.
 
@@ -444,6 +446,27 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 
 ---
 
+## Autonomy Modes
+
+The autonomy mode decides what runs without a permission prompt. Set it for the session with `/autonomy <mode>`, or for good with `"autonomy"` in your settings.json.
+
+| Mode | Edits (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) | Commands, MCP tools |
+|------|------|------|
+| `suggest` | Always prompt, even when `permissions.allow` or `[a]lways` covers them; the auto-fix loop does not run | Prompt unless allowed |
+| `ask` (default) | Prompt unless `permissions.allow` or `[a]lways` covers them | Prompt unless allowed |
+| `auto-edit` | No prompt inside the project directory, except for the files below | Prompt unless allowed |
+| `full-auto` | No prompt | No prompt |
+
+`auto-edit` still prompts for edits outside the project (symlinks are resolved first) and for files where an unprompted edit would become code execution on the next auto-fix check, git operation or CI run: `.git/`, `.claude/`, `.oxideclaw/`, `.agents/`, `.mcp.json`, `.env*`, hook config (`.husky/`, `.githooks/`, `.pre-commit-config.yaml`, `lefthook.yml`), CI config (`.github/`, `.gitlab/`, `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`, `.travis.yml`, `Jenkinsfile`, ...) and build/test-runner config (`package.json`, `.npmrc`, ESLint configs, `Cargo.toml`, `build.rs`, `.cargo/`, `rust-toolchain.toml`, `conftest.py`, `pytest.ini`, `setup.py`, `setup.cfg`, `pyproject.toml`, `tox.ini`, `noxfile.py`, `.venv/`, `Makefile`, `justfile`, `*.csproj`, `*.props`, `*.targets`), wherever they sit in the tree. Started from your home directory (or above it), it pre-approves no edit at all.
+
+`full-auto` needs real isolation: the Bash sandbox enabled in `bwrap` or `firejail` mode (`/sandbox enable bwrap`), with that backend installed. Without it `/autonomy full-auto` is refused and the mode stays as it was; a `full-auto` in settings.json starts as `ask` with a notice, and turning the sandbox off later drops back to `ask`. macOS and Windows have no such sandbox, so `full-auto` is unavailable there until a native one ships. Plan approval (`ExitPlanMode`) still asks.
+
+In every mode `permissions.deny` rules refuse a call outright, without a prompt. The mode applies to the TUI, sub-agents, `-p` (where a call that would prompt is refused), `--headless` SDK sessions and ACP: there it fills in for tools the host's policy does not list, and never overrides the host's `deny` or `ask` lists. A project's `.claude/settings.json` may only make the mode stricter than yours; a looser value is ignored with a notice.
+
+Earlier versions accepted `auto-edit` (then the default) and `full-auto` but prompted for every edit in both. On the first run after upgrading, a stored `"autonomy": "auto-edit"` or `"full-auto"` in your settings.json is changed to `"ask"` once, with a message, so nobody is switched to unprompted edits by upgrading.
+
+---
+
 ## Configuration
 
 ### Settings File
@@ -466,6 +489,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 | `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables (sent as `{"type":"between_tools"}` on Sonnet 5.5; ignored on Fable and Opus 5.5, where the API does not allow thinking to be turned off, and on Opus 5 and Sonnet 5.5 at `xhigh`/`max` effort, where it only allows it at `high` or below). CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
 | `effort` | `low` / `medium` / `high` / `xhigh` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5 (`xhigh` becomes `high` on Opus/Sonnet 4.6, which lack it); older and non-Claude models get a prompt nudge. Set with `/effort` |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
+| `autonomy` | `suggest` / `ask` / `auto-edit` / `full-auto` | `ask` | What runs without a permission prompt; see [Autonomy Modes](#autonomy-modes) |
 | `routerEnabled` | `true` / `false` | `false` | Start with the [smart model router](#smart-model-router) on (same as `/router on`) |
 | `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`) |
 | `routerLowModel` | any model name | `claude-haiku-4-5` | Model for low-complexity turns |

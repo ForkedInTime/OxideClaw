@@ -227,7 +227,7 @@ Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the too
 
 ### 🛡️ &nbsp; Sandbox-first execution
 
-Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; set `"sandboxAllowNetwork": false` to cut the network), or a `strict` mode that is only a best-effort denylist of catastrophic commands with no filesystem or network isolation (the only mode on macOS/Windows). Approvals last for the session: `[a]lways` trusts the whole tool (for Bash, every shell command) until you quit; use `permissions.allow` rules such as `Bash(git:*)` for narrower trust.
+Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; set `"sandboxAllowNetwork": false` to cut the network), or a `strict` mode that is only a best-effort denylist of catastrophic commands with no filesystem or network isolation (the only mode on macOS/Windows). Approvals last for the session: `[a]lways` trusts the whole tool (for Bash, every shell command) until you quit; use `permissions.allow` rules such as `Bash(git:*)` for narrower trust. Edits and commands prompt by default; `/autonomy auto-edit` lets edits inside the project through without a prompt (never to `.git/`, `.env*`, CI, hook or build/test config), and `/autonomy full-auto` drops the prompts entirely, only under `bwrap` or `firejail`. Deny rules hold in every mode.
 
 ### 📁 &nbsp; Config, CLAUDE.md and AGENTS.md
 

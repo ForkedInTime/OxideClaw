@@ -335,7 +335,7 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/vim", "toggle vim editing mode"),
             (
                 "/autonomy",
-                "suggest = confirm every edit; auto-edit (default) = normal rules",
+                "suggest, ask (default), auto-edit (in-project edits), full-auto (sandbox)",
             ),
             ("/theme", "switch theme (dark, light, solarized)"),
             ("/btw", "prepend a note to next message"),
