@@ -165,7 +165,7 @@ Push-to-talk speech input (Whisper). TTS responses in any voice, including a clo
 
 ### ♻️ &nbsp; Auto-fix loop
 
-Every `Write`/`Edit` kicks off a lint + test cycle, using the project's own runner (clippy, ESLint, ruff, `go vet`; `cargo test`, `npm test`, pytest, `go test`) when it is installed, or your `lintCommand`/`testCommand`. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — OxideClaw fixes forward.
+In trusted projects, every edit triggers a lint and test cycle. Untrusted projects skip it until you run /trust. The cycle uses the project's own runner (clippy, ESLint, ruff, `go vet`; `cargo test`, `npm test`, pytest, `go test`) when it is installed, or your `lintCommand`/`testCommand`, and runs inside the same sandbox as the Bash tool when you have one enabled. Those commands execute the project's code (`build.rs`, `conftest.py`, npm scripts), which is why trust comes first. Failures feed back into the next turn for up to three retries, with an explicit instruction not to silence lints or weaken tests. The old rollback-on-fail behaviour is gone — OxideClaw fixes forward.
 
 ### ↩️ &nbsp; `/undo` and `/redo` on shadow refs
 

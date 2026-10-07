@@ -16,6 +16,7 @@ Everything available in OxideClaw, organized by category.
 - [Session Management](#session-management)
 - [SDK / Headless Mode](#sdk--headless-mode)
 - [Editor Integration (ACP)](#editor-integration-acp)
+- [Auto-fix Loop](#auto-fix-loop)
 - [Hooks](#hooks)
 - [Sandboxing](#sandboxing)
 - [Configuration](#configuration)
@@ -362,6 +363,16 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 | `session/load`, `session/set_mode` | Not supported (`-32601`). |
 
 Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, unknown session, media prompt), `-32000` when a prompt is already running, `-32601` unsupported method.
+
+---
+
+## Auto-fix Loop
+
+In trusted projects, every edit triggers a lint and test cycle. Untrusted projects skip it until you run /trust.
+
+After a turn's `Write`, `Edit` or `MultiEdit` calls in the interactive TUI (`-p`, the SDK and ACP do not run auto-fix), OxideClaw runs the project's linter and then its tests: an auto-detected runner (clippy / `cargo test`, ESLint / `npm test`, ruff / pytest, `go vet` / `go test`) when it is installed, or `autoFixLoop.lintCommand` / `autoFixLoop.testCommand` from your settings. Failures go back to the model for up to `autoFixLoop.maxRetries` (default 3) retries. `autoFixLoop.trigger` is `autonomous` (default: only in `auto-edit` and `full-auto` autonomy), `always` or `off`.
+
+Lint and test commands run the project's own code (`build.rs`, `conftest.py`, npm scripts, Makefiles), so nothing runs in a folder that is not in your `trustedProjects` list; the first skipped edit of a session says so once. `/trust` takes effect from the next edit. In a trusted folder the commands run under the same sandbox as the Bash tool when one is enabled (`/sandbox enable`), and a command the sandbox refuses is skipped, never run unsandboxed.
 
 ---
 
