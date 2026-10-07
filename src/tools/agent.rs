@@ -69,6 +69,10 @@ impl AgentTool {
             sub_config.default_shell = ctx.default_shell.clone();
         }
         sub_config.env = ctx.env.clone();
+        // The snapshot is None at tool-build time and the turn dir changes
+        // every prompt; without the live one the child's Write/Edit never
+        // snapshot, and /rewind silently keeps the sub-agent's edits.
+        sub_config.file_snapshot_dir = ctx.snapshot_dir.clone();
         sub_config
     }
 }
@@ -486,6 +490,40 @@ mod tests {
             !refused.exists(),
             "no gate on the context → headless → refused"
         );
+    }
+
+    /// The child's Write/Edit ran with no snapshot dir, so /rewind could not
+    /// restore files a sub-agent changed.
+    #[tokio::test]
+    async fn child_edits_are_snapshotted_into_the_parent_turn_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "before\n").unwrap();
+        let snap = dir.path().join("snapshots").join("turn-3");
+        let tool = AgentTool {
+            config: Config {
+                cwd: dir.path().to_path_buf(),
+                ..config()
+            },
+        };
+        assert!(tool.config.file_snapshot_dir.is_none());
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.permission_gate = Some(PermissionGate::bypass());
+        ctx.snapshot_dir = Some(snap.clone());
+
+        let sub = tool.live_config(&ctx);
+        let write: Vec<DynTool> = vec![Arc::new(crate::tools::file_write::FileWriteTool)];
+        let mut e = tool.build_sub_engine(sub, write, &ctx).unwrap();
+        let call = vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Write".into(),
+            input: json!({"file_path": file.to_str().unwrap(), "content": "after\n"}),
+        }];
+        e.execute_tools(&call).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n");
+        let copy = snap.join(crate::tools::snapshot_name(&file));
+        assert_eq!(std::fs::read_to_string(copy).unwrap(), "before\n");
     }
 
     /// `/sandbox enable` mid-session changes only the live config; the
