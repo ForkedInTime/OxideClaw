@@ -766,7 +766,15 @@ impl Settings {
         let mcp_json_path = cwd.join(".mcp.json");
 
         let global = Self::from_file(&global_path);
-        let project = Self::from_file(&project_path);
+        // Run from $HOME with the legacy ~/.claude config dir, the "project"
+        // file is the global one: loading it again would flag the user's own
+        // hooks/env as untrusted project config (with a false "ignored"
+        // warning) and report any parse error twice.
+        let project = if same_file(&global_path, &project_path) {
+            Self::default()
+        } else {
+            Self::from_file(&project_path)
+        };
         let trusted = Self::is_trusted(&global, cwd);
         // Auto-load .mcp.json from project root — merges its mcpServers on top
         let mcp_extra = mcp_json_path
@@ -1039,17 +1047,24 @@ impl Settings {
     /// Return the path(s) that were actually loaded, for diagnostics.
     pub fn loaded_paths(cwd: &Path) -> Vec<String> {
         let claude_dir = crate::config::Config::claude_dir();
-        [
+        let mut loaded: Vec<std::path::PathBuf> = Vec::new();
+        for p in [
             claude_dir.join("settings.json"),
             cwd.join(".claude").join("settings.json"),
             cwd.join(".mcp.json"),
             Self::local_mcp_path(&claude_dir, cwd),
-        ]
-        .into_iter()
-        .filter(|p| p.exists())
-        .map(|p| p.display().to_string())
-        .collect()
+        ] {
+            // From $HOME the project settings path can be the global file.
+            if p.exists() && !loaded.iter().any(|l| same_file(l, &p)) {
+                loaded.push(p);
+            }
+        }
+        loaded.iter().map(|p| p.display().to_string()).collect()
     }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 #[cfg(test)]
@@ -1595,6 +1610,37 @@ mod load_error_tests {
         assert_eq!(s.load_errors.len(), 1, "{:?}", s.load_errors);
         assert!(s.load_errors[0].contains("not a regular file"));
         assert!(read_config_file(Path::new("/dev/zero")).is_err());
+    }
+
+    /// From $HOME with the legacy ~/.claude config dir, the project settings
+    /// path is the global file: its hooks/env were reported as untrusted
+    /// project config that "was ignored" even though they applied.
+    #[test]
+    fn the_global_file_is_not_also_loaded_as_project_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let claude_dir = home.path().join(".claude");
+        std::fs::create_dir(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env": {"FOO": "1"}, "permissions": {"allow": ["Bash(ls)"]}, "model": "#,
+        )
+        .unwrap();
+        let s = Settings::load_in(&claude_dir, home.path());
+        assert_eq!(s.load_errors.len(), 1, "{:?}", s.load_errors);
+
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env": {"FOO": "1"}, "permissions": {"allow": ["Bash(ls)"]}}"#,
+        )
+        .unwrap();
+        let s = Settings::load_in(&claude_dir, home.path());
+        assert!(
+            s.untrusted_project_config.is_empty(),
+            "{:?}",
+            s.untrusted_project_config
+        );
+        assert_eq!(s.env.get("FOO").map(String::as_str), Some("1"));
+        assert_eq!(s.permissions.allow, vec!["Bash(ls)".to_string()]);
     }
 
     #[cfg(unix)]
