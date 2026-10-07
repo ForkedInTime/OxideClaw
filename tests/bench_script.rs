@@ -1,8 +1,10 @@
 //! `scripts/bench.py --first-frame` times a TUI's first frame behind a
 //! pseudo-terminal. Its `--self-test` runs it against dummy TUIs: a banner
-//! drawn 100 ms after a cursor-position query, text that trickles in, a
-//! ready marker, a hang, a missing key and a sign-in screen. Python and a
-//! Unix pty are needed; without them the test says so and passes.
+//! drawn 100 ms after a cursor-position query (from a temp dir behind a
+//! symlink, as on macOS), text that trickles in, a ready marker, a hang, a
+//! missing key, a sign-in screen, a tool that closes the pty and keeps
+//! running, the out-of-process Ollama stub and the report's table. Python
+//! and a Unix pty are needed; without them the test says so and passes.
 
 use std::process::Command;
 

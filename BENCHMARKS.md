@@ -80,22 +80,26 @@ never copied from their own READMEs.
 
 ### Results
 
-Machine: vm · x86_64 · Linux 6.18.44-fc-v77 (4 vCPUs)
-Date: 2026-10-07 · runs: 20 · terminal: 120x40 xterm-256color · first frame:
-20 visible characters then 50 ms quiet
+Machine: vm · x86_64 · Linux 6.18.44-fc-v77
+Date: 2026-10-07 · runs per tool: 20 · terminal: 120x40 xterm-256color · first frame: 20 visible characters then 50 ms quiet, or the ready marker
 
 | Tool | Version | Path | First frame (median) | p95 | Frame begins |
 |---|---|---|---|---|---|
-| oxideclaw | oxideclaw 0.4.0 | keyless Ollama (`--ollama-stub`) | 29 ms | 36 ms | `No Anthropic key found; using local Ollama model bench-stub:` |
-| oxideclaw | oxideclaw 0.4.0 | no key, no Ollama | needs login | | `Error: No Anthropic credential found. OxideClaw checks, in o` |
+| oxideclaw | oxideclaw 0.4.0 | Ollama stub (`--ollama-stub`) | 29 ms | 36 ms | `No Anthropic key found; using local Ollama model bench-stub:` |
+| oxideclaw | oxideclaw 0.4.0 | default | needs login | | `Error: No Anthropic credential found. OxideClaw checks, in o` |
+
+The two rows are the two reproduce commands above, one with
+`--ollama-stub` and one without; each prints this header and its own row,
+and the `Path` column says which run a row came from.
 
 Notes on this run: with no key, OxideClaw starts on a local Ollama model
 when one answers on `OLLAMA_HOST`, and otherwise exits with the
 missing-credential error, which is not a frame. This machine has no Ollama,
-so the first row answers Ollama's `/api/tags` and `/api/show` from a stub on
-a local port: the time includes OxideClaw's real probe of it, and the frame
-is OxideClaw's full first screen (the keyless notice, the prompt and the
+so the `default` row is that error, and the `Ollama stub` row answers
+Ollama's `/api/tags` and `/api/show` from a stub on a local port: the time
+includes OxideClaw's real probe of it, and the frame is OxideClaw's full
+first screen (the keyless notice, the prompt and the
 status line); no model runs before the first frame. A real Ollama reads
 each pulled model's metadata to answer `/api/show`, so the probe can take
-longer there (it gives up after 800 ms). Measured on a shared VM, so read
-the order of magnitude.
+longer there (it gives up after 800 ms). Measured on a shared 4-vCPU VM,
+so read the order of magnitude.

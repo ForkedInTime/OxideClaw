@@ -25,8 +25,10 @@ login instead of being timed.
 """
 import argparse
 import codecs
+import contextlib
 import fcntl
 import http.server
+import io
 import json
 import os
 import platform
@@ -230,7 +232,10 @@ def clean_env(root):
 
 def _take_tty():
     # Runs in the child after setsid: make the pty its controlling terminal,
-    # as a terminal emulator does.
+    # as a terminal emulator does. Python code between fork and exec is only
+    # safe while this process has no other thread (one could hold a lock the
+    # child then waits on forever), so nothing here starts threads: the
+    # Ollama stub runs in a process of its own.
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
@@ -258,17 +263,47 @@ class OllamaStub(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def start_ollama_stub():
-    """Serve OllamaStub on a free local port; returns its OLLAMA_HOST."""
+def serve_ollama_stub():
+    """Child side of ollama_stub(): serve on a free local port, print it, and
+    exit when the parent closes stdin (or dies)."""
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OllamaStub)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{server.server_address[1]}"
+    print(server.server_address[1], flush=True)
+    sys.stdin.read()
+
+
+@contextlib.contextmanager
+def ollama_stub():
+    """Run OllamaStub in a separate process; yields its OLLAMA_HOST."""
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--serve-ollama-stub"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        port = proc.stdout.readline().strip()
+        if not port.isdigit():
+            raise RuntimeError("the Ollama stub did not start")
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
 
 
 def first_frame_once(argv, min_chars=20, quiet_ms=50, marker=None, timeout_s=10.0, ollama_host=None):
     """One launch. Returns (status, ms, excerpt): status is "frame" (ms is
     spawn to first frame), "needs login", "timeout" or "exited N"."""
-    with tempfile.TemporaryDirectory(prefix="bench-ff-") as root:
+    with tempfile.TemporaryDirectory(prefix="bench-ff-") as tmp:
+        # The physical path, as the tool's getcwd() reports it: a temp dir
+        # behind a symlink (macOS's /var -> /private/var) would otherwise give
+        # HOME and the working directory different spellings.
+        root = os.path.realpath(tmp)
         env = clean_env(root)
         if ollama_host:
             env["OLLAMA_HOST"] = ollama_host
@@ -316,7 +351,13 @@ def first_frame_once(argv, min_chars=20, quiet_ms=50, marker=None, timeout_s=10.
                 except OSError:  # EIO: every slave fd is closed
                     data = b""
                 if not data:
-                    code = proc.wait()
+                    # The tool closed the pty; it may still be running (it
+                    # detached, or redirected its output), so the wait is
+                    # bounded by the same timeout.
+                    try:
+                        code = proc.wait(timeout=max(t0 + timeout_s - time.perf_counter(), 0.1))
+                    except subprocess.TimeoutExpired:
+                        return "timeout", None, term.excerpt()
                     if NO_CREDENTIAL.search(term.excerpt(10000)):
                         return "needs login", None, term.excerpt()
                     return f"exited {code}", None, term.excerpt()
@@ -375,41 +416,38 @@ def first_frame_report(args):
     markers = dict(m.split("=", 1) for m in args.marker if "=" in m)
     if len(markers) != len(args.marker):
         sys.exit("--marker takes TOOL=TEXT")
-    opts = {
-        "min_chars": args.min_chars,
-        "quiet_ms": args.quiet_ms,
-        "timeout_s": args.timeout,
-        "ollama_host": start_ollama_stub() if args.ollama_stub else None,
-    }
+    opts = {"min_chars": args.min_chars, "quiet_ms": args.quiet_ms, "timeout_s": args.timeout}
     rows = []
-    for tool in args.tools:
-        path = shutil.which(tool)
-        if not path:
-            continue
-        m = first_frame([path], args.runs, marker=markers.get(tool), **opts)
-        rows.append((tool, version_of(tool), markers.get(tool), m))
+    with ollama_stub() if args.ollama_stub else contextlib.nullcontext() as host:
+        for tool in args.tools:
+            path = shutil.which(tool)
+            if not path:
+                continue
+            m = first_frame([path], args.runs, marker=markers.get(tool), ollama_host=host, **opts)
+            rows.append((tool, version_of(tool), markers.get(tool), m))
+    # The path column, not the header, says which run a row came from, so
+    # rows from runs with and without --ollama-stub fit one table.
+    how = "Ollama stub (`--ollama-stub`)" if args.ollama_stub else "default"
     print(f"Machine: {platform.node()} · {platform.machine()} · {platform.system()} {platform.release()}")
     print(
         f"Date: {time.strftime('%Y-%m-%d')} · runs per tool: {args.runs} · "
         f"terminal: {COLS}x{ROWS} xterm-256color · first frame: "
         f"{args.min_chars} visible characters then {args.quiet_ms:g} ms quiet, "
-        f"or the ready marker"
-        + (" · Ollama stub answering on OLLAMA_HOST" if args.ollama_stub else "")
-        + "\n"
+        f"or the ready marker\n"
     )
-    print("| Tool | Version | First frame (median) | p95 | Frame begins |")
-    print("|---|---|---|---|---|")
+    print("| Tool | Version | Path | First frame (median) | p95 | Frame begins |")
+    print("|---|---|---|---|---|---|")
     for tool, ver, marker, m in rows:
         shown = m["excerpt"].replace("|", "\\|").replace("`", "'")
         shown = f"`{shown}`" if shown else ""
         if marker:
             shown += f" (marker `{marker}`)"
         if m["status"] == "frame":
-            print(f"| {tool} | {ver} | {m['median_ms']:.0f} ms | {m['p95_ms']:.0f} ms | {shown} |")
+            print(f"| {tool} | {ver} | {how} | {m['median_ms']:.0f} ms | {m['p95_ms']:.0f} ms | {shown} |")
         elif m["status"] == "timeout":
-            print(f"| {tool} | {ver} | timeout (> {args.timeout:g} s) | | {shown} |")
+            print(f"| {tool} | {ver} | {how} | timeout (> {args.timeout:g} s) | | {shown} |")
         else:
-            print(f"| {tool} | {ver} | {m['status']} | | {shown} |")
+            print(f"| {tool} | {ver} | {how} | {m['status']} | | {shown} |")
 
 
 # ── Self-test: --first-frame against dummy TUIs ──────────────────────────────
@@ -477,6 +515,21 @@ DUMMY_LOGIN = (
     "time.sleep(60)\n"
 )
 
+# Closes the terminal and keeps running, as a tool that daemonises does: the
+# pty reads EOF while the process lives on, and the timeout still holds.
+DUMMY_DETACH = "import os, time; os.close(0); os.close(1); os.close(2); time.sleep(60)\n"
+
+# A tool on PATH for the report: answers --version, draws one line that says
+# whether OLLAMA_HOST reached it.
+DUMMY_AGENT = r"""
+import os, sys, time
+if "--version" in sys.argv:
+    print("dummy-agent 1.0")
+    sys.exit(0)
+os.write(1, ("dummy agent ready, OLLAMA_HOST=%s" % ("set" if os.environ.get("OLLAMA_HOST") else "unset")).encode())
+time.sleep(60)
+"""
+
 
 def self_test():
     # A credential in the caller's environment must not reach the tool.
@@ -496,7 +549,15 @@ def self_test():
                 f.write(body)
             return [sys.executable, path]
 
-        m = first_frame(script("banner.py", DUMMY_BANNER), 3)
+        # The temp dir behind a symlink, as on macOS (/var -> /private/var):
+        # the tool's HOME and working directory must still agree.
+        os.mkdir(os.path.join(d, "tmp"))
+        os.symlink(os.path.join(d, "tmp"), os.path.join(d, "tmp-link"))
+        saved_tempdir, tempfile.tempdir = tempfile.tempdir, os.path.join(d, "tmp-link")
+        try:
+            m = first_frame(script("banner.py", DUMMY_BANNER), 3)
+        finally:
+            tempfile.tempdir = saved_tempdir
         want = f"READY {COLS}x{ROWS} dsr=ok key=absent git=yes home=temp"
         check("banner frame", m["status"] == "frame", m["status"])
         if m["status"] == "frame":
@@ -523,10 +584,49 @@ def self_test():
         m = first_frame(script("login.py", DUMMY_LOGIN), 1)
         check("sign-in screen", m["status"] == "needs login", m["status"])
 
-        host = start_ollama_stub()
-        m = first_frame(script("ollama.py", DUMMY_OLLAMA), 1, ollama_host=host)
+        t = time.perf_counter()
+        m = first_frame(script("detach.py", DUMMY_DETACH), 1, timeout_s=0.5)
+        elapsed = time.perf_counter() - t
+        check("closes the pty, keeps running", m["status"] == "timeout", m["status"])
+        check("detached tool killed", elapsed < 5, f"{elapsed:.1f} s for one 0.5 s timeout")
+
+        with ollama_stub() as host:
+            # The harness forks the tool and runs Python in the child before
+            # exec, so the stub must not add a thread to this process.
+            threads = threading.active_count()
+            check("ollama stub out of process", threads == 1, f"{threads} threads")
+            m = first_frame(script("ollama.py", DUMMY_OLLAMA), 1, ollama_host=host)
         ok = m["excerpt"] == "model bench-stub:latest tools=True"
         check("ollama stub", ok, f"{m['status']} {m['excerpt']!r}")
+
+        # The report's table, as BENCHMARKS.md shows it.
+        bindir = os.path.join(d, "bin")
+        os.mkdir(bindir)
+        agent = os.path.join(bindir, "dummy-agent")
+        with open(agent, "w") as f:
+            f.write(f"#!{sys.executable}\n{DUMMY_AGENT}")
+        os.chmod(agent, 0o755)
+        args = argparse.Namespace(
+            tools=["dummy-agent"], runs=1, marker=[], min_chars=20, quiet_ms=50,
+            timeout=10, ollama_stub=True,
+        )
+        saved_path = os.environ["PATH"]
+        os.environ["PATH"] = bindir + os.pathsep + saved_path
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                first_frame_report(args)
+        finally:
+            os.environ["PATH"] = saved_path
+        lines = out.getvalue().splitlines()
+        head = "| Tool | Version | Path | First frame (median) | p95 | Frame begins |"
+        row = "| dummy-agent | dummy-agent 1.0 | Ollama stub (`--ollama-stub`) | "
+        ok = (
+            head in lines
+            and any(l.startswith(row) and "`dummy agent ready, OLLAMA_HOST=set`" in l for l in lines)
+            and any(l.startswith("Date: ") and "runs per tool: 1 ·" in l for l in lines)
+        )
+        check("report table", ok, repr(lines[-1] if lines else ""))
 
     if failures:
         print(f"self-test failed: {', '.join(failures)}")
@@ -551,7 +651,10 @@ def main():
         help="answer Ollama's model listing locally (OxideClaw's keyless path)",
     )
     ap.add_argument("--self-test", action="store_true", help="check --first-frame on dummy TUIs")
+    ap.add_argument("--serve-ollama-stub", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.serve_ollama_stub:
+        return serve_ollama_stub()
     if args.self_test:
         return self_test()
     if args.first_frame:
