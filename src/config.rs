@@ -367,7 +367,7 @@ pub struct Config {
 
     /// Watch debounce (ms) — coalesces rapid filesystem events.
     pub watch_debounce_ms: u64,
-    /// Minimum gap between watch triggers (ms).
+    /// Minimum gap between watch triggers for the same file (ms).
     pub watch_rate_limit_ms: u64,
     /// Comment markers that fire watch auto-action (e.g. `["AI:", "AGENT:"]`).
     pub watch_markers: Vec<String>,
