@@ -385,7 +385,8 @@ enum ConfigSubcommand {
 
 #[derive(Subcommand)]
 enum McpSubcommand {
-    /// List configured MCP servers and the scope each comes from
+    /// List configured MCP servers, the scope each comes from, and the
+    /// protocol revision each one that starts negotiates
     List,
     /// Add an MCP server (stdio or HTTP)
     Add {
@@ -1687,6 +1688,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                 println!();
                 print_mcp_scopes();
             } else {
+                let health = mcp_health(&config.cwd).await;
                 println!("Configured MCP servers ({}):", servers.len());
                 let width = servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
                 for s in &servers {
@@ -1696,8 +1698,15 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                         }
                         crate::mcp::types::McpServerConfig::Http(h) => format!("http: {}", h.url),
                     };
+                    let live = match health.get(&s.name) {
+                        Some(Some(revision)) if s.is_effective() => {
+                            format!("  connected, MCP {revision}")
+                        }
+                        Some(None) if s.is_effective() => "  failed to connect".to_string(),
+                        _ => String::new(),
+                    };
                     println!(
-                        "  {:width$}  {:7}  ({kind}){}",
+                        "  {:width$}  {:7}  ({kind}){}{live}",
                         s.name,
                         s.scope.as_str(),
                         mcp_state(s)
@@ -1935,6 +1944,28 @@ fn mcp_add_config(
         }
         other => anyhow::bail!("unknown transport '{other}' (expected stdio or http)"),
     }
+}
+
+/// Start every server a session in `cwd` would start (trusted, enabled,
+/// `${VAR}`s expanded) and report each one's negotiated protocol revision,
+/// or `None` when it failed to connect. The connections close on return.
+async fn mcp_health(cwd: &std::path::Path) -> std::collections::HashMap<String, Option<String>> {
+    let settings = crate::settings::Settings::load(cwd);
+    if settings.mcp_servers.values().all(|c| c.is_disabled()) {
+        return Default::default();
+    }
+    eprintln!("Checking MCP server health…");
+    let manager =
+        crate::mcp::McpManager::start_with_extra(&settings, &std::collections::HashMap::new(), cwd)
+            .await;
+    let connected = manager.clients.iter().map(|c| {
+        (
+            c.server_name.clone(),
+            Some(c.protocol_revision().to_string()),
+        )
+    });
+    let failed = manager.failed.iter().map(|n| (n.clone(), None));
+    connected.chain(failed).collect()
 }
 
 /// `[needs /trust]`, `[overridden by local]`, `[disabled]` for `mcp list`/`get`.
