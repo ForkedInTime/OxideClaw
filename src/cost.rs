@@ -47,7 +47,9 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         cache_read_mult: 0.1,
         estimated: true,
     };
-    let m = model.to_ascii_lowercase();
+    // OpenRouter spells versions with dots (`anthropic/claude-opus-4.1`);
+    // the generation checks below are written against Anthropic's dashes.
+    let m = model.to_ascii_lowercase().replace('.', "-");
 
     // Ollama and LM Studio run on the user's own hardware: free, and checked
     // first so a local GGUF named after a Claude or GPT model is not billed
@@ -70,18 +72,14 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
             published(10.0, 50.0)
         }
     } else if m.contains("opus") {
-        // Opus 5.5: $4/$20, cache reads $0.20. Opus 4.6–5: $5/$25.
-        // Opus 4.5 and earlier: $15/$75.
+        // Opus 5.5: $4/$20, cache reads $0.20. Opus 4.5–5: $5/$25.
+        // Opus 4.1 and earlier: $15/$75.
         if m.contains("opus-5-5") {
             ModelPrice {
                 cache_read_mult: 0.05,
                 ..published(4.0, 20.0)
             }
-        } else if m.contains("opus-4-5")
-            || m.contains("opus-4-1")
-            || m.contains("opus-4-0")
-            || m.contains("3-opus")
-        {
+        } else if m.contains("3-opus") || m.contains("opus-3") || is_opus_4_0_or_4_1(&m) {
             published(15.0, 75.0)
         } else {
             published(5.0, 25.0)
@@ -116,6 +114,27 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         // magnitude cheaper or dearer, and silently reporting a guess as fact
         // is how a /budget cap gets trusted when it should not be.
         rough(3.0, 15.0)
+    }
+}
+
+/// Opus 4.0 / 4.1 ids: `opus-4` followed by nothing, a date
+/// (`claude-opus-4-20250514`), a Vertex `@date`, or minor version 0 or 1.
+/// Substring checks cannot tell `opus-4-1` from a future `opus-4-10`, nor
+/// `opus-4-20250514` (4.0) from `opus-4-5` (4.5).
+fn is_opus_4_0_or_4_1(m: &str) -> bool {
+    let Some(i) = m.find("opus-4") else {
+        return false;
+    };
+    let rest = &m[i + "opus-4".len()..];
+    let Some(rest) = rest.strip_prefix('-') else {
+        // `opus-4`, `opus-4@20250514`, `opus-4:free`; `opus-45` is not an id.
+        return !rest.starts_with(|c: char| c.is_ascii_digit());
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    match &rest[..digits] {
+        "" => true, // `opus-4-v1`
+        "0" | "1" => true,
+        d => d.len() == 8, // a date, so Opus 4.0
     }
 }
 
@@ -506,6 +525,19 @@ mod price_table_tests {
             ("claude-opus-5", 5.0, 25.0),
             ("claude-sonnet-5-5", 2.0, 10.0),
             ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-opus-4-5", 5.0, 25.0),
+            ("claude-opus-4-5-20251101", 5.0, 25.0),
+            ("openrouter:anthropic/claude-opus-4.5", 5.0, 25.0),
+            ("claude-opus-4-1", 15.0, 75.0),
+            ("claude-opus-4-1-20250805", 15.0, 75.0),
+            ("claude-opus-4-0", 15.0, 75.0),
+            ("claude-opus-4-20250514", 15.0, 75.0),
+            ("us.anthropic.claude-opus-4-20250514-v1:0", 15.0, 75.0),
+            ("claude-opus-4@20250514", 15.0, 75.0),
+            ("openrouter:anthropic/claude-opus-4.1", 15.0, 75.0),
+            ("openrouter:anthropic/claude-opus-4", 15.0, 75.0),
+            ("claude-3-opus-20240229", 15.0, 75.0),
+            ("openrouter:anthropic/claude-3.5-haiku", 0.8, 4.0),
             ("claude-sonnet-5", 2.0, 10.0),
             ("claude-sonnet-4-6", 3.0, 15.0),
             ("claude-haiku-4-5", 1.0, 5.0),
