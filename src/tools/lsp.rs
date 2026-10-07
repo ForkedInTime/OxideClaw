@@ -42,6 +42,28 @@ pub(crate) enum Launch {
     Shell(String),
 }
 
+impl Launch {
+    /// How to start `exe args` in `root` under `containment`'s sandbox: the
+    /// executable itself without one, the wrapped shell line with one.
+    /// `Err` when the sandbox refuses it: never start it bare then.
+    pub(crate) fn contained(
+        exe: &Path,
+        args: &[String],
+        containment: &crate::autofix::Containment,
+        root: &Path,
+    ) -> Result<Launch, String> {
+        let plain = std::iter::once(exe.display().to_string())
+            .chain(args.iter().cloned())
+            .map(|a| crate::sandbox::shell_quote(&a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(match containment.wrap(&plain, root)? {
+            line if line == plain => Launch::Program(exe.to_path_buf()),
+            line => Launch::Shell(line),
+        })
+    }
+}
+
 fn cache_key(command: &str, args: &[String], root: &Path) -> (String, PathBuf) {
     (format!("{command} {}", args.join(" ")), root.to_path_buf())
 }
@@ -281,10 +303,48 @@ impl Tool for LSPTool {
             .unwrap_or(&candidates[0]);
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
 
+        // A language server loads the workspace, which runs project code
+        // (build scripts, proc macros, plugins): only in a trusted project,
+        // and under the Bash tool's sandbox when one is on, as auto-fix does.
+        if !ctx.project_trusted {
+            return Ok(ToolOutput::error(format!(
+                "LSP: not started. Language servers run project code (build scripts, \
+                 proc macros, plugins), so '{command}' only runs in a trusted project. \
+                 Trust this folder with /trust in the TUI, or add it to \
+                 `trustedProjects` in the user settings.json."
+            )));
+        }
+        let launch = match crate::autofix::find_on_path(command, path_var.as_deref()) {
+            Some(exe) => {
+                let containment = crate::autofix::Containment {
+                    trusted: true,
+                    sandbox_mode: ctx.sandbox_mode.clone(),
+                    sandbox_allow_network: ctx.sandbox_allow_network,
+                };
+                match Launch::contained(&exe, &args, &containment, &ctx.cwd) {
+                    Ok(launch) => launch,
+                    Err(reason) => {
+                        return Ok(ToolOutput::error(format!(
+                            "LSP: '{command}' was not started: {reason}"
+                        )));
+                    }
+                }
+            }
+            // Not installed: starting the bare name fails and says what to
+            // install. A sandbox has no command line to wrap then.
+            None if ctx.sandbox_mode.is_some() => {
+                return Ok(ToolOutput::error(format!(
+                    "Could not start language server '{command}': not found on PATH\n\
+                     Make sure it is installed."
+                )));
+            }
+            None => Launch::Plain,
+        };
+
         // One initialised server per (command, root), cached across calls.
         let client = match self
             .pool
-            .client_for(command, &args, &ctx.cwd, &Launch::Plain)
+            .client_for(command, &args, &ctx.cwd, &launch)
             .await
         {
             Ok(c) => c,
@@ -1565,6 +1625,12 @@ mod init_tests {
 mod sync_tests {
     use super::*;
 
+    fn trusted_ctx(dir: &Path) -> ToolContext {
+        let mut ctx = ToolContext::new(dir.to_path_buf());
+        ctx.project_trusted = true;
+        ctx
+    }
+
     /// A file that is not UTF-8 is still queried, unsynced, as before.
     #[tokio::test]
     async fn a_file_that_is_not_utf8_is_still_queried() {
@@ -1614,10 +1680,131 @@ while True:
         let out = tool
             .execute(
                 json!({"operation": "hover", "file_path": "legacy.lua", "line": 1, "character": 6}),
-                &ToolContext::new(dir.path().to_path_buf()),
+                &trusted_ctx(dir.path()),
             )
             .await
             .expect("a Latin-1 file made the query fail");
         assert!(!out.is_error);
+    }
+}
+
+/// The LSP tool against a stand-in server (python3) that logs what it reads
+/// and answers every request with a null result.
+#[cfg(all(test, unix))]
+mod server_tests {
+    use super::*;
+
+    /// `mode`: `ok`, or `deaf` (stops reading its input after `initialized`).
+    /// Logs `initialize processId=<id>`, and `<method> <uri>` for the rest.
+    fn fake_server(dir: &Path, mode: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("server.log");
+        let server = dir.join("server");
+        std::fs::write(
+            &server,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, sys, time
+LOG, MODE = {log:?}, {mode:?}
+def log(s):
+    with open(LOG, "a") as f:
+        f.write(s + "\n")
+while True:
+    n = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        line = line.strip()
+        if not line:
+            break
+        k, v = line.split(b":", 1)
+        if k.strip().lower() == b"content-length":
+            n = int(v)
+    m = json.loads(sys.stdin.buffer.read(n))
+    method, params = m.get("method"), m.get("params") or {{}}
+    if method == "initialize":
+        log("initialize processId=" + json.dumps(params.get("processId")))
+    else:
+        log("%s %s" % (method, params.get("textDocument", {{}}).get("uri", "")))
+    if method == "initialized" and MODE == "deaf":
+        time.sleep(60)
+    if "id" in m and method:
+        b = json.dumps({{"jsonrpc": "2.0", "id": m["id"], "result": None}}).encode()
+        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+        sys.stdout.buffer.flush()
+"#,
+                log = log.display().to_string(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (server, log)
+    }
+
+    fn text(out: &ToolOutput) -> String {
+        out.content
+            .iter()
+            .map(|c| match c {
+                crate::api::types::ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect()
+    }
+
+    /// The tool's server for `.lua`, started from `server` and cached, as if
+    /// lua-language-server were on PATH.
+    async fn lua_server(tool: &LSPTool, dir: &Path, server: &Path) -> Arc<LspClient> {
+        tool.pool
+            .client_for(
+                "lua-language-server",
+                &[],
+                dir,
+                &Launch::Program(server.to_path_buf()),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A language server runs project code: the tool used to start one (and
+    /// query it) in any folder, without a prompt, ignoring `/trust`.
+    #[tokio::test]
+    async fn the_lsp_tool_needs_a_trusted_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, log) = fake_server(dir.path(), "ok");
+        std::fs::write(dir.path().join("a.lua"), "local x = 1\n").unwrap();
+        let tool = LSPTool::default();
+        lua_server(&tool, dir.path(), &server).await;
+        let hover = json!({"operation": "hover", "file_path": "a.lua"});
+
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        let out = tool.execute(hover.clone(), &ctx).await.unwrap();
+        assert!(out.is_error);
+        assert!(text(&out).contains("/trust"), "{}", text(&out));
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(!seen.contains("a.lua"), "{seen}");
+
+        ctx.project_trusted = true;
+        let out = tool.execute(hover, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", text(&out));
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(seen.contains("textDocument/hover"), "{seen}");
+    }
+
+    /// The tool starts servers the way auto-fix does: the executable itself
+    /// without a sandbox, never bare when the sandbox refuses it.
+    #[test]
+    fn servers_start_under_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("rust-analyzer");
+        let mut containment = crate::autofix::Containment {
+            trusted: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Launch::contained(&exe, &[], &containment, dir.path()),
+            Ok(Launch::Program(p)) if p == exe
+        ));
+        containment.sandbox_mode = Some("no-such-sandbox".into());
+        assert!(Launch::contained(&exe, &[], &containment, dir.path()).is_err());
     }
 }

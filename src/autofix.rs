@@ -1239,15 +1239,9 @@ impl LspDiagnostics {
             }
         };
 
-        let plain = std::iter::once(group.exe.display().to_string())
-            .chain(group.args.iter().cloned())
-            .map(|a| crate::sandbox::shell_quote(&a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let launch = match containment.wrap(&plain, &self.root) {
+        let launch = match Launch::contained(&group.exe, &group.args, containment, &self.root) {
+            Ok(launch) => launch,
             Err(reason) => return give_up(format!("was not started: {reason}")),
-            Ok(line) if line == plain => Launch::Program(group.exe.clone()),
-            Ok(line) => Launch::Shell(line),
         };
         let start = tokio::time::timeout_at(
             deadline,

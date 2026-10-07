@@ -883,6 +883,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     ctx.sandbox_mode = Some(config.sandbox_mode.clone());
                 }
                 ctx.sandbox_allow_network = config.sandbox_allow_network;
+                ctx.project_trusted = config.project_trusted;
                 ctx.read_cache = Some(read_cache.clone());
                 // Publish live provider snapshot so AgentTool / spawned
                 // sub-agents inherit `/model` changes made mid-session.

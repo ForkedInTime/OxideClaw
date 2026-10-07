@@ -81,6 +81,10 @@ pub struct ToolContext {
     /// Whether bwrap sandbox allows outbound network (passed to bwrap_wrap).
     pub sandbox_allow_network: bool,
 
+    /// The project is in `trustedProjects` (`/trust`). Tools that run
+    /// project code outside the Bash tool (language servers) need it.
+    pub project_trusted: bool,
+
     /// Shared Read-tool cache: path → content hash. Lets the Read tool skip
     /// re-emitting a file body that hasn't changed since the last read.
     pub read_cache: Option<ReadCache>,
@@ -144,6 +148,7 @@ impl ToolContext {
             env: std::collections::HashMap::new(),
             sandbox_mode: None,
             sandbox_allow_network: true,
+            project_trusted: false,
             read_cache: None,
             live_model: None,
             live_api_key: None,

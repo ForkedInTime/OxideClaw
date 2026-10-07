@@ -65,6 +65,8 @@ impl AgentTool {
             sub_config.sandbox_mode = m.clone();
         }
         sub_config.sandbox_allow_network = ctx.sandbox_allow_network;
+        // `/untrust` changes trust after the snapshot was taken.
+        sub_config.project_trusted = ctx.project_trusted;
         if ctx.default_shell.is_some() {
             sub_config.default_shell = ctx.default_shell.clone();
         }
@@ -529,5 +531,18 @@ mod tests {
             panic!("expected a tool result");
         };
         assert_eq!(*is_error, Some(true), "{content:?}");
+    }
+
+    /// `/trust revoke` changes only the live config: a child built from the
+    /// trusted snapshot would still start language servers.
+    #[test]
+    fn child_trust_follows_the_live_session() {
+        let mut cfg = config();
+        cfg.project_trusted = true;
+        let tool = AgentTool { config: cfg };
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        assert!(!tool.live_config(&ctx).project_trusted);
+        ctx.project_trusted = true;
+        assert!(tool.live_config(&ctx).project_trusted);
     }
 }

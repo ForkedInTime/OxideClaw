@@ -730,6 +730,7 @@ impl QueryEngine {
             ctx.sandbox_mode = Some(self.config.sandbox_mode.clone());
         }
         ctx.sandbox_allow_network = self.config.sandbox_allow_network;
+        ctx.project_trusted = self.config.project_trusted;
         gate = gate.with_bash_shell(&ctx.command_shell());
         ctx.read_cache = Some(self.read_cache.clone());
         // Publish live provider snapshot for AgentTool / spawn sub-agents.
