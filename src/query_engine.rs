@@ -34,6 +34,9 @@ pub struct QueryEngine {
     session_id: Option<String>,
     /// Shared Read-tool cache for deduplicating unchanged re-reads (v2.1.86).
     read_cache: crate::tools::ReadCache,
+    /// The history outlives `query()` (a resumed `-p` session is saved
+    /// back), so compacting after the final turn still pays off.
+    history_saved: bool,
     /// In-process tool middleware chain (empty by default).
     middlewares: crate::browser::middleware::MiddlewareChain,
     /// Turn counter.
@@ -117,6 +120,7 @@ impl QueryEngine {
             cumulative_cost_usd: 0.0,
             session_id: Some(uuid::Uuid::new_v4().to_string()),
             read_cache: crate::tools::new_read_cache(),
+            history_saved: false,
             middlewares: Vec::new(),
             turns: 0,
             gate,
@@ -144,6 +148,58 @@ impl QueryEngine {
                 let _ = sink.send((model, usage));
             }
         }
+    }
+
+    /// Replace the history with a summary (snip if that fails) once the
+    /// context is critically full. Call only between rounds: the summary
+    /// replaces any tool_use whose results are still to come.
+    async fn auto_summarise(&mut self) {
+        if !self.config.auto_compact_enabled {
+            eprintln!(
+                "{}",
+                "Context critically full. Enable auto_compact or run /compact now.".red()
+            );
+            return;
+        }
+        eprintln!(
+            "{}",
+            "Auto-compacting: summarising conversation (summarizeCompact)…".yellow()
+        );
+        // Billed like any other call: it carries the whole history, so it
+        // is often the session's largest.
+        let bill = |u: &Usage| {
+            self.cumulative_cost_usd += estimate_cost_usd(&self.config.model, u);
+            if let Some(sink) = &self.usage_sink {
+                let _ = sink.send((self.config.model.clone(), u.clone()));
+            }
+        };
+        match summarize_compact(&self.client, &self.messages, &self.config, bill).await {
+            Ok(replacement) => {
+                self.messages = replacement;
+                eprintln!(
+                    "{}",
+                    "Compaction complete. Conversation history replaced with summary.".green()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!("Compact failed: {e}. Falling back to snip.").red()
+                );
+                snip_compact(&mut self.messages, &self.config.model);
+            }
+        }
+        self.forget_reads();
+    }
+
+    /// After compaction the bodies of earlier reads are gone from the
+    /// history, so a re-read must return the file, not "unchanged since
+    /// last read".
+    fn forget_reads(&self) {
+        self.read_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Replace the headless default with the parent executor's gate, so a
@@ -380,6 +436,7 @@ impl QueryEngine {
 
             // Context compaction check
             let window = compaction_window(&self.config, None, None);
+            let mut summarise_after_tools = false;
             match compact_needed(response.usage.input_tokens, window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
@@ -401,7 +458,9 @@ impl QueryEngine {
                             "{}",
                             "Auto-compacting: stripping old tool results (snipCompact)…".yellow()
                         );
-                        snip_compact(&mut self.messages, &self.config.model);
+                        if snip_compact(&mut self.messages, &self.config.model) {
+                            self.forget_reads();
+                        }
                     } else {
                         eprintln!(
                             "{}",
@@ -410,52 +469,15 @@ impl QueryEngine {
                     }
                 }
                 // Summarising now would replace the assistant tool_use that the
-                // results appended below answer, orphaning them (a 400). Snip
-                // this round (a no-op mid-round on models whose thinking is
-                // bound to the history); summarise once tool calls stop.
+                // results appended below answer, orphaning them (a 400).
+                // Summarise once they are in.
                 CompactNeeded::Summarise if response.stop_reason == Some(StopReason::ToolUse) => {
-                    if self.config.auto_compact_enabled {
-                        snip_compact(&mut self.messages, &self.config.model);
-                    }
+                    summarise_after_tools = true;
                 }
-                CompactNeeded::Summarise => {
-                    if self.config.auto_compact_enabled {
-                        eprintln!(
-                            "{}",
-                            "Auto-compacting: summarising conversation (summarizeCompact)…"
-                                .yellow()
-                        );
-                        // Billed like any other call: it carries the whole
-                        // history, so it is often the session's largest.
-                        let bill = |u: &Usage| {
-                            self.cumulative_cost_usd += estimate_cost_usd(&self.config.model, u);
-                            if let Some(sink) = &self.usage_sink {
-                                let _ = sink.send((self.config.model.clone(), u.clone()));
-                            }
-                        };
-                        match summarize_compact(&self.client, &self.messages, &self.config, bill)
-                            .await
-                        {
-                            Ok(replacement) => {
-                                self.messages = replacement;
-                                eprintln!("{}", "Compaction complete. Conversation history replaced with summary.".green());
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "{}",
-                                    format!("Compact failed: {e}. Falling back to snip.").red()
-                                );
-                                snip_compact(&mut self.messages, &self.config.model);
-                            }
-                        }
-                    } else {
-                        eprintln!(
-                            "{}",
-                            "Context critically full. Enable auto_compact or run /compact now."
-                                .red()
-                        );
-                    }
-                }
+                CompactNeeded::Summarise if self.history_saved => self.auto_summarise().await,
+                // The loop ends after this turn and the history with it: a
+                // summary now would be a full-history call nobody reads.
+                CompactNeeded::Summarise => {}
             }
 
             // Check stop reason
@@ -502,6 +524,9 @@ impl QueryEngine {
                             .yellow()
                         );
                         break;
+                    }
+                    if summarise_after_tools {
+                        self.auto_summarise().await;
                     }
                     // Continue the loop to get Claude's next response
                 }
@@ -906,6 +931,7 @@ impl QueryEngine {
     pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
         self.session_id = Some(session_id);
         self.messages = messages;
+        self.history_saved = true;
     }
 
     /// The conversation so far, to save it.
@@ -1053,6 +1079,14 @@ pub(crate) mod scripted_api_tests {
             r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#.to_string(),
         ];
         for (i, b) in blocks.iter().enumerate() {
+            // Text arrives as a delta, as from the real API: callers that
+            // read the streamed text (summaries, sub-agent answers) see it.
+            if b["type"] == "text" {
+                events.push(serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}}).to_string());
+                events.push(serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"text_delta","text":b["text"]}}).to_string());
+                events.push(serde_json::json!({"type":"content_block_stop","index":i}).to_string());
+                continue;
+            }
             events.push(
                 serde_json::json!({"type":"content_block_start","index":i,"content_block":b})
                     .to_string(),
@@ -1220,6 +1254,8 @@ pub(crate) mod scripted_api_tests {
         let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
         c.set_base_url_for_test(url);
         e.client = ApiBackend::Anthropic(c);
+        // Only a saved session is worth summarising after its last turn.
+        e.resume_history("saved-session".into(), Vec::new());
 
         e.query("hello").await.unwrap();
 
@@ -1245,6 +1281,66 @@ pub(crate) mod scripted_api_tests {
             "{}",
             e.cumulative_cost_usd
         );
+    }
+
+    /// -p summarised only after its final turn, when the loop was about to
+    /// exit and drop the result, and never between tool rounds. Compaction
+    /// also left the Read cache answering "unchanged since last read" for
+    /// files whose bodies were no longer anywhere in the history.
+    #[tokio::test]
+    async fn summarises_between_tool_rounds_not_after_the_last_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = |blocks: &[serde_json::Value], stop: &str| {
+            sse(blocks, stop).replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#)
+        };
+        let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})];
+        let text = [serde_json::json!({"type":"text","text":"done"})];
+        let summary = sse(
+            &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
+            "end_turn",
+        );
+        let (url, seen) = serve(vec![
+            full(&tool, "tool_use"),
+            summary,
+            full(&text, "end_turn"),
+            sse(&text, "end_turn"),
+        ])
+        .await;
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            auto_compact_enabled: true,
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        e.read_cache
+            .lock()
+            .unwrap()
+            .insert(dir.path().join("lib.rs"), 42);
+
+        e.query("hello").await.unwrap();
+
+        let bodies: Vec<serde_json::Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3, "turn, summary, turn; none after the last");
+        let resumed = bodies[2]["messages"].as_array().unwrap();
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        assert!(
+            resumed[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("automatically compacted")
+        );
+        assert!(e.read_cache.lock().unwrap().is_empty(), "stale read cache");
     }
 
     fn http_error(status: &str, body: &str) -> String {

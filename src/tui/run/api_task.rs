@@ -480,6 +480,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     });
                     messages = replacement;
                     publish_history(&history, &messages, &[]);
+                    // The summary dropped the bodies of this turn's reads;
+                    // a re-read must return the file, not "unchanged".
+                    read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     continue; // retry outer loop with compacted history
                 }
                 Err(compact_err) => {
