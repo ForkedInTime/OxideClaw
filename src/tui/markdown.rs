@@ -865,29 +865,51 @@ fn render_table(rows: &[&str], base: Style, lines: &mut Vec<Line<'static>>) {
         return;
     }
 
-    let mut col_widths: Vec<usize> = vec![0; ncols];
-    for row in &parsed {
-        for (j, cell) in row.iter().enumerate() {
-            if j < ncols {
-                col_widths[j] = col_widths[j].max(cell.len());
-            }
-        }
-    }
-
     let has_separator = parsed.len() > 1 && is_separator_row(&parsed[1]);
     let data_start = if has_separator { 2 } else { 1 };
 
-    // Header
-    {
-        let header = &parsed[0];
-        let mut spans: Vec<Span<'static>> = vec![Span::styled("  ", base)];
-        for (j, width) in col_widths.iter().enumerate().take(ncols) {
-            let cell = header.get(j).map(|s| s.as_str()).unwrap_or("");
-            let padded = format!(" {:<width$} ", cell, width = *width);
-            spans.push(Span::styled(padded, CYAN.add_modifier(Modifier::BOLD)));
+    // Columns are sized by on-screen width: data cells lose their `**`/`` ` ``
+    // markup once rendered, and wide (CJK) chars take two columns, so neither
+    // byte length nor char count lines the `│` separators up.
+    let spans_width = |spans: &[Span<'static>]| spans.iter().map(Span::width).sum::<usize>();
+    let header: Vec<Span<'static>> = (0..ncols)
+        .map(|j| {
+            let cell = parsed[0].get(j).cloned().unwrap_or_default();
+            Span::styled(cell, CYAN.add_modifier(Modifier::BOLD))
+        })
+        .collect();
+    let data: Vec<Vec<Vec<Span<'static>>>> = parsed[data_start..]
+        .iter()
+        .map(|row| {
+            (0..ncols)
+                .map(|j| inline_spans(row.get(j).map(|s| s.as_str()).unwrap_or(""), base))
+                .collect()
+        })
+        .collect();
+
+    let mut col_widths: Vec<usize> = header.iter().map(Span::width).collect();
+    for row in &data {
+        for (j, cell) in row.iter().enumerate() {
+            col_widths[j] = col_widths[j].max(spans_width(cell));
+        }
+    }
+
+    let push_cell =
+        |spans: &mut Vec<Span<'static>>, mut cell: Vec<Span<'static>>, width: usize, j: usize| {
+            let pad = width.saturating_sub(spans_width(&cell)) + 1;
+            spans.push(Span::styled(" ", base));
+            spans.append(&mut cell);
+            spans.push(Span::styled(" ".repeat(pad), base));
             if j + 1 < ncols {
                 spans.push(Span::styled("│", GRAY));
             }
+        };
+
+    // Header
+    {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("  ", base)];
+        for (j, cell) in header.into_iter().enumerate() {
+            push_cell(&mut spans, vec![cell], col_widths[j], j);
         }
         lines.push(Line::from(spans));
     }
@@ -895,7 +917,7 @@ fn render_table(rows: &[&str], base: Style, lines: &mut Vec<Line<'static>>) {
     // Separator
     if has_separator {
         let mut sep = String::from("  ");
-        for (j, width) in col_widths.iter().enumerate().take(ncols) {
+        for (j, width) in col_widths.iter().enumerate() {
             sep.push_str(&"─".repeat(width + 2));
             if j + 1 < ncols {
                 sep.push('┼');
@@ -905,16 +927,10 @@ fn render_table(rows: &[&str], base: Style, lines: &mut Vec<Line<'static>>) {
     }
 
     // Data rows
-    for row in &parsed[data_start..] {
+    for row in data {
         let mut spans: Vec<Span<'static>> = vec![Span::styled("  ", base)];
-        for (j, width) in col_widths.iter().enumerate().take(ncols) {
-            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let padded = format!(" {:<width$} ", cell, width = *width);
-            let mut cell_spans = inline_spans(&padded, base);
-            spans.append(&mut cell_spans);
-            if j + 1 < ncols {
-                spans.push(Span::styled("│", GRAY));
-            }
+        for (j, cell) in row.into_iter().enumerate() {
+            push_cell(&mut spans, cell, col_widths[j], j);
         }
         lines.push(Line::from(spans));
     }
@@ -1109,5 +1125,38 @@ mod robustness_tests {
             "# Title\n\nSome **bold** text and `code`.\n\n- a\n- b\n\n```rs\nlet x = 1;\n```",
         );
         assert!(lines.len() >= 5, "got {} lines", lines.len());
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// Display column of each `│` / `┼` in a rendered line.
+    fn separator_columns(line: &Line<'_>) -> Vec<usize> {
+        let mut col = 0;
+        let mut out = Vec::new();
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                if ch == '│' || ch == '┼' {
+                    out.push(col);
+                }
+                col += Span::raw(ch.to_string()).width();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn table_columns_align_despite_inline_markup_and_wide_chars() {
+        let md = "| Flag | Meaning |\n|------|---------|\n| `--verbose` | loud |\n| **日本語** | jp |\n| plain | x |";
+        let lines = render(md);
+        let cols: Vec<Vec<usize>> = lines
+            .iter()
+            .map(separator_columns)
+            .filter(|c| !c.is_empty())
+            .collect();
+        assert_eq!(cols.len(), 5, "{lines:?}");
+        assert!(cols.iter().all(|c| c == &cols[0]), "misaligned: {cols:?}");
     }
 }
