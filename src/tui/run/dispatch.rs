@@ -637,9 +637,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.overlay = Some(Overlay::new("voice", msg));
         }
         CommandAction::SetTtsEnabled(enabled) => {
+            // Only the state that took effect is kept: saving a refused "on"
+            // made every later turn (and launch) fail with "TTS failed".
+            let mut effective = enabled;
             if enabled {
                 let has_xtts = crate::voice::xtts_available();
                 let has_player = crate::voice::audio_player_available();
+                effective = has_xtts && has_player;
 
                 if !has_xtts {
                     app.entries.push(ChatEntry::system(format!(
@@ -689,10 +693,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 ));
                 app.follow_bottom = true;
             }
-            config.tts_enabled = enabled;
+            config.tts_enabled = effective;
             let _ = crate::config::Config::save_user_setting(
                 "ttsEnabled",
-                serde_json::Value::Bool(enabled),
+                serde_json::Value::Bool(effective),
             );
         }
         CommandAction::ListVoiceModels => {
