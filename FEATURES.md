@@ -488,6 +488,7 @@ XDG paths are opt-in: they are used only when the matching variable is set. Othe
 | `CLAUDE_CONFIG_DIR` | Config directory, overriding `~/.claude` and `XDG_CONFIG_HOME` |
 | `XDG_CONFIG_HOME` | Opt-in config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
 | `XDG_DATA_HOME` | Opt-in data directory base (`$XDG_DATA_HOME/oxideclaw`) |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | CA certificates to trust in place of the OS certificate store (e.g. a TLS-inspecting corporate proxy's root). HTTPS trusts the bundled Mozilla roots plus the OS store by default |
 
 ---
 

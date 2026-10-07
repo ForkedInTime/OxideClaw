@@ -36,8 +36,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process
 async-trait = "0.1"
 
 # HTTP client for Anthropic API (replaces @anthropic-ai/sdk fetch calls)
-# socks: SOCKS5 proxy support; rustls-tls: pure-Rust TLS (no openssl dep)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "socks", "multipart", "rustls-tls"] }
+# socks: SOCKS5 proxy support; rustls-tls: pure-Rust TLS (no openssl dep).
+# rustls-tls-native-roots: also trust the OS store (or SSL_CERT_FILE/DIR), so a
+# corporate TLS-inspecting proxy whose root is installed system-wide works.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "socks", "multipart", "rustls-tls", "rustls-tls-native-roots"] }
 
 # SSE streaming for API responses
 eventsource-stream = "0.2"
