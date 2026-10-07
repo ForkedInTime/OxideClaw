@@ -168,7 +168,7 @@ struct Cli {
     #[arg(long)]
     mcp_config: Vec<String>,
 
-    /// Permission mode: default, auto, bypass
+    /// Permission mode: default or bypass (auto is accepted and runs as default)
     #[arg(long, value_enum)]
     permission_mode: Option<PermissionMode>,
 
@@ -180,8 +180,8 @@ struct Cli {
     #[arg(long)]
     max_thinking_tokens: Option<u32>,
 
-    /// Extra directories to grant tool access to
-    #[arg(long, value_delimiter = ',')]
+    // Accepted but not implemented; see `ignored_flag_warnings`.
+    #[arg(long, value_delimiter = ',', hide = true)]
     add_dir: Vec<String>,
 
     /// Effort level: low, medium, high, xhigh, max
@@ -245,8 +245,8 @@ struct Cli {
     #[arg(long)]
     append_system_prompt_file: Option<String>,
 
-    /// Allow --dangerously-skip-permissions to be used without enabling it by default
-    #[arg(long)]
+    // Accepted but not implemented; see `ignored_flag_warnings`.
+    #[arg(long, hide = true)]
     allow_dangerously_skip_permissions: bool,
 
     /// Maximum USD to spend on API calls (--print mode only)
@@ -274,8 +274,8 @@ struct Cli {
     #[arg(long)]
     register_protocol: bool,
 
-    /// Custom agent definitions JSON
-    #[arg(long)]
+    // Accepted but not implemented; see `ignored_flag_warnings`.
+    #[arg(long, hide = true)]
     agents: Option<String>,
 
     /// Disable all slash commands
@@ -1867,6 +1867,31 @@ fn ignored_flag_warnings(cli: &Cli) -> Vec<&'static str> {
              settings both load. Use --settings <file> to add settings for one run.",
         );
     }
+    if !cli.add_dir.is_empty() {
+        out.push(
+            "--add-dir is not implemented and was ignored; tools are not confined to the \
+             project directory, except under the sandbox, which only binds the project \
+             directory.",
+        );
+    }
+    if cli.agents.is_some() {
+        out.push(
+            "--agents is not implemented and was ignored; custom agent definitions are \
+             not supported yet.",
+        );
+    }
+    if matches!(cli.permission_mode, Some(PermissionMode::Auto)) {
+        out.push(
+            "--permission-mode auto is not implemented; running with the default \
+             permission prompts.",
+        );
+    }
+    if cli.allow_dangerously_skip_permissions {
+        out.push(
+            "--allow-dangerously-skip-permissions has no effect; pass \
+             --dangerously-skip-permissions to skip permission prompts.",
+        );
+    }
     out
 }
 
@@ -1938,6 +1963,14 @@ mod cli_parse_tests {
         assert!(warns(&["--worktree", "feat"])[0].contains("--worktree"));
         assert!(warns(&["--tmux"])[0].contains("--tmux"));
         assert!(warns(&["--setting-sources", "user,project"])[0].contains("--setting-sources"));
+        assert!(warns(&["--add-dir", "../lib"])[0].contains("--add-dir"));
+        assert!(warns(&["--agents", "{}"])[0].contains("--agents"));
+        assert!(warns(&["--permission-mode", "auto"])[0].contains("auto"));
+        assert!(warns(&["--permission-mode", "bypass"]).is_empty());
+        assert!(
+            warns(&["--allow-dangerously-skip-permissions"])[0]
+                .contains("--allow-dangerously-skip-permissions")
+        );
     }
 
     /// The flag split values on spaces, so ordinary pretty JSON became
