@@ -65,7 +65,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         btw_note: app.btw_note.as_deref(),
     };
 
-    match dispatch(&input, &ctx) {
+    let action = dispatch(&input, &ctx);
+    if starts_model_turn(&action, &input, skills, mcp_statuses) && budget_blocks(app, &input) {
+        return Ok(());
+    }
+    match action {
         CommandAction::Quit => {
             crate::voice::stop_xtts_server();
             app.should_quit = true;
@@ -2672,6 +2676,30 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
     Ok(())
 }
 
+/// Commands that send a prompt to the model, mirroring the arms below that
+/// spawn `run_api_task` or the browse loop. /budget is checked against these
+/// before they run, as it is for typed messages.
+fn starts_model_turn(
+    action: &CommandAction,
+    input: &str,
+    skills: &std::collections::HashMap<String, crate::skills::Skill>,
+    mcp_statuses: &[crate::mcp::types::McpServerStatus],
+) -> bool {
+    match action {
+        CommandAction::SendPrompt(_)
+        | CommandAction::BrowseUrl(_)
+        | CommandAction::BrowserScreenshot
+        | CommandAction::Browse { .. } => true,
+        CommandAction::PluginCommand { plugin, .. } => {
+            mcp_statuses.iter().any(|s| &s.name == plugin)
+        }
+        CommandAction::Unknown(_) => {
+            parse_skill_invocation(input).is_some_and(|(name, _)| skills.contains_key(name))
+        }
+        _ => false,
+    }
+}
+
 /// The model /reload should switch to, if any. Only a settings.json model
 /// that changed since it was last read counts: `--model` and
 /// `ANTHROPIC_MODEL` outrank settings at startup, and a reload made to pick
@@ -2743,5 +2771,88 @@ mod reload_tests {
             reloaded_model(Some("ollama:llama3"), &mut seen, "ollama:llama3"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// /summary, skills, plugin commands and the browser commands went
+    /// straight to the model after /budget was spent; only typed messages
+    /// were refused.
+    #[test]
+    fn spent_budget_blocks_prompt_sending_slash_commands() {
+        let mut skills = std::collections::HashMap::new();
+        skills.insert(
+            "deploy".to_string(),
+            crate::skills::Skill {
+                name: "deploy".into(),
+                description: String::new(),
+                prompt_template: "deploy {{ARGS}}".into(),
+                category: None,
+                params: Vec::new(),
+            },
+        );
+        let statuses = [crate::mcp::types::McpServerStatus {
+            name: "ctx".into(),
+            transport: "stdio",
+            tool_count: 1,
+        }];
+        let turn = |a: CommandAction, input: &str| starts_model_turn(&a, input, &skills, &statuses);
+
+        assert!(turn(dispatch_action("/summary"), "/summary"));
+        assert!(turn(CommandAction::BrowserScreenshot, "/screenshot"));
+        assert!(turn(CommandAction::Unknown("deploy".into()), "/deploy now"));
+        assert!(turn(
+            CommandAction::PluginCommand {
+                plugin: "ctx".into(),
+                command: "doctor".into()
+            },
+            "/ctx:doctor"
+        ));
+        assert!(!turn(
+            CommandAction::PluginCommand {
+                plugin: "gone".into(),
+                command: "doctor".into()
+            },
+            "/gone:doctor"
+        ));
+        assert!(!turn(CommandAction::Unknown("nope".into()), "/nope"));
+        assert!(!turn(CommandAction::ShowDiff(None), "/diff"));
+
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        assert!(!budget_blocks(&mut app, "/summary"));
+        app.cost_tracker.set_budget(1.0);
+        app.cost_tracker.total_cost_usd = 1.5;
+        assert!(budget_blocks(&mut app, "/summary"));
+        assert_eq!(app.input.iter().collect::<String>(), "/summary");
+        assert!(app.entries.last().unwrap().text.contains("not sending"));
+    }
+
+    fn dispatch_action(input: &str) -> CommandAction {
+        let config = crate::config::Config::default();
+        let skills = std::collections::HashMap::new();
+        let todo = TodoState::default();
+        let ctx = CommandContext {
+            config: &config,
+            tokens_in: 0,
+            context_window: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cost_summary: String::new(),
+            cache_write_tokens: 0,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: &[],
+            brief_mode: false,
+            btw_note: None,
+        };
+        dispatch(input, &ctx)
     }
 }

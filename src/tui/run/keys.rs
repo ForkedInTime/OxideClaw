@@ -592,14 +592,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             }
 
             // Regular user message → send to Claude, unless the budget is spent.
-            if app.cost_tracker.over_budget() {
-                app.input = raw.chars().collect();
-                app.cursor = app.input.len();
-                app.entries.push(ChatEntry::system(format!(
-                    "Budget of ${:.2} reached — not sending. Use /budget to raise or clear it.",
-                    app.cost_tracker.budget_usd.unwrap_or_default()
-                )));
-                app.scroll_to_bottom();
+            if budget_blocks(app, &raw) {
                 return Ok(());
             }
             app.show_welcome = false;
@@ -971,6 +964,23 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 }
 
 // ── Vim normal-mode key handler ───────────────────────────────────────────────
+
+/// Refuse a model call once /budget is spent, putting `unsent` back in the
+/// input. The Usage-event abort only fires after the first call is billed,
+/// so without this every turn past the cap still cost one full request.
+pub(super) fn budget_blocks(app: &mut App, unsent: &str) -> bool {
+    if !app.cost_tracker.over_budget() {
+        return false;
+    }
+    app.input = unsent.chars().collect();
+    app.cursor = app.input.len();
+    app.entries.push(ChatEntry::system(format!(
+        "Budget of ${:.2} reached — not sending. Use /budget to raise or clear it.",
+        app.cost_tracker.budget_usd.unwrap_or_default()
+    )));
+    app.scroll_to_bottom();
+    true
+}
 
 /// Shift+Enter is only distinguishable from Enter where the terminal took
 /// the keyboard enhancement flags (kitty, foot, WezTerm, Ghostty); elsewhere
