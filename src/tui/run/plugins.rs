@@ -240,6 +240,99 @@ fn registry_install_cmd(
     cmd
 }
 
+/// Clone, install and build a marketplace plugin beside `clone_dir`, then
+/// swap it in. settings.json keeps running the old checkout until the new
+/// one registers, so deleting it first left the plugin broken whenever an
+/// update failed offline, on a bad install, or was aborted with Esc.
+async fn refresh_marketplace_checkout(
+    url: &str,
+    clone_dir: &std::path::Path,
+    pm: &str,
+) -> anyhow::Result<()> {
+    let parent = clone_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("bad plugin directory"))?;
+    let name = clone_dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("bad plugin directory"))?
+        .to_string_lossy();
+    let staging = parent.join(format!(".{name}.staging"));
+    let old = parent.join(format!(".{name}.old"));
+    // Left behind by an aborted update.
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+
+    let prepared = async {
+        let output = tokio::time::timeout(
+            MARKETPLACE_CLONE_TIMEOUT,
+            marketplace_clone_cmd(url, &staging).output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "git clone timed out after {}s",
+                MARKETPLACE_CLONE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("git clone failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git clone failed:\n{}", stderr.trim());
+        }
+        // History is the bulk of the clone and unused at runtime; every
+        // update re-clones anyway.
+        let _ = tokio::fs::remove_dir_all(staging.join(".git")).await;
+
+        let install_output = tokio::process::Command::new(pm)
+            .args(["install"])
+            .current_dir(&staging)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("{pm} install failed: {e}"))?;
+        if !install_output.status.success() {
+            let stderr = String::from_utf8_lossy(&install_output.stderr);
+            anyhow::bail!("{pm} install failed:\n{}", stderr.trim());
+        }
+
+        let has_build = match tokio::fs::read_to_string(staging.join("package.json")).await {
+            Ok(pkg_str) => {
+                let pkg: serde_json::Value = serde_json::from_str(&pkg_str).unwrap_or_default();
+                pkg["scripts"]["build"].is_string()
+            }
+            Err(_) => false,
+        };
+        if has_build {
+            let _ = tokio::process::Command::new(pm)
+                .args(["run", "build"])
+                .current_dir(&staging)
+                .kill_on_drop(true)
+                .output()
+                .await;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = prepared {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(e);
+    }
+
+    let _ = std::fs::remove_dir_all(&old);
+    let had_old = clone_dir.exists();
+    if had_old {
+        std::fs::rename(clone_dir, &old)?;
+    }
+    if let Err(e) = std::fs::rename(&staging, clone_dir) {
+        if had_old {
+            let _ = std::fs::rename(&old, clone_dir);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e.into());
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
+}
+
 /// Install a plugin from npm and register it as an MCP server.
 /// `spec` is either "marketplace:<user/repo>" or a direct npm package spec (e.g. "context-mode@context-mode").
 pub(super) async fn plugin_install_task(
@@ -274,32 +367,8 @@ pub(super) async fn plugin_install_task(
             let safe_name = raw_spec.replace('/', "-");
             let clone_dir = marketplace_dir.join(&safe_name);
 
-            // Clone (shallow) — if already cloned, remove and re-clone for a
-            // clean state.  We strip .git/ after cloning so updates always
-            // start fresh rather than accumulating history.
-            if clone_dir.exists() {
-                let _ = tokio::fs::remove_dir_all(&clone_dir).await;
-            }
             let url = format!("https://github.com/{}.git", raw_spec);
-            let output = tokio::time::timeout(
-                MARKETPLACE_CLONE_TIMEOUT,
-                marketplace_clone_cmd(&url, &clone_dir).output(),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "git clone timed out after {}s",
-                    MARKETPLACE_CLONE_TIMEOUT.as_secs()
-                )
-            })?
-            .map_err(|e| anyhow::anyhow!("git clone failed: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("git clone failed:\n{}", stderr.trim());
-            }
-            // Remove .git/ — we don't need history at runtime and it's
-            // the bulk of the cloned data.
-            let _ = tokio::fs::remove_dir_all(clone_dir.join(".git")).await;
+            refresh_marketplace_checkout(&url, &clone_dir, pm).await?;
 
             // Read package.json for the plugin name
             let pkg_path = clone_dir.join("package.json");
@@ -313,34 +382,6 @@ pub(super) async fn plugin_install_task(
             } else {
                 raw_spec.split('/').next_back().unwrap_or(&raw_spec).to_string()
             };
-
-            // Install dependencies in the cloned directory
-            let install_output = tokio::process::Command::new(pm)
-                .args(["install"])
-                .current_dir(&clone_dir)
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("{pm} install failed: {e}"))?;
-
-            if !install_output.status.success() {
-                let stderr = String::from_utf8_lossy(&install_output.stderr);
-                anyhow::bail!("{pm} install failed:\n{}", stderr.trim());
-            }
-
-            // Build if a build script exists
-            let has_build = if let Ok(pkg_str) = tokio::fs::read_to_string(&pkg_path).await {
-                let pkg: serde_json::Value = serde_json::from_str(&pkg_str).unwrap_or_default();
-                pkg["scripts"]["build"].is_string()
-            } else { false };
-            if has_build {
-                let _ = tokio::process::Command::new(pm)
-                    .args(["run", "build"])
-                    .current_dir(&clone_dir)
-                    .kill_on_drop(true)
-                    .output()
-                    .await;
-            }
 
             // Find entry point for MCP server registration
             let manifest: serde_json::Value = tokio::fs::read_to_string(&pkg_path)
@@ -797,5 +838,107 @@ mod upgrade_tests {
         assert!(upgrade_message("0.4.0", Some("nightly")).contains("Latest release: nightly"));
         assert_eq!(parse_version("v1.2.3-rc1"), Some((1, 2, 3)));
         assert_eq!(parse_version("1.2"), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod marketplace_update_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn installed(root: &std::path::Path) -> std::path::PathBuf {
+        let dir = root.join("marketplaces").join("me-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.js"), "old").unwrap();
+        dir
+    }
+
+    fn leftovers(root: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(root.join("marketplaces"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect()
+    }
+
+    /// `/plugin marketplace update` deleted the working checkout before the
+    /// clone, so an offline update or a failed install left settings.json
+    /// pointing at a directory that no longer existed.
+    #[tokio::test]
+    async fn failed_update_keeps_the_installed_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone_dir = installed(tmp.path());
+
+        let missing = format!("file://{}", tmp.path().join("no-such-repo").display());
+        assert!(
+            refresh_marketplace_checkout(&missing, &clone_dir, "true")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("index.js")).unwrap(),
+            "old"
+        );
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("index.js"), "new").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "v2",
+            ],
+        );
+        let url = format!("file://{}", repo.display());
+
+        // The clone succeeds but the dependency install does not.
+        let err = refresh_marketplace_checkout(&url, &clone_dir, "false")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("install failed"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("index.js")).unwrap(),
+            "old"
+        );
+        assert!(
+            leftovers(tmp.path()).is_empty(),
+            "{:?}",
+            leftovers(tmp.path())
+        );
+
+        refresh_marketplace_checkout(&url, &clone_dir, "true")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("index.js")).unwrap(),
+            "new"
+        );
+        assert!(!clone_dir.join(".git").exists());
+        assert!(
+            leftovers(tmp.path()).is_empty(),
+            "{:?}",
+            leftovers(tmp.path())
+        );
     }
 }
