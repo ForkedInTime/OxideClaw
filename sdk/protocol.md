@@ -360,7 +360,15 @@ Something went wrong during the turn.
 }
 ```
 
-Error codes: `budget_exceeded`, `max_turns_exceeded`, `turn_error`, `internal_error`.
+Error codes:
+
+| Code | Meaning |
+|------|---------|
+| `budget_exceeded` | The session spent its `max_budget_usd`. |
+| `max_turns` | The turn hit `max_turns` agentic iterations before the model finished. |
+| `max_tokens` | The model hit its output-token or context-window limit. |
+| `refusal` | The model declined the request. |
+| `turn_error` | The turn failed (API, network or tool-loop error); `message` has the cause. |
 
 ---
 
@@ -420,7 +428,19 @@ Request-level errors include the request `id`:
 }
 ```
 
-Error codes: `internal_error`, `not_implemented`, `session_not_found`, `invalid_request`, `parse_error`.
+Error codes:
+
+| Code | Meaning |
+|------|---------|
+| `parse_error` | The line is not JSON. |
+| `invalid_request` | The line is JSON but not a known request. |
+| `not_implemented` | The request type is reserved but not implemented yet. |
+| `no_session` | `tool/approve` or `tool/deny` arrived while no session was running to receive it. |
+| `invalid_cwd` | `session/start` named a `cwd` that cannot be used. |
+| `session_create_failed` | The session could not be created (for example, no credential). |
+| `session_list_failed` | Saved sessions could not be listed. |
+| `rag_search_failed` | The codebase index search failed. |
+| `yolo_ack_required` | `browse/start` used `policy: "yolo"` without `yolo_ack: true`. |
 
 A line that is not a valid request still gets an `error` reply: `parse_error` when it is not JSON, `invalid_request` when it is JSON but not a known request (unknown `type`, a missing required field, or a non-string `id`). The reply echoes the line's `id` when it has one (a numeric `id` comes back as a string) and is `""` otherwise.
 

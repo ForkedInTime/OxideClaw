@@ -177,3 +177,38 @@ fn test_health_check_response_serialize() {
     assert!(json.contains(r#""type":"health/check""#));
     assert!(json.contains(r#""active_sessions":1"#));
 }
+
+/// Hosts branch on `error.code`, so every code the SDK sends must be in
+/// sdk/protocol.md and every documented code must actually be sent.
+#[test]
+fn test_protocol_doc_lists_exactly_the_sent_error_codes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let doc = std::fs::read_to_string(root.join("sdk/protocol.md")).unwrap();
+    let mut documented = std::collections::BTreeSet::new();
+    let mut in_codes = false;
+    for line in doc.lines() {
+        if line.starts_with("Error codes:") {
+            in_codes = true;
+            continue;
+        }
+        if in_codes && line.starts_with("| `") {
+            documented.insert(line[3..].split('`').next().unwrap().to_string());
+        } else if in_codes && !line.starts_with('|') && !line.is_empty() {
+            in_codes = false;
+        }
+    }
+
+    // Transport-level codes are bare literals rather than `code: "..."`.
+    let mut sent: std::collections::BTreeSet<String> = ["parse_error", "invalid_request"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    for file in ["src/sdk/mod.rs", "src/sdk/session.rs"] {
+        let src = std::fs::read_to_string(root.join(file)).unwrap();
+        for part in src.split("code: \"").skip(1) {
+            sent.insert(part.split('"').next().unwrap().to_string());
+        }
+    }
+
+    assert_eq!(documented, sent, "sdk/protocol.md error codes drifted from src/sdk");
+}
