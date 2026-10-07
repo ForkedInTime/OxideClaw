@@ -103,6 +103,27 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         } else {
             published(1.0, 5.0)
         }
+    } else if let Some(id) = m.strip_prefix("gemini:") {
+        // Google's paid-tier list prices (2026); dots are dashes by now, so
+        // `gemini-2.5-flash` reads `gemini-2-5-flash`. Flash-Lite before
+        // Flash, which it contains. An unrecognised Gemini model gets the
+        // dearest current rate so a /budget cap errs early, not late.
+        if id.contains("gemma") {
+            // Gemma on the Gemini API has no paid rate.
+            rough(0.0, 0.0)
+        } else if id.contains("flash-lite") {
+            rough(0.10, 0.40)
+        } else if id.contains("gemini-3") && id.contains("flash") {
+            rough(0.50, 3.0)
+        } else if id.contains("gemini-2-0-flash") {
+            rough(0.10, 0.40)
+        } else if id.contains("flash") {
+            rough(0.30, 2.50)
+        } else if id.contains("gemini-2-5-pro") {
+            rough(1.25, 10.0)
+        } else {
+            rough(2.0, 12.0)
+        }
     } else if m.contains("groq:") || m.contains("together:") {
         // Rough estimate for hosted open-source models
         rough(0.5, 1.0)
@@ -398,6 +419,8 @@ fn short_model_name(model: &str) -> String {
         format!("Groq ({rest})")
     } else if let Some(rest) = model.strip_prefix("deepseek:") {
         format!("DeepSeek ({rest})")
+    } else if let Some(rest) = model.strip_prefix("gemini:") {
+        format!("Gemini ({rest})")
     } else {
         model.to_string()
     }
@@ -488,6 +511,39 @@ mod tests {
         let s = t.summary();
         assert!(s.contains("approximate third-party rates"), "{s}");
         assert!(s.contains("not recognised"), "{s}");
+    }
+
+    /// Gemini fell through to the Sonnet-tier fallback, so a `/budget` cap
+    /// on gemini-2.5-flash ($0.30/$2.50) tripped about 6-10x early and `/cost`
+    /// called the model unrecognised.
+    #[test]
+    fn gemini_models_have_rough_rates_not_the_fallback() {
+        for (model, input, output) in [
+            ("gemini:gemini-2.5-flash", 0.30, 2.50),
+            ("gemini:gemini-2.5-flash-lite", 0.10, 0.40),
+            ("gemini:gemini-2.5-pro", 1.25, 10.0),
+            ("gemini:gemini-3-pro-preview", 2.0, 12.0),
+            ("gemini:gemma-3-27b-it", 0.0, 0.0),
+        ] {
+            let p = model_price(model);
+            assert!(p.estimated, "{model}");
+            assert!(!p.fallback, "{model}");
+            assert_eq!((p.input, p.output), (input, output), "{model}");
+        }
+
+        let mut t = CostTracker::new();
+        t.record("gemini:gemini-2.5-flash", 1_000_000, 1_000_000);
+        assert!(t.by_model["gemini:gemini-2.5-flash"].estimated);
+        assert!(!t.by_model["gemini:gemini-2.5-flash"].fallback);
+        assert!(
+            (t.total_cost_usd - 2.80).abs() < 1e-9,
+            "{}",
+            t.total_cost_usd
+        );
+        let s = t.summary();
+        assert!(s.contains("Gemini (gemini-2.5-flash)"), "{s}");
+        assert!(s.contains("approximate third-party rates"), "{s}");
+        assert!(!s.contains("not recognised"), "{s}");
     }
 
     #[test]
