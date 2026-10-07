@@ -216,6 +216,16 @@ A text chunk from the model's response. Collect these to build the full response
 
 ---
 
+### `thinking/delta`
+
+The model's reasoning for one response, one notification per non-empty thinking block once that response has finished streaming. Sent only when `showThinkingSummaries` is on in settings.json; models or backends that return no thinking blocks never send it.
+
+```json
+{"type": "thinking/delta", "session_id": "abc-123", "content": "The failing test points at the parser"}
+```
+
+---
+
 ### `tool/started`
 
 A tool is about to execute (sent for `auto_approve` tools).
