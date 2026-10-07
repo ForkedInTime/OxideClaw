@@ -16,6 +16,69 @@ use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
+/// Ignore pattern covering the database and its WAL/SHM side files at any depth.
+const GIT_EXCLUDE_PATTERN: &str = "**/.claude/rag.db*";
+
+/// The index and memory rows live inside the user's repo; `/checkpoint`,
+/// `/commit` and `/spawn merge` all `git add -A`, which would commit them.
+/// Once per cwd per process, so a turn does not fork git every time.
+fn ensure_git_excluded_once(cwd: &Path) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cwd.to_path_buf());
+    if first {
+        ensure_git_excluded(cwd);
+    }
+}
+
+/// Best effort: add [`GIT_EXCLUDE_PATTERN`] to the repo's private
+/// `info/exclude` (shared by every linked worktree), never `.gitignore`.
+fn ensure_git_excluded(cwd: &Path) {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if rel.is_empty() {
+        return;
+    }
+    // From a subdirectory git prints a cwd-relative path (`../.git/...`).
+    let path = cwd.join(rel);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == GIT_EXCLUDE_PATTERN) {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let sep = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let line = format!("{sep}{GIT_EXCLUDE_PATTERN}\n");
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if let Err(e) = res {
+        debug!("could not add rag.db to {}: {e}", path.display());
+    }
+}
+
 /// Current schema version for the RAG database.
 ///
 /// Bump this every time you add a column, table, or index that existing
@@ -42,6 +105,7 @@ impl RagDb {
 
         let db_path = claude_dir.join("rag.db");
         let conn = Connection::open(&db_path).context("Failed to open RAG database")?;
+        ensure_git_excluded_once(cwd);
 
         // Performance: WAL mode + relaxed sync for indexing speed
         conn.execute_batch(
@@ -146,6 +210,16 @@ impl RagDb {
 
         debug!("RAG database opened at {}", db_path.display());
         Ok(Self { conn, db_path })
+    }
+
+    /// Open the database only if a previous run already created it. Read-only
+    /// consumers (print/SDK/ACP turns, the memory block of the system prompt)
+    /// use this so a one-shot query does not leave `.claude/rag.db` behind.
+    pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
+        if !cwd.join(".claude").join("rag.db").exists() {
+            return Ok(None);
+        }
+        Self::open(cwd).map(Some)
     }
 
     /// Total number of indexed chunks.
@@ -299,6 +373,49 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = RagDb::open(tmp.path()).unwrap();
         (tmp, db)
+    }
+
+    #[test]
+    fn open_existing_does_not_create_the_database() {
+        let tmp = TempDir::new().unwrap();
+        assert!(RagDb::open_existing(tmp.path()).unwrap().is_none());
+        assert!(!tmp.path().join(".claude").exists());
+        RagDb::open(tmp.path()).unwrap();
+        assert!(RagDb::open_existing(tmp.path()).unwrap().is_some());
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn database_is_git_excluded_from_a_subdirectory_and_only_once() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude/settings.json"), "{}").unwrap();
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // An exclude file without a trailing newline must not get the
+        // pattern glued onto its last line.
+        std::fs::write(repo.join(".git/info/exclude"), "*.log").unwrap();
+
+        drop(RagDb::open(&sub).unwrap());
+        drop(RagDb::open(repo).unwrap());
+        ensure_git_excluded(&sub);
+
+        let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, format!("*.log\n{GIT_EXCLUDE_PATTERN}\n"));
+        let status = git(repo, &["status", "--porcelain", "--untracked-files=all"]);
+        assert!(!status.contains("rag.db"), "{status}");
+        assert!(status.contains(".claude/settings.json"), "{status}");
     }
 
     #[test]

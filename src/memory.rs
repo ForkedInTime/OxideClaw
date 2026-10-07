@@ -88,6 +88,12 @@ impl MemoryStore {
         Ok(Self { conn })
     }
 
+    /// Open the store only if rag.db already exists; for read-only callers
+    /// that must not create it (see [`RagDb::open_existing`]).
+    pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
+        Ok(RagDb::open_existing(cwd)?.map(|rag| Self { conn: rag.conn }))
+    }
+
     // ── Write ─────────────────────────────────────────────────────────────────
 
     /// Insert or update a memory entry by key.

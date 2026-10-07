@@ -251,7 +251,7 @@ Rust, Python, JavaScript, TypeScript, Go, Java, C, Bash
 /rag clear           # clear the index
 ```
 
-The index auto-updates when files change between queries.
+The index auto-updates when files change between queries. It lives in `.claude/rag.db` (with the project's `/memory` entries); the interactive TUI builds it on start, while `-p`, SDK and ACP sessions only use an index that already exists and never create one. OxideClaw adds `**/.claude/rag.db*` to the repo's private `.git/info/exclude` so `/checkpoint`, `/commit` and `/spawn merge` never commit it.
 
 ---
 

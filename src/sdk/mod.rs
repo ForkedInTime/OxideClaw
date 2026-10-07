@@ -643,7 +643,9 @@ async fn list_sessions_in(dir: &std::path::Path, limit: Option<usize>) -> Result
 
 /// Search the local RAG index and map results to SDK protocol format.
 fn rag_search(cwd: &std::path::Path, query: &str, limit: usize) -> Result<Vec<RagResult>> {
-    let db = crate::rag::RagDb::open(cwd)?;
+    let Some(db) = crate::rag::RagDb::open_existing(cwd)? else {
+        return Ok(Vec::new());
+    };
     let results = crate::rag::search::search(&db, query, limit as i64)?;
 
     Ok(results

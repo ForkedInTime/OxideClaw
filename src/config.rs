@@ -1617,7 +1617,7 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
         };
 
         // Append persistent memory context (top 10 entries from MemoryStore)
-        let base = if let Ok(store) = crate::memory::MemoryStore::open(&self.cwd) {
+        let base = if let Ok(Some(store)) = crate::memory::MemoryStore::open_existing(&self.cwd) {
             if let Ok(mem_ctx) = store.build_context(10) {
                 if !mem_ctx.is_empty() {
                     format!("{base}\n\n{mem_ctx}")
@@ -2393,6 +2393,19 @@ mod external_system_prompt_tests {
             !prompt.contains("noreply@anthropic.com"),
             "an external model's commits must not be attributed to Anthropic"
         );
+    }
+
+    /// Every -p/SDK/browse engine builds this prompt; reading memory must not
+    /// leave an empty `.claude/rag.db` in a project that never indexed.
+    #[test]
+    fn building_the_prompt_does_not_create_the_rag_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        cfg.build_system_prompt();
+        assert!(!dir.path().join(".claude").exists());
     }
 
     /// The env block must name the shell the Bash tool runs, not $SHELL.

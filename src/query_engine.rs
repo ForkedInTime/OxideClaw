@@ -1022,10 +1022,10 @@ impl QueryEngine {
     /// Retrieve relevant code context from the local RAG index.
     /// Returns a formatted context block, or empty string if RAG is unavailable.
     fn retrieve_rag_context(cwd: &std::path::Path, user_input: &str) -> String {
-        // Only inject RAG if the index exists
-        let db = match rag::RagDb::open(cwd) {
-            Ok(db) => db,
-            Err(_) => return String::new(),
+        // Only inject RAG if the index exists; opening would create it.
+        let db = match rag::RagDb::open_existing(cwd) {
+            Ok(Some(db)) => db,
+            _ => return String::new(),
         };
 
         // Skip if the index is empty (not yet built)
@@ -1189,6 +1189,14 @@ pub(crate) mod scripted_api_tests {
         .unwrap();
         let ctx = QueryEngine::retrieve_rag_context(dir.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
+
+    #[test]
+    fn rag_context_does_not_create_an_index_in_an_unindexed_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn compute() {}\n").unwrap();
+        assert!(QueryEngine::retrieve_rag_context(dir.path(), "compute").is_empty());
+        assert!(!dir.path().join(".claude").exists());
     }
 
     /// -p, `oxideclaw spawn` and Agent sub-agents sent `thinking: None,

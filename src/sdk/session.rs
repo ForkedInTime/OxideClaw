@@ -919,9 +919,10 @@ impl SdkSession {
     /// Retrieve relevant code context from the local RAG index.
     /// Returns a formatted context block, or empty string on any failure.
     fn retrieve_rag_context(cwd: &std::path::Path, user_input: &str) -> String {
-        let db = match rag::RagDb::open(cwd) {
-            Ok(db) => db,
-            Err(_) => return String::new(),
+        // Opening would create the index; only a TUI run or /index builds it.
+        let db = match rag::RagDb::open_existing(cwd) {
+            Ok(Some(db)) => db,
+            _ => return String::new(),
         };
 
         if db.chunk_count().unwrap_or(0) == 0 {
@@ -1107,6 +1108,14 @@ mod cancel_tests {
         .unwrap();
         let ctx = SdkSession::retrieve_rag_context(dir.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
+
+    #[test]
+    fn rag_context_does_not_create_an_index_in_an_unindexed_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn compute() {}\n").unwrap();
+        assert!(SdkSession::retrieve_rag_context(dir.path(), "compute").is_empty());
+        assert!(!dir.path().join(".claude").exists());
     }
 
     fn offline_session() -> (SdkSession, mpsc::UnboundedReceiver<SdkNotification>) {
