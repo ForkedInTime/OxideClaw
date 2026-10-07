@@ -66,9 +66,12 @@ pub(super) async fn upgrade_check_task(tx: tokio::sync::mpsc::UnboundedSender<Ap
     let _ = tx.send(AppEvent::UpgradeCheckDone { message: msg });
 }
 
+/// A package manager's one-off runner: the command and the args that go
+/// before the package name. pnpm's `pnpx` rejects `-y`, so pnpm uses `dlx`.
+type Runner = (&'static str, &'static [&'static str]);
+
 /// Detect the best available JS package manager: bun > pnpm > npm.
-pub(super) fn detect_package_manager() -> (&'static str, &'static str) {
-    // Returns (command, runner) — e.g. ("bun", "bunx"), ("pnpm", "pnpx"), ("npm", "npx")
+pub(super) fn detect_package_manager() -> (&'static str, Runner) {
     fn has(cmd: &str) -> bool {
         std::process::Command::new(cmd)
             .arg("--version")
@@ -79,12 +82,21 @@ pub(super) fn detect_package_manager() -> (&'static str, &'static str) {
             .unwrap_or(false)
     }
     if has("bun") {
-        ("bun", "bunx")
+        ("bun", ("bunx", &[]))
     } else if has("pnpm") {
-        ("pnpm", "pnpx")
+        ("pnpm", ("pnpm", &["dlx"]))
     } else {
-        ("npm", "npx")
+        ("npm", NPM_RUNNER)
     }
+}
+
+const NPM_RUNNER: Runner = ("npx", &["-y"]);
+
+/// MCP server config that fetches and runs `spec` through the runner.
+fn runner_server_cfg((cmd, args): Runner, spec: &str) -> serde_json::Value {
+    let mut argv: Vec<&str> = args.to_vec();
+    argv.push(spec);
+    serde_json::json!({ "command": cmd, "args": argv })
 }
 
 const MARKETPLACE_CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -176,6 +188,31 @@ fn installed_bin(prefix: &std::path::Path, pkg_name: &str) -> Option<std::path::
     bin.is_file().then_some(bin)
 }
 
+/// The entry script of a cloned marketplace plugin: its `bin` (chosen like
+/// `package_bin_name`), else `main`, else `index.js`. Package managers never
+/// link a project's own `bin` into its `node_modules/.bin`, so looking there
+/// always missed and the plugin ran whatever npm package shared its name.
+/// The manifest must not point outside the clone.
+fn clone_entry_point(
+    clone_dir: &std::path::Path,
+    manifest: &serde_json::Value,
+    pkg_name: &str,
+) -> Option<std::path::PathBuf> {
+    let bin = match &manifest["bin"] {
+        serde_json::Value::String(path) => Some(path.as_str()),
+        serde_json::Value::Object(map) => {
+            package_bin_name(manifest, pkg_name).and_then(|name| map.get(&name)?.as_str())
+        }
+        _ => None,
+    };
+    let root = clone_dir.canonicalize().ok()?;
+    [bin, manifest["main"].as_str(), Some("index.js")]
+        .into_iter()
+        .flatten()
+        .filter_map(|rel| root.join(rel).canonicalize().ok())
+        .find(|path| path.starts_with(&root) && path.is_file())
+}
+
 /// Give the plugins dir its own package.json. bun (and npm/pnpm without
 /// --prefix) install into the nearest ancestor that has one, which would be
 /// ~/.claude, ~ or wherever else a stray manifest lives.
@@ -228,7 +265,7 @@ pub(super) async fn plugin_install_task(
 
         let (pm, pm_runner) = tokio::task::spawn_blocking(detect_package_manager)
             .await
-            .unwrap_or(("npm", "npx"));
+            .unwrap_or(("npm", NPM_RUNNER));
 
         if is_marketplace {
             // ── Marketplace install: git clone + install deps locally ─────────
@@ -316,16 +353,11 @@ pub(super) async fn plugin_install_task(
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
-            let bin_name = package_bin_name(&manifest, &npm_name)
-                .unwrap_or_else(|| package_leaf_name(&npm_name).to_string());
-            let bin_path = clone_dir.join("node_modules").join(".bin").join(bin_name);
-            let main_path = clone_dir.join("index.js");
-            let server_cfg = if bin_path.exists() {
-                serde_json::json!({ "command": bin_path.to_string_lossy().as_ref(), "args": [] })
-            } else if main_path.exists() {
-                serde_json::json!({ "command": "node", "args": [main_path.to_string_lossy().as_ref()] })
-            } else {
-                serde_json::json!({ "command": pm_runner, "args": ["-y", &npm_name] })
+            let server_cfg = match clone_entry_point(&clone_dir, &manifest, &npm_name) {
+                Some(entry) => {
+                    serde_json::json!({ "command": "node", "args": [entry.to_string_lossy().as_ref()] })
+                }
+                None => runner_server_cfg(pm_runner, &npm_name),
             };
 
             // Register MCP server in settings.json
@@ -366,7 +398,7 @@ pub(super) async fn plugin_install_task(
                 Some(bin_path) => {
                     serde_json::json!({ "command": bin_path.to_string_lossy().as_ref(), "args": [] })
                 }
-                None => serde_json::json!({ "command": pm_runner, "args": ["-y", &raw_spec] }),
+                None => runner_server_cfg(pm_runner, &raw_spec),
             };
 
             register_mcp_server(&npm_name, server_cfg).await?;
@@ -587,6 +619,64 @@ mod registry_install_tests {
         assert_eq!(
             installed_bin(dir.path(), "@modelcontextprotocol/server-github"),
             Some(nm.join(".bin").join("mcp-server-github"))
+        );
+    }
+
+    /// A marketplace clone's own `bin` is never in its `node_modules/.bin`;
+    /// it must still be what gets registered, not the npm package by name.
+    #[test]
+    fn marketplace_entry_is_the_cloned_bin_then_main_then_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("clone");
+        std::fs::create_dir_all(clone.join("dist")).unwrap();
+        std::fs::write(clone.join("cli.mjs"), "").unwrap();
+        std::fs::write(clone.join("dist/main.js"), "").unwrap();
+        std::fs::write(clone.join("index.js"), "").unwrap();
+        let root = clone.canonicalize().unwrap();
+
+        let obj =
+            serde_json::json!({ "bin": { "context-mode": "./cli.mjs" }, "main": "dist/main.js" });
+        assert_eq!(
+            clone_entry_point(&clone, &obj, "context-mode"),
+            Some(root.join("cli.mjs"))
+        );
+        let s = serde_json::json!({ "bin": "cli.mjs" });
+        assert_eq!(
+            clone_entry_point(&clone, &s, "x"),
+            Some(root.join("cli.mjs"))
+        );
+        let main = serde_json::json!({ "main": "dist/main.js" });
+        assert_eq!(
+            clone_entry_point(&clone, &main, "x"),
+            Some(root.join("dist/main.js"))
+        );
+        // A missing bin target falls through to index.js.
+        let gone = serde_json::json!({ "bin": "missing.js" });
+        assert_eq!(
+            clone_entry_point(&clone, &gone, "x"),
+            Some(root.join("index.js"))
+        );
+
+        // Paths outside the clone are refused.
+        std::fs::write(dir.path().join("evil.js"), "").unwrap();
+        std::fs::remove_file(clone.join("index.js")).unwrap();
+        let escape = serde_json::json!({ "bin": "../evil.js", "main": "/etc/passwd" });
+        assert_eq!(clone_entry_point(&clone, &escape, "x"), None);
+    }
+
+    #[test]
+    fn runner_fallback_never_passes_y_to_pnpm() {
+        assert_eq!(
+            runner_server_cfg(("pnpm", &["dlx"]), "@scope/pkg"),
+            serde_json::json!({ "command": "pnpm", "args": ["dlx", "@scope/pkg"] })
+        );
+        assert_eq!(
+            runner_server_cfg(NPM_RUNNER, "pkg"),
+            serde_json::json!({ "command": "npx", "args": ["-y", "pkg"] })
+        );
+        assert_eq!(
+            runner_server_cfg(("bunx", &[]), "pkg"),
+            serde_json::json!({ "command": "bunx", "args": ["pkg"] })
         );
     }
 
