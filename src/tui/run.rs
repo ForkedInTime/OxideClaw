@@ -40,6 +40,8 @@ fn start_xtts_server_in_background(tx: &mpsc::UnboundedSender<AppEvent>) {
                     "XTTS v2 server ready{gpu} — responses will be spoken."
                 )));
             }
+            // `/voice speak off` or quit while the model was loading.
+            Err(e) if e.is::<crate::voice::XttsStartCancelled>() => {}
             Err(e) => {
                 let _ = tx.send(AppEvent::SystemMessage(format!(
                     "XTTS v2 server failed: {e}\nFalling back to CLI mode (slower)."
@@ -1668,6 +1670,10 @@ async fn run_loop(
             }
             app.voice_recording = false;
             app.voice_task = None;
+            // Here rather than in /quit: Ctrl+C is a key event in raw mode,
+            // not a signal, so nothing else stops the detached server and it
+            // would outlive us holding the model in (V)RAM.
+            crate::voice::stop_xtts_server();
             // Quitting mid-turn: keep what the turn did for --continue.
             if let Some(handle) = app.api_task.take() {
                 handle.abort();

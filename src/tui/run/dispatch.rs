@@ -71,7 +71,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
     }
     match action {
         CommandAction::Quit => {
-            crate::voice::stop_xtts_server();
             app.should_quit = true;
         }
         CommandAction::Clear => {
@@ -670,10 +669,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
                 app.follow_bottom = true;
             } else {
-                crate::voice::stop_xtts_server();
-                app.entries.push(ChatEntry::system(
-                    "TTS off. XTTS v2 server stopped.".to_string(),
-                ));
+                let msg = if crate::voice::stop_xtts_server() {
+                    "TTS off. XTTS v2 server stopped."
+                } else {
+                    "TTS off."
+                };
+                app.entries.push(ChatEntry::system(msg.to_string()));
                 app.follow_bottom = true;
             }
             config.tts_enabled = effective;

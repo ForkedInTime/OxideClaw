@@ -567,10 +567,41 @@ pub fn xtts_server_running() -> bool {
     read_xtts_token(&xtts_dir()).is_some_and(|t| probe_xtts_server(XTTS_SERVER_PORT, &t))
 }
 
+/// The server this process started. Kept here rather than in a local so a
+/// stop can reach it while the model is still loading: the script binds its
+/// port only after the 10-60 s load, so until then the lsof sweep finds
+/// nothing, and a dropped `std::process::Child` is never killed.
+static XTTS_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+/// Bumped by every stop, so a start still waiting on the model learns it was
+/// cancelled instead of announcing a server nobody wants.
+static XTTS_STOP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `ensure_xtts_server` was overtaken by a stop while the model was loading.
+#[derive(Debug)]
+pub struct XttsStartCancelled;
+
+impl std::fmt::Display for XttsStartCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("XTTS v2 server start cancelled")
+    }
+}
+
+impl std::error::Error for XttsStartCancelled {}
+
+fn lock_child(
+    slot: &std::sync::Mutex<Option<std::process::Child>>,
+) -> std::sync::MutexGuard<'_, Option<std::process::Child>> {
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Start the XTTS v2 background server if not already running.
-/// Returns Ok(port) on success. The server process is detached and persists
-/// until OxideClaw exits or /voice speak off is called.
+/// Returns Ok(port) on success. The server persists until OxideClaw exits or
+/// /voice speak off is called; a stop during loading makes this return
+/// `XttsStartCancelled`.
 pub async fn ensure_xtts_server() -> Result<u16> {
+    use std::sync::atomic::Ordering;
+    let generation = XTTS_STOP_GEN.load(Ordering::SeqCst);
     if xtts_server_running() {
         return Ok(XTTS_SERVER_PORT);
     }
@@ -579,89 +610,142 @@ pub async fn ensure_xtts_server() -> Result<u16> {
         .map_err(|e| anyhow!("Could not write the XTTS v2 server script: {e}"))?;
     let token = load_or_create_xtts_token(&xtts_dir())
         .map_err(|e| anyhow!("Could not write the XTTS v2 server token: {e}"))?;
-    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, XTTS_SERVER_PORT));
-    if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok() {
-        return Err(anyhow!(
-            "Port {XTTS_SERVER_PORT} is in use by a program that is not OxideClaw's XTTS v2 server \
-             (Coqui's tts-server also defaults to it). If it is an XTTS server left by an older \
-             OxideClaw, /voice speak off stops it."
-        ));
-    }
-    let python = tts_python()
-        .ok_or_else(|| anyhow!("No Python for TTS venv. Run: uv tool install TTS --python 3.11"))?;
+    {
+        let mut slot = lock_child(&XTTS_CHILD);
+        // A server another call started is still loading: wait for it rather
+        // than spawn a second one this slot could not keep track of.
+        let loading = slot
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+        if !loading {
+            let addr =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, XTTS_SERVER_PORT));
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300))
+                .is_ok()
+            {
+                return Err(anyhow!(
+                    "Port {XTTS_SERVER_PORT} is in use by a program that is not OxideClaw's XTTS v2 server \
+                     (Coqui's tts-server also defaults to it). If it is an XTTS server left by an older \
+                     OxideClaw, /voice speak off stops it."
+                ));
+            }
+            let python = tts_python().ok_or_else(|| {
+                anyhow!("No Python for TTS venv. Run: uv tool install TTS --python 3.11")
+            })?;
 
-    let mut args = vec![script.display().to_string(), XTTS_SERVER_PORT.to_string()];
-    if !cuda_available() {
-        args.push("--cpu".into());
-    }
+            let mut args = vec![script.display().to_string(), XTTS_SERVER_PORT.to_string()];
+            if !cuda_available() {
+                args.push("--cpu".into());
+            }
 
-    // Detached server. An inherited stdin would be the TUI's raw-mode tty:
-    // Coqui's first-run license prompt would block on it forever and eat the
-    // user's keystrokes.
-    let mut child = std::process::Command::new(&python)
-        .args(&args)
-        // Env, not argv: argv is world-readable through `ps`.
-        .env("OXIDECLAW_XTTS_TOKEN", &token)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow!("Failed to start XTTS v2 server: {e}"))?;
+            // An inherited stdin would be the TUI's raw-mode tty: Coqui's
+            // first-run license prompt would block on it forever and eat the
+            // user's keystrokes.
+            let child = std::process::Command::new(&python)
+                .args(&args)
+                // Env, not argv: argv is world-readable through `ps`.
+                .env("OXIDECLAW_XTTS_TOKEN", &token)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| anyhow!("Failed to start XTTS v2 server: {e}"))?;
+            *slot = Some(child);
+        }
+    }
 
     // Up to 60s for model loading.
     await_xtts_ready(
-        &mut child,
+        &XTTS_CHILD,
         120,
         std::time::Duration::from_millis(500),
         xtts_server_running,
+        || XTTS_STOP_GEN.load(Ordering::SeqCst) != generation,
     )
     .await?;
     Ok(XTTS_SERVER_PORT)
 }
 
-/// Wait for a freshly spawned XTTS server to listen. A server that exits
-/// first is reported at once rather than after the full timeout, and one
-/// that never comes up is killed so repeated `/voice` commands do not pile
-/// up stuck Python processes.
+/// Wait for the freshly spawned XTTS server in `slot` to listen. A server
+/// that exits first is reported at once rather than after the full timeout,
+/// and one that never comes up is killed so repeated `/voice` commands do not
+/// pile up stuck Python processes.
 async fn await_xtts_ready(
-    child: &mut std::process::Child,
+    slot: &std::sync::Mutex<Option<std::process::Child>>,
     attempts: u32,
     interval: std::time::Duration,
     ready: impl Fn() -> bool,
+    cancelled: impl Fn() -> bool,
 ) -> Result<()> {
     for _ in 0..attempts {
         tokio::time::sleep(interval).await;
+        if cancelled() {
+            return Err(XttsStartCancelled.into());
+        }
         if ready() {
             return Ok(());
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(anyhow!(
-                "XTTS v2 server exited before it was ready ({status}).\n{XTTS_FIRST_RUN_HINT}"
-            ));
+        match lock_child(slot).as_mut() {
+            // Another waiter timed out and killed it.
+            None => break,
+            Some(child) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(anyhow!(
+                        "XTTS v2 server exited before it was ready ({status}).\n{XTTS_FIRST_RUN_HINT}"
+                    ));
+                }
+            }
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Some(mut child) = lock_child(slot).take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let secs = (interval * attempts).as_secs();
     Err(anyhow!(
         "XTTS v2 server failed to start within {secs} seconds.\n{XTTS_FIRST_RUN_HINT}"
     ))
 }
 
-/// Stop the XTTS v2 server if running. Only a process *listening* on the
-/// port whose command line names xtts is killed: plain `lsof -ti:PORT` also
-/// lists clients and any unrelated server on that port.
-pub fn stop_xtts_server() {
-    let _ = std::process::Command::new("sh")
+/// Cancel any start in progress and kill the server held in `slot`.
+/// Returns whether a live process was killed.
+fn kill_xtts_child(
+    slot: &std::sync::Mutex<Option<std::process::Child>>,
+    stop_gen: &std::sync::atomic::AtomicU64,
+) -> bool {
+    // Bump first: a waiter that then finds the slot empty must see the stop.
+    stop_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let Some(mut child) = lock_child(slot).take() else {
+        return false;
+    };
+    let alive = matches!(child.try_wait(), Ok(None));
+    let _ = child.kill();
+    let _ = child.wait();
+    alive
+}
+
+/// Stop the XTTS v2 server, including one still loading its model. Returns
+/// whether a server was actually stopped.
+///
+/// The lsof sweep is only a fallback for a server this process did not start
+/// (an older OxideClaw's, or another session's): it sees nothing until the
+/// port is bound, and nothing at all where lsof is missing. Only a process
+/// *listening* on the port whose command line names xtts is killed: plain
+/// `lsof -ti:PORT` also lists clients and any unrelated server on that port.
+pub fn stop_xtts_server() -> bool {
+    let ours = kill_xtts_child(&XTTS_CHILD, &XTTS_STOP_GEN);
+    let swept = std::process::Command::new("sh")
         .args([
             "-c",
             &format!(
                 "for p in $(lsof -ti tcp:{XTTS_SERVER_PORT} -sTCP:LISTEN 2>/dev/null); do \
-                   ps -p \"$p\" -o args= 2>/dev/null | grep -qi xtts && kill \"$p\"; \
+                   ps -p \"$p\" -o args= 2>/dev/null | grep -qi xtts && kill \"$p\" && echo \"$p\"; \
                  done"
             ),
         ])
-        .output();
+        .output()
+        .is_ok_and(|o| !o.stdout.trim_ascii().is_empty());
+    ours || swept
 }
 
 // ── Server-based synthesis ───────────────────────────────────────────────────
@@ -1599,20 +1683,27 @@ mod xtts_server_script_tests {
 
 #[cfg(all(test, unix))]
 mod xtts_ready_tests {
-    use super::await_xtts_ready;
+    use super::{XttsStartCancelled, await_xtts_ready, kill_xtts_child};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    fn slot_with(cmd: &str, args: &[&str]) -> Mutex<Option<std::process::Child>> {
+        let child = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        Mutex::new(Some(child))
+    }
 
     #[tokio::test]
     async fn a_server_that_exits_on_its_license_prompt_is_reported_at_once() {
         // Stand-in for Coqui's first-run `input()`: with stdin at EOF the read
         // fails and the process exits, exactly like the real prompt.
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "read answer || exit 3; sleep 30"])
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let slot = slot_with("sh", &["-c", "read answer || exit 3; sleep 30"]);
         let started = std::time::Instant::now();
-        let err = await_xtts_ready(&mut child, 200, Duration::from_millis(50), || false)
+        let err = await_xtts_ready(&slot, 200, Duration::from_millis(50), || false, || false)
             .await
             .unwrap_err()
             .to_string();
@@ -1623,17 +1714,52 @@ mod xtts_ready_tests {
 
     #[tokio::test]
     async fn a_server_that_never_listens_is_killed_on_timeout() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let err = await_xtts_ready(&mut child, 3, Duration::from_millis(20), || false)
+        let slot = slot_with("sleep", &["30"]);
+        let pid = slot.lock().unwrap().as_ref().unwrap().id();
+        let err = await_xtts_ready(&slot, 3, Duration::from_millis(20), || false, || false)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to start"), "{err}");
-        assert!(child.try_wait().unwrap().is_some(), "server left running");
+        assert!(slot.lock().unwrap().is_none());
+        assert!(!pid_alive(pid), "server left running");
+    }
+
+    /// `/voice speak off` (or quitting) while the model loads: the lsof
+    /// sweep cannot see a server that has not bound its port yet, so the
+    /// process has to be killed through the handle, and the waiting start
+    /// must not go on to announce "responses will be spoken".
+    #[tokio::test]
+    async fn a_stop_while_loading_kills_the_server_and_cancels_the_start() {
+        let slot = slot_with("sleep", &["30"]);
+        let pid = slot.lock().unwrap().as_ref().unwrap().id();
+        let stop_gen = AtomicU64::new(0);
+        let generation = stop_gen.load(Ordering::SeqCst);
+
+        let wait = await_xtts_ready(
+            &slot,
+            200,
+            Duration::from_millis(20),
+            || false,
+            || stop_gen.load(Ordering::SeqCst) != generation,
+        );
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            kill_xtts_child(&slot, &stop_gen)
+        };
+        let (res, stopped) = tokio::join!(wait, stop);
+
+        assert!(stopped, "a loading server counts as stopped");
+        assert!(!pid_alive(pid), "server left running");
+        let err = res.unwrap_err();
+        assert!(err.is::<XttsStartCancelled>(), "{err}");
+        // Nothing left to stop: the caller must not claim it stopped one.
+        assert!(!kill_xtts_child(&slot, &stop_gen));
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 }
 
