@@ -513,13 +513,33 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
             }
 
             EntryKind::Error => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "✖ ",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(entry.text.to_owned(), Style::default().fg(Color::Red)),
-                ]));
+                // A failed tool's whole output (a broken build can be ~1 MB)
+                // arrives here. A single span drops its newlines into one
+                // run-on paragraph that floods the screen and is re-wrapped
+                // every frame, so keep line breaks and collapse like
+                // ToolResult, with a little more room for the error itself.
+                const MAX_LINES: usize = 6;
+                let total = entry.text.lines().count();
+                for (i, raw) in entry.text.lines().take(MAX_LINES).enumerate() {
+                    let prefix = if i == 0 {
+                        Span::styled(
+                            "✖ ",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw("  ")
+                    };
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(raw.to_owned(), Style::default().fg(Color::Red)),
+                    ]));
+                }
+                if total > MAX_LINES {
+                    lines.push(Line::from(Span::styled(
+                        format!("    [▸ {} more lines]", total - MAX_LINES),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
                 lines.push(Line::raw(""));
             }
 
@@ -1437,6 +1457,38 @@ mod permission_popup_tests {
             .collect();
         assert!(screen.contains("PERMISSION-CMD"), "{screen}");
         assert!(!screen.contains("BROWSE-TARGET"), "{screen}");
+    }
+
+    /// A failed tool's output was one run-on red paragraph: newlines
+    /// dropped, never collapsed, the whole thing re-wrapped every frame.
+    #[test]
+    fn tool_error_keeps_line_breaks_and_collapses() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.show_welcome = false;
+        let body: String = (0..500).map(|i| format!("err-line-{i}\n")).collect();
+        app.entries.push(crate::tui::app::ChatEntry::error(body));
+        let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.starts_with("✖ err-line-0 ")),
+            "{screen}"
+        );
+        assert!(
+            rows.iter().any(|r| r.starts_with("  err-line-1 ")),
+            "{screen}"
+        );
+        assert!(screen.contains("err-line-5"), "{screen}");
+        assert!(!screen.contains("err-line-6"), "{screen}");
+        assert!(screen.contains("[▸ 494 more lines]"), "{screen}");
     }
 
     /// Raw ESC/BEL in the dialog or in chat must never reach the terminal:
