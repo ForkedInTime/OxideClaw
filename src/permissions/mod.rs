@@ -938,12 +938,8 @@ pub fn is_command_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Bash" | "PowerShell")
 }
 
-/// Compound check for any tool whose input is a shell command string.
-///
-/// Prefix allow-rules are only meaningful if every sub-command is checked. A
-/// rule permitting `Get-` or `git ` must not silently authorise whatever is
-/// chained after the first statement — that is the entire security value of the
-/// rule, and checking the raw string instead of the parts destroys it.
+/// [`check_compound_command_as`] with Bash commands read as POSIX.
+#[cfg(test)]
 pub fn check_compound_command(
     state: &PermissionState,
     tool_name: &str,
@@ -952,8 +948,14 @@ pub fn check_compound_command(
     check_compound_command_as(state, tool_name, full_command, ShellGrammar::Posix)
 }
 
-/// [`check_compound_command`] for a Bash tool whose commands `bash_shell`
-/// parses (the `defaultShell`). PowerShell commands always use its grammar.
+/// Compound check for any tool whose input is a shell command string.
+///
+/// Prefix allow-rules are only meaningful if every sub-command is checked. A
+/// rule permitting `Get-` or `git ` must not silently authorise whatever is
+/// chained after the first statement — that is the entire security value of the
+/// rule, and checking the raw string instead of the parts destroys it.
+/// `bash_shell` is how the shell that runs Bash commands (`defaultShell`)
+/// reads them; PowerShell commands always use its grammar.
 pub fn check_compound_command_as(
     state: &PermissionState,
     tool_name: &str,
