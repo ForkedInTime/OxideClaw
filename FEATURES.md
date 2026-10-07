@@ -64,6 +64,7 @@ own environment variable (shell or `.env`):
 | Groq | `groq:` | `GROQ_API_KEY` |
 | OpenRouter | `openrouter:` | `OPENROUTER_API_KEY` |
 | DeepSeek | `deepseek:` | `DEEPSEEK_API_KEY` |
+| Gemini | `gemini:` | `GEMINI_API_KEY`, else `GOOGLE_API_KEY` (Google's OpenAI-compatible endpoint, `generativelanguage.googleapis.com/v1beta/openai`) |
 | LM Studio | `lmstudio:` | none (`LM_STUDIO_HOST` overrides `http://localhost:1234/v1`) |
 | Together | `together:` | `TOGETHER_API_KEY` |
 | Mistral | `mistral:` | `MISTRAL_API_KEY` |
@@ -82,6 +83,7 @@ Or switch at runtime:
 
 ```
 /model groq:llama-3.3-70b-versatile
+/model gemini:gemini-2.5-flash
 /model oai:gpt-4o
 ```
 
@@ -601,7 +603,8 @@ OxideClaw is XDG Base Directory compliant and never writes to Claude Code's `~/.
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
-| `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `MISTRAL_API_KEY`, `VENICE_API_KEY` | API key for the matching OpenAI-compatible provider |
+| `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `TOGETHER_API_KEY`, `MISTRAL_API_KEY`, `VENICE_API_KEY` | API key for the matching OpenAI-compatible provider |
+| `GOOGLE_API_KEY` | API key for `gemini:` models when `GEMINI_API_KEY` is unset |
 | `OPENAI_API_KEY` | API key for `oai:` models, and for `openai-compat:` endpoints that need one |
 | `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix; shell only, not `.env`) |
 | `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |

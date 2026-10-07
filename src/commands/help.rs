@@ -538,7 +538,7 @@ pub(super) fn cmd_release_notes(_args: &str) -> CommandAction {
            • Smart model router — auto-route by task complexity\n\
            • Cost dashboard (/cost, /budget) — real-time token/cost tracking\n\
            • Parallel agents (/spawn) — background agents in git worktrees\n\
-           • OpenAI-compatible providers — Groq, OpenRouter, DeepSeek, LM Studio, etc.\n\
+           • OpenAI-compatible providers — Groq, OpenRouter, DeepSeek, Gemini, LM Studio, etc.\n\
            • SDK mode (--headless) — NDJSON stdio server for editor/CI embedding\n\
            • Sandbox (/sandbox) — bwrap / firejail execution isolation\n\
            • Session management (/session) — save, resume, search, export\n\

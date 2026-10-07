@@ -638,7 +638,11 @@ pub fn context_window_for_model(model: &str) -> u64 {
         };
         return if one_million { 1_000_000 } else { 200_000 };
     }
-    if ["gpt-4o", "gpt-4", "llama"].iter().any(|k| m.contains(k)) {
+    if m.contains("gemini") {
+        // Gemini 2.x and 3 take 1M input tokens on Google's endpoint and
+        // through OpenRouter alike.
+        1_048_576
+    } else if ["gpt-4o", "gpt-4", "llama"].iter().any(|k| m.contains(k)) {
         128_000
     } else if m.contains("deepseek") {
         64_000
@@ -742,6 +746,9 @@ mod context_window_tests {
     fn non_claude_models_keep_their_table_values() {
         assert_eq!(w("groq:llama-3.3-70b"), 128_000);
         assert_eq!(w("deepseek-chat"), 64_000);
+        assert_eq!(w("gemini:gemini-2.5-flash"), 1_048_576);
+        assert_eq!(w("openrouter:google/gemini-3-pro-preview"), 1_048_576);
+        assert_eq!(w("gemma-7b-it"), 8_192);
         assert_eq!(w("something-new"), 200_000);
     }
 }

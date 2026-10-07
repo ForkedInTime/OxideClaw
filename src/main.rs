@@ -501,6 +501,8 @@ const SAFE_ENV_KEYS: &[&str] = &[
     "OPENAI_API_KEY",
     "GROQ_API_KEY",
     "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     "MISTRAL_API_KEY",
     "OPENROUTER_API_KEY",
     "TOGETHER_API_KEY",
@@ -556,6 +558,8 @@ const PROJECT_UNTRUSTED_ENV_KEYS: &[&str] = &[
     "OPENAI_API_KEY",
     "GROQ_API_KEY",
     "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     "MISTRAL_API_KEY",
     "OPENROUTER_API_KEY",
     "TOGETHER_API_KEY",
@@ -2405,6 +2409,21 @@ mod dotenv_allowlist_tests {
                 SAFE_ENV_KEYS.contains(&key),
                 "{key} must be loadable from .env — it is part of credential resolution"
             );
+        }
+    }
+
+    /// Every provider key, Gemini's GOOGLE_API_KEY fallback included, loads
+    /// from the user's .env, and a cloned repo's .env cannot set it.
+    #[test]
+    fn every_provider_key_is_loadable_and_project_gated() {
+        for p in crate::api::PROVIDERS {
+            for key in crate::api::openai_compat::provider_key_envs(p) {
+                assert!(SAFE_ENV_KEYS.contains(&key), "{key} not loadable from .env");
+                assert!(
+                    PROJECT_UNTRUSTED_ENV_KEYS.contains(&key),
+                    "{key} settable by an untrusted project .env"
+                );
+            }
         }
     }
 

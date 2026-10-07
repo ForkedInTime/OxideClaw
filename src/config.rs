@@ -1845,6 +1845,7 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
      /model groq:<name>           — use Groq (e.g. /model groq:llama-3.3-70b-versatile)
      /model openrouter:<name>     — use OpenRouter (e.g. /model openrouter:meta-llama/llama-3.3-70b-instruct)
      /model deepseek:<name>       — use DeepSeek (e.g. /model deepseek:deepseek-chat)
+     /model gemini:<name>         — use Gemini (e.g. /model gemini:gemini-2.5-flash)
      /model lmstudio:<name>       — use LM Studio (e.g. /model lmstudio:llama-3.2-3b-instruct)
      /model oai:<name>            — use OpenAI (e.g. /model oai:gpt-4o)
      /skill-name [args]           — expand a saved skill

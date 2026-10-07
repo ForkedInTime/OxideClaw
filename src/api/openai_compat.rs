@@ -1,7 +1,7 @@
 /// Generic OpenAI-compatible provider adapter.
 ///
 /// One client that talks to ANY endpoint implementing the OpenAI
-/// `/v1/chat/completions` API: OpenRouter, Groq, DeepSeek, LM Studio,
+/// `/v1/chat/completions` API: OpenRouter, Groq, DeepSeek, Gemini, LM Studio,
 /// llama.cpp, Together AI, Mistral, and hundreds more.
 ///
 /// Named provider shortcuts give convenient prefixes:
@@ -9,6 +9,7 @@
 ///   /model groq:llama-3.3-70b-versatile
 ///   /model openrouter:meta-llama/llama-3.3-70b-instruct
 ///   /model deepseek:deepseek-chat
+///   /model gemini:gemini-2.5-flash
 ///   /model lmstudio:llama-3.2-3b-instruct
 ///   /model together:meta-llama/Llama-3.3-70b-chat-hf
 ///   /model mistral:codestral-latest
@@ -17,6 +18,7 @@
 ///
 /// Provider API keys come from environment variables:
 ///   GROQ_API_KEY, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, etc.
+///   Gemini reads GEMINI_API_KEY, then GOOGLE_API_KEY.
 ///   OPENAI_API_KEY is used only by `oai:` and `openai-compat:`; named
 ///   third-party providers require their own key variable.
 ///   OPENAI_BASE_URL overrides the base URL for the generic `openai-compat:` prefix.
@@ -24,9 +26,9 @@ use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tracing::{debug, warn};
@@ -74,6 +76,15 @@ pub static PROVIDERS: &[ProviderDef] = &[
         name: "DeepSeek",
         base_url: "https://api.deepseek.com/v1",
         key_env: "DEEPSEEK_API_KEY",
+        extra_headers: &[],
+    },
+    // Google's OpenAI-compatible surface of the Gemini API. The key also
+    // comes from GOOGLE_API_KEY; see `provider_api_key`.
+    ProviderDef {
+        prefix: "gemini",
+        name: "Gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        key_env: "GEMINI_API_KEY",
         extra_headers: &[],
     },
     ProviderDef {
@@ -160,6 +171,10 @@ pub(crate) struct OaiToolCall {
     #[serde(rename = "type")]
     pub call_type: String,
     pub function: OaiFunction,
+    /// Gemini's `{"google": {"thought_signature": ...}}`, sent back on the
+    /// calls it came with; see [`gemini_extra_content`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -248,6 +263,9 @@ pub(crate) struct OaiToolCallDelta {
     pub id: Option<String>,
     #[serde(default)]
     pub function: Option<OaiFunctionDelta>,
+    /// Gemini puts the call's thought signature here.
+    #[serde(default)]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -275,11 +293,15 @@ pub(crate) struct OaiUsage {
 /// per provider rather than always on (history survives `/model` switches).
 ///
 /// `mistral_tool_ids` rewrites tool-call ids through [`mistral_tool_id`].
+///
+/// `thought_signatures` is set for Gemini only: the signature each tool call
+/// came back with, by call id; see [`gemini_extra_content`].
 pub(crate) fn translate_messages(
     system: &str,
     messages: &[Message],
     echo_reasoning: bool,
     mistral_tool_ids: bool,
+    thought_signatures: Option<&HashMap<String, String>>,
 ) -> Vec<OaiMessage> {
     let mut out = Vec::with_capacity(messages.len() + 1);
     let tool_id = |id: &str| {
@@ -405,6 +427,9 @@ pub(crate) fn translate_messages(
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse { id, name, input } => {
+                            let extra_content = thought_signatures.and_then(|sigs| {
+                                gemini_extra_content(sigs.get(id), tool_calls.is_empty())
+                            });
                             tool_calls.push(OaiToolCall {
                                 id: tool_id(id),
                                 call_type: "function".into(),
@@ -413,6 +438,7 @@ pub(crate) fn translate_messages(
                                     arguments: serde_json::to_string(input)
                                         .unwrap_or_else(|_| "{}".into()),
                                 },
+                                extra_content,
                             });
                         }
                         // A signed block is Anthropic's own thinking, not
@@ -468,6 +494,30 @@ pub(crate) fn translate_messages(
     }
 
     out
+}
+
+/// Gemini 3 answers 400 when a function call in the current turn comes back
+/// without the thought signature it was sent with. Google's OpenAI-compatible
+/// surface carries it as `extra_content.google.thought_signature`, on the
+/// first call of each step only, so that is where it goes back. A first call
+/// with no signature on record (made by another model, before a `/model`
+/// switch or resume, or evicted) gets the documented placeholder that skips
+/// the check; later parallel calls never carried one.
+const GEMINI_SKIP_SIGNATURE: &str = "skip_thought_signature_validator";
+
+fn gemini_extra_content(signature: Option<&String>, first_call: bool) -> Option<serde_json::Value> {
+    let signature = signature
+        .map(String::as_str)
+        .or(first_call.then_some(GEMINI_SKIP_SIGNATURE))?;
+    Some(serde_json::json!({ "google": { "thought_signature": signature } }))
+}
+
+/// A tool-call delta's Gemini thought signature, if it carries one.
+fn delta_thought_signature(extra_content: Option<&serde_json::Value>) -> Option<&str> {
+    extra_content?
+        .pointer("/google/thought_signature")?
+        .as_str()
+        .filter(|s| !s.is_empty())
 }
 
 /// Mistral rejects (400) any tool-call id that is not exactly 9 ASCII
@@ -558,16 +608,20 @@ fn chunk_error(chunk: &serde_json::Value) -> Option<String> {
 /// A provider failure after the 200 is an `Err`, never a short reply that
 /// looks finished: the caller would otherwise save a truncated answer, or
 /// run a tool whose cut-off arguments parsed to `{}`.
+///
+/// Also returns the Gemini thought signatures that came with tool calls, by
+/// call id (empty for every other server).
 pub(crate) async fn parse_oai_stream(
     resp: reqwest::Response,
     mut on_text: impl FnMut(&str),
-) -> Result<(StreamedResponse, Option<String>)> {
+) -> Result<(StreamedResponse, HashMap<String, String>)> {
     let mut stream = super::idle_bounded(resp.bytes_stream()).eventsource();
     let mut result = StreamedResponse::default();
 
     let mut text_buf = String::new();
     let mut thinking_buf = String::new();
     let mut tool_bufs: HashMap<usize, (String, String, String)> = HashMap::new();
+    let mut tool_signatures: HashMap<usize, String> = HashMap::new();
     let mut last_tool_idx: Option<usize> = None;
     let mut finish_reason: Option<String> = None;
     let mut saw_done = false;
@@ -650,6 +704,9 @@ pub(crate) async fn parse_oai_stream(
                     if let Some(id) = tc.id {
                         entry.0 = id;
                     }
+                    if let Some(sig) = delta_thought_signature(tc.extra_content.as_ref()) {
+                        tool_signatures.insert(idx, sig.to_string());
+                    }
                     if let Some(func) = tc.function {
                         if let Some(name) = func.name {
                             entry.1 = name;
@@ -692,6 +749,11 @@ pub(crate) async fn parse_oai_stream(
 
     let mut tool_entries: Vec<(usize, (String, String, String))> = tool_bufs.into_iter().collect();
     tool_entries.sort_by_key(|(idx, _)| *idx);
+    let signatures: HashMap<String, String> = tool_entries
+        .iter()
+        .filter(|(_, (id, _, _))| !id.is_empty())
+        .filter_map(|(idx, (id, _, _))| Some((id.clone(), tool_signatures.remove(idx)?)))
+        .collect();
     // Some servers (older Ollama, llama.cpp, vLLM) finish with "stop" even
     // when the turn is tool calls. The calls are the turn either way.
     let has_tool_calls = tool_entries
@@ -717,7 +779,7 @@ pub(crate) async fn parse_oai_stream(
         _ => Some(StopReason::EndTurn),
     };
 
-    Ok((result, finish_reason))
+    Ok((result, signatures))
 }
 
 // ─── OpenAI-compatible client ────────────────────────────────────────────────
@@ -736,20 +798,50 @@ pub struct OpenAiCompatClient {
     echo_reasoning: bool,
     /// See [`mistral_tool_id`].
     mistral_tool_ids: bool,
+    /// Gemini only: the thought signatures of recent tool calls, by call id,
+    /// newest last; see [`gemini_extra_content`]. Shared by the clones each
+    /// turn runs on, and capped at [`MAX_THOUGHT_SIGNATURES`].
+    thought_signatures: Option<Arc<Mutex<VecDeque<(String, String)>>>>,
     /// See `ClaudeClient::retry_notifier`. Rate limiting is far more common on
     /// these providers than on Anthropic — Groq and OpenRouter throttle hard.
     retry_notifier: Option<super::retry::RetryNotifier>,
 }
 
-/// The bearer token for `provider`, read only from its own key variable.
+/// Only the current turn's signatures are checked, so the most recent calls
+/// are all that matter; the cap keeps a long session from growing without
+/// bound.
+const MAX_THOUGHT_SIGNATURES: usize = 256;
+
+/// Adds `new` to `store`, dropping the oldest past [`MAX_THOUGHT_SIGNATURES`].
+fn remember_signatures(store: &mut VecDeque<(String, String)>, new: HashMap<String, String>) {
+    store.extend(new);
+    let excess = store.len().saturating_sub(MAX_THOUGHT_SIGNATURES);
+    store.drain(..excess);
+}
+
+/// Gemini's second key variable: the name Google's SDKs and Gemini CLI also
+/// read. GEMINI_API_KEY wins when both are set.
+const GEMINI_FALLBACK_KEY_ENV: &str = "GOOGLE_API_KEY";
+
+/// The key variables `provider` reads, in order.
+pub(crate) fn provider_key_envs(provider: &ProviderDef) -> Vec<&'static str> {
+    match provider.key_env {
+        "" => vec![],
+        k if provider.prefix == "gemini" => vec![k, GEMINI_FALLBACK_KEY_ENV],
+        k => vec![k],
+    }
+}
+
+/// The bearer token for `provider`, read only from its own key variables.
 /// There is deliberately no fallback to OPENAI_API_KEY: that would hand the
 /// user's OpenAI key to Groq, DeepSeek, OpenRouter, etc. whenever their own
 /// variable is unset. Local providers (LM Studio) have no key variable.
 fn provider_api_key(provider: &ProviderDef, env: impl Fn(&str) -> Option<String>) -> String {
-    if provider.key_env.is_empty() {
-        return String::new();
-    }
-    env(provider.key_env).unwrap_or_default()
+    provider_key_envs(provider)
+        .into_iter()
+        .filter_map(env)
+        .find(|v| !v.is_empty())
+        .unwrap_or_default()
 }
 
 impl OpenAiCompatClient {
@@ -799,7 +891,7 @@ impl OpenAiCompatClient {
                 "{}: no API key found.\n  Set {} in your environment.\n  \
                  Example: export {}=your-key-here",
                 provider.name,
-                provider.key_env,
+                provider_key_envs(provider).join(" or "),
                 provider.key_env
             ));
         }
@@ -829,6 +921,7 @@ impl OpenAiCompatClient {
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
             echo_reasoning: provider.prefix == "deepseek",
             mistral_tool_ids: provider.prefix == "mistral",
+            thought_signatures: (provider.prefix == "gemini").then(Default::default),
         })
     }
 
@@ -873,11 +966,20 @@ impl OpenAiCompatClient {
             system_str.clone()
         };
 
+        let signatures: Option<HashMap<String, String>> =
+            self.thought_signatures.as_ref().map(|sigs| {
+                sigs.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect()
+            });
         let oai_messages = translate_messages(
             &system,
             &request.messages,
             self.echo_reasoning,
             self.mistral_tool_ids,
+            signatures.as_ref(),
         );
         let oai_tools = if no_tools {
             vec![]
@@ -947,6 +1049,7 @@ impl OpenAiCompatClient {
                     &request.messages,
                     self.echo_reasoning,
                     self.mistral_tool_ids,
+                    signatures.as_ref(),
                 );
                 oai_request.tools = vec![];
 
@@ -970,7 +1073,15 @@ impl OpenAiCompatClient {
             return Err(anyhow!("{} error {status}: {body}", self.provider_name));
         }
 
-        let (result, _) = parse_oai_stream(resp, on_text).await?;
+        let (result, new_signatures) = parse_oai_stream(resp, on_text).await?;
+        if let Some(sigs) = &self.thought_signatures
+            && !new_signatures.is_empty()
+        {
+            remember_signatures(
+                &mut sigs.lock().unwrap_or_else(|e| e.into_inner()),
+                new_signatures,
+            );
+        }
         Ok(result)
     }
 }
@@ -1008,7 +1119,7 @@ mod reasoning_echo_tests {
     }
 
     fn assistant_json(msgs: &[Message], echo: bool) -> serde_json::Value {
-        let out = translate_messages("", msgs, echo, false);
+        let out = translate_messages("", msgs, echo, false, None);
         serde_json::to_value(&out[1]).unwrap()
     }
 
@@ -1132,7 +1243,7 @@ mod max_tokens_tests {
 
     /// Answers one chat completion with an empty stream and returns the JSON
     /// body the client sent.
-    async fn capture_one_body() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+    pub(super) async fn capture_one_body() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -1172,7 +1283,7 @@ mod max_tokens_tests {
         (format!("http://{addr}"), handle)
     }
 
-    fn request(model: &str) -> MessagesRequest {
+    pub(super) fn request(model: &str) -> MessagesRequest {
         MessagesRequest {
             model: model.into(),
             max_tokens: 12345,
@@ -1192,7 +1303,7 @@ mod max_tokens_tests {
         }
     }
 
-    fn client(base_url: String) -> OpenAiCompatClient {
+    pub(super) fn client(base_url: String) -> OpenAiCompatClient {
         OpenAiCompatClient {
             client: Client::new(),
             base_url,
@@ -1203,6 +1314,7 @@ mod max_tokens_tests {
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
             echo_reasoning: false,
             mistral_tool_ids: false,
+            thought_signatures: None,
             retry_notifier: None,
         }
     }
@@ -1434,7 +1546,7 @@ mod image_tests {
                 },
             ],
         }];
-        let out = translate_messages("", &msgs, false, false);
+        let out = translate_messages("", &msgs, false, false, None);
         let v = serde_json::to_value(&out[0]).unwrap();
         assert_eq!(
             v["content"],
@@ -1452,7 +1564,8 @@ mod image_tests {
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
         }];
-        let v = serde_json::to_value(&translate_messages("", &msgs, false, false)[0]).unwrap();
+        let v =
+            serde_json::to_value(&translate_messages("", &msgs, false, false, None)[0]).unwrap();
         assert_eq!(v["content"], "hi");
     }
 }
@@ -1487,7 +1600,7 @@ mod mistral_tool_id_tests {
     }
 
     fn ids(msgs: &[Message], mistral: bool) -> (String, String) {
-        let out = translate_messages("", msgs, false, mistral);
+        let out = translate_messages("", msgs, false, mistral, None);
         let call = serde_json::to_value(&out[1]).unwrap()["tool_calls"][0]["id"]
             .as_str()
             .unwrap()
@@ -1514,6 +1627,237 @@ mod mistral_tool_id_tests {
         assert_eq!(
             (call.as_str(), result.as_str()),
             ("toolu_01xyz", "toolu_01xyz")
+        );
+    }
+}
+
+#[cfg(test)]
+mod gemini_tests {
+    use super::max_tokens_tests::{capture_one_body, client, request};
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn env_of(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn gemini_prefix_selects_googles_openai_endpoint() {
+        assert!(is_openai_compat_model("gemini:gemini-2.5-flash"));
+        let (p, bare) = parse_provider_model("gemini:gemini-2.5-flash").unwrap();
+        assert_eq!(
+            (p.prefix, p.name, bare),
+            ("gemini", "Gemini", "gemini-2.5-flash")
+        );
+
+        let env = env_of(&[("GEMINI_API_KEY", "gem-key")]);
+        let c = OpenAiCompatClient::from_model_env("gemini:gemini-2.5-flash", env).unwrap();
+        // Requests go to <base>/chat/completions.
+        assert_eq!(
+            c.base_url,
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(c.api_key, "gem-key");
+        assert_eq!(c.provider_name, "Gemini");
+        assert!(c.thought_signatures.is_some());
+        assert!(!c.echo_reasoning && !c.mistral_tool_ids);
+    }
+
+    #[test]
+    fn gemini_key_falls_back_to_google_api_key() {
+        let gemini = PROVIDERS.iter().find(|p| p.prefix == "gemini").unwrap();
+        let key = |vars| provider_api_key(gemini, env_of(vars));
+        assert_eq!(key(&[("GOOGLE_API_KEY", "g")]), "g");
+        assert_eq!(
+            key(&[("GEMINI_API_KEY", "gem"), ("GOOGLE_API_KEY", "g")]),
+            "gem"
+        );
+        // An empty GEMINI_API_KEY is unset, not a key.
+        assert_eq!(key(&[("GEMINI_API_KEY", ""), ("GOOGLE_API_KEY", "g")]), "g");
+        assert_eq!(key(&[("OPENAI_API_KEY", "sk")]), "");
+
+        // GOOGLE_API_KEY is Gemini's alone.
+        let groq = PROVIDERS.iter().find(|p| p.prefix == "groq").unwrap();
+        assert_eq!(
+            provider_api_key(groq, env_of(&[("GOOGLE_API_KEY", "g")])),
+            ""
+        );
+
+        let err = OpenAiCompatClient::from_model_env("gemini:gemini-2.5-flash", |_| None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("GEMINI_API_KEY or GOOGLE_API_KEY"), "{err}");
+    }
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "a.rs"}),
+        }
+    }
+
+    fn calls(
+        blocks: Vec<ContentBlock>,
+        sigs: Option<&HashMap<String, String>>,
+    ) -> serde_json::Value {
+        let msgs = [
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: blocks,
+            },
+        ];
+        serde_json::to_value(&translate_messages("", &msgs, false, false, sigs)[1]).unwrap()
+            ["tool_calls"]
+            .clone()
+    }
+
+    /// Gemini 3 rejects a tool-call follow-up whose call lost its thought
+    /// signature; it goes back where it came from, and a first call with no
+    /// signature on record gets the documented skip value.
+    #[test]
+    fn thought_signatures_go_back_on_gemini_tool_calls() {
+        let sigs = HashMap::from([("fc-1".to_string(), "SIG-1".to_string())]);
+        let v = calls(vec![tool_use("fc-1"), tool_use("fc-2")], Some(&sigs));
+        assert_eq!(
+            v[0]["extra_content"]["google"]["thought_signature"],
+            "SIG-1"
+        );
+        // Parallel calls after the first never carried one.
+        assert!(v[1].get("extra_content").is_none(), "{v}");
+
+        // History from Claude or a resumed session: no signature on record.
+        let v = calls(
+            vec![tool_use("toolu_01"), tool_use("toolu_02")],
+            Some(&sigs),
+        );
+        assert_eq!(
+            v[0]["extra_content"]["google"]["thought_signature"],
+            GEMINI_SKIP_SIGNATURE
+        );
+        assert!(v[1].get("extra_content").is_none(), "{v}");
+
+        // Every other provider rejects unknown fields: none is sent.
+        let v = calls(vec![tool_use("fc-1")], None);
+        assert!(v[0].get("extra_content").is_none(), "{v}");
+    }
+
+    /// Serves one SSE `body` and returns the base URL.
+    async fn serve_stream(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// The shape Google's endpoint streams: parallel calls without `index`,
+    /// the signature on the first call only.
+    const GEMINI_TOOL_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[\
+        {\"extra_content\":{\"google\":{\"thought_signature\":\"SIG-A\"}},\
+        \"function\":{\"arguments\":\"{\\\"file_path\\\":\\\"a.rs\\\"}\",\"name\":\"Read\"},\
+        \"id\":\"function-call-1\",\"type\":\"function\"},\
+        {\"function\":{\"arguments\":\"{\\\"file_path\\\":\\\"b.rs\\\"}\",\"name\":\"Read\"},\
+        \"id\":\"function-call-2\",\"type\":\"function\"}]},\
+        \"finish_reason\":\"tool_calls\",\"index\":0}],\"object\":\"chat.completion.chunk\"}\n\n\
+        data: [DONE]\n\n";
+
+    #[tokio::test]
+    async fn stream_parser_reads_thought_signatures() {
+        let url = serve_stream(GEMINI_TOOL_STREAM).await;
+        let resp = reqwest::get(url).await.unwrap();
+        let (result, sigs) = parse_oai_stream(resp, |_| {}).await.unwrap();
+        assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
+        let ids: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["function-call-1", "function-call-2"]);
+        assert_eq!(
+            sigs,
+            HashMap::from([("function-call-1".to_string(), "SIG-A".to_string())])
+        );
+    }
+
+    /// End to end over a real socket: the signature a turn's tool call came
+    /// with is in the next request, sent from a clone of the client as each
+    /// TUI turn does.
+    #[tokio::test]
+    async fn next_request_carries_the_signature_back() {
+        let mut c = client(serve_stream(GEMINI_TOOL_STREAM).await);
+        c.thought_signatures = Some(Default::default());
+        let first = c
+            .clone()
+            .messages_stream(request("gemini:gemini-3-pro-preview"), |_| {})
+            .await
+            .unwrap();
+
+        let (url, body) = capture_one_body().await;
+        c.base_url = url;
+        let mut req = request("gemini:gemini-3-pro-preview");
+        req.messages.push(Message {
+            role: Role::Assistant,
+            content: first.content,
+        });
+        req.messages.push(Message {
+            role: Role::User,
+            content: ["function-call-1", "function-call-2"]
+                .into_iter()
+                .map(|id| ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: vec![ToolResultContent::Text { text: "ok".into() }],
+                    is_error: None,
+                })
+                .collect(),
+        });
+        let _ = c.messages_stream(req, |_| {}).await;
+        let body = body.await.unwrap();
+        let calls = &body["messages"][1]["tool_calls"];
+        assert_eq!(calls[0]["id"], "function-call-1", "{body}");
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"], "SIG-A",
+            "{body}"
+        );
+        assert!(calls[1].get("extra_content").is_none(), "{body}");
+    }
+
+    #[test]
+    fn signature_store_keeps_the_newest() {
+        let mut store: VecDeque<(String, String)> = (0..MAX_THOUGHT_SIGNATURES)
+            .map(|i| (format!("old{i}"), "s".into()))
+            .collect();
+        remember_signatures(
+            &mut store,
+            HashMap::from([("new".to_string(), "SIG".to_string())]),
+        );
+        assert_eq!(store.len(), MAX_THOUGHT_SIGNATURES);
+        assert_eq!(store.front().unwrap().0, "old1");
+        assert_eq!(
+            store.back().unwrap(),
+            &("new".to_string(), "SIG".to_string())
         );
     }
 }
