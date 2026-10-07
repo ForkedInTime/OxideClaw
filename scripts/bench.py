@@ -26,6 +26,8 @@ login instead of being timed.
 import argparse
 import codecs
 import fcntl
+import http.server
+import json
 import os
 import platform
 import pty
@@ -40,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 
 DEFAULT_TOOLS = ["oxideclaw", "claude", "codex", "gemini", "goose", "opencode", "jcode", "codewhale", "claurst", "ante"]
@@ -231,11 +234,44 @@ def _take_tty():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def first_frame_once(argv, min_chars=20, quiet_ms=50, marker=None, timeout_s=10.0):
+class OllamaStub(http.server.BaseHTTPRequestHandler):
+    """Ollama's model listing and nothing else: one tool-capable model. With
+    no key, OxideClaw starts on a local Ollama model when one answers; this
+    lets a machine without Ollama time that path. No model ever runs."""
+
+    def do_GET(self):
+        self._json({"models": [{"name": "bench-stub:latest"}]} if self.path == "/api/tags" else None)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._json({"capabilities": ["completion", "tools"]} if self.path == "/api/show" else None)
+
+    def _json(self, body):
+        data = json.dumps(body).encode() if body is not None else b""
+        self.send_response(200 if body is not None else 404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+def start_ollama_stub():
+    """Serve OllamaStub on a free local port; returns its OLLAMA_HOST."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OllamaStub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def first_frame_once(argv, min_chars=20, quiet_ms=50, marker=None, timeout_s=10.0, ollama_host=None):
     """One launch. Returns (status, ms, excerpt): status is "frame" (ms is
     spawn to first frame), "needs login", "timeout" or "exited N"."""
     with tempfile.TemporaryDirectory(prefix="bench-ff-") as root:
         env = clean_env(root)
+        if ollama_host:
+            env["OLLAMA_HOST"] = ollama_host
         repo = os.path.join(root, "repo")
         subprocess.run(["git", "init", "-q", repo], env=env, check=True)
         master, slave = pty.openpty()
@@ -343,6 +379,7 @@ def first_frame_report(args):
         "min_chars": args.min_chars,
         "quiet_ms": args.quiet_ms,
         "timeout_s": args.timeout,
+        "ollama_host": start_ollama_stub() if args.ollama_stub else None,
     }
     rows = []
     for tool in args.tools:
@@ -356,7 +393,9 @@ def first_frame_report(args):
         f"Date: {time.strftime('%Y-%m-%d')} · runs per tool: {args.runs} · "
         f"terminal: {COLS}x{ROWS} xterm-256color · first frame: "
         f"{args.min_chars} visible characters then {args.quiet_ms:g} ms quiet, "
-        f"or the ready marker\n"
+        f"or the ready marker"
+        + (" · Ollama stub answering on OLLAMA_HOST" if args.ollama_stub else "")
+        + "\n"
     )
     print("| Tool | Version | First frame (median) | p95 | Frame begins |")
     print("|---|---|---|---|---|")
@@ -422,6 +461,17 @@ time.sleep(60)
 
 DUMMY_SILENT = "import time; time.sleep(60)\n"
 DUMMY_NO_KEY = "import sys; print('Error: ANTHROPIC_API_KEY is not set'); sys.exit(1)\n"
+# What OxideClaw's keyless start asks a local Ollama, from OLLAMA_HOST.
+DUMMY_OLLAMA = r"""
+import json, os, time, urllib.request
+host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+tags = json.load(urllib.request.urlopen(host + "/api/tags", timeout=5))
+show = urllib.request.Request(host + "/api/show", data=b'{"model": "x"}', method="POST")
+caps = json.load(urllib.request.urlopen(show, timeout=5))["capabilities"]
+os.write(1, ("model %s tools=%s" % (tags["models"][0]["name"], "tools" in caps)).encode())
+time.sleep(60)
+"""
+
 DUMMY_LOGIN = (
     "import time; print('Welcome! Please sign in with your browser to continue.'); "
     "time.sleep(60)\n"
@@ -473,6 +523,11 @@ def self_test():
         m = first_frame(script("login.py", DUMMY_LOGIN), 1)
         check("sign-in screen", m["status"] == "needs login", m["status"])
 
+        host = start_ollama_stub()
+        m = first_frame(script("ollama.py", DUMMY_OLLAMA), 1, ollama_host=host)
+        ok = m["excerpt"] == "model bench-stub:latest tools=True"
+        check("ollama stub", ok, f"{m['status']} {m['excerpt']!r}")
+
     if failures:
         print(f"self-test failed: {', '.join(failures)}")
         sys.exit(1)
@@ -490,6 +545,10 @@ def main():
     ap.add_argument(
         "--marker", action="append", default=[], metavar="TOOL=TEXT",
         help="text that means TOOL's UI is up; times its first appearance",
+    )
+    ap.add_argument(
+        "--ollama-stub", action="store_true",
+        help="answer Ollama's model listing locally (OxideClaw's keyless path)",
     )
     ap.add_argument("--self-test", action="store_true", help="check --first-frame on dummy TUIs")
     args = ap.parse_args()

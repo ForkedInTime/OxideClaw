@@ -359,7 +359,7 @@ No API key yet? If Ollama is running locally (or at `OLLAMA_HOST`) and you have 
 | Document | Description |
 |----------|-------------|
 | [FEATURES.md](FEATURES.md) | Complete feature reference — every command, shortcut, and config option |
-| [BENCHMARKS.md](BENCHMARKS.md) | Startup and footprint vs Claude Code, Codex, Gemini CLI, Goose — with the script to reproduce |
+| [BENCHMARKS.md](BENCHMARKS.md) | Startup and footprint vs Claude Code, Codex, Gemini CLI, Goose, and OxideClaw's time to first frame — with the script to reproduce |
 | [sdk/](sdk/) | SDK / headless mode — protocol, examples, integration guide |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
