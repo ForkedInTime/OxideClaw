@@ -8,6 +8,7 @@
 /// built-in tools and to let Claude identify which server provides each tool.
 pub mod client;
 pub mod manager;
+pub mod scope;
 pub mod types;
 
 pub use client::McpClient;

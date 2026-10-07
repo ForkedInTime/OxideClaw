@@ -843,7 +843,7 @@ impl Settings {
 
     /// Load only the mcpServers block from a .mcp.json file.
     /// Returns a Settings with only mcp_servers populated.
-    fn load_mcp_json(path: &Path) -> Self {
+    pub(crate) fn load_mcp_json(path: &Path) -> Self {
         let mut s = Self::default();
         let text = match read_config_file(path) {
             Ok(Some(text)) => text,
@@ -1123,7 +1123,7 @@ impl Settings {
 
 /// Whether the project settings path is really a user-level file: our own
 /// global one, or Claude Code's `~/.claude/settings.json`.
-fn is_user_settings_file(global: &Path, project: &Path) -> bool {
+pub(crate) fn is_user_settings_file(global: &Path, project: &Path) -> bool {
     same_file(global, project)
         || crate::config::Config::claude_code_dir()
             .is_some_and(|d| same_file(&d.join("settings.json"), project))

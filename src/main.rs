@@ -35,6 +35,7 @@ mod watch;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
+use mcp::scope::Scope as McpScope;
 use query_engine::QueryEngine;
 
 #[allow(unused_imports)]
@@ -384,7 +385,7 @@ enum ConfigSubcommand {
 
 #[derive(Subcommand)]
 enum McpSubcommand {
-    /// List configured MCP servers
+    /// List configured MCP servers and the scope each comes from
     List,
     /// Add an MCP server (stdio or HTTP)
     Add {
@@ -394,16 +395,21 @@ enum McpSubcommand {
         command: String,
         /// Arguments for the command (stdio only)
         args: Vec<String>,
-        /// Configuration scope: local (default; private to you, this project),
-        /// project (.claude/settings.json, usually committed), or user
-        #[arg(short = 's', long, default_value = "local")]
-        scope: String,
+        /// Where to keep it: local (default; private to you, this project
+        /// only), project (.mcp.json: shared, usually committed, starts only
+        /// after /trust), or user (all your projects)
+        #[arg(short = 's', long, default_value = "local", value_parser = parse_mcp_scope)]
+        scope: McpScope,
         /// Transport type: stdio (default) or http
         #[arg(short = 't', long, default_value = "stdio")]
         transport: String,
-        /// Environment variables (KEY=VALUE, stdio only)
+        /// Environment variables (KEY=VALUE, stdio only). The project scope
+        /// refuses literal values (use KEY='${KEY}') unless --force
         #[arg(short = 'e', long)]
         env: Vec<String>,
+        /// With --scope project, write literal env values anyway
+        #[arg(long)]
+        force: bool,
     },
     /// Add an MCP server from a JSON string
     AddJson {
@@ -411,27 +417,36 @@ enum McpSubcommand {
         name: String,
         /// JSON configuration string
         json: String,
-        /// Configuration scope: local (default; private to you, this project),
-        /// project (.claude/settings.json, usually committed), or user
-        #[arg(short = 's', long, default_value = "local")]
-        scope: String,
+        /// Where to keep it: local (default; private to you, this project
+        /// only), project (.mcp.json: shared, usually committed, starts only
+        /// after /trust), or user (all your projects)
+        #[arg(short = 's', long, default_value = "local", value_parser = parse_mcp_scope)]
+        scope: McpScope,
+        /// With --scope project, write literal env values or headers anyway
+        #[arg(long)]
+        force: bool,
     },
     /// Import MCP servers from Claude Desktop configuration
     AddFromClaudeDesktop {
-        /// Configuration scope: local (default; private to you, this project),
-        /// project (.claude/settings.json, usually committed), or user
-        #[arg(short = 's', long, default_value = "local")]
-        scope: String,
+        /// Where to keep them: local (default; private to you, this project
+        /// only), project (.mcp.json: shared, usually committed, starts only
+        /// after /trust), or user (all your projects)
+        #[arg(short = 's', long, default_value = "local", value_parser = parse_mcp_scope)]
+        scope: McpScope,
+        /// With --scope project, write literal env values or headers anyway
+        #[arg(long)]
+        force: bool,
     },
     /// Remove an MCP server
     Remove {
         /// Server name to remove
         name: String,
-        /// Configuration scope (if omitted, removes from whichever scope it exists in)
-        #[arg(short = 's', long)]
-        scope: Option<String>,
+        /// Scope to remove it from (local, project or user); may be omitted
+        /// when only one scope defines the name
+        #[arg(short = 's', long, value_parser = parse_mcp_scope)]
+        scope: Option<McpScope>,
     },
-    /// Show details about an MCP server
+    /// Show details about an MCP server, including its scope
     Get {
         /// Server name
         name: String,
@@ -439,6 +454,10 @@ enum McpSubcommand {
     /// Stop this project's .mcp.json and project-settings MCP servers from
     /// starting by revoking its trust (same as /trust revoke)
     ResetProjectChoices,
+}
+
+fn parse_mcp_scope(s: &str) -> std::result::Result<McpScope, String> {
+    McpScope::parse(s).map_err(|e| e.to_string())
 }
 
 /// Safe allowlist of env vars that oxideclaw may load from .env files.
@@ -1632,71 +1651,86 @@ fn warn_settings_load_errors(config: &Config) {
 
 async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()> {
     let config = Config::load()?;
+    let config_dir = Config::config_dir();
     // Otherwise a typo in settings.json reads as "No MCP servers configured".
     warn_settings_load_errors(&config);
     match subcommand {
         None | Some(McpSubcommand::List) => {
-            let settings = crate::settings::Settings::load(&config.cwd);
-            if settings.mcp_servers.is_empty() {
-                println!("No MCP servers configured.");
+            let servers = crate::mcp::scope::list(&config.cwd, &config_dir);
+            if servers.is_empty() {
+                println!("No MCP servers configured. Add one:");
                 println!(
-                    "Add servers to {} or .claude/settings.json:",
-                    Config::config_dir().join("settings.json").display()
+                    "  oxideclaw mcp add <name> <command> [args...]   (or a URL with -t http)"
                 );
-                println!("  {{");
-                println!("    \"mcpServers\": {{");
-                println!(
-                    "      \"my-server\": {{\"command\": \"npx\", \"args\": [\"-y\", \"@my/mcp-server\"]}}"
-                );
-                println!("    }}");
-                println!("  }}");
+                println!();
+                print_mcp_scopes();
             } else {
-                println!("Configured MCP servers ({}):", settings.mcp_servers.len());
-                for (name, cfg) in &settings.mcp_servers {
-                    let kind = match cfg {
-                        crate::mcp::types::McpServerConfig::Stdio(s) => {
-                            format!("stdio: {}", s.command)
+                println!("Configured MCP servers ({}):", servers.len());
+                let width = servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
+                for s in &servers {
+                    let kind = match &s.config {
+                        crate::mcp::types::McpServerConfig::Stdio(c) => {
+                            format!("stdio: {}", c.command)
                         }
                         crate::mcp::types::McpServerConfig::Http(h) => format!("http: {}", h.url),
                     };
-                    let state = if cfg.is_disabled() {
-                        "  [disabled]"
-                    } else {
-                        ""
-                    };
-                    println!("  {name}  ({kind}){state}");
+                    println!(
+                        "  {:width$}  {:7}  ({kind}){}",
+                        s.name,
+                        s.scope.as_str(),
+                        mcp_state(s)
+                    );
                 }
+                println!();
+                print_mcp_scopes();
             }
         }
         Some(McpSubcommand::Get { name }) => {
-            let settings = crate::settings::Settings::load(&config.cwd);
-            match settings.mcp_servers.get(name) {
-                None => {
-                    eprintln!("Server '{name}' not found.");
-                    std::process::exit(1);
-                }
-                Some(cfg) => {
-                    println!("MCP server: {name}");
-                    match cfg {
-                        crate::mcp::types::McpServerConfig::Stdio(s) => {
-                            println!("  transport: stdio");
-                            println!("  command:   {}", s.command);
-                            if !s.args.is_empty() {
-                                println!("  args:      {:?}", s.args);
-                            }
-                            if !s.env.is_empty() {
-                                println!("  env:       {:?}", s.env);
-                            }
-                        }
-                        crate::mcp::types::McpServerConfig::Http(h) => {
-                            println!("  transport: http");
-                            println!("  url:       {}", h.url);
-                            if !h.headers.is_empty() {
-                                println!("  headers:   {:?}", h.headers);
-                            }
-                        }
+            let entries: Vec<_> = crate::mcp::scope::list(&config.cwd, &config_dir)
+                .into_iter()
+                .filter(|s| &s.name == name)
+                .collect();
+            let Some(main) = entries
+                .iter()
+                .find(|s| s.is_effective())
+                .or_else(|| entries.first())
+            else {
+                eprintln!("Server '{name}' not found.");
+                std::process::exit(1);
+            };
+            println!("MCP server: {name}");
+            println!("  scope:     {} ({})", main.scope, main.path.display());
+            if main.needs_trust {
+                println!("  status:    not started until you /trust this project");
+            } else if main.config.is_disabled() {
+                println!("  status:    disabled");
+            }
+            match &main.config {
+                crate::mcp::types::McpServerConfig::Stdio(s) => {
+                    println!("  transport: stdio");
+                    println!("  command:   {}", s.command);
+                    if !s.args.is_empty() {
+                        println!("  args:      {:?}", s.args);
+                    }
+                    if !s.env.is_empty() {
+                        println!("  env:       {:?}", s.env);
                     }
                 }
+                crate::mcp::types::McpServerConfig::Http(h) => {
+                    println!("  transport: http");
+                    println!("  url:       {}", h.url);
+                    if !h.headers.is_empty() {
+                        println!("  headers:   {:?}", h.headers);
+                    }
+                }
+            }
+            for other in entries.iter().filter(|s| !std::ptr::eq(*s, main)) {
+                println!(
+                    "  also in:   {} ({}){}",
+                    other.scope,
+                    other.path.display(),
+                    mcp_state(other)
+                );
             }
         }
         Some(McpSubcommand::Add {
@@ -1706,24 +1740,24 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             scope,
             transport,
             env,
+            force,
         }) => {
             let cfg = mcp_add_config(transport, command, args, env)?;
-            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::config_dir())?;
-            println!(
-                "Added MCP server '{name}' (scope: {scope}) to {}",
-                path.display()
-            );
+            let path = crate::mcp::scope::add(name, cfg, *scope, &config.cwd, &config_dir, *force)?;
+            mcp_added(name, *scope, &path, &config);
         }
-        Some(McpSubcommand::AddJson { name, json, scope }) => {
+        Some(McpSubcommand::AddJson {
+            name,
+            json,
+            scope,
+            force,
+        }) => {
             let cfg: crate::mcp::types::McpServerConfig =
                 serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
-            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::config_dir())?;
-            println!(
-                "Added MCP server '{name}' (scope: {scope}) to {}",
-                path.display()
-            );
+            let path = crate::mcp::scope::add(name, cfg, *scope, &config.cwd, &config_dir, *force)?;
+            mcp_added(name, *scope, &path, &config);
         }
-        Some(McpSubcommand::AddFromClaudeDesktop { scope }) => {
+        Some(McpSubcommand::AddFromClaudeDesktop { scope, force }) => {
             let desktop_config = find_claude_desktop_config();
             match desktop_config {
                 None => {
@@ -1749,38 +1783,52 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                         return Ok(());
                     }
                     let mut imported = 0usize;
+                    let mut written = None;
                     for (name, val) in &servers {
-                        match serde_json::from_value::<crate::mcp::types::McpServerConfig>(
+                        let added = serde_json::from_value::<crate::mcp::types::McpServerConfig>(
                             val.clone(),
-                        ) {
-                            Ok(cfg) => {
-                                mcp_write_server(
-                                    name,
-                                    cfg,
-                                    scope,
-                                    &config.cwd,
-                                    &Config::config_dir(),
-                                )?;
+                        )
+                        .map_err(anyhow::Error::from)
+                        .and_then(|cfg| {
+                            crate::mcp::scope::add(
+                                name,
+                                cfg,
+                                *scope,
+                                &config.cwd,
+                                &config_dir,
+                                *force,
+                            )
+                        });
+                        match added {
+                            Ok(path) => {
                                 println!("  Imported: {name}");
                                 imported += 1;
+                                written = Some(path);
                             }
-                            Err(e) => {
-                                eprintln!("  Skipped '{name}': {e}");
-                            }
+                            Err(e) => eprintln!("  Skipped '{name}': {e}"),
                         }
                     }
-                    println!("Imported {imported} server(s) from Claude Desktop.");
+                    match written {
+                        Some(path) => println!(
+                            "Imported {imported} server(s) from Claude Desktop into the {scope} \
+                             scope ({}).",
+                            path.display()
+                        ),
+                        None => println!("Imported no servers from Claude Desktop."),
+                    }
                 }
             }
         }
         Some(McpSubcommand::Remove { name, scope }) => {
-            let removed =
-                mcp_remove_server(name, scope.as_deref(), &config.cwd, &Config::config_dir())?;
-            if removed {
-                println!("Removed MCP server '{name}'.");
-            } else {
-                eprintln!("Server '{name}' not found in any settings file.");
-                std::process::exit(1);
+            match crate::mcp::scope::remove(name, *scope, &config.cwd, &config_dir)? {
+                Some(from) => println!("Removed MCP server '{name}' from the {from} scope."),
+                None => {
+                    match scope {
+                        Some(s) => eprintln!("Server '{name}' not found in the {s} scope."),
+                        None => eprintln!("Server '{name}' not found in any scope."),
+                    }
+                    std::process::exit(1);
+                }
             }
         }
         Some(McpSubcommand::ResetProjectChoices) => {
@@ -1864,92 +1912,38 @@ fn mcp_add_config(
     }
 }
 
-/// Write an MCP server config to the settings file for `scope`; returns it.
-fn mcp_write_server(
-    name: &str,
-    cfg: crate::mcp::types::McpServerConfig,
-    scope: &str,
-    cwd: &std::path::Path,
-    config_dir: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    let path = mcp_scope_path(scope, cwd, config_dir)?;
-    if scope == "project" {
-        let has_secrets = match &cfg {
-            crate::mcp::types::McpServerConfig::Stdio(s) => !s.env.is_empty(),
-            crate::mcp::types::McpServerConfig::Http(h) => !h.headers.is_empty(),
-        };
-        if has_secrets {
-            eprintln!(
-                "Warning: '{name}' has env/headers and {} is usually committed; \
-                 use --scope local to keep tokens out of the repo.",
-                path.display()
-            );
-        }
+/// `[needs /trust]`, `[overridden by local]`, `[disabled]` for `mcp list`/`get`.
+fn mcp_state(s: &crate::mcp::scope::ScopedServer) -> String {
+    let mut state = String::new();
+    if s.needs_trust {
+        state.push_str("  [needs /trust]");
     }
-    let mut json = config::read_json_object(&path)?;
-    if json.get("mcpServers").is_none() {
-        json["mcpServers"] = serde_json::json!({});
+    if let Some(by) = s.overridden_by {
+        state.push_str(&format!("  [overridden by {by}]"));
     }
-    json["mcpServers"][name] = serde_json::to_value(&cfg)?;
-    // New files are created 0600 and existing modes kept, so a token in
-    // `env` is not left world-readable.
-    config::write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
-    Ok(path)
+    if s.config.is_disabled() {
+        state.push_str("  [disabled]");
+    }
+    state
 }
 
-/// Remove an MCP server from the specified scope (or all scopes if scope is None).
-fn mcp_remove_server(
-    name: &str,
-    scope: Option<&str>,
-    cwd: &std::path::Path,
-    config_dir: &std::path::Path,
-) -> Result<bool> {
-    let paths: Vec<std::path::PathBuf> = if let Some(s) = scope {
-        vec![mcp_scope_path(s, cwd, config_dir)?]
-    } else {
-        // `project` is refused in the home directory (Claude Code's ~/.claude).
-        ["user", "project", "local"]
-            .into_iter()
-            .filter_map(|s| mcp_scope_path(s, cwd, config_dir).ok())
-            // Where older versions wrote `--scope local`.
-            .chain([cwd.join(".mcp.json")])
-            .collect()
-    };
-    let mut removed = false;
-    for path in &paths {
-        if !path.exists() {
-            continue;
-        }
-        let mut json = config::read_json_object(path)?;
-        if let Some(servers) = json.get_mut("mcpServers").and_then(|v| v.as_object_mut())
-            && servers.remove(name).is_some()
-        {
-            config::write_json_atomic(path, &serde_json::to_string_pretty(&json)?)?;
-            removed = true;
-        }
-    }
-    Ok(removed)
+fn print_mcp_scopes() {
+    println!("Scopes (--scope):");
+    println!("  local    only you, only this project (default; kept in your config dir)");
+    println!("  project  .mcp.json in the repo: shared, starts only after /trust");
+    println!("  user     only you, every project (your settings.json)");
 }
 
-/// Resolve the settings file path for an mcp scope.
-fn mcp_scope_path(
-    scope: &str,
-    cwd: &std::path::Path,
-    config_dir: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    match scope {
-        "user" => Ok(config_dir.join("settings.json")),
-        "project" if Config::is_claude_code_project(cwd) => anyhow::bail!(
-            "{} is Claude Code's directory, not a project; use --scope user for OxideClaw's {}",
-            cwd.join(".claude").display(),
-            config_dir.join("settings.json").display()
-        ),
-        "project" => Ok(cwd.join(".claude").join("settings.json")),
-        // Private, outside the repo, and loaded without the trust gate: the
-        // old `.mcp.json` target leaked `-e` tokens into a shared file and
-        // was then ignored in untrusted projects.
-        "local" => Ok(crate::settings::Settings::local_mcp_path(config_dir, cwd)),
-        other => anyhow::bail!("unknown scope '{other}' (expected local, project or user)"),
+fn mcp_added(name: &str, scope: McpScope, path: &std::path::Path, config: &Config) {
+    println!(
+        "Added MCP server '{name}' to the {scope} scope ({}).",
+        path.display()
+    );
+    if scope == McpScope::Project && !config.project_trusted {
+        println!(
+            "{} is not trusted, so its .mcp.json servers do not start until you run /trust.",
+            config.cwd.display()
+        );
     }
 }
 
@@ -2667,7 +2661,7 @@ mod dotenv_allowlist_tests {
 
 #[cfg(test)]
 mod mcp_scope_tests {
-    use super::{mcp_remove_server, mcp_write_server};
+    use crate::mcp::scope::{Scope, add, remove};
     use crate::mcp::types::{McpServerConfig, StdioServerConfig};
 
     fn server_with_token() -> McpServerConfig {
@@ -2685,8 +2679,15 @@ mod mcp_scope_tests {
     fn default_local_scope_is_private_and_loaded_in_an_untrusted_project() {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
-        let path =
-            mcp_write_server("gh", server_with_token(), "local", repo.path(), home.path()).unwrap();
+        let path = add(
+            "gh",
+            server_with_token(),
+            Scope::Local,
+            repo.path(),
+            home.path(),
+            false,
+        )
+        .unwrap();
 
         assert!(path.starts_with(home.path()), "{}", path.display());
         assert!(!repo.path().join(".mcp.json").exists());
@@ -2702,29 +2703,46 @@ mod mcp_scope_tests {
         assert!(settings.mcp_servers.contains_key("gh"));
         assert!(settings.untrusted_project_config.is_empty());
 
-        assert!(mcp_remove_server("gh", None, repo.path(), home.path()).unwrap());
+        assert_eq!(
+            remove("gh", None, repo.path(), home.path()).unwrap(),
+            Some(Scope::Local)
+        );
         let settings = crate::settings::Settings::load_in(home.path(), repo.path());
         assert!(!settings.mcp_servers.contains_key("gh"));
     }
 
     #[test]
-    fn an_unknown_scope_is_an_error_not_mcp_json() {
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        assert!(
-            mcp_write_server("gh", server_with_token(), "loacl", repo.path(), home.path()).is_err()
-        );
-        assert!(!repo.path().join(".mcp.json").exists());
+    fn an_unknown_scope_is_a_cli_error() {
+        use clap::Parser;
+        let parse = |scope: &str| {
+            super::Cli::try_parse_from(["oxideclaw", "mcp", "add", "-s", scope, "gh", "npx"])
+        };
+        assert!(parse("loacl").is_err());
+        assert!(parse("project").is_ok());
+        // The default is local.
+        let cli = super::Cli::try_parse_from(["oxideclaw", "mcp", "add", "gh", "npx"]).unwrap();
+        let Some(super::Commands::Mcp {
+            subcommand: Some(super::McpSubcommand::Add { scope, force, .. }),
+        }) = cli.command
+        else {
+            panic!("expected mcp add");
+        };
+        assert_eq!(scope, Scope::Local);
+        assert!(!force);
     }
 
-    /// Entries older versions wrote to `.mcp.json` can still be removed.
+    /// Entries older versions wrote to `.mcp.json` with `--scope local` are
+    /// the project scope now and can still be removed.
     #[test]
     fn remove_without_scope_also_sweeps_legacy_mcp_json() {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let legacy = repo.path().join(".mcp.json");
         std::fs::write(&legacy, r#"{"mcpServers":{"gh":{"command":"npx"}}}"#).unwrap();
-        assert!(mcp_remove_server("gh", None, repo.path(), home.path()).unwrap());
+        assert_eq!(
+            remove("gh", None, repo.path(), home.path()).unwrap(),
+            Some(Scope::Project)
+        );
         let left = std::fs::read_to_string(&legacy).unwrap();
         assert!(!left.contains("\"gh\""), "{left}");
     }
