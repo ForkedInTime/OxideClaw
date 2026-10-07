@@ -163,8 +163,9 @@ pub enum OpenAiApi {
     Auto,
     /// Chat Completions for every provider.
     Chat,
-    /// Responses for `oai:` and for the `openai-compat:` endpoint, which
-    /// must then serve `/responses`.
+    /// Responses for `oai:` and for the endpoints whose base URL the user
+    /// sets (`openai-compat:`, `lmstudio:`), which must then serve
+    /// `/responses`. The named cloud presets keep Chat Completions.
     Responses,
 }
 
@@ -189,7 +190,7 @@ pub fn uses_responses_api(model: &str, api: OpenAiApi) -> bool {
     match api {
         OpenAiApi::Chat => false,
         OpenAiApi::Auto => provider.prefix == "oai",
-        OpenAiApi::Responses => matches!(provider.prefix, "oai" | "openai-compat"),
+        OpenAiApi::Responses => matches!(provider.prefix, "oai" | "openai-compat" | "lmstudio"),
     }
 }
 
@@ -892,6 +893,10 @@ pub struct OpenAiCompatClient {
     /// Set to true after the first 400 "does not support tools" error.
     no_tools: Arc<AtomicBool>,
     tools_notice_sent: Arc<AtomicBool>,
+    /// Responses API: set after OpenAI refuses reasoning summaries (an
+    /// organization that is not verified); later requests leave them out.
+    no_summary: Arc<AtomicBool>,
+    summary_notice_sent: Arc<AtomicBool>,
     /// See [`translate_messages`]: only DeepSeek wants reasoning echoed back.
     echo_reasoning: bool,
     /// See [`mistral_tool_id`].
@@ -1029,6 +1034,8 @@ impl OpenAiCompatClient {
             extra_headers,
             no_tools: Arc::new(AtomicBool::new(false)),
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
+            no_summary: Arc::new(AtomicBool::new(false)),
+            summary_notice_sent: Arc::new(AtomicBool::new(false)),
             echo_reasoning: provider.prefix == "deepseek",
             mistral_tool_ids: provider.prefix == "mistral",
             thought_signatures: (provider.prefix == "gemini").then(Default::default),
@@ -1062,6 +1069,12 @@ impl OpenAiCompatClient {
     pub fn take_tools_notice(&self) -> bool {
         self.no_tools.load(Ordering::Relaxed)
             && !self.tools_notice_sent.swap(true, Ordering::Relaxed)
+    }
+
+    /// True once, after reasoning summaries were refused and turned off.
+    pub fn take_summary_notice(&self) -> bool {
+        self.no_summary.load(Ordering::Relaxed)
+            && !self.summary_notice_sent.swap(true, Ordering::Relaxed)
     }
 
     /// Streaming call — drop-in replacement for ClaudeClient::messages_stream.
@@ -1574,6 +1587,8 @@ mod max_tokens_tests {
             extra_headers: vec![],
             no_tools: Arc::new(AtomicBool::new(false)),
             tools_notice_sent: Arc::new(AtomicBool::new(false)),
+            no_summary: Arc::new(AtomicBool::new(false)),
+            summary_notice_sent: Arc::new(AtomicBool::new(false)),
             echo_reasoning: false,
             mistral_tool_ids: false,
             thought_signatures: None,

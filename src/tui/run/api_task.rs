@@ -573,6 +573,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 "Note: this model doesn't support tools — running in text-only mode.".into(),
             ));
         }
+        if client.take_summary_notice() {
+            let _ = tx.send(AppEvent::SystemMessage(
+                "Note: OpenAI refused reasoning summaries (they need a verified organization), \
+                 so showThinkingSummaries is ignored for this session."
+                    .into(),
+            ));
+        }
 
         // Emit thinking blocks to the TUI (if show_thinking_summaries is enabled)
         if config.show_thinking_summaries {

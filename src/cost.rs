@@ -165,14 +165,13 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         }
     } else if m.contains("mistral:") {
         rough(2.0, 6.0)
-    } else if m.contains("oai:") || m.contains("openai:") {
-        // GPT-4o class pricing. Cached input is half price on GPT-4o, the
-        // largest share OpenAI charges (GPT-4.1 and o-series: a quarter,
-        // GPT-5: a tenth).
-        ModelPrice {
-            cache_read_mult: 0.5,
-            ..rough(2.5, 10.0)
-        }
+    } else if let Some(id) = ["oai:", "openai:"].iter().find_map(|p| {
+        model
+            .to_ascii_lowercase()
+            .strip_prefix(p)
+            .map(str::to_string)
+    }) {
+        openai_price(&id)
     } else {
         // Unknown model — fall back to Sonnet-tier rates so a budget still
         // functions, but flag it: an unrecognised model may be an order of
@@ -192,6 +191,104 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
             fallback: true,
             ..rough(3.0, 15.0)
         }
+    }
+}
+
+/// OpenAI list prices per million tokens (standard tier, 2026-10) for the
+/// bare model id, dots kept (`gpt-5.4-mini`). Each family has its own
+/// cached-input rate: a tenth of input on GPT-5, a quarter on GPT-4.1 and
+/// o3 / o4-mini, half on GPT-4o and older o-series; the `-pro` models have
+/// none. Variants are matched before their base id (`-pro`, `-mini`,
+/// `-nano`). A GPT-5 point release or GPT-6 model newer than this table is
+/// billed at the dearest rate known for its tier and flagged, so a
+/// `/budget` cap errs early rather than late.
+fn openai_price(id: &str) -> ModelPrice {
+    let price = |input: f64, output: f64, cache_read_mult: f64| ModelPrice {
+        input,
+        output,
+        cache_read_mult,
+        estimated: false,
+        fallback: false,
+        long_context: None,
+    };
+    let estimated = |p: ModelPrice| ModelPrice {
+        estimated: true,
+        ..p
+    };
+    let tier = |t: &str| id.contains(&format!("-{t}"));
+    if let Some((major, minor)) = crate::api::openai_compat::responses::gpt_version(id)
+        && major >= 5
+    {
+        let v = (major, minor);
+        return if tier("pro") {
+            match v {
+                (5, 0) | (5, 1) => price(15.0, 120.0, 1.0),
+                (5, 2) | (5, 3) => price(21.0, 168.0, 1.0),
+                (5, 4) | (5, 5) => price(30.0, 180.0, 1.0),
+                _ => estimated(price(30.0, 180.0, 1.0)),
+            }
+        } else if tier("nano") {
+            match v {
+                (5, 0..=3) => price(0.05, 0.40, 0.1),
+                (5, 4) => price(0.20, 1.25, 0.1),
+                _ => estimated(price(0.20, 1.25, 0.1)),
+            }
+        } else if tier("mini") {
+            match v {
+                (5, 0..=3) => price(0.25, 2.0, 0.1),
+                (5, 4) => price(0.75, 4.50, 0.1),
+                _ => estimated(price(0.75, 4.50, 0.1)),
+            }
+        } else {
+            // The base model, its `-codex` and `-chat-latest` variants.
+            match v {
+                (5, 0) | (5, 1) => price(1.25, 10.0, 0.1),
+                (5, 2) | (5, 3) => price(1.75, 14.0, 0.1),
+                (5, 4) => price(2.50, 15.0, 0.1),
+                (5, 5) => price(5.0, 30.0, 0.1),
+                // Later tiers run from $0.20 to $10 in (GPT-6 Astra).
+                _ => estimated(price(10.0, 50.0, 0.1)),
+            }
+        };
+    }
+    if id.starts_with("gpt-4.1") {
+        if tier("nano") {
+            price(0.10, 0.40, 0.25)
+        } else if tier("mini") {
+            price(0.40, 1.60, 0.25)
+        } else {
+            price(2.0, 8.0, 0.25)
+        }
+    } else if id.starts_with("gpt-4o") || id.starts_with("chatgpt-4o") {
+        if tier("mini") {
+            price(0.15, 0.60, 0.5)
+        } else {
+            price(2.50, 10.0, 0.5)
+        }
+    } else if id.starts_with("o3-deep-research") {
+        price(10.0, 40.0, 0.25)
+    } else if id.starts_with("o4-mini-deep-research") {
+        price(2.0, 8.0, 0.25)
+    } else if id.starts_with("o3-pro") {
+        price(20.0, 80.0, 1.0)
+    } else if id.starts_with("o3-mini") {
+        price(1.10, 4.40, 0.5)
+    } else if id.starts_with("o3") {
+        price(2.0, 8.0, 0.25)
+    } else if id.starts_with("o4-mini") {
+        price(1.10, 4.40, 0.25)
+    } else if id.starts_with("o1-pro") {
+        price(150.0, 600.0, 1.0)
+    } else if id.starts_with("o1-mini") {
+        price(1.10, 4.40, 0.5)
+    } else if id.starts_with("o1") {
+        price(15.0, 60.0, 0.5)
+    } else if id.starts_with("codex-mini") {
+        price(1.50, 6.0, 0.25)
+    } else {
+        // Anything else (GPT-4 Turbo, GPT-3.5, a new family): GPT-4o rates,
+        // flagged. Half price is the largest cached share OpenAI charges.
+        estimated(price(2.50, 10.0, 0.5))
     }
 }
 
@@ -697,12 +794,67 @@ mod price_table_tests {
         }
     }
 
+    /// OpenAI list prices per family: variants before their base id, and
+    /// each family's own cached-input share. `oai:gpt-5` was billed at
+    /// GPT-4o rates (2x input, 5x cache reads) and the `-pro` models at a
+    /// tenth of theirs, so `/budget` stopped them far too late.
+    #[test]
+    fn openai_models_have_their_own_list_prices() {
+        let m = 1_000_000;
+        for (model, input, output, cached) in [
+            ("oai:gpt-5", 1.25, 10.0, 0.125),
+            ("oai:gpt-5-mini", 0.25, 2.0, 0.025),
+            ("oai:gpt-5-nano", 0.05, 0.40, 0.005),
+            ("oai:gpt-5-pro", 15.0, 120.0, 15.0),
+            ("oai:gpt-5-chat-latest", 1.25, 10.0, 0.125),
+            ("oai:gpt-5.1-codex-max", 1.25, 10.0, 0.125),
+            ("oai:gpt-5.1-codex-mini", 0.25, 2.0, 0.025),
+            ("oai:gpt-5.2", 1.75, 14.0, 0.175),
+            ("oai:gpt-5.2-pro", 21.0, 168.0, 21.0),
+            ("oai:gpt-5.3-codex", 1.75, 14.0, 0.175),
+            ("oai:gpt-5.4", 2.50, 15.0, 0.25),
+            ("oai:gpt-5.4-mini", 0.75, 4.50, 0.075),
+            ("oai:gpt-5.4-nano", 0.20, 1.25, 0.02),
+            ("oai:gpt-5.4-pro", 30.0, 180.0, 30.0),
+            ("oai:gpt-5.5", 5.0, 30.0, 0.5),
+            ("oai:gpt-5.5-pro", 30.0, 180.0, 30.0),
+            ("oai:o3", 2.0, 8.0, 0.5),
+            ("oai:o3-pro", 20.0, 80.0, 20.0),
+            ("oai:o3-mini", 1.10, 4.40, 0.55),
+            ("oai:o4-mini", 1.10, 4.40, 0.275),
+            ("oai:o1", 15.0, 60.0, 7.5),
+            ("oai:gpt-4.1", 2.0, 8.0, 0.5),
+            ("oai:gpt-4.1-mini", 0.40, 1.60, 0.1),
+            ("oai:gpt-4.1-nano", 0.10, 0.40, 0.025),
+            ("OAI:GPT-4o", 2.50, 10.0, 1.25),
+            ("openai:gpt-4o-mini", 0.15, 0.60, 0.075),
+        ] {
+            let p = model_price(model);
+            let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+            assert!(
+                close(p.input, input) && close(p.output, output),
+                "{model}: {} / {}",
+                p.input,
+                p.output
+            );
+            let got = p.cost(0, 0, m, 0);
+            assert!(close(got, cached), "{model} cache read: {got}");
+            assert!(!p.estimated, "{model} is a list price");
+        }
+        // Newer than the table: flagged, and never cheaper than the newest
+        // known model of its tier.
+        for (model, floor) in [("oai:gpt-6-astra", 5.0), ("oai:gpt-5.9-pro", 30.0)] {
+            let p = model_price(model);
+            assert!(p.estimated && p.input >= floor, "{model}: {}", p.input);
+        }
+    }
+
     /// Third-party rows the code itself calls "rough" must say so, or the
     /// dashboard presents a guess as fact (the exact bug PR #14 fixed for
     /// unknown models).
     #[test]
     fn approximate_third_party_rates_are_flagged_as_estimates() {
-        for model in ["groq:llama-3", "together:mixtral", "openai:gpt-4o"] {
+        for model in ["groq:llama-3", "together:mixtral", "oai:gpt-4-turbo"] {
             assert!(model_price(model).estimated, "{model}");
         }
         assert!(
@@ -757,7 +909,9 @@ mod price_table_tests {
         let tenth = 100_000;
         for (model, cached_per_m) in [
             ("oai:gpt-4o", 1.25),
-            ("openai:gpt-4.1", 1.25),
+            ("openai:gpt-4.1", 0.5),
+            ("oai:gpt-5", 0.125),
+            ("oai:o4-mini", 0.275),
             ("deepseek:deepseek-chat", 0.07),
             ("deepseek:deepseek-reasoner", 0.07),
             ("gemini:gemini-2.5-flash", 0.075),

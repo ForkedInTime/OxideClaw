@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 // ─── Models ──────────────────────────────────────────────────────────────────
 
 /// `gpt-<major>[.<minor>]` → `(major, minor)`.
-fn gpt_version(model: &str) -> Option<(u32, u32)> {
+pub(crate) fn gpt_version(model: &str) -> Option<(u32, u32)> {
     let rest = model.strip_prefix("gpt-")?;
     let mut nums = rest
         .split(|c: char| !c.is_ascii_digit())
@@ -55,11 +55,16 @@ pub(crate) fn is_reasoning_model(bare: &str) -> bool {
 /// `low`/`medium`/`high`; `xhigh` arrived with gpt-5.1-codex-max and
 /// GPT-5.2, so older models get `high` instead of a 400. `max` is sent as
 /// the highest of those two the model takes: OpenAI documents it per model,
-/// and a wrong guess is a failed request.
+/// and a wrong guess is a failed request. GPT-5 `-pro` models think at
+/// `high` or above only (gpt-5-pro takes nothing else), so `low` and
+/// `medium` go out as `high` there.
 pub(crate) fn reasoning_effort(bare: &str, level: &str) -> Option<&'static str> {
     let m = bare.to_ascii_lowercase();
-    let xhigh = m.contains("codex-max") || gpt_version(&m).is_some_and(|v| v >= (5, 2));
+    let version = gpt_version(&m);
+    let xhigh = m.contains("codex-max") || version.is_some_and(|v| v >= (5, 2));
+    let pro = m.contains("-pro") && version.is_some_and(|(major, _)| major >= 5);
     match level.trim().to_ascii_lowercase().as_str() {
+        "low" | "medium" if pro => Some("high"),
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
@@ -76,8 +81,10 @@ pub(crate) fn reasoning_effort(bare: &str, level: &str) -> Option<&'static str> 
 pub(crate) enum TurnItem {
     /// A `reasoning` item with `encrypted_content`, sent back verbatim.
     Reasoning(serde_json::Value),
-    /// An assistant `message`; its text is in the history.
-    Message { phase: Option<String> },
+    /// An assistant `message` and the text it streamed. The history holds
+    /// every message item's text joined by a blank line; `text` splits it
+    /// back into one input item per message, each with its own `phase`.
+    Message { phase: Option<String>, text: String },
     /// A `function_call` by `call_id`; its name and arguments are in the
     /// history.
     Call(String),
@@ -109,6 +116,23 @@ fn remember_turn(store: &mut TurnStore, turn: StoredTurn) {
     store.drain(..excess);
 }
 
+/// Records a finished turn, or forgets an older one with the same key when
+/// this turn has nothing to replay: two replies with the same text ("Done.")
+/// share a key, and the older turn's reasoning must not be sent with the
+/// newer reply.
+fn record_turn(store: &mut TurnStore, key: String, model: String, items: Vec<TurnItem>) {
+    let worth_keeping = items.iter().any(|i| match i {
+        TurnItem::Reasoning(_) => true,
+        TurnItem::Message { phase, .. } => phase.is_some(),
+        TurnItem::Call(_) => false,
+    });
+    if worth_keeping {
+        remember_turn(store, StoredTurn { key, model, items });
+    } else {
+        store.retain(|t| t.key != key);
+    }
+}
+
 /// Identifies an assistant message across requests: its first tool call id,
 /// else a hash of its text. The same blocks are stored in history, so the
 /// key computed from the parsed reply finds the turn again.
@@ -122,6 +146,10 @@ fn turn_key(content: &[ContentBlock]) -> Option<String> {
     let text = joined_text(content);
     (!text.is_empty()).then(|| format!("text:{:016x}", fnv1a(&text)))
 }
+
+/// Between the texts of a response's message items, in the transcript and
+/// in the history.
+const MESSAGE_SEPARATOR: &str = "\n\n";
 
 fn joined_text(content: &[ContentBlock]) -> String {
     content
@@ -167,8 +195,19 @@ pub(super) fn translate_input(
     store: &TurnStore,
 ) -> Vec<serde_json::Value> {
     use serde_json::json;
+    // A stored turn goes back with the last assistant message that has its
+    // key only. Two replies with the same text share a key, and sending its
+    // reasoning item twice is a 400 (duplicate item id).
+    let mut last_with_key = HashMap::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if matches!(msg.role, Role::Assistant)
+            && let Some(key) = turn_key(&msg.content)
+        {
+            last_with_key.insert(key, i);
+        }
+    }
     let mut out = Vec::with_capacity(messages.len());
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role {
             Role::User => {
                 for block in &msg.content {
@@ -237,7 +276,7 @@ pub(super) fn translate_input(
                         _ => None,
                     })
                     .collect();
-                let message = |phase: Option<&str>| {
+                let message = |text: &str, phase: Option<&str>| {
                     let mut m = json!({ "type": "message", "role": "assistant", "content": text });
                     if let Some(p) = phase {
                         m["phase"] = p.into();
@@ -252,23 +291,45 @@ pub(super) fn translate_input(
                         "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                     })
                 };
-                let stored = turn_key(&msg.content).and_then(|key| {
-                    store
-                        .iter()
-                        .rev()
-                        .find(|t| t.key == key && t.model == model)
-                });
+                let stored = turn_key(&msg.content)
+                    .filter(|key| last_with_key.get(key) == Some(&i))
+                    .and_then(|key| {
+                        store
+                            .iter()
+                            .rev()
+                            .find(|t| t.key == key && t.model == model)
+                    });
+                let items = stored.map(|t| t.items.as_slice()).unwrap_or_default();
+                // Several message items (commentary, then the final answer)
+                // go back one per item with its own phase while their texts
+                // still make up the history's text. Otherwise the text goes
+                // as one message, with a phase only if there was one item.
+                let texts: Vec<&str> = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        TurnItem::Message { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let split = texts.len() > 1 && texts.join(MESSAGE_SEPARATOR) == text;
+                let one_message = texts.len() == 1;
 
                 // Replay the turn in the order the model produced it: each
                 // reasoning item must be followed by the item it led to.
                 let mut turn = Vec::new();
-                let mut text_sent = text.is_empty();
+                let mut text_sent = text.is_empty() || split;
                 let mut calls_sent = vec![false; calls.len()];
-                for item in stored.map(|t| t.items.as_slice()).unwrap_or_default() {
+                for item in items {
                     match item {
                         TurnItem::Reasoning(r) => turn.push(r.clone()),
-                        TurnItem::Message { phase } if !text_sent => {
-                            turn.push(message(phase.as_deref()));
+                        TurnItem::Message { phase, text } if split => {
+                            if !text.is_empty() {
+                                turn.push(message(text, phase.as_deref()));
+                            }
+                        }
+                        TurnItem::Message { phase, .. } if !text_sent => {
+                            let phase = phase.as_deref().filter(|_| one_message);
+                            turn.push(message(&text, phase));
                             text_sent = true;
                         }
                         TurnItem::Message { .. } => {}
@@ -283,7 +344,7 @@ pub(super) fn translate_input(
                     }
                 }
                 if !text_sent {
-                    turn.push(message(None));
+                    turn.push(message(&text, None));
                 }
                 for (c, sent) in calls.iter().zip(calls_sent) {
                     if !sent {
@@ -380,6 +441,10 @@ pub(super) async fn parse_responses_stream(
     let mut stream = crate::api::idle_bounded(resp.bytes_stream()).eventsource();
     let mut result = StreamedResponse::default();
     let mut text_buf = String::new();
+    // output_index → that message item's text; a new item starts a new
+    // paragraph in `text_buf`.
+    let mut texts: BTreeMap<u64, String> = BTreeMap::new();
+    let mut text_item: Option<u64> = None;
     let mut thinking_buf = String::new();
     // (output_index, summary or content index) of the last reasoning delta:
     // a new summary part starts a new paragraph.
@@ -407,8 +472,14 @@ pub(super) async fn parse_responses_stream(
             "response.output_text.delta" | "response.refusal.delta" => {
                 refusal |= v["type"] == "response.refusal.delta";
                 if !delta.is_empty() {
+                    if !text_buf.is_empty() && text_item != Some(idx) {
+                        on_text(MESSAGE_SEPARATOR);
+                        text_buf.push_str(MESSAGE_SEPARATOR);
+                    }
+                    text_item = Some(idx);
                     on_text(delta);
                     text_buf.push_str(delta);
+                    texts.entry(idx).or_default().push_str(delta);
                 }
             }
             // Summaries (OpenAI) and raw reasoning text (gpt-oss servers).
@@ -461,7 +532,8 @@ pub(super) async fn parse_responses_stream(
                     }
                     Some("message") if done => {
                         let phase = item["phase"].as_str().map(str::to_string);
-                        items.insert(idx, TurnItem::Message { phase });
+                        let text = texts.get(&idx).cloned().unwrap_or_default();
+                        items.insert(idx, TurnItem::Message { phase, text });
                     }
                     _ => {}
                 }
@@ -606,17 +678,23 @@ impl OpenAiCompatClient {
             request.thinking,
             Some(ThinkingConfig::Adaptive { summarized: true })
         );
-        let reasoning = (reasoning_model && (effort.is_some() || summary)).then(|| {
-            let mut r = serde_json::json!({});
-            if let Some(effort) = effort {
-                r["effort"] = effort.into();
-            }
-            if summary {
-                r["summary"] = "auto".into();
-            }
-            r
-        });
-        let body = ResponsesRequest {
+        // Reasoning summaries need a verified organization; see
+        // `summary_refused`.
+        let summary = summary && !self.no_summary.load(Ordering::Relaxed);
+        let reasoning_param = |summary: bool| {
+            (reasoning_model && (effort.is_some() || summary)).then(|| {
+                let mut r = serde_json::json!({});
+                if let Some(effort) = effort {
+                    r["effort"] = effort.into();
+                }
+                if summary {
+                    r["summary"] = "auto".into();
+                }
+                r
+            })
+        };
+        let reasoning = reasoning_param(summary);
+        let mut body = ResponsesRequest {
             model: model.clone(),
             instructions,
             input,
@@ -638,34 +716,60 @@ impl OpenAiCompatClient {
             reasoning,
         };
 
-        let resp = super::super::retry::send_with_retry(
-            || self.post(&url, &body),
-            self.retry_notifier.as_ref(),
-            false,
-            &format!("{} request failed", self.provider_name),
-        )
-        .await?;
-        let status = resp.status();
-        if !status.is_success() {
+        let mut resp = self.send_responses(&url, &body).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("{} error {status}: {text}", self.provider_name));
+            if !(summary && summary_refused(status, &text)) {
+                return Err(anyhow!("{} error {status}: {text}", self.provider_name));
+            }
+            // Leave summaries off for the rest of the session rather than
+            // fail every turn over a display setting.
+            self.no_summary.store(true, Ordering::Relaxed);
+            debug!("Reasoning summaries refused, sending without: {text}");
+            body.reasoning = reasoning_param(false);
+            resp = self.send_responses(&url, &body).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("{} error {status}: {text}", self.provider_name));
+            }
         }
 
         let (result, items) = parse_responses_stream(resp, on_text).await?;
-        let worth_keeping = items.iter().any(|i| {
-            matches!(
-                i,
-                TurnItem::Reasoning(_) | TurnItem::Message { phase: Some(_) }
-            )
-        });
-        if worth_keeping && let Some(key) = turn_key(&result.content) {
-            remember_turn(
+        if let Some(key) = turn_key(&result.content) {
+            record_turn(
                 &mut store.lock().unwrap_or_else(|e| e.into_inner()),
-                StoredTurn { key, model, items },
+                key,
+                model,
+                items,
             );
         }
         Ok(result)
     }
+}
+
+impl OpenAiCompatClient {
+    async fn send_responses(
+        &self,
+        url: &str,
+        body: &ResponsesRequest,
+    ) -> Result<reqwest::Response> {
+        super::super::retry::send_with_retry(
+            || self.post(url, body),
+            self.retry_notifier.as_ref(),
+            false,
+            &format!("{} request failed", self.provider_name),
+        )
+        .await
+    }
+}
+
+/// A 400 over `reasoning.summary`: OpenAI generates reasoning summaries only
+/// for organizations that have verified their identity, and says so in the
+/// error ("must be verified to generate reasoning summaries").
+fn summary_refused(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST && body.to_ascii_lowercase().contains("summar")
 }
 
 #[cfg(test)]
@@ -692,46 +796,65 @@ mod tests {
     /// Answers one request with `body` as an event stream; the handle yields
     /// the request line and the JSON body the client sent.
     async fn serve(body: String) -> (String, tokio::task::JoinHandle<(String, serde_json::Value)>) {
+        let (url, all) = serve_seq(vec![("200 OK", "text/event-stream", body)]).await;
+        (
+            url,
+            tokio::spawn(async move { all.await.unwrap().remove(0) }),
+        )
+    }
+
+    /// Answers one request per `(status, content type, body)`, in order, each
+    /// on its own connection; the handle yields every request line and body.
+    async fn serve_seq(
+        replies: Vec<(&'static str, &'static str, String)>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<(String, serde_json::Value)>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            let body_start = loop {
-                let n = sock.read(&mut chunk).await.unwrap();
-                assert!(n > 0, "connection closed before the body");
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break i + 4;
+            let mut seen = Vec::new();
+            for (status, content_type, body) in replies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let body_start = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "connection closed before the body");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                let len: usize = head
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                while buf.len() < body_start + len {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "connection closed mid-body");
+                    buf.extend_from_slice(&chunk[..n]);
                 }
-            };
-            let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
-            let len: usize = head
-                .to_ascii_lowercase()
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("content-length:")
-                        .map(|v| v.trim().to_string())
-                })
-                .unwrap()
-                .parse()
-                .unwrap();
-            while buf.len() < body_start + len {
-                let n = sock.read(&mut chunk).await.unwrap();
-                assert!(n > 0, "connection closed mid-body");
-                buf.extend_from_slice(&chunk[..n]);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                let json = serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();
+                seen.push((request_line, json));
             }
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-            let request_line = head.lines().next().unwrap_or_default().to_string();
-            let json = serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();
-            (request_line, json)
+            seen
         });
         (format!("http://{addr}"), handle)
     }
@@ -989,6 +1112,7 @@ mod tests {
                 TurnItem::Reasoning(reasoning_item()),
                 TurnItem::Message {
                     phase: Some("final_answer".into()),
+                    text: "done".into(),
                 },
             ],
         }]);
@@ -1059,6 +1183,22 @@ mod tests {
         // 2K in at $2.50 + 8K cached at $1.25 + 300 out at $10, per MTok.
         assert!(
             (t.total_cost_usd - 0.018).abs() < 1e-12,
+            "{}",
+            t.total_cost_usd
+        );
+
+        // GPT-5 reads cache at a tenth of its $1.25 input: 2K in at $1.25 +
+        // 8K cached at $0.125 + 300 out at $10, per MTok.
+        let mut t = crate::cost::CostTracker::new();
+        t.record_with_cache(
+            "oai:gpt-5",
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
+        assert!(
+            (t.total_cost_usd - 0.0065).abs() < 1e-12,
             "{}",
             t.total_cost_usd
         );
@@ -1280,13 +1420,18 @@ mod tests {
         // A non-official base URL keeps Chat Completions unless forced.
         assert!(!uses("openai-compat:gpt-5", OpenAiApi::Auto));
         assert!(uses("openai-compat:gpt-5", OpenAiApi::Responses));
-        // Named third-party presets never switch.
+        // So does LM Studio (a user-set LM_STUDIO_HOST), which serves
+        // /v1/responses too.
+        assert!(!uses("lmstudio:qwen", OpenAiApi::Auto));
+        assert!(uses("lmstudio:qwen", OpenAiApi::Responses));
+        assert!(!uses("lmstudio:qwen", OpenAiApi::Chat));
+        // Named cloud presets never switch.
         for model in [
             "groq:llama-3.3-70b",
             "gemini:gemini-2.5-flash",
             "deepseek:deepseek-chat",
             "openrouter:openai/gpt-5",
-            "lmstudio:qwen",
+            "mistral:mistral-large-latest",
         ] {
             assert!(!uses(model, OpenAiApi::Auto), "{model}");
             assert!(!uses(model, OpenAiApi::Responses), "{model}");
@@ -1348,7 +1493,211 @@ mod tests {
         assert_eq!(reasoning_effort("gpt-5.1-codex-max", "max"), Some("xhigh"));
         assert_eq!(reasoning_effort("gpt-6-sol", "xhigh"), Some("xhigh"));
         assert_eq!(reasoning_effort("gpt-5", "ultra"), None);
+        // gpt-5-pro takes `high` only; the -pro models never go below it.
+        assert_eq!(reasoning_effort("gpt-5-pro", "low"), Some("high"));
+        assert_eq!(reasoning_effort("gpt-5-pro", "medium"), Some("high"));
+        assert_eq!(reasoning_effort("gpt-5-pro", "max"), Some("high"));
+        assert_eq!(reasoning_effort("gpt-5.5-pro", "medium"), Some("high"));
+        assert_eq!(reasoning_effort("gpt-5.5-pro", "xhigh"), Some("xhigh"));
+        assert_eq!(reasoning_effort("o3-pro", "low"), Some("low"));
+        assert_eq!(reasoning_effort("gpt-5-mini", "low"), Some("low"));
         assert_eq!(gpt_version("gpt-5-mini"), Some((5, 0)));
         assert_eq!(gpt_version("gpt-5.2-codex"), Some((5, 2)));
+    }
+    fn assistant(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// Two replies with the same text share a key. The stored turn's
+    /// reasoning goes back once, with the newest of them: the same item id
+    /// twice in `input` is a 400 on every later request.
+    #[test]
+    fn identical_replies_replay_their_reasoning_once() {
+        let key = turn_key(&assistant("Done.").content).unwrap();
+        let store = TurnStore::from([StoredTurn {
+            key: key.clone(),
+            model: "gpt-5".into(),
+            items: vec![
+                TurnItem::Reasoning(reasoning_item()),
+                TurnItem::Message {
+                    phase: Some("final_answer".into()),
+                    text: "Done.".into(),
+                },
+            ],
+        }]);
+        let msgs = [
+            user("a"),
+            assistant("Done."),
+            user("b"),
+            assistant("Done."),
+            user("c"),
+        ];
+        let input = translate_input(&msgs, "gpt-5", &store);
+        let reasoning: Vec<usize> = input
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i["type"] == "reasoning")
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(reasoning, [3], "{input:#?}");
+        assert_eq!(input[4]["phase"], "final_answer");
+        assert!(input[1].get("phase").is_none(), "{input:#?}");
+
+        // A newer "Done." with nothing to replay forgets the older turn, so
+        // its reasoning is not sent with a reply it did not lead to.
+        let mut store = store;
+        record_turn(
+            &mut store,
+            key,
+            "gpt-5".into(),
+            vec![TurnItem::Message {
+                phase: None,
+                text: "Done.".into(),
+            }],
+        );
+        assert!(store.is_empty());
+    }
+
+    /// Commentary, reasoning, then the final answer: the transcript and
+    /// history keep the two messages apart, and the replay sends each with
+    /// its own phase, in the order the model produced them.
+    #[tokio::test]
+    async fn message_items_stay_separate_with_their_own_phase() {
+        let msg = |idx: u64, id: &str, text: &str, phase: &str| {
+            [
+                json!({"type": "response.output_item.added", "output_index": idx,
+                       "item": {"id": id, "type": "message", "status": "in_progress",
+                                "role": "assistant", "content": [], "phase": phase}}),
+                json!({"type": "response.output_text.delta", "item_id": id, "output_index": idx,
+                       "content_index": 0, "delta": text, "logprobs": []}),
+                json!({"type": "response.output_item.done", "output_index": idx,
+                       "item": {"id": id, "type": "message", "status": "completed", "role": "assistant",
+                                "phase": phase,
+                                "content": [{"type": "output_text", "text": text, "annotations": []}]}}),
+            ]
+        };
+        let mut events = Vec::new();
+        events.extend(msg(0, "msg_1", "I'll check.", "commentary"));
+        events.push(
+            json!({"type": "response.output_item.done", "output_index": 1,
+                           "item": reasoning_item()}),
+        );
+        events.extend(msg(2, "msg_2", "All good.", "final_answer"));
+        events.push(completed(usage(100, 0, 20, 8)));
+
+        let (url, _req) = serve(sse(&events)).await;
+        let mut c = responses_client(url);
+        let mut shown = String::new();
+        let first = c
+            .clone()
+            .messages_stream(request("oai:gpt-5.2-codex"), |t| shown.push_str(t))
+            .await
+            .unwrap();
+        assert_eq!(shown, "I'll check.\n\nAll good.");
+        assert_eq!(
+            first.content,
+            vec![ContentBlock::Text {
+                text: "I'll check.\n\nAll good.".into()
+            }]
+        );
+
+        let (url, req) = serve(text_turn()).await;
+        c.base_url = url;
+        let mut next = request("oai:gpt-5.2-codex");
+        next.messages.push(Message {
+            role: Role::Assistant,
+            content: first.content,
+        });
+        next.messages.push(user("thanks"));
+        c.messages_stream(next, |_| {}).await.unwrap();
+        let (_, body) = req.await.unwrap();
+        assert_eq!(
+            body["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "message", "role": "assistant", "content": "I'll check.", "phase": "commentary"},
+                reasoning_item(),
+                {"type": "message", "role": "assistant", "content": "All good.", "phase": "final_answer"},
+                {"type": "message", "role": "user", "content": "thanks"},
+            ]),
+            "{body}"
+        );
+    }
+
+    /// OpenAI refuses reasoning summaries to organizations that are not
+    /// verified. The request goes again without them, later requests leave
+    /// them out, and the user is told once.
+    #[tokio::test]
+    async fn refused_summaries_are_dropped_for_the_session() {
+        let refusal = json!({"error": {
+            "message": "Your organization must be verified to generate reasoning summaries. \
+                        Please go to: https://platform.openai.com/settings/organization/general \
+                        and click on Verify Organization.",
+            "type": "invalid_request_error", "param": "reasoning.summary", "code": "unsupported_value"}})
+        .to_string();
+        let (url, reqs) = serve_seq(vec![
+            ("400 Bad Request", "application/json", refusal),
+            ("200 OK", "text/event-stream", text_turn()),
+            ("200 OK", "text/event-stream", text_turn()),
+        ])
+        .await;
+        let c = responses_client(url);
+        let summarized = || {
+            let mut r = request("oai:gpt-5");
+            r.output_config = Some(OutputConfig {
+                effort: "low".into(),
+            });
+            r.thinking = Some(ThinkingConfig::Adaptive { summarized: true });
+            r
+        };
+        let backend = crate::api::ApiBackend::OpenAiCompat(c.clone());
+        let r = backend.messages_stream(summarized(), |_| {}).await.unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+        assert!(backend.take_summary_notice());
+        assert!(!backend.take_summary_notice(), "told once");
+        c.clone()
+            .messages_stream(summarized(), |_| {})
+            .await
+            .unwrap();
+
+        let bodies: Vec<_> = reqs.await.unwrap().into_iter().map(|(_, b)| b).collect();
+        assert_eq!(
+            bodies[0]["reasoning"],
+            json!({"effort": "low", "summary": "auto"})
+        );
+        assert_eq!(bodies[1]["reasoning"], json!({"effort": "low"}));
+        assert_eq!(bodies[2]["reasoning"], json!({"effort": "low"}));
+    }
+
+    /// Any other 400 is the user's error to see, not a reason to retry.
+    #[tokio::test]
+    async fn other_bad_requests_are_not_retried_without_summaries() {
+        let (url, reqs) = serve_seq(vec![(
+            "400 Bad Request",
+            "application/json",
+            json!({"error": {"message": "Invalid value for 'reasoning.effort'", "code": "invalid_value"}})
+                .to_string(),
+        )])
+        .await;
+        let c = responses_client(url);
+        let mut r = request("oai:gpt-5");
+        r.output_config = Some(OutputConfig {
+            effort: "low".into(),
+        });
+        r.thinking = Some(ThinkingConfig::Adaptive { summarized: true });
+        let err = c.messages_stream(r, |_| {}).await.unwrap_err().to_string();
+        assert!(err.contains("Invalid value"), "{err}");
+        assert!(!c.take_summary_notice());
+        assert_eq!(reqs.await.unwrap().len(), 1);
     }
 }

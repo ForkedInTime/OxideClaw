@@ -133,7 +133,7 @@ pub struct Settings {
 
     /// `"auto"` (default: the Responses API for `oai:`, Chat Completions
     /// for every other provider), `"chat"` (Chat Completions for `oai:`
-    /// too) or `"responses"` (also for the `openai-compat:` endpoint).
+    /// too) or `"responses"` (also for `openai-compat:` and `lmstudio:`).
     pub openai_api: Option<String>,
 
     /// Extended thinking budget in tokens (enables interleaved thinking).

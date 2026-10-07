@@ -937,6 +937,15 @@ impl ApiBackend {
             Self::Anthropic(_) => false,
         }
     }
+
+    /// Returns true the first time called after OpenAI refused reasoning
+    /// summaries (an unverified organization) and they were turned off.
+    pub fn take_summary_notice(&self) -> bool {
+        match self {
+            Self::OpenAiCompat(c) => c.take_summary_notice(),
+            Self::Ollama(_) | Self::Anthropic(_) => false,
+        }
+    }
 }
 
 /// The JSON body for `request`. With `cache_history` the last block of the
