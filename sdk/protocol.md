@@ -450,6 +450,7 @@ Error codes:
 | `session_create_failed` | The session could not be created (for example, no credential). |
 | `session_list_failed` | Saved sessions could not be listed. |
 | `rag_search_failed` | The codebase index search failed. |
+| `goal_required` | `browse/start` had an empty or blank `goal`. |
 | `yolo_ack_required` | `browse/start` used `policy: "yolo"` without `yolo_ack: true`. |
 
 A line that is not a valid request still gets an `error` reply: `parse_error` when it is not JSON, `invalid_request` when it is JSON but not a known request (unknown `type`, a missing required field, or a non-string `id`). The reply echoes the line's `id` when it has one (a numeric `id` comes back as a string) and is `""` otherwise.
