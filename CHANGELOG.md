@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stay drafts until the Linux x86_64 binaries (gnu and musl) have started on
   Debian 10 and Rocky Linux 8 (glibc 2.28), Ubuntu 22.04, Debian 12, Rocky
   Linux 9 and Alpine.
+- **Gemini provider.** `/model gemini:<model>` (e.g. `gemini:gemini-2.5-flash`)
+  talks to Google's OpenAI-compatible endpoint with `GEMINI_API_KEY`, falling
+  back to `GOOGLE_API_KEY`; both load from your own `.env` and, like every
+  provider key, are refused from an untrusted project `.env`. Gemini 3
+  thought signatures are kept and sent back with tool-call follow-ups, which
+  Google otherwise rejects. Gemini models get their 1M context window (Gemma
+  on the same endpoint keeps its smaller one), Google's "input token count
+  exceeds the maximum" error triggers compaction, and `/cost` and `/budget`
+  use rough Gemini rates instead of the unknown-model Sonnet rate.
+- **GEMINI.md.** A project set up for Gemini CLI keeps its instructions:
+  `GEMINI.md` is found by the same rules as `CLAUDE.md` and `AGENTS.md`
+  (config dir, then root or home down to the working directory, symlinks
+  inside the project refused), goes into the system prompt last as the
+  lowest-priority source, is refreshed by `/reload` and skipped by `--bare`.
 
 ### Changed
 

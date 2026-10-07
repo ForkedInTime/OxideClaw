@@ -230,7 +230,7 @@ struct Cli {
     #[arg(long)]
     include_hook_events: bool,
 
-    /// Minimal mode: skip hooks, CLAUDE.md/AGENTS.md discovery, and LSP
+    /// Minimal mode: skip hooks, CLAUDE.md/AGENTS.md/GEMINI.md discovery, and LSP
     #[arg(long)]
     bare: bool,
 
