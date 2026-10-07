@@ -18,10 +18,12 @@
 //!   opt-in is a plain setting (`allowPrivateNetworkFetch`), and the
 //!   user-driven CDP browser gets it by default.
 //!
-//! The check happens on the **resolved addresses**, not the hostname, and
-//! `fetch` pins the connection to exactly those addresses so a DNS answer
-//! cannot change between the check and the connect. Redirects are followed
-//! by hand so every hop goes through the same check.
+//! The check happens on the **resolved addresses**, not the hostname, and a
+//! direct connection is pinned to exactly those addresses so a DNS answer
+//! cannot change between the check and the connect. Public destinations go
+//! through the proxy `HTTP(S)_PROXY` names, if any, which resolves the host
+//! itself; private ones never do. Redirects are followed by hand so every
+//! hop goes through the same check.
 
 use anyhow::{Result, anyhow, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -172,21 +174,49 @@ pub async fn fetch(
     max_bytes: usize,
     timeout: std::time::Duration,
 ) -> Result<Fetched> {
+    fetch_with_env(url, policy, max_bytes, timeout, |k| {
+        std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+    })
+    .await
+}
+
+/// `fetch` with the proxy variables read through `env`.
+async fn fetch_with_env(
+    url: &str,
+    policy: &NetPolicy,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Fetched> {
     let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL {url:?}: {e}"))?;
     for _ in 0..=MAX_REDIRECTS {
-        let addrs = policy.resolve(&current).await?;
         let host = current
             .host_str()
             .ok_or_else(|| anyhow!("URL has no host: {current}"))?
             .to_string();
-        // Pin the connection to the addresses that passed the check.
-        // Redirects are disabled so each hop comes back through `resolve`.
-        let client = reqwest::Client::builder()
+        // Per scheme, as reqwest's own system-proxy lookup does.
+        let vars: &[&str] = if current.scheme() == "https" {
+            &["HTTPS_PROXY", "ALL_PROXY"]
+        } else {
+            &["HTTP_PROXY", "ALL_PROXY"]
+        };
+        let chain = EnvProxy::from_vars(&env, vars)
+            .filter(|p| !no_proxy_covers(&p.no_proxy, &host))
+            .map(|p| p.url);
+        // `no_proxy` drops reqwest's implicit HTTP(S)_PROXY, which would
+        // send even a pinned, policy-checked host to a proxy that resolves
+        // it again, and could not resolve a name only that proxy knows.
+        // Redirects are disabled so each hop comes back through `route`.
+        let builder = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&host, &addrs)
             .timeout(timeout)
-            .user_agent(USER_AGENT)
-            .build()?;
+            .user_agent(USER_AGENT);
+        let client = match route(policy, &current, chain).await? {
+            Route::Direct(addrs) => builder.resolve_to_addrs(&host, &addrs),
+            Route::Upstream(proxy) => builder.proxy(reqwest::Proxy::all(proxy.as_str())?),
+        }
+        .build()?;
         let resp = client.get(current.clone()).send().await?;
         let status = resp.status();
 
@@ -290,48 +320,29 @@ pub struct Upstream {
     no_proxy: Vec<String>,
 }
 
-impl Upstream {
-    /// The proxy `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (either case,
-    /// in that order) names, with `NO_PROXY`. Only `http://` proxies (or a
-    /// bare `host:port`) can be chained; anything else is ignored.
-    pub fn from_env() -> Option<Self> {
-        Self::from_vars(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
-    }
+/// The proxy the environment names and its `NO_PROXY` list.
+struct EnvProxy {
+    /// The proxy URL, `http://` added to a bare `host:port`.
+    url: Url,
+    /// `NO_PROXY` entries, lower-case, without a leading `.` or `*.`.
+    no_proxy: Vec<String>,
+}
 
-    fn from_vars(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+impl EnvProxy {
+    /// The first of `vars` (either case) that is set, with `NO_PROXY`.
+    fn from_vars(get: impl Fn(&str) -> Option<String>, vars: &[&str]) -> Option<Self> {
         let either = |k: &str| get(k).or_else(|| get(&k.to_ascii_lowercase()));
-        let raw = either("HTTPS_PROXY")
-            .or_else(|| either("HTTP_PROXY"))
-            .or_else(|| either("ALL_PROXY"))?;
+        let raw = vars.iter().find_map(|k| either(k))?;
         let raw = raw.trim();
         let with_scheme = if raw.contains("://") {
             raw.to_string()
         } else {
             format!("http://{raw}")
         };
-        let url = match Url::parse(&with_scheme) {
-            Ok(u) if u.scheme() == "http" => u,
-            _ => {
-                tracing::warn!(
-                    "browser: proxy {raw:?} is not an http:// proxy; launched Chrome connects directly"
-                );
-                return None;
-            }
+        let Ok(url) = Url::parse(&with_scheme) else {
+            tracing::warn!("proxy {raw:?} is not a valid URL; connecting directly");
+            return None;
         };
-        let host = url.host_str()?.to_string();
-        let port = url.port_or_known_default()?;
-        let auth = (!url.username().is_empty()).then(|| {
-            use base64::Engine as _;
-            let creds = format!(
-                "{}:{}",
-                percent_decode(url.username()),
-                percent_decode(url.password().unwrap_or(""))
-            );
-            format!(
-                "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(creds)
-            )
-        });
         let no_proxy = either("NO_PROXY")
             .unwrap_or_default()
             .split(',')
@@ -346,6 +357,56 @@ impl Upstream {
             })
             .filter(|e| !e.is_empty())
             .collect();
+        Some(Self { url, no_proxy })
+    }
+}
+
+/// `no_proxy` covers `host` (itself or a parent domain, or `*`).
+fn no_proxy_covers(no_proxy: &[String], host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    no_proxy.iter().any(|e| {
+        e == "*"
+            || host == *e
+            || host
+                .strip_suffix(e.as_str())
+                .is_some_and(|r| r.ends_with('.'))
+    })
+}
+
+impl Upstream {
+    /// The proxy `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (either case,
+    /// in that order) names, with `NO_PROXY`. Only `http://` proxies (or a
+    /// bare `host:port`) can be chained; anything else is ignored.
+    pub fn from_env() -> Option<Self> {
+        Self::from_vars(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+    }
+
+    fn from_vars(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let EnvProxy { url, no_proxy } =
+            EnvProxy::from_vars(get, &["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"])?;
+        if url.scheme() != "http" {
+            tracing::warn!(
+                "browser: proxy {url} is not an http:// proxy; launched Chrome connects directly"
+            );
+            return None;
+        }
+        let host = url.host_str()?.to_string();
+        let port = url.port_or_known_default()?;
+        let auth = (!url.username().is_empty()).then(|| {
+            use base64::Engine as _;
+            let creds = format!(
+                "{}:{}",
+                percent_decode(url.username()),
+                percent_decode(url.password().unwrap_or(""))
+            );
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(creds)
+            )
+        });
         Some(Self {
             host,
             port,
@@ -356,17 +417,7 @@ impl Upstream {
 
     /// `NO_PROXY` covers `host` (itself or a parent domain, or `*`).
     fn bypasses(&self, host: &str) -> bool {
-        let host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_ascii_lowercase();
-        self.no_proxy.iter().any(|e| {
-            e == "*"
-                || host == *e
-                || host
-                    .strip_suffix(e.as_str())
-                    .is_some_and(|r| r.ends_with('.'))
-        })
+        no_proxy_covers(&self.no_proxy, host)
     }
 }
 
@@ -391,12 +442,47 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Where one proxied connection goes after the policy check.
-enum Route {
+/// Where one connection goes after the policy check.
+enum Route<P> {
     /// Straight to these checked addresses.
     Direct(Vec<SocketAddr>),
     /// Through the environment's proxy, which resolves the host itself.
-    Upstream(Upstream),
+    Upstream(P),
+}
+
+/// Route a connection to `url` under `policy`, given the proxy (NO_PROXY
+/// already applied) the environment names for it. The policy check always
+/// runs first. Public destinations then go through the proxy; loopback/LAN
+/// targets (allowed by the policy) connect directly. A name that does not
+/// resolve here may still resolve at the proxy (a network whose only way
+/// out is that proxy): the hostname checks applied, but the address pin
+/// cannot, since the proxy does its own DNS.
+async fn route<P>(policy: &NetPolicy, url: &Url, chain: Option<P>) -> Result<Route<P>> {
+    match policy.resolve(url).await {
+        Ok(addrs) => Ok(match chain {
+            Some(up)
+                if addrs
+                    .iter()
+                    .all(|a| NetPolicy::STRICT.check_ip(a.ip()).is_ok()) =>
+            {
+                Route::Upstream(up)
+            }
+            _ => Route::Direct(addrs),
+        }),
+        Err(e) => {
+            let unresolvable = matches!(url.scheme(), "http" | "https")
+                && match (url.host(), url.port_or_known_default()) {
+                    (Some(Host::Domain(d)), Some(port)) => {
+                        tokio::net::lookup_host((d, port)).await.is_err()
+                    }
+                    _ => false,
+                };
+            match chain {
+                Some(up) if unresolvable => Ok(Route::Upstream(up)),
+                _ => Err(e),
+            }
+        }
+    }
 }
 
 async fn spawn_policy_proxy_with(
@@ -475,41 +561,18 @@ async fn proxy_one(
     };
     let host = url.host_str().unwrap_or("").to_string();
     let port = url.port_or_known_default().unwrap_or(80);
+    // NO_PROXY hosts connect directly, after the same check.
     let chain = upstream.filter(|u| !u.bypasses(&host));
-    // The policy check always runs first. Public destinations then go
-    // through the environment's proxy; loopback/LAN targets (allowed by the
-    // policy) and NO_PROXY hosts connect directly. A name that does not
-    // resolve here may still resolve at the upstream proxy (a network whose
-    // only way out is that proxy): the hostname checks applied, but the
-    // address pin cannot, since the upstream proxy does its own DNS.
-    let route = match policy.resolve(&url).await {
-        Ok(addrs) => match chain {
-            Some(up)
-                if addrs
-                    .iter()
-                    .all(|a| NetPolicy::STRICT.check_ip(a.ip()).is_ok()) =>
-            {
-                Route::Upstream(up)
-            }
-            _ => Route::Direct(addrs),
-        },
+    let route = match route(&policy, &url, chain).await {
+        Ok(r) => r,
         Err(e) => {
-            let unresolvable = match url.host() {
-                Some(Host::Domain(d)) => tokio::net::lookup_host((d, port)).await.is_err(),
-                _ => false,
-            };
-            match chain {
-                Some(up) if unresolvable => Route::Upstream(up),
-                _ => {
-                    let _ = client
-                        .write_all(&refusal(
-                            "403 Forbidden",
-                            &format!("Blocked by OxideClaw network policy: {e}"),
-                        ))
-                        .await;
-                    return;
-                }
-            }
+            let _ = client
+                .write_all(&refusal(
+                    "403 Forbidden",
+                    &format!("Blocked by OxideClaw network policy: {e}"),
+                ))
+                .await;
+            return;
         }
     };
     let (mut upstream, via) = match route {
@@ -976,7 +1039,7 @@ mod tests {
 
     // ── upstream proxy chaining ──────────────────────────────────────────
 
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let m: std::collections::HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1091,6 +1154,86 @@ mod tests {
             seen[1].contains("Proxy-Authorization: Basic dTpw"),
             "{}",
             seen[1]
+        );
+    }
+
+    /// reqwest applied HTTP(S)_PROXY on its own, so `fetch` sent pinned
+    /// hosts to the proxy anyway, and a name only the proxy can resolve
+    /// failed the local lookup. Public and locally unresolvable hosts now go
+    /// through the proxy (with its credentials); private ones never do.
+    #[tokio::test]
+    async fn fetch_routes_public_hosts_through_the_env_proxy() {
+        let (up, seen) = fake_upstream(
+            "HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\nvia-proxy",
+        )
+        .await;
+        let proxy = format!("http://u:p@127.0.0.1:{}", up.port);
+        let env = vars(&[("HTTP_PROXY", proxy.as_str())]);
+        let t = std::time::Duration::from_secs(10);
+        for url in [
+            "http://oxideclaw-proxy-only.invalid/page",
+            "http://93.184.215.14/x",
+        ] {
+            let got = fetch_with_env(url, &NetPolicy::STRICT, 1024, t, &env)
+                .await
+                .unwrap();
+            assert_eq!(got.body, b"via-proxy", "{url}");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[0].starts_with("GET http://oxideclaw-proxy-only.invalid/page HTTP/1.1\r\n"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0]
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic dtpw"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].starts_with("GET http://93.184.215.14/x "),
+            "{}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_keeps_private_hosts_off_the_env_proxy() {
+        let (up, seen) = fake_upstream("HTTP/1.1 200 OK\r\n\r\nfrom-proxy").await;
+        let proxy = format!("127.0.0.1:{}", up.port);
+        let env = vars(&[
+            ("HTTP_PROXY", proxy.as_str()),
+            ("ALL_PROXY", proxy.as_str()),
+        ]);
+        let t = std::time::Duration::from_secs(10);
+        let (base, hits) = scripted_server(vec![ok("local")]).await;
+
+        let err = fetch_with_env(&base, &NetPolicy::STRICT, 1024, t, &env)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("private"), "{err}");
+        let err = fetch_with_env(
+            "http://169.254.169.254/",
+            &NetPolicy::LOCAL_OK,
+            1024,
+            t,
+            &env,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("metadata"), "{err}");
+
+        let got = fetch_with_env(&base, &NetPolicy::LOCAL_OK, 1024, t, &env)
+            .await
+            .unwrap();
+        assert_eq!(got.body, b"local");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the proxy"
         );
     }
 
