@@ -663,27 +663,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             .to_string(),
                     ));
                 } else {
-                    // Auto-start XTTS v2 server for fast synthesis
-                    let tx2 = tx.clone();
-                    tokio::spawn(async move {
-                        match crate::voice::ensure_xtts_server().await {
-                            Ok(_port) => {
-                                let gpu = if crate::voice::cuda_available() {
-                                    " (GPU)"
-                                } else {
-                                    " (CPU)"
-                                };
-                                let _ = tx2.send(AppEvent::SystemMessage(format!(
-                                    "XTTS v2 server ready{gpu} — responses will be spoken."
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = tx2.send(AppEvent::SystemMessage(format!(
-                                    "XTTS v2 server failed: {e}\nFalling back to CLI mode (slower)."
-                                )));
-                            }
-                        }
-                    });
+                    start_xtts_server_in_background(tx);
                     app.entries.push(ChatEntry::system(
                         "TTS on — starting XTTS v2 server (loading model, ~10s)...".to_string(),
                     ));

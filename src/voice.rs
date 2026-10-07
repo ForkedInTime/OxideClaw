@@ -1142,7 +1142,7 @@ pub fn voice_status(enabled: bool, tts_enabled: bool) -> String {
             "✓ XTTS v2 server running (CPU)"
         }
     } else if xtts_ok {
-        "✓ XTTS v2 available (server will auto-start on use)"
+        "✓ XTTS v2 available (server starts with TTS on: /voice speak on or at launch)"
     } else {
         "✗ XTTS v2 not installed"
     };

@@ -23,6 +23,32 @@ use input_helpers::*;
 use keys::*;
 use plugins::*;
 
+/// Start the XTTS v2 server off the event loop (model load takes ~10-60s)
+/// and report the outcome. Without it every reply runs the `tts` CLI, which
+/// reloads the model each time.
+fn start_xtts_server_in_background(tx: &mpsc::UnboundedSender<AppEvent>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        match crate::voice::ensure_xtts_server().await {
+            Ok(_port) => {
+                let gpu = if crate::voice::cuda_available() {
+                    " (GPU)"
+                } else {
+                    " (CPU)"
+                };
+                let _ = tx.send(AppEvent::SystemMessage(format!(
+                    "XTTS v2 server ready{gpu} — responses will be spoken."
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::SystemMessage(format!(
+                    "XTTS v2 server failed: {e}\nFalling back to CLI mode (slower)."
+                )));
+            }
+        }
+    });
+}
+
 /// First `n` characters of an id for display. Session ids are UUIDs, but a
 /// hand-edited or foreign `.meta` file can carry anything; a byte slice
 /// panics on a short or non-ASCII id and takes the picker down with it.
@@ -670,6 +696,15 @@ async fn run_loop(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut term_events = EventStream::new();
+
+    // ttsEnabled persists across launches but /quit stops the server, so a
+    // new session must start it like `/voice speak on` does.
+    if config.tts_enabled
+        && crate::voice::xtts_available()
+        && crate::voice::audio_player_available()
+    {
+        start_xtts_server_in_background(&tx);
+    }
 
     // ── Background RAG indexing (incremental, non-blocking) ────────────────
     {
