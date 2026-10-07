@@ -866,10 +866,19 @@ impl LspClient {
 
     async fn initialize(&self, command: &str, root: &Path) -> Result<()> {
         let root_uri = path_to_uri(root);
+        // In a PID-namespace sandbox (bwrap --unshare-pid, firejail) our PID
+        // is not the server's to see: vscode-languageserver servers (pyright,
+        // typescript-language-server) poll it and exit within seconds when it
+        // is missing. Null leaves parent-death cleanup to `exec` +
+        // kill_on_drop, bwrap's --die-with-parent and stdin EOF.
+        let process_id = match self.sandbox_line {
+            Some(_) => Value::Null,
+            None => json!(std::process::id()),
+        };
         self.request(
             "initialize",
             json!({
-                "processId": std::process::id(),
+                "processId": process_id,
                 "rootUri": root_uri,
                 "rootPath": root.to_string_lossy(),
                 "capabilities": {
@@ -1806,5 +1815,28 @@ while True:
         ));
         containment.sandbox_mode = Some("no-such-sandbox".into());
         assert!(Launch::contained(&exe, &[], &containment, dir.path()).is_err());
+    }
+
+    /// Inside bwrap's PID namespace our PID does not exist, and pyright and
+    /// typescript-language-server exit ~3 s after `initialize` names one.
+    #[tokio::test]
+    async fn a_sandboxed_server_is_not_given_our_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, log) = fake_server(dir.path(), "ok");
+        let line = crate::sandbox::shell_quote(&server.display().to_string());
+        let boxed = LspClient::connect("server", &[], dir.path(), &Launch::Shell(line))
+            .await
+            .unwrap();
+        boxed.initialize("server", dir.path()).await.unwrap();
+        let plain = LspClient::connect("server", &[], dir.path(), &Launch::Program(server))
+            .await
+            .unwrap();
+        plain.initialize("server", dir.path()).await.unwrap();
+        let seen = std::fs::read_to_string(&log).unwrap();
+        let ids: Vec<&str> = seen
+            .lines()
+            .filter_map(|l| l.strip_prefix("initialize processId="))
+            .collect();
+        assert_eq!(ids, ["null", &std::process::id().to_string()], "{seen}");
     }
 }
