@@ -98,7 +98,6 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "skills",
     "stats",
     "status",
-    "statusline",
     "summary",
     "tasks",
     "teleport",
@@ -516,7 +515,6 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "init-verifiers" => cmd_init_verifiers(),
         "agents" => cmd_agents(ctx),
         "stats" => cmd_stats(ctx),
-        "statusline" => cmd_statusline(args),
 
         // ── New features (voice, sandbox, thinkback, teleport, share, etc.) ─────
         "voice" => cmd_voice(args, ctx),
@@ -656,6 +654,53 @@ mod completion_list_tests {
             assert!(
                 SLASH_COMMANDS.contains(&name),
                 "/{name} is in /help but not tab-completable"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod removed_command_tests {
+    use super::*;
+
+    /// `/statusline` had an agent write a `statusLine` setting that OxideClaw
+    /// never reads, so it is gone: not listed, not completed, not dispatched.
+    #[test]
+    fn statusline_is_an_unknown_command() {
+        let listed = HELP_CATEGORIES
+            .iter()
+            .flat_map(|(_, _, cmds)| cmds.iter())
+            .any(|(cmd, _)| cmd.starts_with("/statusline"));
+        assert!(!listed, "/statusline is still in /help");
+        assert!(!SLASH_COMMANDS.contains(&"statusline"));
+
+        let config = Config::default();
+        let skills = HashMap::new();
+        let todo = TodoState::default();
+        let ctx = CommandContext {
+            config: &config,
+            tokens_in: 0,
+            context_window: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_summary: String::new(),
+            cost_recorded: false,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: &[],
+            brief_mode: false,
+            btw_note: None,
+        };
+        for input in ["/statusline", "/statusline show my git branch"] {
+            assert!(
+                matches!(dispatch(input, &ctx), CommandAction::Unknown(ref n) if n == "statusline"),
+                "{input} must fall through to the unknown-command message"
             );
         }
     }

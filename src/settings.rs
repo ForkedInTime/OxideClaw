@@ -179,7 +179,7 @@ pub struct Settings {
     /// Example: "apiKeyHelper": "aws secretsmanager get-secret-value --query SecretString --output text --secret-id my-api-key"
     pub api_key_helper: Option<String>,
 
-    /// Disable all hooks and statusLine execution globally.
+    /// Disable all hooks globally.
     #[serde(rename = "disableAllHooks")]
     pub disable_all_hooks: Option<bool>,
 
@@ -1719,6 +1719,18 @@ mod load_error_tests {
         assert_eq!(s.permissions.deny, vec!["Bash".to_string()]);
         assert_eq!(s.load_errors.len(), 1);
         assert!(s.load_errors[0].contains(".claude"), "{:?}", s.load_errors);
+    }
+
+    /// `/statusline` once wrote a `statusLine` key that nothing reads; a file
+    /// that still holds one must load cleanly, with no error notice.
+    #[test]
+    fn a_leftover_status_line_setting_is_ignored_silently() {
+        let s = load(
+            Some(r#"{"model": "opus", "statusLine": {"type": "command", "command": "ps1"}}"#),
+            None,
+        );
+        assert_eq!(s.model.as_deref(), Some("opus"));
+        assert!(s.load_errors.is_empty(), "{:?}", s.load_errors);
     }
 
     #[test]

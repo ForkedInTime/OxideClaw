@@ -175,7 +175,7 @@ pub(super) fn cmd_agents(ctx: &CommandContext) -> CommandAction {
     lines.push(
         "Note: OxideClaw lists these files but does not load them yet. The Agent tool \
          supports only its built-in types: general-purpose, Explore, Plan, verification, \
-         oxideclaw-guide, statusline-setup."
+         oxideclaw-guide."
             .into(),
     );
 

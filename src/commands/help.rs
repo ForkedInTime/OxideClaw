@@ -343,7 +343,6 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/release-notes", "open upstream release notes"),
             ("/keybindings", "show keyboard shortcuts"),
             ("/ide", "show IDE integration info"),
-            ("/statusline", "configure the status line from your PS1"),
             ("/notifications", "notify on task completion (on, off)"),
             ("/banner", "set a custom banner label"),
             ("/color", "show terminal color settings"),
@@ -426,17 +425,6 @@ pub(super) fn cmd_theme(args: &str, ctx: &CommandContext) -> CommandAction {
         ));
     }
     CommandAction::SetTheme(theme)
-}
-
-pub(super) fn cmd_statusline(args: &str) -> CommandAction {
-    let prompt = if args.trim().is_empty() {
-        "Configure my statusLine from my shell PS1 configuration".to_string()
-    } else {
-        args.trim().to_string()
-    };
-    CommandAction::SendPrompt(format!(
-        "Create an Agent with subagent_type \"statusline-setup\" and the prompt \"{prompt}\""
-    ))
 }
 
 // ── Voice ──────────────────────────────────────────────────────────────────────
@@ -611,7 +599,6 @@ mod help_listing_tests {
             "/teleport",
             "/thinkback",
             "/ultraplan",
-            "/statusline",
             "/notifications",
             "/init-verifiers",
             "/install-missing",

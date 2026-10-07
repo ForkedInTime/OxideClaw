@@ -84,7 +84,7 @@ struct AgentInput {
     description: Option<String>,
     /// Specialized agent type — selects system prompt and tool restrictions.
     /// One of: "Explore", "Plan", "general-purpose", "verification",
-    ///         "oxideclaw-guide", "statusline-setup"
+    ///         "oxideclaw-guide"
     #[serde(default)]
     subagent_type: Option<String>,
 }
@@ -102,8 +102,7 @@ impl Tool for AgentTool {
         - Explore: Fast agent specialized for exploring codebases. Read-only: no file modifications.\n\
         - Plan: Software architect agent for designing implementation plans. Read-only.\n\
         - verification: Verification specialist — tries to break implementations.\n\
-        - oxideclaw-guide: Answers questions about OxideClaw, Agent SDK, and Claude API.\n\
-        - statusline-setup: Configures the user's OxideClaw status line setting.\n\n\
+        - oxideclaw-guide: Answers questions about OxideClaw, Agent SDK, and Claude API.\n\n\
         When the agent is done, it will return a single message back to you."
     }
 
@@ -121,8 +120,8 @@ impl Tool for AgentTool {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "Specialized agent type. One of: general-purpose, Explore, Plan, verification, oxideclaw-guide, statusline-setup",
-                    "enum": ["general-purpose", "Explore", "Plan", "verification", "oxideclaw-guide", "statusline-setup"]
+                    "description": "Specialized agent type. One of: general-purpose, Explore, Plan, verification, oxideclaw-guide",
+                    "enum": ["general-purpose", "Explore", "Plan", "verification", "oxideclaw-guide"]
                 }
             },
             "required": ["prompt"]
@@ -200,10 +199,6 @@ impl Tool for AgentTool {
                         "WebFetch".to_string(),
                         "WebSearch".to_string(),
                     ]),
-                ),
-                Some("statusline-setup") => (
-                    Some(STATUSLINE_SETUP_SYSTEM_PROMPT.to_string()),
-                    Some(vec!["Read".to_string(), "Edit".to_string()]),
                 ),
                 _ => (None, None), // general-purpose: inherit parent config
             };
@@ -354,20 +349,6 @@ and use OxideClaw, the Claude Agent SDK, and the Claude API effectively.
 - Provide specific, actionable answers with examples where helpful.
 - Keep answers concise and focused on what the user needs.";
 
-const STATUSLINE_SETUP_SYSTEM_PROMPT: &str = "\
-You are a status line setup agent for OxideClaw. Your job is to create or update the \
-statusLine command in the user's OxideClaw settings.
-
-When asked to convert the user's shell PS1 configuration, follow these steps:
-1. Read the user's shell configuration files (~/.zshrc, ~/.bashrc, ~/.bash_profile, ~/.profile)
-2. Extract the PS1 value
-3. Convert PS1 escape sequences to shell commands:
-   - \\u → $(whoami), \\h → $(hostname -s), \\w → $(pwd), \\W → $(basename \"$(pwd)\")
-   - \\$ → $, \\n → newline, \\t → $(date +%H:%M:%S)
-4. Write the converted statusLine command to the user's settings.json
-
-Only use Read and Edit tools. Do not create new files unless asked.";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +372,33 @@ mod tests {
                 text.as_str()
             })
             .collect()
+    }
+
+    /// `statusline-setup` wrote a `statusLine` setting that nothing reads, so
+    /// the Agent tool no longer offers it to the model.
+    #[test]
+    fn statusline_setup_is_not_an_agent_type() {
+        let tool = AgentTool { config: config() };
+        assert!(!tool.description().contains("statusline"));
+        let schema = tool.input_schema();
+        let kind = &schema["properties"]["subagent_type"];
+        let offered: Vec<&str> = kind["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                "general-purpose",
+                "Explore",
+                "Plan",
+                "verification",
+                "oxideclaw-guide"
+            ]
+        );
+        assert!(!kind["description"].as_str().unwrap().contains("statusline"));
     }
 
     #[tokio::test]
