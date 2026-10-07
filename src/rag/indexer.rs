@@ -389,6 +389,14 @@ pub struct IndexResult {
     pub elapsed_ms: u128,
 }
 
+/// Files larger than this are never read for indexing.
+const MAX_INDEX_BYTES: u64 = 100_000;
+
+/// The size gate, checked from metadata before a file is read.
+fn too_large_to_index(meta: &std::fs::Metadata) -> bool {
+    meta.len() > MAX_INDEX_BYTES
+}
+
 /// Index a project directory into the RAG database.
 /// Incremental: only re-indexes files whose mtime changed.
 /// Set `force` to true to clear and re-index everything.
@@ -468,7 +476,7 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
         // Check size before reading: oversized files never get a row, so the
         // mtime check below never skips them and every pass (one per prompt)
         // would buffer the whole file (a 200 MB .ts video, a bundled .js).
-        if meta.len() > 100_000 {
+        if too_large_to_index(&meta) {
             files_skipped += 1;
             continue;
         }
@@ -501,7 +509,7 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
         };
 
         // Skip very large files (>100KB or >5000 lines)
-        if source.len() > 100_000 || source.lines().count() > 5000 {
+        if source.len() as u64 > MAX_INDEX_BYTES || source.lines().count() > 5000 {
             files_skipped += 1;
             continue;
         }
@@ -606,6 +614,11 @@ mod tests {
         let big = std::fs::File::create(tmp.path().join("bundle.js")).unwrap();
         big.set_len(64 * 1024 * 1024).unwrap();
         drop(big);
+        // The gate is decided from metadata alone, before any read: the
+        // old code read the whole 64 MiB file and dropped it afterwards.
+        let meta = |name: &str| std::fs::metadata(tmp.path().join(name)).unwrap();
+        assert!(too_large_to_index(&meta("bundle.js")));
+        assert!(!too_large_to_index(&meta("small.rs")));
         let db = RagDb::open(tmp.path()).unwrap();
         for _ in 0..2 {
             let r = index_project(&db, tmp.path(), false).unwrap();
