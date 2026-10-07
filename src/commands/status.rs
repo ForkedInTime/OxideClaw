@@ -77,7 +77,9 @@ pub(super) fn cmd_cost(ctx: &CommandContext) -> CommandAction {
 
 pub(super) fn cmd_context(ctx: &CommandContext) -> CommandAction {
     let limit = ctx.context_window;
-    let used = ctx.tokens_in;
+    // Cached prefix tokens occupy the window too; input_tokens excludes them.
+    // Same sum as the status bar and auto-compact.
+    let used = ctx.tokens_in + ctx.cache_read_tokens + ctx.cache_write_tokens;
     let pct = (used * 100).checked_div(limit).unwrap_or(0);
     let bar_len = 30usize;
     let filled = (pct as usize * bar_len / 100).min(bar_len);
@@ -448,7 +450,9 @@ pub(super) fn cmd_env(ctx: &CommandContext) -> CommandAction {
 
 pub(super) fn cmd_ctx_viz(ctx: &CommandContext) -> CommandAction {
     let limit = ctx.context_window;
-    let used = ctx.tokens_in;
+    // Cached prefix tokens occupy the window too; input_tokens excludes them.
+    // Same sum as the status bar and auto-compact.
+    let used = ctx.tokens_in + ctx.cache_read_tokens + ctx.cache_write_tokens;
     let pct = (used * 100).checked_div(limit).unwrap_or(0);
 
     // Build a visual histogram of context usage
@@ -613,6 +617,24 @@ mod status_command_tests {
         assert!(status.contains("set (sk-\u{201c}...)"), "{status}");
         let env = with_ctx(&config, |_| {}, |c| message(cmd_env(c)));
         assert!(env.contains("ANTHROPIC_API_KEY: sk-\u{201c}..."), "{env}");
+    }
+
+    /// With prompt caching on, most of the prompt is cache tokens, which
+    /// input_tokens excludes; /context reported ~0% while the status bar
+    /// showed the window nearly full.
+    #[test]
+    fn context_views_count_cached_tokens() {
+        let config = Config::default();
+        let edit = |c: &mut CommandContext| {
+            c.tokens_in = 1_000;
+            c.cache_read_tokens = 150_000;
+            c.cache_write_tokens = 29_000;
+        };
+        let ctx_text = with_ctx(&config, edit, |c| message(cmd_context(c)));
+        assert!(ctx_text.contains("] 90%"), "{ctx_text}");
+        assert!(ctx_text.contains("Used:      180000 tokens"), "{ctx_text}");
+        let viz = with_ctx(&config, edit, |c| message(cmd_ctx_viz(c)));
+        assert!(viz.contains("180000 / 200000 tokens used"), "{viz}");
     }
 
     /// A first turn stopped by /budget or Esc, or any spend before /clear,
