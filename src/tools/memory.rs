@@ -77,10 +77,12 @@ fn open_memory(
     opts.open(path)
 }
 
+/// Lossy so one stray non-UTF-8 byte (a Latin-1 paste) does not hide the whole
+/// file from the model and prompt it to start over.
 fn read_memory(path: &Path, nofollow: bool) -> std::io::Result<String> {
-    let mut s = String::new();
-    open_memory(path, OpenOptions::new().read(true), nofollow)?.read_to_string(&mut s)?;
-    Ok(s)
+    let mut bytes = Vec::new();
+    open_memory(path, OpenOptions::new().read(true), nofollow)?.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn write_memory(path: &Path, content: &str, replace: bool, nofollow: bool) -> std::io::Result<()> {
@@ -101,17 +103,21 @@ fn write_memory(path: &Path, content: &str, replace: bool, nofollow: bool) -> st
             .truncate(false),
         nofollow,
     )?;
-    let mut existing = String::new();
-    // Non-UTF-8 content is replaced, matching the old read-or-empty behaviour.
-    let _ = f.read_to_string(&mut existing);
-    let new_content = if existing.trim().is_empty() {
-        content.to_string()
-    } else {
-        format!("{}\n\n{}", existing.trim_end(), content)
-    };
+    // Raw bytes, and a failed read aborts before the truncate below: the old
+    // read_to_string left `existing` empty on non-UTF-8 content, so an
+    // "append" wiped every earlier entry.
+    let mut existing = Vec::new();
+    f.read_to_end(&mut existing)?;
+    let existing = existing.trim_ascii_end();
+    let mut new_content = Vec::with_capacity(existing.len() + 2 + content.len());
+    if !existing.is_empty() {
+        new_content.extend_from_slice(existing);
+        new_content.extend_from_slice(b"\n\n");
+    }
+    new_content.extend_from_slice(content.as_bytes());
     f.set_len(0)?;
     f.rewind()?;
-    f.write_all(new_content.as_bytes())
+    f.write_all(&new_content)
 }
 
 // ── MemoryRead ────────────────────────────────────────────────────────────────
@@ -138,17 +144,18 @@ impl Tool for MemoryReadTool {
         let mut parts: Vec<String> = Vec::new();
 
         let global = global_memory_path();
-        if global.exists() {
-            match std::fs::read_to_string(&global) {
-                Ok(content) if !content.trim().is_empty() => {
-                    parts.push(format!(
-                        "## Global memory ({})\n\n{}",
-                        global.display(),
-                        content.trim()
-                    ));
-                }
-                _ => {}
+        match read_memory(&global, false) {
+            Ok(content) if !content.trim().is_empty() => {
+                parts.push(format!(
+                    "## Global memory ({})\n\n{}",
+                    global.display(),
+                    content.trim()
+                ));
             }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                parts.push(format!("Global memory unreadable: {e}"));
+            }
+            _ => {}
         }
 
         match project_memory_path_checked(&ctx.cwd, SensitiveOp::Read) {
@@ -345,5 +352,26 @@ mod tests {
         assert!(!write_project(cwd, "only", true).await.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "only");
         assert!(project_memory_path_checked(cwd, SensitiveOp::Read).is_ok());
+    }
+
+    #[tokio::test]
+    async fn append_keeps_non_utf8_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let path = cwd.join(".claude/memory.md");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::write(&path, b"old fact 1\ncaf\xE9\nold fact 2\n").unwrap();
+
+        assert!(!write_project(cwd, "new fact", false).await.is_error);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old fact 1\ncaf\xE9\nold fact 2\n\nnew fact"
+        );
+
+        let text = read_memory(&path, true).unwrap();
+        assert!(
+            text.contains("old fact 2") && text.contains("new fact"),
+            "{text}"
+        );
     }
 }
