@@ -1284,9 +1284,58 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let question_lines = q.question.lines().count() as u16;
+    let mut lines = vec![Line::raw("")];
+    for ql in q.question.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {ql}"),
+            Style::default().fg(Color::White),
+        )));
+    }
+    lines.push(Line::raw(""));
+    let question = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+
+    // Render the text input row with cursor
+    let before: String = q.input[..q.cursor].iter().collect();
+    let rest = &q.input[q.cursor..];
+    // A space cursor cell is whitespace to the word wrapper, which drops it
+    // where a row breaks; NBSP draws the same but wraps as text.
+    let cur_ch = match rest.first() {
+        Some(' ') | None => "\u{a0}".to_string(),
+        Some(c) => c.to_string(),
+    };
+    let after_str: String = rest.iter().skip(1).collect();
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                "  > ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(before, Style::default().fg(Color::White)),
+            Span::styled(cur_ch, Style::default().bg(Color::White).fg(Color::Black)),
+            Span::styled(after_str, Style::default().fg(Color::White)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Enter to send  ·  Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]))
+    .wrap(Wrap { trim: true });
+
+    // Sized by wrapped rows, not question lines: a long one-line question
+    // wrapped past the popup's height and pushed the answer field and hint
+    // out of it.
     let popup_w = (area.width * 7 / 10).max(50).min(area.width);
-    let popup_h = (question_lines + 7).max(8).min(area.height);
+    let inner_w = popup_w.saturating_sub(2).max(1);
+    let rows = |p: &Paragraph| u16::try_from(p.line_count(inner_w)).unwrap_or(u16::MAX);
+    let (question_h, footer_h) = (rows(&question), rows(&footer));
+    let popup_h = question_h
+        .saturating_add(footer_h)
+        .saturating_add(2)
+        .max(8)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect {
@@ -1310,49 +1359,20 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let mut lines = vec![Line::raw("")];
-    for ql in q.question.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("  {ql}"),
-            Style::default().fg(Color::White),
-        )));
-    }
-    lines.push(Line::raw(""));
-
-    // Render the text input row with cursor
-    let before: String = q.input[..q.cursor].iter().collect();
-    let rest: Vec<char> = q.input[q.cursor..].to_vec();
-    let cursor_str = rest.first().map_or(" ", |_| " "); // block cursor
-    let (cur_ch, after_str) = if rest.is_empty() {
-        (" ".to_string(), String::new())
-    } else {
-        (rest[0].to_string(), rest[1..].iter().collect())
+    // The answer field and hint are pinned to the bottom, so on a short
+    // terminal the question is clipped rather than the place to type.
+    let footer_h = footer_h.min(inner.height);
+    let question_area = Rect {
+        height: inner.height - footer_h,
+        ..inner
     };
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  > ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(before, Style::default().fg(Color::White)),
-        Span::styled(cur_ch, Style::default().bg(Color::White).fg(Color::Black)),
-        Span::styled(after_str, Style::default().fg(Color::White)),
-    ]));
-
-    let _ = cursor_str; // suppress unused warning
-
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "  Enter to send  ·  Esc to cancel",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
-        inner,
-    );
+    let footer_area = Rect {
+        y: inner.y + question_area.height,
+        height: footer_h,
+        ..inner
+    };
+    f.render_widget(question, question_area);
+    f.render_widget(footer, footer_area);
 }
 
 #[cfg(test)]
@@ -1592,5 +1612,47 @@ mod permission_popup_tests {
         assert!(bad.is_empty(), "control chars rendered: {bad:?}");
         let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(screen.contains("\u{241b}[2K"), "{screen}");
+    }
+
+    fn screen_rows(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The dialog was sized by the question's '\n' count, so a long
+    /// one-line question wrapped over the answer field and the hint.
+    #[test]
+    fn ask_user_keeps_the_answer_field_under_a_long_question() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.pending_user_question = Some(crate::tui::app::PendingUserQuestion {
+            question: format!(
+                "{} which one?",
+                "should the migration keep the old column ".repeat(7)
+            ),
+            reply,
+            input: "yes".chars().collect(),
+            cursor: 3,
+        });
+        for (w, h) in [(100, 30), (80, 30), (80, 9)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| {
+                let area = f.area();
+                draw_ask_user(f, area, &app);
+            })
+            .unwrap();
+            let screen = screen_rows(&term).join("\n");
+            assert!(screen.contains("> yes"), "{w}x{h}\n{screen}");
+            assert!(screen.contains("Enter to send"), "{w}x{h}\n{screen}");
+            if h == 30 {
+                assert!(screen.contains("which one?"), "{w}x{h}\n{screen}");
+            }
+        }
     }
 }
