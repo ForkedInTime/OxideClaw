@@ -1407,11 +1407,7 @@ async fn run_loop(
                             _ => {}
                         }
                     }
-                    Event::Paste(text) => {
-                        for ch in text.chars() {
-                            app.insert_char(ch);
-                        }
-                    }
+                    Event::Paste(text) => app.paste(&text),
                     Event::Resize(cols, rows) => {
                         last_term_cols = cols;
                         last_term_rows = rows;

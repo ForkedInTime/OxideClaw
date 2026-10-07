@@ -961,6 +961,25 @@ impl App {
         self.follow_bottom = true;
     }
 
+    /// A bracketed paste. Terminals (xterm, VTE, iTerm2) send line breaks as
+    /// bare CR, which every line-aware path here ignores, so a multi-line
+    /// paste collapsed into one line. Routed like typed keys: into an open
+    /// AskUser dialog (one line, so breaks become spaces), dropped while a
+    /// permission or browse approval prompt hides the main input.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(q) = self.pending_user_question.as_mut() {
+            for ch in text.chars() {
+                q.input.insert(q.cursor, if ch == '\n' { ' ' } else { ch });
+                q.cursor += 1;
+            }
+        } else if self.pending_permission.is_none() && self.browse_approval.is_none() {
+            for ch in text.chars() {
+                self.insert_char(ch);
+            }
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -1651,6 +1670,33 @@ mod trim_entries_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn paste_turns_cr_line_breaks_into_newlines() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.paste("a\rb\r\nc\nd");
+        assert_eq!(app.input.iter().collect::<String>(), "a\nb\nc\nd");
+        assert_eq!(app.input_line_count(), 4);
+    }
+
+    /// Paste went into the hidden main prompt while AskUser was open, so
+    /// Enter sent an empty answer.
+    #[test]
+    fn paste_goes_into_the_open_askuser_dialog() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (tx, _rx) = oneshot::channel();
+        app.pending_user_question = Some(PendingUserQuestion {
+            question: "Name?".into(),
+            reply: tx,
+            input: vec!['>'],
+            cursor: 1,
+        });
+        app.paste("foo\r\nbar");
+        let q = app.pending_user_question.as_ref().unwrap();
+        assert_eq!(q.input.iter().collect::<String>(), ">foo bar");
+        assert_eq!(q.cursor, 8);
+        assert!(app.input.is_empty());
+    }
 
     fn app_with(n: usize) -> App {
         let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
