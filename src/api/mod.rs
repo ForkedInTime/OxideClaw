@@ -416,6 +416,8 @@ impl ClaudeClient {
         let mut text_blocks: HashMap<usize, String> = HashMap::with_capacity(4);
         let mut tool_blocks: HashMap<usize, (String, String, String)> = HashMap::with_capacity(4); // id, name, json
         let mut thinking_blocks: HashMap<usize, (String, String)> = HashMap::with_capacity(4); // thinking, sig
+        // Redacted thinking arrives whole in content_block_start; no deltas.
+        let mut redacted_blocks: HashMap<usize, String> = HashMap::new();
 
         while let Some(event) = next_sse_event(&mut stream).await? {
             if event.data == "[DONE]" {
@@ -445,6 +447,9 @@ impl ClaudeClient {
                     }
                     StreamContentBlock::Thinking { thinking } => {
                         thinking_blocks.insert(index, (thinking, String::new()));
+                    }
+                    StreamContentBlock::RedactedThinking { data } => {
+                        redacted_blocks.insert(index, data);
                     }
                 },
                 StreamEvent::ContentBlockDelta { index, delta } => match delta {
@@ -492,6 +497,8 @@ impl ClaudeClient {
                             thinking,
                             signature,
                         });
+                    } else if let Some(data) = redacted_blocks.remove(&index) {
+                        result.content.push(ContentBlock::RedactedThinking { data });
                     }
                 }
                 StreamEvent::MessageDelta { delta, usage } => {
@@ -874,6 +881,82 @@ impl ApiBackend {
             Self::OpenAiCompat(c) => c.take_tools_notice(),
             Self::Anthropic(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod redacted_thinking_tests {
+    use super::*;
+    use crate::query_engine::scripted_api_tests::{serve, sse};
+    use serde_json::json;
+
+    fn request(messages: Vec<Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-haiku-4-5".into(),
+            max_tokens: 16,
+            messages,
+            system: Default::default(),
+            tools: vec![],
+            stream: None,
+            thinking: None,
+            output_config: None,
+            betas: vec![],
+            session_id: None,
+        }
+    }
+
+    /// A redacted_thinking block failed to parse and vanished, so the tool
+    /// round was replayed as a bare tool_use: a 400 on the next request.
+    #[tokio::test]
+    async fn redacted_thinking_survives_the_stream_and_is_replayed() {
+        let first = sse(
+            &[
+                json!({"type": "redacted_thinking", "data": "ENCRYPTED"}),
+                json!({"type": "tool_use", "id": "t1", "name": "Read", "input": {}}),
+            ],
+            "tool_use",
+        );
+        let (url, seen) = serve(vec![first, sse(&[], "end_turn")]).await;
+        let mut c = ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+
+        let user = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "go".into() }],
+        };
+        let r = c
+            .messages_stream(request(vec![user.clone()]), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            r.content[0],
+            ContentBlock::RedactedThinking {
+                data: "ENCRYPTED".into()
+            }
+        );
+        assert!(matches!(r.content[1], ContentBlock::ToolUse { .. }));
+
+        let history = vec![
+            user,
+            Message {
+                role: Role::Assistant,
+                content: r.content,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: vec![ToolResultContent::text("ok")],
+                    is_error: None,
+                }],
+            },
+        ];
+        c.messages_stream(request(history), |_| {}).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[1]).unwrap();
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type": "redacted_thinking", "data": "ENCRYPTED"})
+        );
     }
 }
 

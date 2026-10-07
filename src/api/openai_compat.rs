@@ -419,6 +419,7 @@ pub(crate) fn translate_messages(
                             signature,
                         } if signature.is_empty() => reasoning_parts.push(thinking.as_str()),
                         ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. } => {}
                     }

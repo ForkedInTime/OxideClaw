@@ -96,6 +96,11 @@ pub enum ContentBlock {
         thinking: String,
         signature: String,
     },
+    /// Thinking the safety system encrypted. Opaque, but it must be replayed
+    /// like a signed `Thinking` block or the next tool-loop request is a 400.
+    RedactedThinking {
+        data: String,
+    },
     Image {
         source: ImageSource,
     },
@@ -236,6 +241,7 @@ pub enum StreamContentBlock {
     Text { text: String },
     ToolUse { id: String, name: String },
     Thinking { thinking: String },
+    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Deserialize)]

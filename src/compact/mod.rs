@@ -169,8 +169,12 @@ pub fn snip_compact(messages: &mut [Message], model: &str) -> bool {
 pub fn drop_thinking(messages: &mut [Message]) {
     for msg in messages {
         let before = msg.content.len();
-        msg.content
-            .retain(|b| !matches!(b, ContentBlock::Thinking { .. }));
+        msg.content.retain(|b| {
+            !matches!(
+                b,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        });
         if msg.content.is_empty() && before > 0 {
             msg.content.push(ContentBlock::Text {
                 text: "(no response)".into(),
@@ -294,6 +298,7 @@ fn render_history(messages: &[Message]) -> String {
                     let head: String = thinking.chars().take(200).collect();
                     out.push_str(&format!("[Thinking: {head}]\n"));
                 }
+                ContentBlock::RedactedThinking { .. } => {}
                 ContentBlock::Image { .. } => {
                     out.push_str("[Image attachment]\n");
                 }
@@ -691,6 +696,21 @@ mod snip_tests {
                     .any(|b| matches!(b, ContentBlock::Thinking { .. }))
             })
             .collect()
+    }
+
+    /// Redacted thinking is bound like signed thinking: left behind after an
+    /// edit, it is the same 400.
+    #[test]
+    fn drop_thinking_also_drops_redacted_thinking() {
+        let mut h = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::RedactedThinking { data: "enc".into() },
+                ContentBlock::Text { text: "a".into() },
+            ],
+        }];
+        drop_thinking(&mut h);
+        assert_eq!(h[0].content, vec![ContentBlock::Text { text: "a".into() }]);
     }
 
     #[test]
