@@ -386,9 +386,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 Err(e) => {
                     let err_str = e.to_string();
 
-                    // prompt_too_long: signal outer loop to compact and retry
-                    if err_str.contains("prompt is too long") || err_str.contains("prompt_too_long")
-                    {
+                    // Over the context window: signal outer loop to compact and retry
+                    if crate::api::is_context_overflow(&err_str) {
                         should_compact_retry = true;
                         break StreamedResponse {
                             content: vec![],
@@ -1343,5 +1342,70 @@ mod loop_guard_tests {
         let last = messages.last().unwrap();
         assert_eq!(last.role, Role::User);
         assert_eq!(last.content.len(), 1);
+    }
+
+    fn task(
+        url: String,
+        dir: &std::path::Path,
+        budget: Option<f64>,
+    ) -> (ApiTask, mpsc::UnboundedReceiver<AppEvent>) {
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.to_path_buf(),
+            ..Config::default()
+        };
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = ApiTask {
+            client: ApiBackend::Anthropic(c),
+            tools: Vec::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "go".into() }],
+            }],
+            config,
+            perm_state: PermissionState::new(false, &[], &[]),
+            system_prompt: String::new(),
+            tx,
+            plan_mode: false,
+            skill_no_shell: false,
+            session_id: "s".into(),
+            budget_remaining_usd: budget,
+            history: TurnHistory::default(),
+        };
+        (task, rx)
+    }
+
+    /// Only Anthropic's "prompt is too long" took the compact-and-retry
+    /// path; an OpenAI-style overflow failed the turn, and the oversized
+    /// history it left behind failed every later prompt too.
+    #[tokio::test]
+    async fn an_openai_style_overflow_compacts_and_retries() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let body = r#"{"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70321 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let overflow = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
+        let (url, seen) = serve(vec![overflow, text("summary"), text("answer")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (t, mut rx) = task(url, dir.path(), None);
+        run_api_task(t).await;
+
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        let (mut compacted, mut done, mut failed) = (false, false, None);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Compacted { .. } => compacted = true,
+                AppEvent::Done { .. } => done = true,
+                AppEvent::TurnFailed(e) => failed = Some(e),
+                _ => {}
+            }
+        }
+        assert_eq!(failed, None);
+        assert!(compacted && done);
     }
 }

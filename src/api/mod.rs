@@ -629,6 +629,55 @@ pub fn context_window_for_model(model: &str) -> u64 {
     }
 }
 
+/// Whether an API error is the provider rejecting the request as larger than
+/// the model's context window. Each backend words it differently: Anthropic
+/// says "prompt is too long", OpenAI/Groq/DeepSeek/OpenRouter/Mistral say
+/// "maximum context length" or `context_length_exceeded`. Only Anthropic's
+/// wording used to be recognised, so on the others an overflowing turn
+/// failed instead of compacting, and every later prompt failed the same way.
+pub fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "prompt is too long",
+        "prompt_too_long",
+        "context_length_exceeded",
+        "maximum context length",
+        "context length exceeded",
+        "exceeds the context window",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
+}
+
+#[cfg(test)]
+mod context_overflow_tests {
+    use super::is_context_overflow;
+
+    #[test]
+    fn every_backends_overflow_wording_is_recognised() {
+        for e in [
+            "API stream error 400 Bad Request: prompt is too long: 205290 tokens > 200000 maximum",
+            r#"OpenAI error 400 Bad Request: {"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130512 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+            r#"DeepSeek error 400 Bad Request: {"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70321 tokens (70321 in the messages, 0 in the completion).","type":"invalid_request_error"}}"#,
+            r#"Mistral error 400 Bad Request: {"object":"error","message":"Prompt contains 40000 tokens and 0 draft tokens, too large for model with 32768 maximum context length","type":"invalid_request_error"}"#,
+            "OpenAI error 400 Bad Request: Your input exceeds the context window of this model.",
+        ] {
+            assert!(is_context_overflow(e), "{e}");
+        }
+    }
+
+    #[test]
+    fn other_errors_are_not_overflows() {
+        for e in [
+            "API stream error 401 Unauthorized: invalid x-api-key",
+            r#"Groq error 429 Too Many Requests: {"error":{"message":"Rate limit reached"}}"#,
+            "OpenAI error 400 Bad Request: max_tokens is too large",
+        ] {
+            assert!(!is_context_overflow(e), "{e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod context_window_tests {
     use super::context_window_for_model as w;
