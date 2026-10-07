@@ -130,15 +130,23 @@ impl StdioTransport {
         // transport is dropped: stdin EOF is how the server learns to exit.
         let reply_tx = stdin_tx.downgrade();
         tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim();
+            // Raw bytes, not `lines()`: a line that is not UTF-8 is an Err
+            // from `next_line`, which would end the loop and disconnect a
+            // server that is still running. Only EOF or an I/O error may.
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let trimmed = buf.trim_ascii();
                 if trimmed.is_empty() {
                     continue;
                 }
-                // Ignore malformed / partial lines
-                let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
+                // Ignore malformed / partial / undecodable lines
+                let Ok(msg) = serde_json::from_slice::<Value>(trimmed) else {
                     continue;
                 };
                 if let Some(method) = msg.get("method").and_then(Value::as_str) {
@@ -1287,6 +1295,37 @@ cat >/dev/null"#,
         assert_eq!(out["r1"]["result"], json!({}));
         assert_eq!(out["r2"]["id"], json!("s2"));
         assert_eq!(out["r2"]["error"]["code"], json!(-32601));
+    }
+
+    /// A stray non-UTF-8 line (a print() under a cp1252 locale) ended the
+    /// reader as if the server had exited, failing every later call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_skips_a_non_utf8_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cmd, args) = sh_server(
+            r#"read l
+printf 'caf\351 \377\n'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read l
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}'
+cat >/dev/null"#,
+        );
+        let t = StdioTransport::connect(&cmd, &args, &HashMap::new(), dir.path())
+            .await
+            .unwrap();
+        let first =
+            tokio::time::timeout(Duration::from_secs(10), t.call(1, "initialize", json!({})))
+                .await
+                .expect("first call hung")
+                .unwrap();
+        assert_eq!(first, json!({}));
+        let second =
+            tokio::time::timeout(Duration::from_secs(10), t.call(2, "tools/list", json!({})))
+                .await
+                .expect("second call hung")
+                .unwrap();
+        assert_eq!(second, json!({"ok": true}));
     }
 
     /// A call made after the server died sat in the pending map the reader
