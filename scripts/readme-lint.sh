@@ -3,9 +3,11 @@
 #
 # Checks:
 #   1. sdk/README.md health-check example `"version":"X.Y.Z"` matches Cargo.toml
-#   2. README.md "N CDP tools" claim matches count of browser tool impls
+#   2. README.md "N CDP tools" / "Nine CDP-driven tools" claim matches the
+#      count of browser tool impls
 #   3. README.md "N providers" claim matches count of named entries in the
-#      OpenAI-compat provider registry
+#      OpenAI-compat provider registry (the PROVIDERS table only, not the
+#      tool names in that file's tests)
 #   4. README.md keeps the 'Autonomous browser agent' row
 #   5. README.md "Rust X.Y+" matches Cargo.toml rust-version
 #
@@ -32,7 +34,16 @@ fi
 # ── 2. Browser tool count ────────────────────────────────────────────────────
 # Count tools named browser_*; browse_done is the agent-loop terminator, not a CDP tool.
 browser_tool_count=$(grep -A1 -E '^\s*fn name\(&self\) -> &str \{' src/tools/browser_tools.rs | grep -c '"browser_')
-browser_claim=$(grep -oE '[0-9]+ CDP tools' README.md | head -1 | grep -oE '^[0-9]+')
+# The claim may be written in digits ("9 CDP tools") or as a word at the
+# start of a sentence ("Nine CDP-driven tools").
+browser_claim=$(grep -oiE '\b([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) CDP(-driven)? tools' README.md \
+  | head -1 | awk '{print tolower($1)}')
+case "$browser_claim" in
+  one) browser_claim=1 ;; two) browser_claim=2 ;; three) browser_claim=3 ;;
+  four) browser_claim=4 ;; five) browser_claim=5 ;; six) browser_claim=6 ;;
+  seven) browser_claim=7 ;; eight) browser_claim=8 ;; nine) browser_claim=9 ;;
+  ten) browser_claim=10 ;; eleven) browser_claim=11 ;; twelve) browser_claim=12 ;;
+esac
 
 if [ "$browser_tool_count" = "$browser_claim" ]; then
   ok "README.md \"${browser_claim} CDP tools\" matches src/tools/browser_tools.rs"
@@ -42,7 +53,10 @@ else
 fi
 
 # ── 3. OpenAI-compat provider count ──────────────────────────────────────────
-provider_count=$(grep -cE '^\s*name: "' src/api/openai_compat.rs)
+# Only the registry: the same file's tests build tool definitions with
+# `name: "Read"` and the like, which are not providers.
+provider_count=$(awk '/^pub static PROVIDERS/ {on=1} on && /^\];/ {on=0} on' src/api/openai_compat.rs \
+  | grep -cE '^\s*name: "')
 provider_claim=$(grep -oE '[0-9]+ providers' README.md | head -1 | grep -oE '^[0-9]+')
 
 if [ "$provider_count" = "$provider_claim" ]; then
