@@ -172,10 +172,12 @@ impl PermissionGate {
             CheckResult::Allow => GateOutcome::Allowed,
             CheckResult::Deny => GateOutcome::Denied(format!("Permission denied: {tool_name}")),
             CheckResult::Ask => match &self.asker {
+                // Only name remedies that grant permission: --allowed-tools
+                // filters the tool list but never authorises a call.
                 None => GateOutcome::Denied(format!(
                     "Permission denied: {tool_name} requires approval and no interactive \
-                     session is attached. Allow it with permissions.allow in settings.json, \
-                     --allowedTools, or --dangerously-skip-permissions."
+                     session is attached. Allow it with permissions.allow in settings.json \
+                     or --dangerously-skip-permissions."
                 )),
                 Some(asker) => {
                     let description = describe_tool_call(tool_name, input);
@@ -308,6 +310,15 @@ mod tests {
             matches!(out, GateOutcome::Denied(ref m) if m.contains("no interactive session")),
             "{out:?}"
         );
+        // The hint must not send users to a flag that does not exist
+        // (`--allowedTools`) or one that grants nothing (`--allowed-tools`).
+        let GateOutcome::Denied(msg) = out else {
+            unreachable!()
+        };
+        assert!(msg.contains("permissions.allow"), "{msg}");
+        assert!(msg.contains("--dangerously-skip-permissions"), "{msg}");
+        assert!(!msg.to_lowercase().contains("allowedtools"), "{msg}");
+        assert!(!msg.contains("--allowed-tools"), "{msg}");
         assert_eq!(
             g.decide("Read", &json!({"file_path": "x"})).await,
             GateOutcome::Allowed
