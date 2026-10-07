@@ -638,7 +638,17 @@ pub fn context_window_for_model(model: &str) -> u64 {
         };
         return if one_million { 1_000_000 } else { 200_000 };
     }
-    if m.contains("gemini") {
+    // Gemma before Gemini: Google's endpoint serves Gemma under the same
+    // `gemini:` prefix, and a 1M guess there means compaction never fires
+    // before the server rejects the request.
+    if m.contains("gemma") {
+        // Gemma 3 takes 128k; Gemma 1 and 2 (`gemma-7b`, `gemma2-9b`) 8k.
+        if ["gemma-3", "gemma3"].iter().any(|k| m.contains(k)) {
+            131_072
+        } else {
+            8_192
+        }
+    } else if m.contains("gemini") {
         // Gemini 2.x and 3 take 1M input tokens on Google's endpoint and
         // through OpenRouter alike.
         1_048_576
@@ -648,8 +658,6 @@ pub fn context_window_for_model(model: &str) -> u64 {
         64_000
     } else if m.contains("mistral") {
         32_000
-    } else if m.contains("gemma") {
-        8_192
     } else {
         // Unknown models: assume a 200k Claude-class window.
         200_000
@@ -659,7 +667,8 @@ pub fn context_window_for_model(model: &str) -> u64 {
 /// Whether an API error is the provider rejecting the request as larger than
 /// the model's context window. Each backend words it differently: Anthropic
 /// says "prompt is too long", OpenAI/Groq/DeepSeek/OpenRouter/Mistral say
-/// "maximum context length" or `context_length_exceeded`. Only Anthropic's
+/// "maximum context length" or `context_length_exceeded`, Gemini says the
+/// input token count "exceeds the maximum number of tokens allowed". Only Anthropic's
 /// wording used to be recognised, so on the others an overflowing turn
 /// failed instead of compacting, and every later prompt failed the same way.
 pub fn is_context_overflow(err: &str) -> bool {
@@ -671,6 +680,7 @@ pub fn is_context_overflow(err: &str) -> bool {
         "maximum context length",
         "context length exceeded",
         "exceeds the context window",
+        "exceeds the maximum number of tokens allowed",
     ]
     .iter()
     .any(|k| e.contains(k))
@@ -688,6 +698,7 @@ mod context_overflow_tests {
             r#"DeepSeek error 400 Bad Request: {"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70321 tokens (70321 in the messages, 0 in the completion).","type":"invalid_request_error"}}"#,
             r#"Mistral error 400 Bad Request: {"object":"error","message":"Prompt contains 40000 tokens and 0 draft tokens, too large for model with 32768 maximum context length","type":"invalid_request_error"}"#,
             "OpenAI error 400 Bad Request: Your input exceeds the context window of this model.",
+            r#"Gemini error 400 Bad Request: [{"error":{"code":400,"message":"The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}]"#,
         ] {
             assert!(is_context_overflow(e), "{e}");
         }
@@ -749,6 +760,9 @@ mod context_window_tests {
         assert_eq!(w("gemini:gemini-2.5-flash"), 1_048_576);
         assert_eq!(w("openrouter:google/gemini-3-pro-preview"), 1_048_576);
         assert_eq!(w("gemma-7b-it"), 8_192);
+        assert_eq!(w("gemini:gemma-3-27b-it"), 131_072);
+        assert_eq!(w("gemini:gemma-2-9b-it"), 8_192);
+        assert_eq!(w("ollama:gemma3:27b"), 131_072);
         assert_eq!(w("something-new"), 200_000);
     }
 }
