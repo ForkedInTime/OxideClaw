@@ -118,8 +118,9 @@ fn router_is_documented_as_off_by_default_and_is() {
     assert!(README.contains("The model router is optional. Give two or more tiers a model"));
     assert!(FEATURES.contains("## Smart Model Router\n\nOptional."));
     assert!(FEATURES.contains(
-        "The router starts on once two or more tiers are set. `\"enabled\": false` keeps it off"
+        "The router starts on once two or more tiers are set in the `router` block. `\"enabled\": false` keeps it off"
     ));
+    assert!(FEATURES.contains("Tiers set only with the flat keys do not switch the router on"));
     assert!(FEATURES.contains("By default a keyword and length heuristic scores the prompt"));
     assert!(FEATURES.contains("With `\"classifier\": \"model\"` the low tier is asked"));
 }

@@ -101,7 +101,10 @@ impl Classifier {
 /// reasoning store, summaries or tools found unsupported), which a client
 /// built fresh every prompt would lose.
 #[derive(Clone, Default)]
-pub struct TierHealth(Arc<Mutex<HashMap<String, Result<Option<ApiBackend>, String>>>>);
+pub struct TierHealth(Arc<Mutex<HashMap<String, Verdict>>>);
+
+/// Usable (with the client kept for it, if any) or why not.
+type Verdict = Result<Option<ApiBackend>, String>;
 
 impl std::fmt::Debug for TierHealth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,7 +120,7 @@ impl std::fmt::Debug for TierHealth {
 }
 
 impl TierHealth {
-    fn get(&self, model: &str) -> Option<Result<Option<ApiBackend>, String>> {
+    fn get(&self, model: &str) -> Option<Verdict> {
         self.0.lock().ok()?.get(model).cloned()
     }
 
@@ -125,7 +128,7 @@ impl TierHealth {
         self.store(model, health.map(|()| None));
     }
 
-    fn store(&self, model: &str, health: Result<Option<ApiBackend>, String>) {
+    fn store(&self, model: &str, health: Verdict) {
         if let Ok(mut m) = self.0.lock() {
             m.insert(model.to_string(), health);
         }
