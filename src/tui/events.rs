@@ -64,6 +64,9 @@ pub enum AppEvent {
     CompactFailed(String),
     /// Informational notice from the harness (not from Claude)
     SystemMessage(String),
+    /// Auto-fix skipped its lint and test run because the project is not
+    /// trusted. Shown once per session, not after every edit.
+    AutoFixUntrusted,
     /// Claude called AskUserQuestion — show a text-input dialog
     AskUser {
         question: String,

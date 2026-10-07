@@ -88,6 +88,11 @@ pub struct Settings {
     #[serde(skip)]
     pub untrusted_project_config: Vec<String>,
 
+    /// Whether the project these settings were loaded for is trusted, as
+    /// decided by `merge_with_trust`. Gates auto-fix's lint and test runs.
+    #[serde(skip)]
+    pub project_trusted: bool,
+
     /// Settings files that exist but could not be read or parsed, as
     /// "<path>: <error>". Such a file contributes nothing — not even its
     /// `permissions.deny` or hooks — so the user has to be told.
@@ -739,6 +744,7 @@ impl Settings {
             merged = merged.merge(extra);
         }
         merged.untrusted_project_config = dropped;
+        merged.project_trusted = trusted;
         merged
     }
 
@@ -1010,6 +1016,7 @@ impl Settings {
             // Global-only: a project must not be able to trust itself.
             trusted_projects: self.trusted_projects,
             untrusted_project_config: self.untrusted_project_config,
+            project_trusted: self.project_trusted,
             load_errors: {
                 let mut v = self.load_errors;
                 v.extend(other.load_errors);

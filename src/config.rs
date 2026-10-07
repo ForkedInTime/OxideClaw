@@ -327,6 +327,11 @@ pub struct Config {
     #[serde(skip)]
     pub untrusted_project_config: Vec<String>,
 
+    /// `cwd` is in the global `trustedProjects` list. Auto-fix runs the
+    /// project's lint and test commands only when set; `/trust` updates it.
+    #[serde(skip)]
+    pub project_trusted: bool,
+
     /// Settings files that could not be read or parsed and were ignored
     /// whole (see `Settings::load_errors`). Shown at startup, on stderr in
     /// non-interactive modes, and in /reload, /trust and /doctor.
@@ -497,6 +502,7 @@ impl Default for Config {
             file_snapshot_dir: None,
             sandbox_enabled: false,
             untrusted_project_config: Vec::new(),
+            project_trusted: false,
             settings_load_errors: Vec::new(),
             api_key_helper_rejected: Vec::new(),
             sandbox_mode: "strict".to_string(),
@@ -744,6 +750,7 @@ impl Config {
             theme: new.theme,
             sandbox_enabled: new.sandbox_enabled,
             untrusted_project_config: new.untrusted_project_config,
+            project_trusted: new.project_trusted,
             settings_load_errors: new.settings_load_errors,
             sandbox_mode: new.sandbox_mode,
             voice_enabled: new.voice_enabled,
@@ -895,6 +902,7 @@ impl Config {
         self.api_key_helper = settings.api_key_helper;
         self.api_key_helper_rejected = settings.helper_rejected.clone();
         self.untrusted_project_config = settings.untrusted_project_config;
+        self.project_trusted = settings.project_trusted;
         self.settings_load_errors = settings.load_errors;
         self.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
         // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
@@ -2644,6 +2652,27 @@ mod flag_settings_retarget_tests {
         assert!(bare.claudemd.is_empty());
         assert!(bare.agentsmd.is_empty());
         assert_ne!(bare.phase_router.research_model, "claude-bare-test-model");
+    }
+
+    /// Auto-fix reads trust from here; `--settings` must not drop it, and a
+    /// project cannot grant it to itself.
+    #[test]
+    fn load_settings_reports_whether_the_project_is_trusted() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+        let own = serde_json::json!({ "trustedProjects": [project.path()] }).to_string();
+        std::fs::write(project.path().join(".claude/settings.json"), &own).unwrap();
+        let cfg = Config {
+            cwd: project.path().into(),
+            claude_dir_override: Some(home.path().into()),
+            flag_settings: Some(serde_json::from_str(r#"{"verbose": true}"#).unwrap()),
+            ..Config::default()
+        };
+        assert!(!cfg.load_settings().project_trusted);
+
+        std::fs::write(home.path().join("settings.json"), &own).unwrap();
+        assert!(cfg.load_settings().project_trusted);
     }
 
     #[test]

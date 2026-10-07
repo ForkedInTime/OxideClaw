@@ -599,6 +599,10 @@ pub struct App {
     /// AskUserQuestion dialog — Claude is waiting for user text input
     pub pending_user_question: Option<PendingUserQuestion>,
 
+    /// The "auto-fix skipped: not trusted" notice was already shown; every
+    /// later edit in the session skips the check silently.
+    pub auto_fix_untrusted_noticed: bool,
+
     /// Image file to attach to the next user message (set by /image command)
     pub pending_image: Option<String>,
 
@@ -823,6 +827,7 @@ impl App {
             saved_input: Vec::new(),
             pending_permission: None,
             pending_user_question: None,
+            auto_fix_untrusted_noticed: false,
             pending_image: None,
             plan_mode: false,
             brief_mode: false,
@@ -1515,6 +1520,13 @@ impl App {
                 self.entries.push(ChatEntry::system(msg));
                 self.scroll_to_bottom();
             }
+            AppEvent::AutoFixUntrusted => {
+                if !std::mem::replace(&mut self.auto_fix_untrusted_noticed, true) {
+                    self.entries
+                        .push(ChatEntry::system(crate::autofix::UNTRUSTED_NOTICE));
+                    self.scroll_to_bottom();
+                }
+            }
             // The recording state was cleared when Ctrl+R stopped it; clearing
             // it again here dropped the stop sender of a newer recording, which
             // killed that recorder mid-dictation.
@@ -1968,6 +1980,24 @@ mod background_event_tests {
         });
         assert!(!app.is_loading && app.side_task.is_none());
         task.abort();
+    }
+
+    /// Every edit in an untrusted folder skips auto-fix; the reason is
+    /// worth saying once, not after each edit.
+    #[test]
+    fn the_untrusted_auto_fix_notice_shows_once_per_session() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.apply(AppEvent::AutoFixUntrusted);
+        app.apply(AppEvent::AutoFixUntrusted);
+        app.apply(AppEvent::AutoFixUntrusted);
+        let shown: Vec<_> = app
+            .entries
+            .iter()
+            .filter(|e| e.text == crate::autofix::UNTRUSTED_NOTICE)
+            .collect();
+        assert_eq!(shown.len(), 1);
+        assert!(matches!(shown[0].kind, EntryKind::System));
+        assert!(shown[0].text.contains("Run /trust"));
     }
 
     #[test]

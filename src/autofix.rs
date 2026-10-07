@@ -41,6 +41,37 @@ pub struct AutoFixConfig {
 /// Default test timeout if the user hasn't overridden it.
 pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = 60;
 
+/// Shown once per session when an edit would have started a check in a
+/// project that is not in `trustedProjects`.
+pub const UNTRUSTED_NOTICE: &str = "Auto-fix skipped: this folder is not trusted. \
+     Run /trust to let OxideClaw run its lint and test commands.";
+
+/// What auto-fix may run and how contained. Lint and test commands execute
+/// project code (`build.rs`, `conftest.py`, npm scripts, Makefiles), so an
+/// untrusted project runs none of them, and a trusted one runs them under
+/// the same sandbox as the Bash tool.
+#[derive(Debug, Clone, Default)]
+pub struct Containment {
+    /// The project is in the global `trustedProjects` list (`/trust`).
+    pub trusted: bool,
+    /// The Bash tool's sandbox mode when the user enabled one; `None` runs
+    /// the commands directly, as Bash does.
+    pub sandbox_mode: Option<String>,
+    pub sandbox_allow_network: bool,
+}
+
+impl Containment {
+    /// `cmd` as the shell should run it: wrapped by the active sandbox, or
+    /// unchanged without one. `Err` when the sandbox refuses it (a strict
+    /// pattern, a missing backend, an unknown mode): never run it bare then.
+    pub fn wrap(&self, cmd: &str, cwd: &Path) -> Result<String, String> {
+        match &self.sandbox_mode {
+            Some(mode) => crate::sandbox::apply_sandbox(cmd, mode, cwd, self.sandbox_allow_network),
+            None => Ok(cmd.to_string()),
+        }
+    }
+}
+
 /// When should the auto-fix check run?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoFixTrigger {
@@ -643,6 +674,9 @@ pub enum AutoFixAction {
     /// `status` as a SystemMessage and end the turn with a `Done`
     /// event preserving the partial work.
     GiveUp { status: String },
+    /// A check would have run but the project is not trusted, so nothing
+    /// ran. Caller shows `UNTRUSTED_NOTICE` once per session and continues.
+    Untrusted,
 }
 
 /// Run lint + tests and decide what the TUI turn loop should do next.
@@ -650,16 +684,31 @@ pub enum AutoFixAction {
 /// `autonomy_mode` is the current autonomy string (`"read-only"` /
 /// `"plan-only"` / `"auto-edit"` / `"full-auto"`).
 /// `retries_used` is the number of retries *already consumed* by this
-/// user-prompt turn (so the first call passes `0`).
+/// user-prompt turn (so the first call passes `0`). Nothing runs unless
+/// `containment.trusted`; what does run goes through its sandbox.
 pub fn run_auto_fix_check(
     cwd: &Path,
     config: &AutoFixConfig,
     autonomy_mode: &str,
     retries_used: u32,
+    containment: &Containment,
     cancel: &AtomicBool,
 ) -> AutoFixAction {
     if !should_trigger(config, autonomy_mode) {
         return AutoFixAction::Continue { status: None };
+    }
+
+    // Before detection: even the clippy probe below runs a binary in the
+    // project (rustup honours its `rust-toolchain.toml`). Only file checks
+    // decide whether there was anything to skip.
+    if !containment.trusted {
+        let would_run = detect_lint_command(cwd, &config.lint_command).is_some()
+            || detect_test_command(cwd, &config.test_command).is_some();
+        return if would_run {
+            AutoFixAction::Untrusted
+        } else {
+            AutoFixAction::Continue { status: None }
+        };
     }
 
     // Overrides run as given, so a script the model broke still fails. An
@@ -681,10 +730,21 @@ pub fn run_auto_fix_check(
         return AutoFixAction::Continue { status: None };
     }
 
+    // The feedback names the plain commands; the shell gets the wrapped ones.
+    let wrap = |cmd: &Option<String>| cmd.as_deref().map(|c| containment.wrap(c, cwd)).transpose();
+    let (lint_run, test_run) = match (wrap(&lint_cmd), wrap(&test_cmd)) {
+        (Ok(lint), Ok(test)) => (lint, test),
+        (Err(reason), _) | (_, Err(reason)) => {
+            return AutoFixAction::Continue {
+                status: Some(format!("[auto-fix] skipped: {reason}")),
+            };
+        }
+    };
+
     let outcome = run_checks(
         cwd,
-        lint_cmd.as_deref(),
-        test_cmd.as_deref(),
+        lint_run.as_deref(),
+        test_run.as_deref(),
         config.timeout_secs,
         cancel,
     );
@@ -742,6 +802,14 @@ pub fn run_auto_fix_check(
 #[cfg(test)]
 mod tests {
     static NOT_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A trusted project with no sandbox: commands run as given.
+    fn trusted() -> super::Containment {
+        super::Containment {
+            trusted: true,
+            ..Default::default()
+        }
+    }
 
     // ── Auto-detected runners must be runnable ───────────────────────────────
 
@@ -913,7 +981,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 10,
         };
-        let action = super::run_auto_fix_check(proj.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
+        let action = super::run_auto_fix_check(
+            proj.path(),
+            &cfg,
+            "auto-edit",
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         assert!(
             matches!(action, super::AutoFixAction::Retry { .. }),
             "{action:?}"
@@ -1302,7 +1377,8 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
+        let action =
+            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
         assert!(
             matches!(action, AutoFixAction::Continue { .. }),
             "got {action:?}"
@@ -1320,7 +1396,8 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
+        let action =
+            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
         match action {
             AutoFixAction::Retry { feedback, status } => {
                 assert!(feedback.contains("Your last edits failed"));
@@ -1343,7 +1420,8 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 1, &NOT_CANCELLED);
+        let action =
+            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 1, &trusted(), &NOT_CANCELLED);
         match action {
             AutoFixAction::Retry { feedback, status } => {
                 assert!(feedback.contains("## Tests"));
@@ -1364,7 +1442,8 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3, &NOT_CANCELLED);
+        let action =
+            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3, &trusted(), &NOT_CANCELLED);
         match action {
             AutoFixAction::GiveUp { status } => {
                 assert!(status.contains("cap reached"));
@@ -1386,7 +1465,8 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
+        let action =
+            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
         match action {
             AutoFixAction::Continue { status } => {
                 assert!(status.is_none(), "trigger off should be silent");
@@ -1406,7 +1486,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "suggest", 0, &NOT_CANCELLED);
+        let action = run_auto_fix_check(dir.path(), &cfg, "suggest", 0, &trusted(), &NOT_CANCELLED);
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
     }
 
@@ -1421,7 +1501,185 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
+        let action =
+            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
+    }
+
+    // ── Trust and sandbox ────────────────────────────────────────────────────
+
+    fn marker_cfg() -> AutoFixConfig {
+        AutoFixConfig {
+            enabled: true,
+            trigger: AutoFixTrigger::Always,
+            lint_command: Some("touch lint.marker".to_string()),
+            test_command: Some("touch test.marker".to_string()),
+            max_retries: 3,
+            timeout_secs: 10,
+        }
+    }
+
+    /// Lint and test commands run project code; an untrusted folder used to
+    /// run them after every edit in the default `auto-edit` autonomy.
+    #[test]
+    fn an_untrusted_project_runs_no_check_at_all() {
+        let dir = tempdir().unwrap();
+        let untrusted = Containment::default();
+        let action = run_auto_fix_check(
+            dir.path(),
+            &marker_cfg(),
+            "auto-edit",
+            0,
+            &untrusted,
+            &NOT_CANCELLED,
+        );
+        assert!(matches!(action, AutoFixAction::Untrusted), "{action:?}");
+        assert!(!dir.path().join("lint.marker").exists());
+        assert!(!dir.path().join("test.marker").exists());
+
+        // An auto-detected runner is not even probed.
+        let proj = tempdir().unwrap();
+        std::fs::write(proj.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let cfg = AutoFixConfig {
+            lint_command: None,
+            test_command: None,
+            ..marker_cfg()
+        };
+        let action = run_auto_fix_check(
+            proj.path(),
+            &cfg,
+            "auto-edit",
+            0,
+            &untrusted,
+            &NOT_CANCELLED,
+        );
+        assert!(matches!(action, AutoFixAction::Untrusted), "{action:?}");
+
+        // Nothing would have run: nothing to tell the user either.
+        let empty = tempdir().unwrap();
+        let action = run_auto_fix_check(
+            empty.path(),
+            &cfg,
+            "auto-edit",
+            0,
+            &untrusted,
+            &NOT_CANCELLED,
+        );
+        assert!(
+            matches!(action, AutoFixAction::Continue { status: None }),
+            "{action:?}"
+        );
+        // Nor when auto-fix would not have triggered.
+        let action = run_auto_fix_check(
+            dir.path(),
+            &AutoFixConfig {
+                trigger: AutoFixTrigger::Off,
+                ..marker_cfg()
+            },
+            "auto-edit",
+            0,
+            &untrusted,
+            &NOT_CANCELLED,
+        );
+        assert!(
+            matches!(action, AutoFixAction::Continue { status: None }),
+            "{action:?}"
+        );
+    }
+
+    #[test]
+    fn a_trusted_project_runs_its_checks() {
+        let dir = tempdir().unwrap();
+        let action = run_auto_fix_check(
+            dir.path(),
+            &marker_cfg(),
+            "auto-edit",
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
+        assert!(
+            matches!(action, AutoFixAction::Continue { status: Some(_) }),
+            "{action:?}"
+        );
+        assert!(dir.path().join("lint.marker").exists());
+        assert!(dir.path().join("test.marker").exists());
+    }
+
+    /// Auto-fix is never less contained than Bash: the strict denylist
+    /// applies, and a sandbox that cannot be applied refuses instead of
+    /// running the command bare.
+    #[test]
+    fn checks_go_through_the_bash_sandbox() {
+        let dir = tempdir().unwrap();
+        let strict = Containment {
+            trusted: true,
+            sandbox_mode: Some("strict".to_string()),
+            sandbox_allow_network: false,
+        };
+        let cfg = AutoFixConfig {
+            lint_command: None,
+            test_command: Some("touch test.marker # rm -rf /".to_string()),
+            ..marker_cfg()
+        };
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &strict, &NOT_CANCELLED);
+        match action {
+            AutoFixAction::Continue { status: Some(s) } => {
+                assert!(s.contains("Blocked by strict sandbox"), "{s}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        assert!(!dir.path().join("test.marker").exists());
+
+        let broken = Containment {
+            sandbox_mode: Some("bogus".to_string()),
+            ..strict
+        };
+        let action = run_auto_fix_check(
+            dir.path(),
+            &marker_cfg(),
+            "auto-edit",
+            0,
+            &broken,
+            &NOT_CANCELLED,
+        );
+        match action {
+            AutoFixAction::Continue { status: Some(s) } => assert!(s.contains("bogus"), "{s}"),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        assert!(!dir.path().join("lint.marker").exists());
+        assert!(!dir.path().join("test.marker").exists());
+    }
+
+    /// The namespace modes wrap the command exactly as for Bash; without
+    /// the backend installed they refuse. Either way the bare command never
+    /// reaches the shell.
+    #[test]
+    fn namespace_sandboxes_wrap_the_check_command() {
+        let cwd = std::path::Path::new("/work/proj");
+        let no_sandbox = trusted();
+        assert_eq!(no_sandbox.wrap("make test", cwd).unwrap(), "make test");
+        for (mode, binary, no_net) in [
+            ("bwrap", "bwrap ", "--unshare-net"),
+            ("firejail", "firejail ", "--net=none"),
+        ] {
+            let c = Containment {
+                trusted: true,
+                sandbox_mode: Some(mode.to_string()),
+                sandbox_allow_network: false,
+            };
+            match c.wrap("make test", cwd) {
+                Ok(cmd) => {
+                    assert!(cmd.starts_with(binary), "{cmd}");
+                    assert!(cmd.contains(no_net), "{cmd}");
+                    assert!(cmd.ends_with("-c 'make test'"), "{cmd}");
+                    assert_eq!(
+                        Ok(cmd),
+                        crate::sandbox::apply_sandbox("make test", mode, cwd, false)
+                    );
+                }
+                Err(e) => assert!(e.contains(&format!("{mode} not found")), "{e}"),
+            }
+        }
     }
 }

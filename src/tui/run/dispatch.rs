@@ -1174,6 +1174,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 config.sandbox_mode = mode;
                 reloaded.push("sandboxMode");
             }
+            config.project_trusted = settings.project_trusted;
 
             // Reload CLAUDE.md + AGENTS.md; --bare never loads them.
             if !config.bare_mode {
@@ -2252,7 +2253,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                 "Revoked trust for {canonical}. Its settings hooks, \
                                  apiKeyHelper and MCP servers, and OLLAMA_HOST / \
                                  ANTHROPIC_MODEL from its .env, will be ignored — restart \
-                                 oxideclaw to apply."
+                                 oxideclaw to apply. Auto-fix stops running its lint and \
+                                 test commands now."
                             ),
                             Err(e) => format!("Could not save trust: {e}"),
                         }
@@ -2265,7 +2267,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         Ok(()) => format!(
                             "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
                              servers will be honoured, and so will OLLAMA_HOST / ANTHROPIC_MODEL \
-                             from its .env — restart oxideclaw to apply."
+                             from its .env — restart oxideclaw to apply. Auto-fix runs its \
+                             lint and test commands from the next edit."
                         ),
                         Err(e) => format!("Could not save trust: {e}"),
                     }
@@ -2284,6 +2287,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 ),
             };
             app.entries.push(ChatEntry::system(msg));
+            // Auto-fix reads trust per edit, so a change applies at once.
+            config.project_trusted = config.load_settings().project_trusted;
         }
         CommandAction::AutoCommitStatus => {
             let cwd_ok = oxideclaw::autocommit::is_git_repo(&config.cwd);

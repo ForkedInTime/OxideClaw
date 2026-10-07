@@ -985,6 +985,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // Lint and tests can run for minutes; keep them off the
                     // async worker that also drives the UI channel.
                     let (auto_fix, autonomy) = (config.auto_fix.clone(), config.autonomy.clone());
+                    // Trust is the launch project's: a worktree it entered
+                    // holds the same repo. The sandbox is the Bash tool's.
+                    let containment = crate::autofix::Containment {
+                        trusted: config.project_trusted,
+                        sandbox_mode: config.sandbox_enabled.then(|| config.sandbox_mode.clone()),
+                        sandbox_allow_network: config.sandbox_allow_network,
+                    };
                     // Esc aborts this task at the await below, which leaves
                     // the blocking check running; dropping the guard there
                     // tells it to kill its lint/test processes.
@@ -1002,6 +1009,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             &auto_fix,
                             &autonomy,
                             auto_fix_retries,
+                            &containment,
                             &cancel,
                         )
                     })
@@ -1019,6 +1027,10 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             if let Some(msg) = status {
                                 let _ = tx.send(AppEvent::SystemMessage(msg));
                             }
+                        }
+                        // The app shows the notice once per session.
+                        crate::autofix::AutoFixAction::Untrusted => {
+                            let _ = tx.send(AppEvent::AutoFixUntrusted);
                         }
                         crate::autofix::AutoFixAction::Retry { feedback, status } => {
                             let _ = tx.send(AppEvent::SystemMessage(status));
@@ -1714,12 +1726,9 @@ mod loop_guard_tests {
         }
     }
 
-    /// Esc aborts the task while the auto-fix check runs; the lint/test
-    /// process it started ran on, unseen, until it finished or timed out.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn aborting_the_turn_kills_the_running_auto_fix_check() {
-        use crate::query_engine::scripted_api_tests::serve;
+    /// The model's reply: one Write of `a.txt`, which starts the auto-fix
+    /// check once it has run.
+    fn write_a_txt_response() -> String {
         let input = serde_json::json!({"file_path": "a.txt", "content": "x"}).to_string();
         let events = [
             serde_json::json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
@@ -1730,16 +1739,26 @@ mod loop_guard_tests {
             serde_json::json!({"type":"message_stop"}),
         ];
         let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
-        let write = format!(
+        format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
-        );
+        )
+    }
+
+    /// Esc aborts the task while the auto-fix check runs; the lint/test
+    /// process it started ran on, unseen, until it finished or timed out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_the_turn_kills_the_running_auto_fix_check() {
+        use crate::query_engine::scripted_api_tests::serve;
+        let write = write_a_txt_response();
         let (url, _) = serve(vec![write]).await;
         let dir = tempfile::tempdir().unwrap();
         let (mut t, mut rx) = task(url, dir.path(), None);
         t.tools = vec![std::sync::Arc::new(FakeWrite)];
         t.perm_state = PermissionState::new(false, &["Write".into()], &[]);
         t.config.autonomy = "auto-edit".into();
+        t.config.project_trusted = true;
         t.config.auto_fix = crate::autofix::AutoFixConfig {
             trigger: crate::autofix::AutoFixTrigger::Always,
             test_command: Some("echo $$ > check.pid; exec sleep 30".into()),
@@ -1776,6 +1795,44 @@ mod loop_guard_tests {
                 "a cancelled turn sent Done"
             );
         }
+    }
+
+    /// The default `auto-edit` autonomy ran the project's lint and test
+    /// commands after every edit, trusted folder or not.
+    #[tokio::test]
+    async fn an_untrusted_project_edit_runs_no_auto_fix_command() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let done = sse(
+            &[serde_json::json!({"type":"text","text":"done"})],
+            "end_turn",
+        );
+        let (url, _) = serve(vec![write_a_txt_response(), done]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut t, mut rx) = task(url, dir.path(), None);
+        t.tools = vec![std::sync::Arc::new(FakeWrite)];
+        t.perm_state = PermissionState::new(false, &["Write".into()], &[]);
+        t.config.autonomy = "auto-edit".into();
+        assert!(!t.config.project_trusted);
+        t.config.auto_fix = crate::autofix::AutoFixConfig {
+            lint_command: Some("touch lint.marker".into()),
+            test_command: Some("touch test.marker".into()),
+            ..Default::default()
+        };
+        run_api_task(t).await;
+
+        assert!(!dir.path().join("lint.marker").exists());
+        assert!(!dir.path().join("test.marker").exists());
+        let (mut untrusted, mut done) = (0, false);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::AutoFixUntrusted => untrusted += 1,
+                AppEvent::Done { .. } => done = true,
+                AppEvent::TurnFailed(e) => panic!("turn failed: {e}"),
+                _ => {}
+            }
+        }
+        assert_eq!(untrusted, 1);
+        assert!(done);
     }
 
     /// A connection that dies after the headers but before any text is
