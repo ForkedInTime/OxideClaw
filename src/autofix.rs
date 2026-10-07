@@ -202,9 +202,14 @@ fn runnable_detected(
     if cmd.starts_with("cargo clippy") {
         // `cargo clippy` without the clippy component exits 101.
         let resolved = resolved.display().to_string();
-        // run_command goes through `sh -c` on unix only.
+        // run_command goes through `sh -c` on unix and `cmd /D /S /C` on
+        // Windows; both split an unquoted path at a space (`C:\Users\John
+        // Doe\...`). Windows paths cannot contain `"`. Not the bare name:
+        // cmd.exe searches the current directory (the repo) before PATH.
         #[cfg(unix)]
         let resolved = crate::sandbox::shell_quote(&resolved);
+        #[cfg(windows)]
+        let resolved = format!("\"{resolved}\"");
         let probe = format!("{resolved} clippy --version");
         let wrapped = containment.wrap(&probe, cwd).ok()?;
         if !matches!(
@@ -371,6 +376,14 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool
             };
         }
     };
+    // Killing cmd.exe alone leaves the cargo/npm/pytest tree it started
+    // running and holding the pipes; the job reaches all of it. Dropped (and
+    // closed) on every return path.
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::io::AsRawHandle;
+        crate::tools::bash::Job::assign(child.as_raw_handle())
+    };
 
     // Drain both pipes while the command runs. Reading only after exit
     // deadlocked any run printing more than a pipe buffer (64 KiB — a normal
@@ -433,6 +446,10 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool
                     #[cfg(unix)]
                     unsafe {
                         libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                    #[cfg(windows)]
+                    if let Some(job) = &job {
+                        job.terminate();
                     }
                     let _ = child.kill();
                     let _ = child.wait();
@@ -656,7 +673,7 @@ pub fn format_feedback_message(
 /// Output that says the check could not run in a namespace sandbox (no
 /// network, a tool or path outside it), as opposed to code that is wrong.
 /// Lower-case substrings matched against lower-cased output.
-const SANDBOX_ENVIRONMENT_ERRORS: [&str; 15] = [
+const SANDBOX_ENVIRONMENT_ERRORS: [&str; 13] = [
     // cargo with an empty or unreachable registry
     "failed to download",
     "failed to get `",
@@ -671,9 +688,8 @@ const SANDBOX_ENVIRONMENT_ERRORS: [&str; 15] = [
     "eai_again",
     "enotfound",
     "failed to establish a new connection",
-    // a program or path the sandbox does not expose
-    "command not found",
-    ": not found",
+    // a path the sandbox does not expose (a missing program is matched by
+    // name in `sandbox_environment_failure`)
     "read-only file system",
 ];
 
@@ -681,22 +697,32 @@ const SANDBOX_ENVIRONMENT_ERRORS: [&str; 15] = [
 /// namespace sandbox (bwrap, firejail) because of the sandbox itself. The
 /// model would otherwise be told its edit broke the build and spend every
 /// retry chasing an error no edit can fix.
+///
+/// `outputs` pairs each check's plain (unwrapped) command with its output. A
+/// "not found" line counts only when it names that command's own program:
+/// `do_bild: command not found` from a script the model edited is the
+/// model's bug, while `ruff: command not found` means the sandbox hid ruff.
 fn sandbox_environment_failure(
     containment: &Containment,
-    outputs: &[&Option<String>],
+    outputs: &[(Option<&str>, &Option<String>)],
 ) -> Option<String> {
     let mode = containment
         .sandbox_mode
         .as_deref()
         .filter(|m| crate::sandbox::mode_enforces_isolation(m))?;
-    let line = outputs
-        .iter()
-        .filter_map(|o| o.as_deref())
-        .flat_map(str::lines)
-        .find(|line| {
+    let line = outputs.iter().find_map(|(cmd, out)| {
+        let missing: Vec<String> = cmd
+            .and_then(|c| c.split_whitespace().next())
+            .and_then(|p| Path::new(p).file_name())
+            .map(|p| p.to_string_lossy().to_ascii_lowercase())
+            .map(|p| vec![format!("{p}: command not found"), format!("{p}: not found")])
+            .unwrap_or_default();
+        out.as_deref()?.lines().find(|line| {
             let line = line.to_ascii_lowercase();
             SANDBOX_ENVIRONMENT_ERRORS.iter().any(|e| line.contains(e))
-        })?;
+                || missing.iter().any(|m| line.contains(m.as_str()))
+        })
+    })?;
     let line: String = line.trim().chars().take(200).collect();
     Some(format!(
         "[auto-fix] skipped: the check could not run inside the {mode} sandbox \
@@ -832,9 +858,13 @@ pub fn run_auto_fix_check(
             lint_stderr,
             test_stderr,
         } => {
-            if let Some(status) =
-                sandbox_environment_failure(containment, &[&lint_stderr, &test_stderr])
-            {
+            if let Some(status) = sandbox_environment_failure(
+                containment,
+                &[
+                    (lint_cmd.as_deref(), &lint_stderr),
+                    (test_cmd.as_deref(), &test_stderr),
+                ],
+            ) {
                 return AutoFixAction::Continue {
                     status: Some(status),
                 };
@@ -906,6 +936,24 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The clippy probe runs the resolved cargo path through cmd.exe, which
+    /// split an unquoted `C:\Users\John Doe\...` at the space and dropped
+    /// clippy for every Rust project on such a machine.
+    #[cfg(windows)]
+    #[test]
+    fn windows_clippy_probe_survives_a_space_in_the_cargo_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let bin = parent.path().join("John Doe");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("cargo.cmd"), "@exit /b 0\r\n").unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let cmd = "cargo clippy --all-targets -- -D warnings".to_string();
+        assert_eq!(
+            runnable(cwd.path(), cmd.clone(), Some(bin.as_os_str())),
+            Some(cmd)
+        );
     }
 
     /// Windows ran checks by splitting on spaces and spawning the first word,
@@ -1779,12 +1827,21 @@ mod tests {
                 .to_string(),
         );
         let sh = Some("bash: line 1: ruff: command not found\n".to_string());
+        let dash = Some("sh: 1: ruff: not found\n".to_string());
         let go = Some("dial tcp: lookup proxy.golang.org: Temporary failure\n".to_string());
-        for out in [&cargo, &sh, &go] {
-            let status = super::sandbox_environment_failure(&bwrap, &[&None, out])
-                .expect("an environment failure");
+        for out in [&cargo, &sh, &dash, &go] {
+            let status = super::sandbox_environment_failure(
+                &bwrap,
+                &[(None, &None), (Some("ruff check ."), out)],
+            )
+            .expect("an environment failure");
             assert!(status.contains("bwrap sandbox"), "{status}");
         }
+        // The venv runner is matched by its file name.
+        assert!(
+            super::sandbox_environment_failure(&bwrap, &[(Some(".venv/bin/ruff check ."), &sh)])
+                .is_some()
+        );
 
         // A real build error is still the model's to fix.
         let rustc = Some(
@@ -1793,9 +1850,28 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            super::sandbox_environment_failure(&bwrap, &[&rustc, &None]),
+            super::sandbox_environment_failure(
+                &bwrap,
+                &[(Some("cargo clippy"), &rustc), (Some("cargo test"), &None)]
+            ),
             None
         );
+        // "not found" from inside the project (a function the model renamed
+        // in a script, an HTTP 404) is the model's to fix, not the sandbox's.
+        for out in [
+            "./build.sh: line 3: do_bild: command not found\n",
+            "404 Client Error: Not Found for url: http://localhost/x\n",
+        ] {
+            let out = Some(out.to_string());
+            assert_eq!(
+                super::sandbox_environment_failure(
+                    &bwrap,
+                    &[(Some("make check"), &None), (Some("./build.sh test"), &out)]
+                ),
+                None,
+                "{out:?}"
+            );
+        }
         // Without a namespace sandbox the environment is the user's own, and
         // a failure is reported as before.
         for mode in [None, Some("strict".to_string())] {
@@ -1803,7 +1879,13 @@ mod tests {
                 sandbox_mode: mode,
                 ..bwrap.clone()
             };
-            assert_eq!(super::sandbox_environment_failure(&c, &[&cargo, &sh]), None);
+            assert_eq!(
+                super::sandbox_environment_failure(
+                    &c,
+                    &[(Some("cargo test"), &cargo), (Some("ruff check ."), &sh)]
+                ),
+                None
+            );
         }
     }
 

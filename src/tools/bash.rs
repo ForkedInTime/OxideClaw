@@ -35,7 +35,7 @@ pub(crate) struct ProcessGroupGuard {
     /// Without KILL_ON_JOB_CLOSE, so closing it on a disarmed guard leaves
     /// deliberate background jobs alone, as on Unix.
     #[cfg(windows)]
-    job: Option<usize>,
+    job: Option<Job>,
 }
 
 impl ProcessGroupGuard {
@@ -44,7 +44,9 @@ impl ProcessGroupGuard {
         // completion. Since we just spawned it, this is always Some.
         let pgid = child.id().map(|id| id as i32);
         #[cfg(windows)]
-        let job = assign_job(&child);
+        let job = child
+            .raw_handle()
+            .and_then(|h| Job::assign(h as std::os::windows::io::RawHandle));
         Self {
             child,
             pgid,
@@ -79,40 +81,64 @@ impl Drop for ProcessGroupGuard {
             }
         }
         #[cfg(windows)]
-        if let Some(job) = self.job.take() {
-            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-            // SAFETY: `job` is the live handle `assign_job` created and only
-            // this Drop closes it.
-            unsafe {
-                if self.pgid.take().is_some() {
-                    TerminateJobObject(job as HANDLE, 1);
-                }
-                CloseHandle(job as HANDLE);
-            }
+        if let Some(job) = self.job.take()
+            && self.pgid.take().is_some()
+        {
+            job.terminate();
         }
     }
 }
 
-/// Put `child` in a fresh job object; `None` (the old shell-only kill) if
-/// Windows refuses.
+/// A Windows job object holding a process and everything it starts (children
+/// inherit the job). Dropping it only closes the handle: no
+/// KILL_ON_JOB_CLOSE, so a deliberate background job outlives a clean exit.
+/// The HANDLE is kept as an integer so holders stay `Send`.
 #[cfg(windows)]
-fn assign_job(child: &Child) -> Option<usize> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
-    let process = child.raw_handle()? as HANDLE;
-    // SAFETY: plain FFI with null (default) attributes and name; the process
-    // handle is valid while `child` is alive, and a failed job is closed.
-    unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() {
-            return None;
+pub(crate) struct Job(usize);
+
+#[cfg(windows)]
+impl Job {
+    /// Put `process` (a live process handle) in a fresh job; `None` (the old
+    /// shell-only kill) if Windows refuses.
+    pub(crate) fn assign(process: std::os::windows::io::RawHandle) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: plain FFI with null (default) attributes and name; the
+        // process handle is valid while its owner is alive, and a failed job
+        // is closed.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            if AssignProcessToJobObject(job, process as HANDLE) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Job(job as usize))
         }
-        if AssignProcessToJobObject(job, process) == 0 {
-            CloseHandle(job);
-            return None;
+    }
+
+    /// Kill every process in the job.
+    pub(crate) fn terminate(&self) {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: `self.0` is the live handle `assign` created; only Drop
+        // closes it.
+        unsafe {
+            TerminateJobObject(self.0 as HANDLE, 1);
         }
-        Some(job as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        // SAFETY: the handle `assign` created, closed exactly once here.
+        unsafe {
+            CloseHandle(self.0 as HANDLE);
+        }
     }
 }
 
