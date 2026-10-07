@@ -124,6 +124,21 @@ fn text_reply(text: &str) -> serde_json::Value {
     })
 }
 
+fn bash_call_reply(command: &str) -> serde_json::Value {
+    let args = serde_json::json!({ "command": command }).to_string();
+    serde_json::json!({
+        "id": "c", "object": "chat.completion.chunk", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": { "name": "Bash", "arguments": args }
+            }]},
+            "finish_reason": "tool_calls"
+        }]
+    })
+}
+
 fn openai_env(port: u16) -> Vec<(&'static str, String)> {
     vec![
         ("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}/v1")),
@@ -217,4 +232,35 @@ fn stream_json_input_sends_every_user_message() {
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("no user message"), "{}", stderr(&out));
+}
+
+/// Hitting --max-turns exited 0 with nothing on stdout to mark the run as
+/// cut off.
+#[test]
+fn print_mode_reports_the_turn_cap() {
+    let e = env();
+    let (port, bodies) = serve(bash_call_reply("echo hi"));
+    let out = run(
+        &e,
+        &[
+            "-p",
+            "--dangerously-skip-permissions",
+            "--max-turns",
+            "1",
+            "--output-format",
+            "json",
+            "--model",
+            "openai-compat:test",
+            "go",
+        ],
+        &openai_env(port),
+        "",
+    );
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert!(!out.status.success(), "exited 0 at the turn cap");
+    assert!(stderr(&out).contains("--max-turns"), "{}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(last["subtype"], "error_max_turns");
+    assert_eq!(last["is_error"], true);
 }

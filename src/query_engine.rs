@@ -353,12 +353,7 @@ impl QueryEngine {
             content,
         });
 
-        const DEFAULT_MAX_TURNS: u32 = 50;
-        let max_turns = if self.config.max_turns > 0 {
-            self.config.max_turns
-        } else {
-            DEFAULT_MAX_TURNS
-        };
+        let max_turns = self.turn_cap();
         let mut turn = 0u32;
 
         loop {
@@ -366,6 +361,17 @@ impl QueryEngine {
             self.turns = turn;
             if turn > max_turns {
                 self.notice(format!("Stopped after {max_turns} turns.").yellow());
+                // Otherwise the per-turn records of a cut-off run look the
+                // same as a finished one.
+                if self.json_output || self.stream_json_output {
+                    let result = serde_json::json!({
+                        "type": "result",
+                        "subtype": "error_max_turns",
+                        "is_error": true,
+                        "num_turns": max_turns,
+                    });
+                    println!("{result}");
+                }
                 break;
             }
             // Build tool definitions for this turn
@@ -796,12 +802,7 @@ impl QueryEngine {
 
         // Sub-agents (Agent tool, /spawn) run unattended with a bypass gate,
         // so they need the same turn cap and budget as the headless loop.
-        const DEFAULT_MAX_TURNS: u32 = 50;
-        let max_turns = if self.config.max_turns > 0 {
-            self.config.max_turns
-        } else {
-            DEFAULT_MAX_TURNS
-        };
+        let max_turns = self.turn_cap();
         // The agent's answer is its last message, not all its narration.
         let mut final_text = String::new();
         let mut turns = 0u32;
@@ -952,6 +953,21 @@ impl QueryEngine {
     /// How many turns the engine has executed since the last `query()` call.
     pub fn turns_used(&self) -> u32 {
         self.turns
+    }
+
+    /// `--max-turns`, or the default cap when it is 0.
+    fn turn_cap(&self) -> u32 {
+        const DEFAULT_MAX_TURNS: u32 = 50;
+        if self.config.max_turns > 0 {
+            self.config.max_turns
+        } else {
+            DEFAULT_MAX_TURNS
+        }
+    }
+
+    /// The last `query()` stopped at the turn cap rather than finishing.
+    pub fn hit_turn_cap(&self) -> bool {
+        self.turns > self.turn_cap()
     }
 
     /// Extract the text content from the last assistant message, if any.

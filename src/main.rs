@@ -140,7 +140,7 @@ struct Cli {
     #[arg(long, value_enum, default_value = "text")]
     output_format: OutputFormat,
 
-    /// Max agentic turns before stopping (0 = unlimited)
+    /// Max agentic turns before stopping (0 = the default cap of 50)
     #[arg(long, default_value = "0")]
     max_turns: u32,
 
@@ -1280,6 +1280,14 @@ async fn run() -> Result<()> {
             match until_signal(engine.query(prompt)).await {
                 Some(r) => r?,
                 None => return Ok(()),
+            }
+            // A script must be able to tell a cut-off run from a finished one.
+            if engine.hit_turn_cap() {
+                outcome = Err(anyhow::anyhow!(
+                    "stopped at the turn limit before the task finished; raise it with \
+                     --max-turns"
+                ));
+                break;
             }
         }
         // Overwrite, not append: compaction may have rewritten the history.
