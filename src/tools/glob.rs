@@ -5,6 +5,7 @@ use anyhow::Result;
 use glob::{MatchOptions, Pattern};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
@@ -18,6 +19,56 @@ const MAX_GLOB_RESULTS: usize = 1000;
 /// returned 1000 to pick the newest, but a `**/*` over a huge tree must not
 /// grow memory without bound.
 const MAX_SCANNED_MATCHES: usize = 10 * MAX_GLOB_RESULTS;
+
+/// Cap on the patterns one `{a,b}` expansion may produce, so a pattern like
+/// `{a,b}{c,d}{e,f}...` cannot turn one call into thousands of tree walks.
+const MAX_BRACE_PATTERNS: usize = 256;
+
+/// Expand `{a,b}` alternations (nested ones too) into separate patterns. The
+/// glob crate treats braces as literal characters, so `**/*.{ts,tsx}` would
+/// otherwise only match a file literally named `x.{ts,tsx}`. As in bash, a
+/// brace group without a top-level comma or without a closing brace stays
+/// literal.
+pub(crate) fn expand_braces(pattern: &str) -> Vec<String> {
+    let mut start = 0;
+    while let Some(off) = pattern[start..].find('{') {
+        let open = start + off;
+        let mut depth = 0usize;
+        let mut bounds = vec![open];
+        let mut close = None;
+        for (i, ch) in pattern[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                ',' if depth == 1 => bounds.push(open + i),
+                _ => {}
+            }
+        }
+        let Some(close) = close.filter(|_| bounds.len() > 1) else {
+            start = open + 1;
+            continue;
+        };
+        bounds.push(close);
+        let (prefix, suffix) = (&pattern[..open], &pattern[close + 1..]);
+        let mut out = Vec::new();
+        for w in bounds.windows(2) {
+            let alt = &pattern[w[0] + 1..w[1]];
+            out.extend(expand_braces(&format!("{prefix}{alt}{suffix}")));
+            if out.len() >= MAX_BRACE_PATTERNS {
+                break;
+            }
+        }
+        out.truncate(MAX_BRACE_PATTERNS);
+        return out;
+    }
+    vec![pattern.to_string()]
+}
 
 /// Split `pattern` into the directory to walk and the part left to match
 /// against paths relative to it: leading wildcard-free components join the
@@ -94,20 +145,25 @@ impl Tool for GlobTool {
             None => ctx.cwd.clone(),
         };
 
-        let (root, rel_pattern) = split_pattern(&base, &input.pattern);
-        let pattern =
-            Pattern::new(&rel_pattern).map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?;
+        // One walk per `{a,b}` alternative, each from its own literal prefix.
+        let mut walks: Vec<(PathBuf, Pattern, usize)> = Vec::new();
+        for alt in expand_braces(&input.pattern) {
+            let (root, rel_pattern) = split_pattern(&base, &alt);
+            let pattern = Pattern::new(&rel_pattern)
+                .map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?;
+            let max_depth = if rel_pattern.contains("**") {
+                usize::MAX
+            } else {
+                rel_pattern.split('/').count()
+            };
+            walks.push((root, pattern, max_depth));
+        }
         // `*` and `?` stay within one path component, as when the pattern was
         // expanded directory by directory; only `**` crosses separators.
         let options = MatchOptions {
             case_sensitive: true,
             require_literal_separator: true,
             require_literal_leading_dot: false,
-        };
-        let max_depth = if rel_pattern.contains("**") {
-            usize::MAX
-        } else {
-            rel_pattern.split('/').count()
         };
 
         // What the user's deny rules keep from Glob: the per-call check only
@@ -124,42 +180,46 @@ impl Tool for GlobTool {
         // but refuses one that leads back to an ancestor. Off the async
         // runtime, since the walk has no await point.
         let walk = tokio::task::spawn_blocking(move || {
+            let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut entries: Vec<(SystemTime, String)> = Vec::new();
-            let walker = WalkDir::new(&root)
-                .follow_links(true)
-                .max_depth(max_depth)
-                .into_iter()
-                .filter_entry(|e| {
-                    if e.depth() == 0 {
-                        return true;
+            for (root, pattern, max_depth) in &walks {
+                let walker = WalkDir::new(root)
+                    .follow_links(true)
+                    .max_depth(*max_depth)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        if e.depth() == 0 {
+                            return true;
+                        }
+                        if deny.denies(e.path()) {
+                            return false;
+                        }
+                        // Skip VCS metadata and common vendor dirs (v2.1.92: + .jj, .sl).
+                        !(e.file_type().is_dir()
+                            && crate::tools::grep::EXCLUDED_DIRS
+                                .contains(&e.file_name().to_string_lossy().as_ref()))
+                    });
+                for entry in walker.filter_map(|e| e.ok()) {
+                    if entry.depth() == 0 || entry.file_type().is_dir() {
+                        continue;
                     }
-                    if deny.denies(e.path()) {
-                        return false;
+                    let path = entry.path();
+                    let Ok(rel) = path.strip_prefix(root) else {
+                        continue;
+                    };
+                    if !pattern.matches_path_with(rel, options) || !seen.insert(path.to_path_buf())
+                    {
+                        continue;
                     }
-                    // Skip VCS metadata and common vendor dirs (v2.1.92: + .jj, .sl).
-                    !(e.file_type().is_dir()
-                        && crate::tools::grep::EXCLUDED_DIRS
-                            .contains(&e.file_name().to_string_lossy().as_ref()))
-                });
-            for entry in walker.filter_map(|e| e.ok()) {
-                if entry.depth() == 0 || entry.file_type().is_dir() {
-                    continue;
-                }
-                let path = entry.path();
-                let Ok(rel) = path.strip_prefix(&root) else {
-                    continue;
-                };
-                if !pattern.matches_path_with(rel, options) {
-                    continue;
-                }
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                entries.push((mtime, path.display().to_string()));
-                if entries.len() >= MAX_SCANNED_MATCHES {
-                    return (entries, true);
+                    let mtime = entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    entries.push((mtime, path.display().to_string()));
+                    if entries.len() >= MAX_SCANNED_MATCHES {
+                        return (entries, true);
+                    }
                 }
             }
             (entries, false)
@@ -290,5 +350,80 @@ mod tests {
         // `path` as base.
         let out = glob(&ctx, json!({"pattern": "*.rs", "path": "src/nested"})).await;
         assert_eq!(out, base.join("src/nested/deep.rs").display().to_string());
+    }
+
+    fn touch(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x").unwrap();
+    }
+
+    #[test]
+    fn braces_expand_nested_and_leave_unbalanced_literal() {
+        assert_eq!(expand_braces("**/*.{ts,tsx}"), ["**/*.ts", "**/*.tsx"]);
+        assert_eq!(
+            expand_braces("{src,lib/{a,b}}/*.rs"),
+            ["src/*.rs", "lib/a/*.rs", "lib/b/*.rs"]
+        );
+        assert_eq!(expand_braces("a{b"), ["a{b"]);
+        assert_eq!(expand_braces("{x}.rs"), ["{x}.rs"]);
+        assert_eq!(expand_braces("{,.}env"), ["env", ".env"]);
+    }
+
+    /// `**/*.{ts,tsx}` returned "No files matched" because the glob crate
+    /// has no brace syntax.
+    #[tokio::test]
+    async fn brace_patterns_match_each_alternative_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "src/a.ts");
+        touch(root, "src/b.tsx");
+        touch(root, "src/c.js");
+        let ctx = ToolContext::new(root.to_path_buf());
+        let t = glob(&ctx, json!({"pattern": "**/*.{ts,tsx}"})).await;
+        assert!(t.contains("a.ts") && t.contains("b.tsx"), "{t}");
+        assert!(!t.contains("c.js"), "{t}");
+        let t = glob(&ctx, json!({"pattern": "**/{a,a}.ts"})).await;
+        assert_eq!(t.lines().count(), 1, "{t}");
+    }
+
+    /// A `path` naming a Next.js `[slug]` route was spliced in as a
+    /// character class and never matched the directory.
+    #[tokio::test]
+    async fn base_path_with_brackets_is_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "app/[slug]/page.tsx");
+        let ctx = ToolContext::new(root.to_path_buf());
+        let t = glob(&ctx, json!({"pattern": "*.tsx", "path": "app/[slug]"})).await;
+        assert!(t.contains("page.tsx"), "{t}");
+    }
+
+    /// Every component of the absolute match was checked against the
+    /// vendor-dir list, so a project under `/build/...` or an explicit
+    /// `path: node_modules/x` matched nothing.
+    #[tokio::test]
+    async fn vendor_dirs_are_skipped_only_below_the_requested_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("build/app");
+        touch(&proj, "src/main.rs");
+        touch(&proj, "node_modules/x/index.js");
+        touch(&proj, "target/debug/gen.rs");
+        let ctx = ToolContext::new(proj.clone());
+
+        let t = glob(&ctx, json!({"pattern": "**/*.rs"})).await;
+        assert!(t.contains("main.rs"), "{t}");
+        assert!(!t.contains("gen.rs"), "{t}");
+        let t = glob(&ctx, json!({"pattern": "**/*.js"})).await;
+        assert!(!t.contains("index.js"), "{t}");
+
+        let t = glob(
+            &ctx,
+            json!({"pattern": "**/*.js", "path": "node_modules/x"}),
+        )
+        .await;
+        assert!(t.contains("index.js"), "{t}");
+        let t = glob(&ctx, json!({"pattern": "target/debug/*.rs"})).await;
+        assert!(t.contains("gen.rs"), "{t}");
     }
 }
