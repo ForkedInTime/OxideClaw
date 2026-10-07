@@ -228,6 +228,31 @@ pub async fn run_stop_hooks(hooks: &HooksConfig, session_id: &str, cwd: &std::pa
     }
 }
 
+/// Run Notification hooks when a turn ends with a text reply.
+/// `message` is exported as `CLAUDE_MESSAGE` and `prompt` on stdin.
+pub async fn run_notification_hooks(
+    hooks: &HooksConfig,
+    message: &str,
+    session_id: &str,
+    cwd: &std::path::Path,
+) {
+    for hook in &hooks.notification {
+        execute_hook(
+            hook,
+            HookEnvVars {
+                event: "Notification",
+                tool_name: None,
+                tool_input: None,
+                tool_result: None,
+                prompt: Some(message),
+                session_id,
+                cwd,
+            },
+        )
+        .await;
+    }
+}
+
 /// Run SessionStart hooks.
 pub async fn run_session_start_hooks(hooks: &HooksConfig, session_id: &str, cwd: &std::path::Path) {
     for hook in &hooks.session_start {
@@ -996,6 +1021,22 @@ mod tests {
     }
 
     // ── userPromptSubmit ─────────────────────────────────────────────────────
+
+    /// `notification` was parsed and documented but nothing ever ran it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notification_hook_receives_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HooksConfig {
+            notification: vec![entry(
+                "printf '%s|%s' \"$CLAUDE_HOOK_EVENT\" \"$CLAUDE_MESSAGE\" > out.txt",
+            )],
+            ..Default::default()
+        };
+        run_notification_hooks(&cfg, "All tests pass.", "sess", dir.path()).await;
+        let out = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+        assert_eq!(out, "Notification|All tests pass.");
+    }
 
     fn cfg_prompt(commands: &[&str]) -> HooksConfig {
         HooksConfig {

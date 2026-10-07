@@ -1081,17 +1081,35 @@ async fn run_loop(
                                 });
                             }
 
+                            let reply_text: String = new_messages.iter()
+                                .rfind(|m| m.role == Role::Assistant)
+                                .map(|m| m.content.iter()
+                                    .filter_map(|b| if let ContentBlock::Text { text } = b {
+                                        Some(text.as_str())
+                                    } else { None })
+                                    .collect::<Vec<_>>()
+                                    .join(" "))
+                                .unwrap_or_default();
+
+                            // Notification hooks: not awaited, so a slow hook
+                            // never holds up the next prompt.
+                            if let Some(hook_cfg) = &config.hooks
+                                && !config.disable_all_hooks
+                                && !hook_cfg.notification.is_empty()
+                                && !reply_text.is_empty()
+                            {
+                                let hook_cfg = hook_cfg.clone();
+                                let msg = reply_text.clone();
+                                let sid = session.id.clone();
+                                let cwd = config.cwd.clone();
+                                tokio::spawn(async move {
+                                    hooks::run_notification_hooks(&hook_cfg, &msg, &sid, &cwd).await;
+                                });
+                            }
+
                             // TTS: speak the last assistant response
                             if config.tts_enabled {
-                                let tts_text: String = new_messages.iter()
-                                    .rfind(|m| m.role == Role::Assistant)
-                                    .map(|m| m.content.iter()
-                                        .filter_map(|b| if let ContentBlock::Text { text } = b {
-                                            Some(text.as_str())
-                                        } else { None })
-                                        .collect::<Vec<_>>()
-                                        .join(" "))
-                                    .unwrap_or_default();
+                                let tts_text = reply_text;
                                 if !tts_text.is_empty() {
                                     // Cancel any previous TTS still playing
                                     if let Some(prev) = app.tts_stop_tx.take() {
