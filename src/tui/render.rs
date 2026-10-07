@@ -1213,66 +1213,70 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    // Use pre-rendered markdown lines — computed once in Overlay::new(), not every frame
-    let total = overlay.rendered.len();
-    let visible = inner.height as usize;
-
     // For interactive overlays, highlight the selected item line.
     // Session list lines start with "  N. [" — the Nth item maps to selectable_ids[N-1].
-    let selected_1based = if overlay.is_interactive() {
-        overlay.selected + 1
-    } else {
-        0
+    // "N. " with the space, so item 1 does not also match "10." to "19.".
+    let selected_prefix = overlay
+        .is_interactive()
+        .then(|| format!("{}. ", overlay.selected + 1));
+    let is_selected = |line: &Line| {
+        selected_prefix.as_ref().is_some_and(|prefix| {
+            let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            raw.trim_start().starts_with(prefix.as_str())
+        })
     };
 
+    // Scroll is counted in wrapped rows, not lines: a session row wider than
+    // the popup takes two rows, and a line-based offset let the selection
+    // drift below the bottom edge (where `d` would delete an unseen session)
+    // and stopped short of the last rows of a long non-interactive overlay.
+    // Lines are pre-rendered markdown, computed once in Overlay::new().
+    let width = inner.width.max(1);
+    let rows_of = |lines: &[Line<'static>]| {
+        Paragraph::new(Text::from(lines.to_vec()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    };
+    let total = rows_of(&overlay.rendered);
+    let visible = inner.height as usize;
+
     // Auto-scroll to keep the selected item visible
-    if selected_1based > 0 {
-        let prefix = format!("{}.", selected_1based);
-        if let Some(line_idx) = overlay.rendered.iter().position(|line| {
-            let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            raw.trim_start().starts_with(&prefix)
-        }) {
-            // Ensure the selected line is within the visible window
-            if line_idx < overlay.scroll {
-                overlay.scroll = line_idx;
-            } else if line_idx >= overlay.scroll + visible {
-                overlay.scroll = line_idx.saturating_sub(visible - 1);
-            }
+    if let Some(line_idx) = overlay.rendered.iter().position(is_selected) {
+        let top = rows_of(&overlay.rendered[..line_idx]);
+        let bottom = top + rows_of(&overlay.rendered[line_idx..=line_idx]).max(1);
+        if top < overlay.scroll {
+            overlay.scroll = top;
+        } else if bottom > overlay.scroll + visible {
+            overlay.scroll = bottom.saturating_sub(visible);
         }
     }
 
     overlay.scroll = overlay.scroll.min(total.saturating_sub(visible));
-    let skip = overlay.scroll;
 
     let display: Vec<Line> = overlay
         .rendered
         .iter()
-        .skip(skip)
-        .take(visible)
         .cloned()
         .map(|mut line| {
-            // Check if this rendered line starts with a list number matching the selected item
-            if selected_1based > 0 {
-                let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                let trimmed = raw.trim_start();
-                let prefix = format!("{}.", selected_1based);
-                if trimmed.starts_with(&prefix) {
-                    // Highlight the entire line
-                    for span in &mut line.spans {
-                        span.style = span
-                            .style
-                            .bg(Color::Rgb(50, 50, 80))
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD);
-                    }
+            if is_selected(&line) {
+                // Highlight the entire line
+                for span in &mut line.spans {
+                    span.style = span
+                        .style
+                        .bg(Color::Rgb(50, 50, 80))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD);
                 }
             }
             line
         })
         .collect();
 
+    let scroll = u16::try_from(overlay.scroll).unwrap_or(u16::MAX);
     f.render_widget(
-        Paragraph::new(Text::from(display)).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(display))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         inner,
     );
 }
@@ -1654,5 +1658,63 @@ mod permission_popup_tests {
                 assert!(screen.contains("which one?"), "{w}x{h}\n{screen}");
             }
         }
+    }
+
+    /// Overlay scroll was counted in lines while session rows wrap to two
+    /// screen rows, so from about the 7th session on the highlighted row was
+    /// below the popup's bottom edge, and `d` deleted a session out of view.
+    #[test]
+    fn overlay_selection_stays_visible_when_rows_wrap() {
+        let preview = "refactor the auth middleware so tokens refresh ".repeat(2);
+        let text: String = (1..=20)
+            .map(|n| {
+                format!(
+                    "  {n}. [abcd{n:04}] Tue Oct 6, 2:32 PM — {}\n",
+                    &preview[..60]
+                )
+            })
+            .collect();
+        let ids: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.overlay = Some(crate::tui::app::Overlay::with_items("sessions", text, ids));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let order: Vec<usize> = (0..20).chain((0..20).rev()).collect();
+        for sel in order {
+            app.overlay.as_mut().unwrap().selected = sel;
+            term.draw(|f| {
+                let area = f.area();
+                draw_overlay(f, area, &mut app, theme_colors("dark"));
+            })
+            .unwrap();
+            let rows = screen_rows(&term);
+            let buf = term.backend().buffer();
+            let lit: Vec<String> = (0..buf.area.height)
+                .filter(|&y| (0..buf.area.width).any(|x| buf[(x, y)].bg == Color::Rgb(50, 50, 80)))
+                .map(|y| rows[y as usize].clone())
+                .collect();
+            let want = format!("{}. [abcd", sel + 1);
+            assert!(
+                lit.first().is_some_and(|row| row.contains(&want)),
+                "selection {} not on screen: {lit:?}",
+                sel + 1
+            );
+            // "1." used to light up 10.-19. as well.
+            assert!(lit.len() <= 2, "{lit:?}");
+        }
+
+        // A non-interactive overlay scrolls all the way to its last row.
+        let long: String = (0..40)
+            .map(|i| format!("line {i} {}\n\n", "word ".repeat(30)))
+            .collect::<String>()
+            + "END-OF-OVERLAY";
+        app.overlay = Some(crate::tui::app::Overlay::new("notes", long));
+        app.overlay.as_mut().unwrap().scroll = usize::MAX;
+        term.draw(|f| {
+            let area = f.area();
+            draw_overlay(f, area, &mut app, theme_colors("dark"));
+        })
+        .unwrap();
+        let screen = screen_rows(&term).join("\n");
+        assert!(screen.contains("END-OF-OVERLAY"), "{screen}");
     }
 }
