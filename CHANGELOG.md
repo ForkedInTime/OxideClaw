@@ -82,6 +82,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`/undo`, `/redo` and `/rewind` are one timeline of turns.** `/undo [N]`
+  (default 1) now takes the last N turns off the conversation and the saved
+  session as well as reverting their files, so the model no longer sees
+  them; `/undo` with no count no longer opens a picker. `/redo [N]` puts
+  turns back, files and conversation, oldest first, until the next prompt.
+  `/rewind` is now a picker of turns that runs the same undo, and
+  `/rewind N` is `/undo N`. Every turn is snapshotted however it ends
+  (done, Esc, a failed request, the `/budget` stop, quit), and an undo
+  rewrites only the paths the undone turns changed. An undo that would
+  overwrite one of those files changed by hand since the last snapshot is
+  refused with the file names and changes nothing, where it used to
+  overwrite it and save the edit to a recovery ref; hand edits to other
+  files are left alone. Outside a git repository, with auto-commit off, or
+  in a session whose snapshots are not in this repository (resumed
+  elsewhere, or pruned), only the conversation moves and a one-line notice
+  says so. Turns a compaction summarised undo conversation only. The turns
+  `/redo` can bring back are kept in `<id>.redo` next to the session, never
+  in its `.meta`, and in memory only with `--no-session-persistence`.
+- **The `/rewind` file-snapshot store is gone.** Write, Edit, MultiEdit,
+  NotebookEdit and sub-agents no longer copy files into a per-turn snapshot
+  directory; `/rewind` undoes through the auto-commit snapshots. Snapshot
+  directories left by older versions are ignored, and removed with their
+  session.
 - **MCP startup and handshake.** A server that stays silent on methods it
   does not know now adds up to 5 seconds to its startup (the
   `server/discover` probe timeout). Handshake-era servers are offered
