@@ -907,7 +907,13 @@ pub(crate) async fn await_approval(
     approval_id: &str,
     timeout: std::time::Duration,
 ) -> ApprovalOutcome {
-    let deadline = tokio::time::Instant::now() + timeout;
+    // The host picks the timeout; a "never" sentinel such as u64::MAX
+    // seconds overflows `Instant + Duration`, a panic that aborts the
+    // release build and every session in it.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365 * 30));
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some((received_id, reason))) => {
@@ -954,6 +960,14 @@ mod approval_wait_tests {
         tx.send(("old-id".into(), None)).unwrap();
         let out = await_approval(&mut rx, "this-id", Duration::from_millis(200)).await;
         assert_eq!(out, ApprovalOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_never_timeout_does_not_overflow() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(("this-id".into(), None)).unwrap();
+        let out = await_approval(&mut rx, "this-id", Duration::from_secs(u64::MAX)).await;
+        assert_eq!(out, ApprovalOutcome::Approved);
     }
 
     #[tokio::test]
