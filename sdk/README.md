@@ -91,12 +91,10 @@ Your App                    OxideClaw
 | Type | When |
 |------|------|
 | `message/delta` | Text chunk from the model |
-| `thinking/delta` | Reasoning chunk (when `showThinkingSummaries` is on) |
 | `tool/started` | Tool execution began |
 | `tool/approval_needed` | Tool needs host approval |
 | `tool/completed` | Tool finished |
 | `cost/updated` | Token usage + cost after each API call |
-| `model/routed` | Smart router switched models for this turn |
 | `context/health` | Context window usage % |
 | `progress/updated` | Estimated progress through the task |
 | `turn/completed` | Turn finished — final response, total cost, duration |
