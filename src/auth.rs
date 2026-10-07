@@ -333,21 +333,38 @@ fn run_api_key_helper_with(cmd: &str, detach: bool, timeout: Duration) -> Result
     use std::io::Read;
     use std::process::{Command, Stdio};
 
+    let piped = |c: &mut Command| {
+        c.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    };
     let mut c = Command::new("sh");
-    c.arg("-c")
-        .arg(cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    c.arg("-c").arg(cmd);
+    piped(&mut c);
     #[cfg(unix)]
     if detach {
         crate::tools::bash::new_session(&mut c);
     }
     #[cfg(not(unix))]
     let _ = detach;
-    let mut child = c
-        .spawn()
-        .map_err(|e| format!("apiKeyHelper could not run: {e}"))?;
+    let spawned = c.spawn();
+    // Stock Windows has no `sh` (Git for Windows only puts git\cmd on PATH),
+    // so the helper never ran there. Keep `sh` first for Git Bash/MSYS users
+    // with POSIX helpers, and fall back to cmd.exe. `/S /C "<cmd>"` makes cmd
+    // strip just the outer quotes; `arg` would escape inner quotes with
+    // backslashes, which cmd does not understand.
+    #[cfg(windows)]
+    let spawned = match spawned {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new("cmd");
+            c.args(["/S", "/C"]).raw_arg(format!("\"{cmd}\""));
+            piped(&mut c);
+            c.spawn()
+        }
+        other => other,
+    };
+    let mut child = spawned.map_err(|e| format!("apiKeyHelper could not run: {e}"))?;
 
     // Drained on threads: a full pipe must not stall the helper, and the
     // deadline must hold even if it never closes them.
