@@ -167,7 +167,7 @@ RAG search: 'TOCTOU' — 1 results
 
 ### 💰 &nbsp; Live cost dashboard, `/budget` hard stop, optional router
 
-Every token is priced in real time, prompt-cache hits at the provider's cached rate (Claude, OpenAI, DeepSeek, Gemini; full input price where no cached rate is known). Cap the bill with `/budget $5` at any point in a session (or `routerBudget` in settings.json): OxideClaw warns at 80% and stops the loop when the budget is exceeded, counting sub-agents and background agents against the same cap.
+Every token is priced in real time, prompt-cache hits at Claude's published cached rate and at a conservative cached rate, never below the real one, for OpenAI, DeepSeek and Gemini (full input price where no cached rate is known). Cap the bill with `/budget $5` at any point in a session (or `routerBudget` in settings.json): OxideClaw warns at 80% and stops the loop when the budget is exceeded, counting sub-agents and background agents against the same cap.
 
 The smart router is optional and off by default. `/router on` sends each prompt to a tier picked by a keyword and length heuristic; the default tiers are Claude models (Haiku, Sonnet, your current model, Opus), and `/router low <model>` points a tier at any provider, Ollama included.
 

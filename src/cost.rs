@@ -130,8 +130,12 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
             gemini(0.30, 2.50)
         } else if id.contains("gemini-2-5-pro") {
             gemini(1.25, 10.0)
-        } else {
+        } else if id.contains("gemini-3") && id.contains("pro") {
             gemini(2.0, 12.0)
+        } else {
+            // No published cached rate for an unrecognised model: a cache
+            // hit costs the full input rate.
+            rough(2.0, 12.0)
         }
     } else if m.contains("groq:") || m.contains("together:") {
         // Rough estimate for hosted open-source models
@@ -158,7 +162,17 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         // functions, but flag it: an unrecognised model may be an order of
         // magnitude cheaper or dearer, and silently reporting a guess as fact
         // is how a /budget cap gets trusted when it should not be.
+        // An unprefixed model goes to the Anthropic backend (a proxy alias,
+        // a Bedrock ARN, a new Claude family name), where Sonnet-tier cache
+        // reads are 10% of input; a provider-prefixed one has no known
+        // cached rate, so a hit costs the full input rate.
+        let cache_read_mult = if crate::api::openai_compat::is_openai_compat_model(model) {
+            1.0
+        } else {
+            0.1
+        };
         ModelPrice {
+            cache_read_mult,
             fallback: true,
             ..rough(3.0, 15.0)
         }
@@ -730,6 +744,7 @@ mod price_table_tests {
             ("deepseek:deepseek-reasoner", 0.07),
             ("gemini:gemini-2.5-flash", 0.075),
             ("gemini:gemini-2.5-pro", 0.3125),
+            ("gemini:gemini-3-pro-preview", 0.5),
         ] {
             let got = model_price(model).cost(0, 0, m, 0);
             assert!((got - cached_per_m).abs() < 1e-9, "{model}: {got}");
@@ -741,9 +756,32 @@ mod price_table_tests {
             "venice:llama-3.3-70b",
             "openai-compat:my-model",
             "openrouter:openai/gpt-4o",
+            "gemini:learnlm-1.5-pro-experimental",
+            "gemini:gemini-1.5-pro",
         ] {
             let p = model_price(model);
             assert_eq!(p.cost(0, 0, m, 0), p.cost(m, 0, 0, 0), "{model}");
         }
+    }
+
+    /// An unrecognised unprefixed model runs on the Anthropic backend (a
+    /// proxy alias, a Bedrock ARN, a new Claude family), where Sonnet-tier
+    /// cache reads are 10% of input; full input there would report a mostly
+    /// cached session at several times its cost and trip /budget early.
+    #[test]
+    fn unknown_anthropic_backend_model_keeps_sonnet_cache_rate() {
+        let m = 1_000_000;
+        for model in [
+            "my-claude-proxy",
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc",
+        ] {
+            let p = model_price(model);
+            assert!(p.fallback, "{model}");
+            assert!((p.cost(0, 0, m, 0) - 0.3).abs() < 1e-9, "{model}");
+        }
+        // Behind an OpenAI-compatible prefix the cached rate is unknown.
+        let p = model_price("openai-compat:my-claude-proxy");
+        assert!(p.fallback);
+        assert!((p.cost(0, 0, m, 0) - 3.0).abs() < 1e-9);
     }
 }
