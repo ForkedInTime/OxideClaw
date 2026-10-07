@@ -90,6 +90,10 @@ pub struct SdkSession {
     child_usage_rx: mpsc::UnboundedReceiver<(String, Usage)>,
     /// Sub-agent (input, output) tokens recorded since the last CostUpdated.
     child_tokens: (u64, u64),
+    /// The last turn ended with the context critically full. Summarised when
+    /// the next prompt arrives (ACP), not at once: a one-shot SDK session
+    /// never sends one, and the summary would be a call nobody reads.
+    summarise_pending: bool,
 }
 
 impl SdkSession {
@@ -141,6 +145,7 @@ impl SdkSession {
             child_usage_tx,
             child_usage_rx,
             child_tokens: (0, 0),
+            summarise_pending: false,
         })
     }
 
@@ -202,8 +207,16 @@ impl SdkSession {
             None => prompt,
         };
 
+        // ACP runs every prompt on this session, so without this the
+        // history grew until each prompt was rejected as too long.
+        if std::mem::take(&mut self.summarise_pending) {
+            let (i, o) = self.auto_summarise().await;
+            turn_input_tokens += i;
+            turn_output_tokens += o;
+        }
+
         // 3. Push user message
-        let base = self.messages.len();
+        let mut base = self.messages.len();
         let mut content = vec![ContentBlock::Text { text: prompt }];
         if !rag_context.is_empty() {
             content.push(ContentBlock::Text { text: rag_context });
@@ -351,6 +364,25 @@ impl SdkSession {
                 tokens_max: window,
                 compaction_imminent: input_tok >= crate::compact::thresholds(window).1,
             });
+            let mut summarise_after_tools = false;
+            if self.config.auto_compact_enabled {
+                match crate::compact::compact_needed(input_tok, window) {
+                    crate::compact::CompactNeeded::Snip => {
+                        if crate::compact::snip_compact(&mut self.messages, &self.config.model) {
+                            self.forget_reads();
+                        }
+                    }
+                    // Summarising now would replace the tool_use the results
+                    // below answer, orphaning them (a 400).
+                    crate::compact::CompactNeeded::Summarise
+                        if response.stop_reason == Some(StopReason::ToolUse) =>
+                    {
+                        summarise_after_tools = true;
+                    }
+                    crate::compact::CompactNeeded::Summarise => self.summarise_pending = true,
+                    _ => {}
+                }
+            }
 
             // Budget check
             if self.cost_tracker.over_budget() {
@@ -402,6 +434,13 @@ impl SdkSession {
                         });
                         end = TurnEnd::BudgetExceeded;
                         break;
+                    }
+                    if summarise_after_tools {
+                        let (i, o) = self.auto_summarise().await;
+                        turn_input_tokens += i;
+                        turn_output_tokens += o;
+                        // A later failed request must not drop the summary.
+                        base = self.messages.len();
                     }
 
                     // Progress notification
@@ -457,6 +496,59 @@ impl SdkSession {
         });
 
         Ok(end)
+    }
+
+    /// Replace the history with a summary (snip if that fails). Call only
+    /// between rounds: the summary replaces any tool_use whose results are
+    /// still to come. Returns the summary call's (input, output) tokens.
+    async fn auto_summarise(&mut self) -> (u64, u64) {
+        let cancel = Arc::clone(&self.cancel);
+        let mut usage = Usage::default();
+        let summary = {
+            let call = crate::compact::summarize_compact(
+                &self.client,
+                &self.messages,
+                &self.config,
+                |u| usage = u.clone(),
+            );
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                r = call => Some(r),
+            }
+        };
+        let Some(summary) = summary else {
+            // Not done: try again before the next prompt.
+            self.summarise_pending = true;
+            return (0, 0);
+        };
+        // Billed like any other call: it carries the whole history.
+        self.cost_tracker.record_with_cache(
+            &self.config.model,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        match summary {
+            Ok(replacement) => self.messages = replacement,
+            Err(e) => {
+                debug!("SDK auto-compact summary failed, snipping instead: {e:#}");
+                crate::compact::snip_compact(&mut self.messages, &self.config.model);
+            }
+        }
+        self.forget_reads();
+        (usage.input_tokens, usage.output_tokens)
+    }
+
+    /// After compaction the bodies of earlier reads are gone from the
+    /// history, so a re-read must return the file, not "unchanged since
+    /// last read".
+    fn forget_reads(&self) {
+        self.read_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Execute tool calls with policy-based approval.
@@ -1539,6 +1631,71 @@ mod guard_tests {
         assert_eq!(bash.0.load(Ordering::SeqCst), 1, "the tool had started");
         assert!(is_error(&r), "{r:?}");
         assert!(result_text(&r).contains("Cancelled"), "{r:?}");
+    }
+
+    /// The SDK session never compacted, so a long ACP session grew until
+    /// every prompt was rejected as too long. Summarised between tool
+    /// rounds, and before the next prompt when a turn ends critically full.
+    #[tokio::test]
+    async fn a_full_context_is_summarised_between_rounds_and_before_the_next_prompt() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let full = |blocks: &[serde_json::Value], stop: &str| {
+            sse(blocks, stop).replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#)
+        };
+        let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Bash","input":{}})];
+        let text = [serde_json::json!({"type":"text","text":"done"})];
+        let summary = || {
+            sse(
+                &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
+                "end_turn",
+            )
+        };
+        let (url, seen) = serve(vec![
+            full(&tool, "tool_use"),
+            summary(),
+            full(&text, "end_turn"),
+            summary(),
+            sse(&text, "end_turn"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.model = "claude-sonnet-5".into();
+        c.auto_compact_enabled = true;
+        let (mut s, _) = session(c);
+        let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        client.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(client);
+        s.read_cache
+            .lock()
+            .unwrap()
+            .insert(dir.path().join("lib.rs"), 42);
+
+        s.execute_turn("first".into()).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 3, "turn, summary, turn");
+        assert!(s.read_cache.lock().unwrap().is_empty(), "stale read cache");
+        s.execute_turn("second".into()).await.unwrap();
+
+        let bodies: Vec<serde_json::Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 5, "summary, then the second prompt");
+        for i in [2, 4] {
+            let msgs = bodies[i]["messages"].as_array().unwrap();
+            assert!(
+                msgs[0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("automatically compacted"),
+                "request {i}: {msgs:?}"
+            );
+        }
+        let last = bodies[4]["messages"].as_array().unwrap();
+        assert_eq!(last.len(), 2, "{last:?}");
+        assert_eq!(last[1]["content"][0]["text"], "second");
     }
 
     /// Sub-agent spend never reached the SDK's tracker, so CostUpdated,
