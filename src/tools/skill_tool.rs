@@ -1,6 +1,6 @@
 /// SkillTool — port of skill.ts
 /// Looks up a skill by name from the skills registry and executes it.
-/// Skills are .md files in ~/.claude/skills/ or .claude/skills/ — each is a prompt template.
+/// Skills are .md files in the global config dir's skills/ or .claude/skills/ — each is a prompt template.
 use super::{Tool, ToolContext, ToolOutput, async_trait};
 use anyhow::Result;
 use serde::Deserialize;
@@ -26,7 +26,8 @@ impl Tool for SkillTool {
 
     fn description(&self) -> &str {
         "Execute a skill by name. Skills are markdown prompt templates stored in \
-        ~/.claude/skills/ or .claude/skills/. Use DiscoverSkills to list available skills."
+        the global skills dir (~/.claude/skills/ by default) or .claude/skills/. \
+        Use DiscoverSkills to list available skills."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -57,7 +58,8 @@ impl Tool for SkillTool {
             ));
         }
 
-        let path = find_skill(&ctx.cwd, &input.skill)?;
+        let global = crate::config::Config::claude_dir().join("skills");
+        let path = find_skill(&ctx.cwd, &global, &input.skill)?;
         // Skill is unprompted and echoes the file back, so a repo-shipped
         // `.claude/skills/setup.md -> ~/.ssh/id_rsa` would hand the model the
         // key that Read refuses.
@@ -77,16 +79,12 @@ impl Tool for SkillTool {
     }
 }
 
-fn find_skill(cwd: &std::path::Path, name: &str) -> Result<PathBuf> {
-    let dirs: Vec<PathBuf> = {
-        let mut d = Vec::new();
-        // Local project skills override global ones
-        d.push(cwd.join(".claude").join("skills"));
-        if let Some(home) = dirs::home_dir() {
-            d.push(home.join(".claude").join("skills"));
-        }
-        d
-    };
+/// `global` must be the same dir `/name` loads from (`Config::claude_dir()`),
+/// or a skill under CLAUDE_CONFIG_DIR / XDG works as `/name` but is "not
+/// found" here.
+fn find_skill(cwd: &std::path::Path, global: &std::path::Path, name: &str) -> Result<PathBuf> {
+    // Local project skills override global ones
+    let dirs = [cwd.join(".claude").join("skills"), global.to_path_buf()];
 
     for dir in &dirs {
         let path = dir.join(format!("{name}.md"));
@@ -96,9 +94,10 @@ fn find_skill(cwd: &std::path::Path, name: &str) -> Result<PathBuf> {
     }
 
     Err(anyhow::anyhow!(
-        "Skill '{}' not found. Searched in .claude/skills/ and ~/.claude/skills/.\n\
+        "Skill '{}' not found. Searched in .claude/skills/ and {}.\n\
         Use DiscoverSkills to see available skills.",
-        name
+        name,
+        global.display()
     ))
 }
 
@@ -154,6 +153,31 @@ mod tests {
                 "{name:?} read outside the skills dir"
             );
         }
+    }
+
+    /// The global dir was hard-coded to ~/.claude/skills, so skills under
+    /// CLAUDE_CONFIG_DIR or XDG config were invisible to the model.
+    #[test]
+    fn find_skill_searches_the_given_global_dir_after_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("xdg/oxideclaw/skills");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(cwd.join(".claude/skills")).unwrap();
+        std::fs::write(global.join("deploy.md"), "global").unwrap();
+        std::fs::write(global.join("both.md"), "global").unwrap();
+        std::fs::write(cwd.join(".claude/skills/both.md"), "local").unwrap();
+
+        assert_eq!(
+            find_skill(&cwd, &global, "deploy").unwrap(),
+            global.join("deploy.md")
+        );
+        assert_eq!(
+            find_skill(&cwd, &global, "both").unwrap(),
+            cwd.join(".claude/skills/both.md")
+        );
+        let err = find_skill(&cwd, &global, "nope").unwrap_err().to_string();
+        assert!(err.contains(&global.display().to_string()), "{err}");
     }
 
     #[cfg(unix)]

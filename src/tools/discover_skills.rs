@@ -1,5 +1,5 @@
 /// DiscoverSkillsTool — port of discoverSkills.ts
-/// Lists available skills from ~/.claude/skills/ and .claude/skills/
+/// Lists available skills from the global skills dir and .claude/skills/
 use super::{Tool, ToolContext, ToolOutput, async_trait};
 use anyhow::Result;
 use serde_json::json;
@@ -14,7 +14,8 @@ impl Tool for DiscoverSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "List available skills (slash commands) from ~/.claude/skills/ and .claude/skills/. \
+        "List available skills (slash commands) from the global skills dir \
+        (~/.claude/skills/ by default) and .claude/skills/. \
         Returns a list of skill names and their first-line descriptions."
     }
 
@@ -23,61 +24,18 @@ impl Tool for DiscoverSkillsTool {
     }
 
     async fn execute(&self, _input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        let mut skills: Vec<(String, String)> = Vec::new();
-
-        let dirs: Vec<PathBuf> = {
-            let mut d = Vec::new();
-            if let Some(home) = dirs::home_dir() {
-                d.push(home.join(".claude").join("skills"));
-            }
-            d.push(ctx.cwd.join(".claude").join("skills"));
-            d
-        };
-
-        for dir in &dirs {
-            if !dir.is_dir() {
-                continue;
-            }
-            let mut entries = tokio::fs::read_dir(dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let name = path
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if name.is_empty() {
-                        continue;
-                    }
-
-                    // Read first non-empty, non-frontmatter line as description
-                    // (never from a link to key material).
-                    let desc =
-                        if super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read)
-                            .is_none()
-                            && let Ok(content) = tokio::fs::read_to_string(&path).await
-                        {
-                            extract_description(&content)
-                        } else {
-                            String::new()
-                        };
-
-                    // Avoid duplicates (local overrides global)
-                    if !skills.iter().any(|(n, _)| n == &name) {
-                        skills.push((name, desc));
-                    }
-                }
-            }
-        }
+        // Same global dir `/name` loads from, so CLAUDE_CONFIG_DIR / XDG
+        // skills are listed too.
+        let global = crate::config::Config::claude_dir().join("skills");
+        let skills = list_skills(&[ctx.cwd.join(".claude").join("skills"), global.clone()]).await?;
 
         if skills.is_empty() {
-            return Ok(ToolOutput::success(
-                "No skills found. Place .md files in ~/.claude/skills/ or .claude/skills/.",
-            ));
+            return Ok(ToolOutput::success(format!(
+                "No skills found. Place .md files in {} or .claude/skills/.",
+                global.display()
+            )));
         }
 
-        skills.sort_by(|a, b| a.0.cmp(&b.0));
         let lines: Vec<String> = skills
             .iter()
             .map(|(name, desc)| {
@@ -91,6 +49,49 @@ impl Tool for DiscoverSkillsTool {
 
         Ok(ToolOutput::success(lines.join("\n")))
     }
+}
+
+/// Skills in `dirs`, sorted by name; on a name clash the earlier dir wins.
+async fn list_skills(dirs: &[PathBuf]) -> Result<Vec<(String, String)>> {
+    let mut skills: Vec<(String, String)> = Vec::new();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let name = path
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+
+                // Read first non-empty, non-frontmatter line as description
+                // (never from a link to key material).
+                let desc = if super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read)
+                    .is_none()
+                    && let Ok(content) = tokio::fs::read_to_string(&path).await
+                {
+                    extract_description(&content)
+                } else {
+                    String::new()
+                };
+
+                // Avoid duplicates (local overrides global)
+                if !skills.iter().any(|(n, _)| n == &name) {
+                    skills.push((name, desc));
+                }
+            }
+        }
+    }
+
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(skills)
 }
 
 fn extract_description(content: &str) -> String {
@@ -133,4 +134,33 @@ fn extract_description(content: &str) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The global dir was hard-coded to ~/.claude/skills, so skills under
+    /// CLAUDE_CONFIG_DIR or XDG config were missing from the list, and a
+    /// global copy shadowed the project's description.
+    #[tokio::test]
+    async fn lists_the_given_global_dir_and_project_wins_clashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("xdg/oxideclaw/skills");
+        let local = dir.path().join("proj/.claude/skills");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(global.join("deploy.md"), "Ship it").unwrap();
+        std::fs::write(global.join("both.md"), "global copy").unwrap();
+        std::fs::write(local.join("both.md"), "project copy").unwrap();
+
+        let skills = list_skills(&[local, global]).await.unwrap();
+        assert_eq!(
+            skills,
+            vec![
+                ("both".to_string(), "project copy".to_string()),
+                ("deploy".to_string(), "Ship it".to_string()),
+            ]
+        );
+    }
 }
