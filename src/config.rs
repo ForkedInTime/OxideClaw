@@ -1032,8 +1032,8 @@ impl Config {
         // ── CLAUDE.md + AGENTS.md files (global + project hierarchy) — skipped in bare mode
         if !self.bare_mode {
             let dir = self.config_dir();
-            self.claudemd = Self::load_claude_md_in(&dir, &self.cwd);
-            self.agentsmd = Self::load_agents_md_in(&dir, &self.cwd);
+            self.claudemd = Self::load_instruction_files(&dir, &self.cwd, "CLAUDE.md");
+            self.agentsmd = Self::load_instruction_files(&dir, &self.cwd, "AGENTS.md");
         }
 
         // ── CLAUDE.md phase-routing directive override
@@ -1148,22 +1148,33 @@ impl Config {
     ///
     /// Returns the concatenated text, with a source comment before each section.
     pub fn load_claude_md(cwd: &Path) -> String {
-        Self::load_claude_md_in(&Self::claude_dir(), cwd)
+        Self::load_instruction_files(&Self::claude_dir(), cwd, "CLAUDE.md")
     }
 
-    fn load_claude_md_in(claude_dir: &Path, cwd: &Path) -> String {
+    /// Load and merge all AGENTS.md files in priority order (same as CLAUDE.md).
+    /// Industry-standard agent configuration — works across OxideClaw and other AGENTS.md-aware agents.
+    pub fn load_agents_md(cwd: &Path) -> String {
+        Self::load_instruction_files(&Self::claude_dir(), cwd, "AGENTS.md")
+    }
+
+    /// `global_dir/name`, then `name` in every directory from the filesystem
+    /// root (or home) down to `cwd`, outermost first.
+    fn load_instruction_files(global_dir: &Path, cwd: &Path, name: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         // Track canonical paths so symlinks / relative traversal can't inject the same file twice
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-        let mut include = |path: &PathBuf| {
-            // A symlinked instruction file is refused: a repository could
-            // point CLAUDE.md at ~/.ssh/id_rsa and have the key read into the
-            // system prompt. Same rule the file tools apply.
-            if path
-                .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
+        let mut include = |path: &PathBuf, trusted: bool| {
+            // A symlinked instruction file in the project tree is refused: a
+            // repository could point CLAUDE.md at ~/.ssh/id_rsa and have the
+            // key read into the system prompt. Same rule the file tools
+            // apply. The global file is exempt: no repository can plant it,
+            // and dotfile managers (stow, home-manager) install it as a link.
+            if !trusted
+                && path
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
             {
                 tracing::warn!("ignoring symlinked instruction file {}", path.display());
                 return;
@@ -1181,17 +1192,15 @@ impl Config {
             }
         };
 
-        // ── Global: ~/.claude/CLAUDE.md ──────────────────────────────────────
-        let global = claude_dir.join("CLAUDE.md");
-        include(&global);
+        include(&global_dir.join(name), true);
 
-        // ── Walk from cwd up toward home/root, collect CLAUDE.md files ───────
+        // ── Walk from cwd up toward home/root, collect instruction files ─────
         // We collect outermost → innermost so that more-local files override.
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let mut ancestry: Vec<PathBuf> = Vec::new();
         let mut dir = cwd.to_path_buf();
         loop {
-            let candidate = dir.join("CLAUDE.md");
+            let candidate = dir.join(name);
             if candidate.exists() {
                 ancestry.push(candidate);
             }
@@ -1205,69 +1214,7 @@ impl Config {
         // ancestry is innermost-first; reverse to get outermost-first
         ancestry.reverse();
         for path in ancestry {
-            include(&path);
-        }
-
-        parts.join("\n\n")
-    }
-
-    /// Load and merge all AGENTS.md files in priority order (same as CLAUDE.md).
-    /// Industry-standard agent configuration — works across OxideClaw and other AGENTS.md-aware agents.
-    pub fn load_agents_md(cwd: &Path) -> String {
-        Self::load_agents_md_in(&Self::claude_dir(), cwd)
-    }
-
-    fn load_agents_md_in(claude_dir: &Path, cwd: &Path) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-        let mut include = |path: &PathBuf| {
-            // A symlinked instruction file is refused: a repository could
-            // point CLAUDE.md at ~/.ssh/id_rsa and have the key read into the
-            // system prompt. Same rule the file tools apply.
-            if path
-                .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                tracing::warn!("ignoring symlinked instruction file {}", path.display());
-                return;
-            }
-            let key = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if !seen.insert(key) {
-                return;
-            }
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    parts.push(format!("<!-- {} -->\n{}", path.display(), trimmed));
-                }
-            }
-        };
-
-        // Global: ~/.claude/AGENTS.md
-        let global = claude_dir.join("AGENTS.md");
-        include(&global);
-
-        // Walk from cwd up toward home/root
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let mut ancestry: Vec<PathBuf> = Vec::new();
-        let mut dir = cwd.to_path_buf();
-        loop {
-            let candidate = dir.join("AGENTS.md");
-            if candidate.exists() {
-                ancestry.push(candidate);
-            }
-            if dir == home {
-                break;
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
-        ancestry.reverse();
-        for path in ancestry {
-            include(&path);
+            include(&path, false);
         }
 
         parts.join("\n\n")
@@ -2170,6 +2117,28 @@ mod instruction_file_symlink_tests {
             !agents.contains("PRIVATE KEY"),
             "AGENTS.md symlink was followed"
         );
+    }
+
+    /// home-manager / stow install `~/.claude/CLAUDE.md` as a symlink into
+    /// the dotfiles store. The global file is the user's own, so it loads.
+    #[test]
+    fn symlinked_global_instruction_files_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("dotfiles");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("CLAUDE.md"), "global claude rules").unwrap();
+        std::fs::write(store.join("AGENTS.md"), "global agents rules").unwrap();
+        let global = tmp.path().join("claude");
+        std::fs::create_dir(&global).unwrap();
+        std::os::unix::fs::symlink(store.join("CLAUDE.md"), global.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(store.join("AGENTS.md"), global.join("AGENTS.md")).unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        let claude = Config::load_instruction_files(&global, &repo, "CLAUDE.md");
+        assert!(claude.contains("global claude rules"), "{claude}");
+        let agents = Config::load_instruction_files(&global, &repo, "AGENTS.md");
+        assert!(agents.contains("global agents rules"), "{agents}");
     }
 
     #[test]
