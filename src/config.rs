@@ -222,6 +222,16 @@ pub struct Config {
     /// Tools explicitly blocked via CLI (empty = none blocked).
     pub disallowed_tools: Vec<String>,
 
+    /// `--allowed-tools` rules with a specifier (`Bash(git status:*)`),
+    /// also in `permissions_allow`; kept apart so another project's settings
+    /// do not drop them.
+    #[serde(default)]
+    pub cli_permissions_allow: Vec<String>,
+
+    /// `--disallowed-tools` rules with a specifier, also in `permissions_deny`.
+    #[serde(default)]
+    pub cli_permissions_deny: Vec<String>,
+
     /// Custom system prompt override (replaces built-in if non-empty).
     pub system_prompt_override: Option<String>,
 
@@ -486,6 +496,8 @@ impl Default for Config {
             max_turns: 0,
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
+            cli_permissions_allow: Vec::new(),
+            cli_permissions_deny: Vec::new(),
             system_prompt_override: None,
             append_system_prompt: None,
             session_name: None,
@@ -843,6 +855,8 @@ impl Config {
             max_turns: old.max_turns,
             allowed_tools: old.allowed_tools,
             disallowed_tools: old.disallowed_tools,
+            cli_permissions_allow: old.cli_permissions_allow,
+            cli_permissions_deny: old.cli_permissions_deny,
             system_prompt_override: old.system_prompt_override,
             append_system_prompt: old.append_system_prompt,
             session_name: old.session_name,
@@ -868,6 +882,59 @@ impl Config {
             flag_settings: old.flag_settings,
             config_dir_override: old.config_dir_override,
         };
+        self.add_cli_permission_rules();
+    }
+
+    /// Apply `--allowed-tools` / `--disallowed-tools` (each empty when the
+    /// flag was not given). A bare tool name filters the tool list; a rule
+    /// with a specifier (`Bash(git status:*)`) becomes a permission allow or
+    /// deny rule and leaves its tool available, so when `--allowed-tools`
+    /// also lists bare names, the rule's tool is kept beside them.
+    pub fn apply_tool_flags(
+        &mut self,
+        allowed: &[String],
+        disallowed: &[String],
+    ) -> std::result::Result<(), String> {
+        if allowed.is_empty() && disallowed.is_empty() {
+            return Ok(());
+        }
+        let known = crate::tools::builtin_tool_names(self);
+        if !allowed.is_empty() {
+            let flag = crate::permissions::parse_tool_flag("--allowed-tools", allowed, &known)?;
+            if !flag.names.is_empty() {
+                let mut names = flag.names;
+                names.extend(
+                    flag.rules
+                        .iter()
+                        .filter_map(|r| r.split_once('('))
+                        .map(|(tool, _)| tool.to_string()),
+                );
+                self.allowed_tools = names;
+            }
+            self.cli_permissions_allow = flag.rules;
+        }
+        if !disallowed.is_empty() {
+            let flag =
+                crate::permissions::parse_tool_flag("--disallowed-tools", disallowed, &known)?;
+            self.disallowed_tools = flag.names;
+            self.cli_permissions_deny = flag.rules;
+        }
+        self.add_cli_permission_rules();
+        Ok(())
+    }
+
+    /// Add the command-line rules to the ones the settings files gave.
+    fn add_cli_permission_rules(&mut self) {
+        for (rules, cli) in [
+            (&mut self.permissions_allow, &self.cli_permissions_allow),
+            (&mut self.permissions_deny, &self.cli_permissions_deny),
+        ] {
+            for rule in cli {
+                if !rules.contains(rule) {
+                    rules.push(rule.clone());
+                }
+            }
+        }
     }
 
     /// A default config for `cwd` (the process's when None) with
@@ -3638,5 +3705,160 @@ mod autonomy_migration_tests {
         assert!(c.fall_back_from_full_auto().is_some());
         assert_eq!(c.autonomy, Autonomy::Ask);
         assert_eq!(c.fall_back_from_full_auto(), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_flag_tests {
+    use super::Config;
+    use crate::permissions::{GateOutcome, PermissionGate};
+    use serde_json::json;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cfg(dir: &std::path::Path) -> Config {
+        Config {
+            cwd: dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    fn tool_names(cfg: &Config) -> Vec<String> {
+        let mut tools = crate::tools::all_tools_with_state(cfg).0;
+        crate::tools::apply_tool_filters(&mut tools, cfg);
+        let mut names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    async fn bash(gate: &PermissionGate, command: &str) -> GateOutcome {
+        gate.decide("Bash", &json!({ "command": command })).await
+    }
+
+    #[test]
+    fn bare_names_filter_the_tool_list_and_grant_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.apply_tool_flags(&v(&["read,grep", "Bash"]), &v(&["Write"]))
+            .unwrap();
+        assert_eq!(c.allowed_tools, ["Read", "Grep", "Bash"]);
+        assert_eq!(c.disallowed_tools, ["Write"]);
+        assert!(c.permissions_allow.is_empty() && c.permissions_deny.is_empty());
+        assert_eq!(tool_names(&c), ["Bash", "Grep", "Read"]);
+    }
+
+    /// `Bash(git status:*)` used to be taken as a tool name, matched no
+    /// tool and left the model with none, approving nothing.
+    #[tokio::test]
+    async fn an_allow_rule_keeps_its_tool_and_approves_only_matching_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.apply_tool_flags(&v(&["Bash(git status:*)"]), &[])
+            .unwrap();
+        assert!(c.allowed_tools.is_empty(), "a rule restricts no tools");
+        assert_eq!(c.permissions_allow, ["Bash(git status:*)"]);
+        let names = tool_names(&c);
+        assert!(names.iter().any(|n| n == "Bash") && names.iter().any(|n| n == "Edit"));
+
+        let gate = PermissionGate::headless(&c);
+        assert_eq!(bash(&gate, "git status").await, GateOutcome::Allowed);
+        assert_eq!(
+            bash(&gate, "git status --short").await,
+            GateOutcome::Allowed
+        );
+        for cmd in ["git push", "git status && rm -rf x", "touch x"] {
+            assert!(
+                matches!(bash(&gate, cmd).await, GateOutcome::Denied(_)),
+                "{cmd} was approved"
+            );
+        }
+    }
+
+    /// With bare names restricting the list, the rule's tool stays in it.
+    #[test]
+    fn a_rule_beside_bare_names_keeps_its_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.apply_tool_flags(&v(&["Read bash(npm run test, lint)"]), &[])
+            .unwrap();
+        assert_eq!(c.allowed_tools, ["Read", "Bash"]);
+        assert_eq!(c.permissions_allow, ["Bash(npm run test, lint)"]);
+        assert_eq!(tool_names(&c), ["Bash", "Read"]);
+    }
+
+    /// A deny rule refuses matching calls, even under
+    /// --dangerously-skip-permissions, and leaves the tool for the rest.
+    #[tokio::test]
+    async fn a_deny_rule_blocks_matching_calls_and_keeps_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.dangerously_skip_permissions = true;
+        c.apply_tool_flags(&[], &v(&["Bash(git push:*),WebFetch"]))
+            .unwrap();
+        assert_eq!(c.disallowed_tools, ["WebFetch"]);
+        assert_eq!(c.permissions_deny, ["Bash(git push:*)"]);
+        let names = tool_names(&c);
+        assert!(names.iter().any(|n| n == "Bash"));
+        assert!(!names.iter().any(|n| n == "WebFetch"));
+
+        let gate = PermissionGate::headless(&c);
+        assert!(matches!(
+            bash(&gate, "git push origin main").await,
+            GateOutcome::Denied(_)
+        ));
+        assert_eq!(bash(&gate, "git status").await, GateOutcome::Allowed);
+    }
+
+    #[test]
+    fn bad_entries_are_errors_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        for (allowed, disallowed, needle) in [
+            (vec!["Bsh"], vec![], "--allowed-tools: unknown tool `Bsh`"),
+            (vec!["Bash(git status:*"], vec![], "unclosed `(`"),
+            (
+                vec![],
+                vec!["Agent(explore)"],
+                "--disallowed-tools: `Agent(explore)`",
+            ),
+            (vec!["Bash()"], vec![], "`Bash()` is not a permission rule"),
+            (
+                vec![""],
+                vec![],
+                "--allowed-tools: no tool names or rules given",
+            ),
+        ] {
+            let mut c = cfg(dir.path());
+            let err = c
+                .apply_tool_flags(&v(&allowed), &v(&disallowed))
+                .unwrap_err();
+            assert!(err.contains(needle), "{err}");
+            assert!(c.permissions_allow.is_empty() && c.permissions_deny.is_empty());
+        }
+    }
+
+    /// SDK `session/start` and ACP `session/new` move the config to the
+    /// session's project, whose settings replace the permission rules.
+    #[test]
+    fn rules_survive_a_switch_to_another_project() {
+        let launch = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".claude")).unwrap();
+        std::fs::write(
+            project.path().join(".claude/settings.json"),
+            r#"{"permissions": {"deny": ["Bash(curl:*)"]}}"#,
+        )
+        .unwrap();
+        let mut c = Config {
+            config_dir_override: Some(home.path().into()),
+            ..cfg(launch.path())
+        };
+        c.apply_tool_flags(&v(&["Bash(git status:*)"]), &v(&["Bash(git push:*)"]))
+            .unwrap();
+        c.retarget_cwd(project.path().to_path_buf());
+        assert_eq!(c.permissions_allow, ["Bash(git status:*)"]);
+        assert_eq!(c.permissions_deny, ["Bash(curl:*)", "Bash(git push:*)"]);
     }
 }

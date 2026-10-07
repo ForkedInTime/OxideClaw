@@ -336,6 +336,95 @@ pub fn rule_is_supported(rule: &str) -> bool {
     }
 }
 
+/// What one of `--allowed-tools` / `--disallowed-tools` asked for.
+#[derive(Debug, Default, PartialEq)]
+pub struct ToolFlag {
+    /// Bare tool names, which filter the tool list.
+    pub names: Vec<String>,
+    /// Rules with a specifier (`Bash(git status:*)`), which become
+    /// permission allow / deny rules.
+    pub rules: Vec<String>,
+}
+
+/// Parse every value given for `flag` against `known`, the built-in tool
+/// names. Entries are separated by commas or whitespace outside parentheses,
+/// as Claude Code splits them, so the space in `Bash(git status:*)` stays in
+/// the rule. Tool names are matched case-insensitively and stored in their
+/// canonical spelling; any `mcp__` name passes, since MCP tools are not
+/// known until their servers start. An unknown tool, a rule OxideClaw cannot
+/// parse or unbalanced parentheses is an error: dropping the entry would run
+/// with other tools or fewer rules than the user asked for.
+pub fn parse_tool_flag(
+    flag: &str,
+    values: &[String],
+    known: &[String],
+) -> Result<ToolFlag, String> {
+    let mut out = ToolFlag::default();
+    for value in values {
+        let mut entries = vec![String::new()];
+        let mut depth = 0usize;
+        for c in value.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| format!("{flag}: `{value}` has a `)` with no `(`"))?;
+                }
+                c if depth == 0 && (c == ',' || c.is_whitespace()) => {
+                    entries.push(String::new());
+                    continue;
+                }
+                _ => {}
+            }
+            entries.last_mut().expect("never empty").push(c);
+        }
+        if depth > 0 {
+            return Err(format!("{flag}: `{value}` has an unclosed `(`"));
+        }
+        for entry in entries.iter().filter(|e| !e.is_empty()) {
+            let (tool, spec) = match entry.split_once('(') {
+                Some((tool, rest)) => (tool, Some(rest)),
+                None => (entry.as_str(), None),
+            };
+            let tool = if tool.to_ascii_lowercase().starts_with("mcp__") {
+                tool.to_string()
+            } else {
+                known
+                    .iter()
+                    .find(|k| k.eq_ignore_ascii_case(tool))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "{flag}: unknown tool `{entry}`. Known tools: {}; MCP tools \
+                             are named mcp__<server>__<tool>.",
+                            known.join(", ")
+                        )
+                    })?
+            };
+            let Some(spec) = spec else {
+                out.names.push(tool);
+                continue;
+            };
+            let rule = format!("{tool}({spec}");
+            if !spec.ends_with(')') || !rule_is_supported(&rule) {
+                return Err(format!(
+                    "{flag}: `{entry}` is not a permission rule OxideClaw understands. \
+                     Rules look like Bash(git status:*), Bash(npm run *), \
+                     WebFetch(domain:example.com) or Edit(src/**); only Bash, PowerShell, \
+                     WebFetch and the file tools (Read, Write, Edit, MultiEdit, Grep, Glob, \
+                     NotebookRead, NotebookEdit, LSP) take one."
+                ));
+            }
+            out.rules.push(rule);
+        }
+    }
+    if out.names.is_empty() && out.rules.is_empty() {
+        return Err(format!("{flag}: no tool names or rules given"));
+    }
+    Ok(out)
+}
+
 /// Check whether a permission rule entry matches the given tool call.
 ///
 /// Rule syntax (the Claude Code forms plus OxideClaw's `prefix:`):
@@ -1678,5 +1767,64 @@ mod tests {
         let desc = describe_tool_call("PowerShell", &input);
         assert!(desc.contains("PowerShell"), "{desc}");
         assert!(desc.contains("Get-Process"), "{desc}");
+    }
+}
+
+#[cfg(test)]
+mod tool_flag_tests {
+    use super::{ToolFlag, parse_tool_flag};
+
+    fn parse(values: &[&str]) -> Result<ToolFlag, String> {
+        let known: Vec<String> = ["Bash", "Read", "Edit", "WebFetch", "Agent"]
+            .map(String::from)
+            .to_vec();
+        let values: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        parse_tool_flag("--allowed-tools", &values, &known)
+    }
+
+    /// Commas and whitespace separate entries only outside parentheses, so
+    /// `Bash(git status:*)` and `Bash(npm run a,b)` stay whole.
+    #[test]
+    fn splits_on_commas_and_spaces_outside_parentheses() {
+        let got = parse(&[
+            "read, Bash(git status:*) edit",
+            "Bash(npm run a,b),mcp__github",
+            "\tWebFetch(domain:example.com)\n",
+        ])
+        .unwrap();
+        assert_eq!(got.names, ["Read", "Edit", "mcp__github"]);
+        assert_eq!(
+            got.rules,
+            [
+                "Bash(git status:*)",
+                "Bash(npm run a,b)",
+                "WebFetch(domain:example.com)"
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_are_validated_with_the_permission_rule_parser() {
+        for bad in [
+            "Agent(explore)",
+            "Bash()",
+            "WebFetch(example.com)",
+            "Bash(git)x",
+            "mcp__github__push(x)",
+        ] {
+            let err = parse(&[bad]).unwrap_err();
+            assert!(err.contains("is not a permission rule"), "{bad}: {err}");
+        }
+        for (bad, why) in [
+            ("Bash(git status", "unclosed `(`"),
+            ("Bash)", "`)` with no `(`"),
+            ("Bsh", "unknown tool `Bsh`"),
+            ("Bsh(ls:*)", "unknown tool `Bsh(ls:*)`"),
+            (" , ", "no tool names or rules given"),
+        ] {
+            let err = parse(&[bad]).unwrap_err();
+            assert!(err.starts_with("--allowed-tools: "), "{err}");
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 }

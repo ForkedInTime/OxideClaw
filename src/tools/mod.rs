@@ -1198,6 +1198,33 @@ pub fn all_tools_with_state_and_mcp(
     (tools, shared)
 }
 
+/// Every built-in tool name, including those only some setups build (the
+/// browser tools, LSP, agent swarms, MCP resources): the names
+/// `--allowed-tools` and `--disallowed-tools` accept besides MCP tools.
+pub fn builtin_tool_names(config: &crate::config::Config) -> Vec<String> {
+    let all = crate::config::Config {
+        browser_enabled: true,
+        bare_mode: false,
+        ..config.clone()
+    };
+    let conditional: [DynTool; 5] = [
+        Arc::new(send_message::SendMessageTool),
+        Arc::new(team_tools::TeamCreateTool),
+        Arc::new(team_tools::TeamDeleteTool),
+        Arc::new(mcp_resources::ListMcpResourcesTool { clients: vec![] }),
+        Arc::new(mcp_resources::ReadMcpResourceTool { clients: vec![] }),
+    ];
+    let mut names: Vec<String> = all_tools_with_state(&all)
+        .0
+        .iter()
+        .chain(conditional.iter())
+        .map(|t| t.name().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 #[cfg(test)]
 mod sensitive_path_tests {
     use super::*;
@@ -1619,6 +1646,25 @@ mod tool_search_snapshot_tests {
             ..Default::default()
         };
         assert!(has_jira(&other));
+    }
+
+    /// Every name the tool set can hold is one the flags accept.
+    #[test]
+    fn builtin_tool_names_cover_the_optional_tools() {
+        let names = builtin_tool_names(&crate::config::Config {
+            bare_mode: true,
+            ..Default::default()
+        });
+        for n in [
+            "Bash",
+            "LSP",
+            "SendMessage",
+            "ListMcpResources",
+            "ToolSearch",
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} missing: {names:?}");
+        }
+        assert!(names.iter().any(|x| x == "browser_navigate"), "{names:?}");
     }
 }
 

@@ -146,12 +146,19 @@ struct Cli {
     #[arg(long, default_value = "0")]
     max_turns: u32,
 
-    /// Tools to allow (comma-separated or repeated flag). Restricts to this set.
-    #[arg(long, value_delimiter = ',')]
+    /// Tools to allow, comma- or space-separated or a repeated flag. A bare
+    /// name (Read) restricts the tool list to the names given; a rule
+    /// (Bash(git status:*)) runs matching calls without a prompt and keeps
+    /// its tool available.
+    // No value_delimiter: clap would split `Bash(npm run a,b)` inside the
+    // parentheses. permissions::parse_tool_flag splits outside them.
+    #[arg(long)]
     allowed_tools: Vec<String>,
 
-    /// Tools to block (comma-separated or repeated flag).
-    #[arg(long, value_delimiter = ',')]
+    /// Tools to block, comma- or space-separated or a repeated flag. A bare
+    /// name (Bash) removes the tool; a rule (Bash(git push:*)) refuses
+    /// matching calls and keeps the tool for the rest.
+    #[arg(long)]
     disallowed_tools: Vec<String>,
 
     /// System prompt override (replaces built-in system prompt)
@@ -948,11 +955,9 @@ async fn run() -> Result<()> {
     if cli.max_turns > 0 {
         config.max_turns = cli.max_turns;
     }
-    if !cli.allowed_tools.is_empty() {
-        config.allowed_tools = cli.allowed_tools.clone();
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.disallowed_tools = cli.disallowed_tools.clone();
+    if let Err(e) = config.apply_tool_flags(&cli.allowed_tools, &cli.disallowed_tools) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
     }
     if let Some(sp) = cli.system_prompt {
         config.system_prompt_override = Some(sp);

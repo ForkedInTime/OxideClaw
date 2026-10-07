@@ -293,3 +293,111 @@ fn reset_project_choices_revokes_trust() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("not trusted"));
     assert_eq!(trusted(&e.config_dir), vec!["/elsewhere"]);
 }
+
+/// The tool names a recorded chat-completions request offered the model.
+fn offered_tools(body: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t["function"]["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Runs `-p` against a model that asks for `touch marker` on every turn;
+/// returns whether the marker was made and what the second request carried
+/// back as the tool result.
+fn touch_marker_with(flags: &[&str]) -> (bool, Vec<String>, String) {
+    let e = env();
+    let (port, bodies) = serve(bash_call_reply("touch marker"));
+    let mut args = vec!["-p", "--max-turns", "2", "--model", "openai-compat:test"];
+    args.extend_from_slice(flags);
+    args.push("go");
+    let out = run(&e, &args, &openai_env(port), "");
+    let bodies = bodies.lock().unwrap();
+    assert!(bodies.len() >= 2, "{}", stderr(&out));
+    (
+        e.project.join("marker").exists(),
+        offered_tools(&bodies[0]),
+        bodies[1].clone(),
+    )
+}
+
+/// `--allowed-tools 'Bash(git status:*)'` was taken as a tool name: it
+/// matched no tool, so the model got none and nothing was pre-approved.
+/// A rule now keeps every tool and approves only the calls it matches.
+#[test]
+fn allowed_tools_rules_approve_only_matching_commands() {
+    let (made, tools, _) = touch_marker_with(&["--allowed-tools", "Bash(touch marker)"]);
+    assert!(
+        made,
+        "a matching rule must run the command without a prompt"
+    );
+    for t in ["Bash", "Edit", "Read"] {
+        assert!(tools.iter().any(|n| n == t), "{t} missing: {tools:?}");
+    }
+
+    let (made, _, result) = touch_marker_with(&["--allowed-tools", "Bash(git status:*)"]);
+    assert!(!made, "a rule for git status approved touch");
+    assert!(result.contains("Permission denied"), "{result}");
+}
+
+/// Bare names still restrict the tool list; a rule beside them keeps its tool.
+#[test]
+fn allowed_tools_bare_names_filter_the_tool_list() {
+    let (made, mut tools, result) = touch_marker_with(&[
+        "--allowed-tools",
+        "Read,Grep",
+        "--allowed-tools",
+        "Bash(ls:*)",
+    ]);
+    tools.sort();
+    assert_eq!(tools, ["Bash", "Grep", "Read"]);
+    assert!(!made && result.contains("Permission denied"), "{result}");
+}
+
+/// A `--disallowed-tools` rule refuses matching calls even under
+/// --dangerously-skip-permissions, and leaves the tool for other calls.
+#[test]
+fn disallowed_tools_rules_block_matching_commands() {
+    let (made, tools, result) = touch_marker_with(&[
+        "--dangerously-skip-permissions",
+        "--disallowed-tools",
+        "Bash(touch:*) WebFetch",
+    ]);
+    assert!(!made, "the deny rule did not hold");
+    assert!(result.contains("Permission denied"), "{result}");
+    assert!(tools.iter().any(|n| n == "Bash"), "{tools:?}");
+    assert!(!tools.iter().any(|n| n == "WebFetch"), "{tools:?}");
+}
+
+/// An entry that does not parse is a startup error, never dropped.
+#[test]
+fn malformed_tool_flags_exit_non_zero_with_the_reason() {
+    let e = env();
+    for (flag, value, needle) in [
+        (
+            "--allowed-tools",
+            "Bash(git status:*",
+            "Error: --allowed-tools: `Bash(git status:*` has an unclosed `(`",
+        ),
+        (
+            "--disallowed-tools",
+            "Bassh",
+            "Error: --disallowed-tools: unknown tool `Bassh`",
+        ),
+        (
+            "--allowed-tools",
+            "Agent(explore)",
+            "`Agent(explore)` is not a permission rule",
+        ),
+    ] {
+        let out = run(&e, &["-p", flag, value, "go"], &[], "");
+        assert_eq!(out.status.code(), Some(1), "{flag} {value}");
+        assert!(stderr(&out).contains(needle), "{}", stderr(&out));
+    }
+}

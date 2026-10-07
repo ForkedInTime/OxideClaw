@@ -194,8 +194,9 @@ impl PermissionGate {
             CheckResult::Allow => GateOutcome::Allowed,
             CheckResult::Deny => GateOutcome::Denied(format!("Permission denied: {tool_name}")),
             CheckResult::Ask => match &self.asker {
-                // Only name remedies that grant permission: --allowed-tools
-                // filters the tool list but never authorises a call.
+                // Only name remedies that grant permission: a bare
+                // --allowed-tools name filters the tool list but never
+                // authorises a call; an --allowed-tools rule does.
                 None if forced_prompt => GateOutcome::Denied(format!(
                     "Permission denied: {tool_name} needs a prompt, which no interactive \
                      session is attached to show: autonomy is \"{}\", where every edit \
@@ -205,8 +206,9 @@ impl PermissionGate {
                 )),
                 None => GateOutcome::Denied(format!(
                     "Permission denied: {tool_name} requires approval and no interactive \
-                     session is attached. Allow it with permissions.allow in settings.json \
-                     or --dangerously-skip-permissions."
+                     session is attached. Allow it with a permissions.allow rule in \
+                     settings.json or an --allowed-tools rule such as \
+                     'Bash(git status:*)', or pass --dangerously-skip-permissions."
                 )),
                 Some(asker) => {
                     let description = describe_tool_call(tool_name, input);
@@ -340,14 +342,18 @@ mod tests {
             "{out:?}"
         );
         // The hint must not send users to a flag that does not exist
-        // (`--allowedTools`) or one that grants nothing (`--allowed-tools`).
+        // (`--allowedTools`), and must name the --allowed-tools form that
+        // grants (a rule), not a bare name, which only filters the tools.
         let GateOutcome::Denied(msg) = out else {
             unreachable!()
         };
         assert!(msg.contains("permissions.allow"), "{msg}");
         assert!(msg.contains("--dangerously-skip-permissions"), "{msg}");
         assert!(!msg.to_lowercase().contains("allowedtools"), "{msg}");
-        assert!(!msg.contains("--allowed-tools"), "{msg}");
+        assert!(
+            msg.contains("--allowed-tools rule such as 'Bash(git status:*)'"),
+            "{msg}"
+        );
         assert_eq!(
             g.decide("Read", &json!({"file_path": "x"})).await,
             GateOutcome::Allowed
