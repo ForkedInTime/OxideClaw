@@ -1002,6 +1002,11 @@ impl LspClient {
     /// about the text it was first given.
     pub(crate) async fn sync_document(&self, path: &Path) -> Result<Synced> {
         let text = tokio::fs::read_to_string(path).await?;
+        self.sync_text(path, text).await
+    }
+
+    /// `sync_document` with `text` in place of what is on disk.
+    pub(crate) async fn sync_text(&self, path: &Path, text: String) -> Result<Synced> {
         let uri = path_to_uri(path);
         let mut docs = self.documents.lock().await;
         let seq = *self.publish_seq.borrow();

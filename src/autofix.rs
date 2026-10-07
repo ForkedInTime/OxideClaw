@@ -1123,10 +1123,11 @@ struct ServerFiles<'a> {
     files: Vec<&'a (PathBuf, Option<LspBaseline>)>,
 }
 
-/// What one server said: per file, its new problems (`None`: no report).
+/// What one server said: per file, its new problems (`None`: no report),
+/// and whether that report is complete enough to count as a check.
 #[derive(Default)]
 struct ServerReport {
-    files: Vec<(PathBuf, Option<Vec<Diag>>)>,
+    files: Vec<(PathBuf, Option<Vec<Diag>>, bool)>,
     note: Option<String>,
 }
 
@@ -1191,10 +1192,10 @@ impl LspDiagnostics {
         for (group, report) in groups.iter().zip(reports) {
             out.notes.extend(report.note);
             let mut reported = false;
-            for (path, problems) in report.files {
+            for (path, problems, complete) in report.files {
                 let Some(problems) = problems else { continue };
                 reported = true;
-                out.checked += 1;
+                out.checked += usize::from(complete);
                 let shown = path
                     .strip_prefix(&self.root)
                     .unwrap_or(&path)
@@ -1272,42 +1273,72 @@ impl LspDiagnostics {
         // last sent them (`/undo`, a Bash edit): its view of them shapes
         // the edited files' diagnostics.
         let edited: Vec<PathBuf> = group.files.iter().map(|f| f.0.clone()).collect();
-        match tokio::time::timeout_at(deadline, client.refresh_open_documents(&edited)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) if !client.is_dead() => {}
-            Ok(Err(_)) => return give_up("exited".into()),
-            Err(_) => {
-                client.mark_dead();
-                return give_up(format!(
-                    "did not take the edited files within {}",
-                    seconds(config.timeout)
-                ));
+        let refresh = client.refresh_open_documents(&edited);
+        if let Err(why) = send(&client, deadline, config.timeout, refresh).await {
+            return give_up(why);
+        }
+
+        // With no report from before the edit, the server checks the
+        // pre-edit text first. Keeping only errors on the edited lines
+        // instead dropped the ones an edit causes elsewhere in the file (a
+        // changed signature, a removed import still used further down).
+        let mut baselines: Vec<Option<LspBaseline>> =
+            group.files.iter().map(|f| f.1.clone()).collect();
+        let (mut pre, mut pre_files) = (Vec::new(), Vec::new());
+        for (i, (file, baseline)) in group.files.iter().zip(&baselines).enumerate() {
+            let Some(LspBaseline {
+                content: Some(text),
+                diagnostics: None,
+            }) = baseline
+            else {
+                continue;
+            };
+            // A new (or empty) file: every error in it is the edit's.
+            if text.is_empty() || cancel.load(Ordering::SeqCst) {
+                continue;
             }
+            let sync = client.sync_text(&file.0, text.clone());
+            match send(&client, deadline, config.timeout, sync).await {
+                Ok(Some(s)) => {
+                    pre.push(s);
+                    pre_files.push((i, text.clone()));
+                }
+                Ok(None) => {}
+                Err(why) => return give_up(why),
+            }
+        }
+        if !pre.is_empty() {
+            let published = client
+                .wait_for_diagnostics(&pre, config.settle, deadline, cancel)
+                .await;
+            for ((i, text), r) in pre_files.into_iter().zip(published) {
+                if let Some(r) = r {
+                    baselines[i] = Some(LspBaseline {
+                        content: Some(r.stale_text.unwrap_or(text)),
+                        diagnostics: Some(r.diagnostics),
+                    });
+                }
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return ServerReport::default();
         }
 
         let mut synced = Vec::new();
         let mut files = Vec::new();
-        for (path, baseline) in &group.files {
+        for (file, baseline) in group.files.iter().zip(baselines) {
             if cancel.load(Ordering::SeqCst) {
                 return ServerReport::default();
             }
-            // A server that stopped reading its input blocks this write once
-            // the text outgrows the pipe buffer: the cap covers it too.
-            match tokio::time::timeout_at(deadline, client.sync_document(path)).await {
-                Ok(Ok(s)) => {
+            let sync = client.sync_document(&file.0);
+            match send(&client, deadline, config.timeout, sync).await {
+                Ok(Some(s)) => {
                     synced.push(s);
-                    files.push((path, baseline));
+                    files.push((&file.0, baseline));
                 }
                 // A file deleted since is simply not checked.
-                Ok(Err(_)) if !client.is_dead() => {}
-                Ok(Err(_)) => return give_up("exited".into()),
-                Err(_) => {
-                    client.mark_dead();
-                    return give_up(format!(
-                        "did not take the edited files within {}",
-                        seconds(config.timeout)
-                    ));
-                }
+                Ok(None) => {}
+                Err(why) => return give_up(why),
             }
         }
         if synced.is_empty() {
@@ -1327,7 +1358,7 @@ impl LspDiagnostics {
         // start, or one that publishes only on change and found the file
         // clean) is kept: the next check asks it again.
         let mut report = ServerReport::default();
-        let mut silent = 0;
+        let (mut silent, mut partial) = (0, 0);
         for ((path, baseline), published) in files.into_iter().zip(published) {
             let problems = published.map(|r| {
                 // A set the server published for an older text is read
@@ -1343,16 +1374,56 @@ impl LspDiagnostics {
                     config.warnings,
                 )
             });
+            // Errors the edit caused off its own lines are unknown when
+            // the pre-edit text got no report in time.
+            let complete = !matches!(
+                &baseline,
+                Some(LspBaseline { content: Some(t), diagnostics: None }) if !t.is_empty()
+            );
             silent += usize::from(problems.is_none());
-            report.files.push((path.clone(), problems));
+            partial += usize::from(problems.is_some() && !complete);
+            report.files.push((path.clone(), problems, complete));
         }
-        if silent > 0 {
-            report.note = Some(format!(
-                "[auto-fix] {command} reported nothing on {silent} edited file(s) within {}",
-                seconds(config.timeout)
-            ));
-        }
+        let within = seconds(config.timeout);
+        report.note = [
+            (silent > 0).then(|| {
+                format!("[auto-fix] {command} reported nothing on {silent} edited file(s) within {within}")
+            }),
+            (partial > 0).then(|| {
+                format!(
+                    "[auto-fix] {command} reported only on the edited lines of {partial} \
+                     edited file(s) within {within}"
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| format!("{a}\n{b}"));
         report
+    }
+}
+
+/// `op` on `client`, within `deadline`: `Ok(None)` when it failed on a live
+/// server (a file deleted since), `Err` with why to give the server up when
+/// it exited or did not take the write in time. A server that stopped
+/// reading its input blocks a write once the text outgrows the pipe buffer.
+async fn send<T>(
+    client: &crate::tools::lsp::LspClient,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    op: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<Option<T>, String> {
+    match tokio::time::timeout_at(deadline, op).await {
+        Ok(Ok(t)) => Ok(Some(t)),
+        Ok(Err(_)) if !client.is_dead() => Ok(None),
+        Ok(Err(_)) => Err("exited".into()),
+        Err(_) => {
+            client.mark_dead();
+            Err(format!(
+                "did not take the edited files within {}",
+                seconds(timeout)
+            ))
+        }
     }
 }
 
@@ -2707,8 +2778,9 @@ mod lsp_diff_tests {
 }
 
 /// Auto-fix against a stand-in language server (python3 speaking LSP over
-/// stdio): it reports an error on every line containing `ERR` and a
-/// warning on every line containing `WARN`.
+/// stdio): it reports an error on every line containing `ERR`, a warning
+/// on every line containing `WARN`, and an error on every `use NAME` line
+/// with no `def NAME` line in the file.
 #[cfg(all(test, unix))]
 mod lsp_check_tests {
     use super::*;
@@ -2771,6 +2843,10 @@ while True:
                 if word in l:
                     c = l.index(word)
                     diags.append({{"range": {{"start": {{"line": i, "character": c}}, "end": {{"line": i, "character": c + 3}}}}, "severity": sev, "message": "bad " + l.strip()}})
+        defs = {{l.split()[1] for l in text.splitlines() if l.startswith("def ")}}
+        for i, l in enumerate(text.splitlines()):
+            if l.startswith("use ") and l.split()[1] not in defs:
+                diags.append({{"range": {{"start": {{"line": i, "character": 0}}, "end": {{"line": i, "character": len(l)}}}}, "severity": 1, "message": "undefined " + l.split()[1]}})
         if MODE == "lag" and method == "textDocument/didChange":
             log("lagging")
         elif MODE == "silent" or (MODE == "same" and last.get(doc["uri"]) == diags):
@@ -2949,9 +3025,29 @@ while True:
         assert!(feedback.contains("app.py:4:5 bad w = ERR2"), "{feedback}");
         assert!(!feedback.contains("bad x = ERR"), "{feedback}");
         assert_eq!(f.log().matches("start").count(), 1, "one server, reused");
-        // The open document gets its new text, not a second didOpen.
+        // The first check opens the pre-edit text, then sends the edit; the
+        // open document gets its new text after, not a second didOpen.
         assert_eq!(f.log().matches("didOpen").count(), 1, "{}", f.log());
-        assert_eq!(f.log().matches("didChange").count(), 1, "{}", f.log());
+        assert_eq!(f.log().matches("didChange").count(), 2, "{}", f.log());
+    }
+
+    /// An error the edit causes on a line it did not touch counts, though
+    /// no server was running before the edit: the check gets a report on
+    /// the pre-edit text first. It used to keep only errors on edited lines.
+    #[test]
+    fn an_error_the_edit_causes_elsewhere_is_fed_back() {
+        let f = fixture("ok");
+        let file = f.file("app.py");
+        std::fs::write(&file, "def f\nuse f\nx = ERR\n").unwrap();
+        let before = f.baseline(&file);
+        assert!(before.diagnostics.is_none(), "no server was running yet");
+        std::fs::write(&file, "def g\nuse f\nx = ERR\n").unwrap();
+        let action = f.check(vec![(file, Some(before))], &config(), &trusted());
+        let AutoFixAction::Retry { feedback, .. } = &action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(feedback.contains("app.py:2:1 undefined f"), "{feedback}");
+        assert!(!feedback.contains("bad x = ERR"), "{feedback}");
     }
 
     /// Language servers run project code: an untrusted folder starts none,
@@ -3216,19 +3312,14 @@ while True:
         let f = fixture("lag");
         let file = f.file("app.py");
         std::fs::write(
-            &file, "x = 1
-",
-        )
-        .unwrap();
-        let before = f.baseline(&file);
-        std::fs::write(
             &file,
             "x = 1
 y = ERR
 ",
         )
         .unwrap();
-        let action = f.check(vec![(file.clone(), Some(before))], &config(), &trusted());
+        // No baseline, so the edited text is what the server is opened with.
+        let action = f.check(vec![(file.clone(), None)], &config(), &trusted());
         let AutoFixAction::Retry { feedback, .. } = &action else {
             panic!("expected a retry: {action:?}");
         };
