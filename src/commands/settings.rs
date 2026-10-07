@@ -306,7 +306,9 @@ pub(super) fn cmd_hooks(ctx: &CommandContext) -> CommandAction {
                 "    ]\n",
                 "  }\n}\n\n",
                 "Env vars: TOOL_NAME, TOOL_INPUT (pre), TOOL_RESULT (post).\n",
-                "Empty matcher or \"*\" matches all tools."
+                "Empty matcher or \"*\" matches all tools.\n\n",
+                "Other events: userPromptSubmit, notification, stop, sessionStart,\n",
+                "preCompact, postCompact (matcher ignored)."
             ).into());
             }
             Some(h) => h.clone(),
@@ -314,37 +316,49 @@ pub(super) fn cmd_hooks(ctx: &CommandContext) -> CommandAction {
 
     let mut lines = vec!["Hooks\n".to_string()];
 
-    if hooks.pre_tool_use.is_empty() && hooks.post_tool_use.is_empty() {
+    // Every event in HooksConfig runs, so listing only the tool hooks made
+    // a stop/sessionStart-only config read as "No hooks defined".
+    let sections: [(&str, &Vec<crate::settings::HookEntry>, bool); 8] = [
+        ("Pre-tool-use", &hooks.pre_tool_use, true),
+        ("Post-tool-use", &hooks.post_tool_use, true),
+        ("User-prompt-submit", &hooks.user_prompt_submit, false),
+        ("Notification", &hooks.notification, false),
+        ("Stop", &hooks.stop, false),
+        ("Session-start", &hooks.session_start, false),
+        ("Pre-compact", &hooks.pre_compact, false),
+        ("Post-compact", &hooks.post_compact, false),
+    ];
+
+    if sections.iter().all(|(_, entries, _)| entries.is_empty()) {
         lines.push("  No hooks defined.".into());
     }
 
-    if !hooks.pre_tool_use.is_empty() {
-        lines.push("Pre-tool-use:".into());
-        for h in &hooks.pre_tool_use {
-            let matcher = if h.matcher.is_empty() || h.matcher == "*" {
-                "*all*".to_string()
+    for (label, entries, tool_hook) in sections {
+        if entries.is_empty() {
+            continue;
+        }
+        lines.push(format!("{label}:"));
+        for h in entries {
+            if tool_hook {
+                let matcher = if h.matcher.is_empty() || h.matcher == "*" {
+                    "*all*".to_string()
+                } else {
+                    h.matcher.clone()
+                };
+                lines.push(format!("  [{matcher}]  {}", h.command));
             } else {
-                h.matcher.clone()
-            };
-            lines.push(format!("  [{matcher}]  {}", h.command));
+                lines.push(format!("  {}", h.command));
+            }
         }
         lines.push(String::new());
     }
 
-    if !hooks.post_tool_use.is_empty() {
-        lines.push("Post-tool-use:".into());
-        for h in &hooks.post_tool_use {
-            let matcher = if h.matcher.is_empty() || h.matcher == "*" {
-                "*all*".to_string()
-            } else {
-                h.matcher.clone()
-            };
-            lines.push(format!("  [{matcher}]  {}", h.command));
-        }
-    }
-
-    lines.push(String::new());
-    lines.push("Env vars: TOOL_NAME, TOOL_INPUT (pre), TOOL_RESULT (post).".into());
+    lines.push(
+        "Env vars: TOOL_NAME, TOOL_INPUT (pre), TOOL_RESULT (post), \
+         CLAUDE_MESSAGE (userPromptSubmit, notification); \
+         CLAUDE_HOOK_EVENT, CLAUDE_SESSION_ID, CLAUDE_CWD (all)."
+            .into(),
+    );
 
     let _ = ctx; // suppress unused warning
     CommandAction::Message(lines.join("\n"))
@@ -530,5 +544,92 @@ mod router_command_tests {
                 _ => panic!("{args:?}: expected a tier change"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hooks_command_tests {
+    use super::*;
+    use crate::settings::{HookEntry, HooksConfig};
+
+    fn hooks_output(hooks: HooksConfig) -> String {
+        let config = Config {
+            hooks: Some(hooks),
+            ..Config::default()
+        };
+        let skills = HashMap::new();
+        let todo = TodoState::default();
+        let ctx = CommandContext {
+            config: &config,
+            tokens_in: 0,
+            context_window: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cost_summary: String::new(),
+            cache_write_tokens: 0,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: &[],
+            brief_mode: false,
+            btw_note: None,
+        };
+        match cmd_hooks(&ctx) {
+            CommandAction::Message(m) => m,
+            _ => panic!("/hooks should print a message"),
+        }
+    }
+
+    fn entry(command: &str) -> HookEntry {
+        HookEntry {
+            matcher: String::new(),
+            command: command.into(),
+        }
+    }
+
+    /// A config with only non-tool hooks used to report "No hooks defined"
+    /// while those hooks ran on every prompt / session end.
+    #[test]
+    fn lists_every_configured_hook_event() {
+        let out = hooks_output(HooksConfig {
+            user_prompt_submit: vec![entry("echo prompt")],
+            notification: vec![entry("echo notify")],
+            stop: vec![entry("echo bye")],
+            session_start: vec![entry("echo hi")],
+            pre_compact: vec![entry("echo pre")],
+            post_compact: vec![entry("echo post")],
+            ..HooksConfig::default()
+        });
+        assert!(!out.contains("No hooks defined"), "{out}");
+        for want in [
+            "User-prompt-submit:\n  echo prompt",
+            "Notification:\n  echo notify",
+            "Stop:\n  echo bye",
+            "Session-start:\n  echo hi",
+            "Pre-compact:\n  echo pre",
+            "Post-compact:\n  echo post",
+        ] {
+            assert!(out.contains(want), "missing {want:?} in:\n{out}");
+        }
+        assert!(!out.contains("Pre-tool-use"), "{out}");
+    }
+
+    #[test]
+    fn empty_hooks_config_says_none_defined() {
+        let out = hooks_output(HooksConfig::default());
+        assert!(out.contains("No hooks defined"), "{out}");
+        let out = hooks_output(HooksConfig {
+            pre_tool_use: vec![HookEntry {
+                matcher: "Bash".into(),
+                command: "echo run".into(),
+            }],
+            ..HooksConfig::default()
+        });
+        assert!(out.contains("Pre-tool-use:\n  [Bash]  echo run"), "{out}");
+        assert!(!out.contains("No hooks defined"), "{out}");
     }
 }
