@@ -364,7 +364,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     }
 
     // ── Vim mode routing ───────────────────────────────────────────────────────
-    if app.vim_enabled {
+    if vim_routes_key(app, &key) {
         if app.vim_normal {
             handle_vim_normal(key, app);
             return Ok(());
@@ -992,6 +992,19 @@ pub(super) fn budget_blocks(app: &mut App, unsent: &str) -> bool {
     true
 }
 
+/// Whether vim mode gets this key before the main match. Esc while a turn or
+/// TTS is running and Ctrl+S must reach their cancel/stop arms: vim would eat
+/// them as a mode switch, and while loading every other key is blocked, so
+/// Ctrl+C (quit) was the only way out.
+fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
+    if !app.vim_enabled {
+        return false;
+    }
+    let cancels_work = key.code == KeyCode::Esc && (app.is_loading || app.tts_stop_tx.is_some());
+    let stops_tts = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
+    !(cancels_work || stops_tts)
+}
+
 /// Shift+Enter is only distinguishable from Enter where the terminal took
 /// the keyboard enhancement flags (kitty, foot, WezTerm, Ghostty); elsewhere
 /// and inside tmux it arrives as a plain Enter and would submit. Alt+Enter
@@ -1028,6 +1041,45 @@ mod newline_key_tests {
         assert!(!is_newline_key(
             KeyCode::Char('j'),
             KeyModifiers::CONTROL | KeyModifiers::ALT
+        ));
+    }
+}
+
+#[cfg(test)]
+mod vim_routing_tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn vim_app(normal: bool) -> App {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.vim_enabled = true;
+        app.vim_normal = normal;
+        app
+    }
+
+    #[test]
+    fn esc_reaches_cancel_while_loading_in_both_vim_modes() {
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        for normal in [true, false] {
+            let mut app = vim_app(normal);
+            assert!(vim_routes_key(&app, &esc), "idle Esc is a vim mode switch");
+            app.start_loading();
+            assert!(!vim_routes_key(&app, &esc), "Esc could not cancel the turn");
+        }
+    }
+
+    #[test]
+    fn esc_and_ctrl_s_stop_tts_in_vim_mode() {
+        let mut app = vim_app(true);
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        app.tts_stop_tx = Some(stop_tx);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!vim_routes_key(&app, &esc));
+        assert!(!vim_routes_key(&app, &ctrl_s));
+        assert!(vim_routes_key(
+            &app,
+            &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
         ));
     }
 }
