@@ -253,7 +253,8 @@ struct Cli {
     #[arg(long)]
     max_budget_usd: Option<f64>,
 
-    /// Fallback model to use when primary model is overloaded (HTTP 529)
+    /// Fallback model to use when primary model is overloaded (HTTP 529;
+    /// --print mode only)
     #[arg(long)]
     fallback_model: Option<String>,
 
@@ -922,8 +923,8 @@ async fn run() -> Result<()> {
         // Does not enable bypass by default — just allows it to be toggled
         // (stored for future permission prompt support)
     }
-    if let Some(fb) = cli.fallback_model {
-        config.fallback_model = Some(fb);
+    if let Some(fb) = cli.fallback_model.as_deref() {
+        config.fallback_model = Some(crate::commands::resolve_model_alias(fb));
     }
     if let Some(budget) = cli.max_budget_usd {
         config.max_budget_usd = Some(budget);
@@ -1904,6 +1905,14 @@ fn ignored_flag_warnings(cli: &Cli) -> Vec<&'static str> {
              own git worktree.",
         );
     }
+    // Only the -p engine switches models on an overload; the TUI, --headless
+    // and acp loops retry the primary model.
+    if cli.fallback_model.is_some() && !cli.print {
+        out.push(
+            "--fallback-model only applies with --print and was ignored; this session \
+             retries the primary model when it is overloaded.",
+        );
+    }
     if !cli.setting_sources.is_empty() {
         out.push(
             "--setting-sources is not implemented and was ignored; user and project \
@@ -2014,6 +2023,9 @@ mod cli_parse_tests {
             warns(&["--allow-dangerously-skip-permissions"])[0]
                 .contains("--allow-dangerously-skip-permissions")
         );
+        // Only the -p engine switches to the fallback on an overload.
+        assert!(warns(&["--fallback-model", "haiku"])[0].contains("--fallback-model"));
+        assert!(warns(&["-p", "hi", "--fallback-model", "haiku"]).is_empty());
     }
 
     /// Only the last user event was kept, and string `content` (valid in the

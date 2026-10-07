@@ -212,7 +212,7 @@ pub struct Config {
     /// Effort level (low/medium/high/xhigh/max) — influences thinking budget.
     pub effort: Option<String>,
 
-    /// Max agentic turns before stopping (0 = unlimited).
+    /// Max agentic turns before stopping (0 = default cap of 50).
     pub max_turns: u32,
 
     /// Tools explicitly allowed via CLI (empty = use defaults).
@@ -660,7 +660,10 @@ impl Config {
         }
 
         // ── Optional env var overrides (env wins over settings files)
-        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+        if let Some(model) = std::env::var("ANTHROPIC_MODEL")
+            .ok()
+            .and_then(|m| env_model(&m))
+        {
             cfg.model = model;
         }
         if let Ok(host) = std::env::var("OLLAMA_HOST") {
@@ -2146,6 +2149,31 @@ mod instruction_file_symlink_tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "project rules").unwrap();
         assert!(Config::load_claude_md(tmp.path()).contains("project rules"));
+    }
+}
+
+/// `ANTHROPIC_MODEL` as a request model. Nothing downstream resolves
+/// aliases, so `opus` would be sent verbatim and every request rejected; an
+/// empty value would select no model at all and is ignored.
+fn env_model(raw: &str) -> Option<String> {
+    let m = raw.trim();
+    (!m.is_empty()).then(|| crate::commands::resolve_model_alias(m))
+}
+
+#[cfg(test)]
+mod env_model_tests {
+    #[test]
+    fn aliases_resolve_and_blank_is_ignored() {
+        assert_eq!(
+            super::env_model(" opus ").as_deref(),
+            Some(crate::commands::resolve_model_alias("opus").as_str())
+        );
+        assert_ne!(super::env_model("opus").as_deref(), Some("opus"));
+        assert_eq!(
+            super::env_model("claude-haiku-4-5").as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(super::env_model("  "), None);
     }
 }
 
