@@ -1089,27 +1089,21 @@ impl App {
 
     /// e — move to end of current/next word.
     pub fn word_end(&mut self) {
+        // Always step past the current char first: on the last char of a
+        // word, scanning from the cursor found it already "at the end" and
+        // `e` never moved on to the next word.
         let len = self.input.len();
-        if len == 0 {
+        let mut i = self.cursor + 1;
+        while i < len && self.input[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= len {
             return;
         }
-        // If on whitespace, skip it first
-        if self.cursor < len && self.input[self.cursor].is_whitespace() {
-            while self.cursor < len && self.input[self.cursor].is_whitespace() {
-                self.cursor += 1;
-            }
-        } else if self.cursor + 1 < len && !self.input[self.cursor + 1].is_whitespace() {
-            self.cursor += 1;
-        } else {
-            return;
+        while i + 1 < len && !self.input[i + 1].is_whitespace() {
+            i += 1;
         }
-        // Now advance to last char of this word
-        while self.cursor + 1 < len && !self.input[self.cursor + 1].is_whitespace() {
-            self.cursor += 1;
-        }
-        if self.cursor >= len && len > 0 {
-            self.cursor = len - 1;
-        }
+        self.cursor = i;
     }
 
     /// x — delete the character under the cursor (normal mode).
@@ -1694,6 +1688,28 @@ mod trim_entries_tests {
     }
 
     use super::*;
+
+    /// On the last char of a word, `e` returned without moving, so repeated
+    /// presses stuck at the end of the first word.
+    #[test]
+    fn vim_e_moves_to_the_end_of_the_next_word() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.input = "foo  bar b".chars().collect();
+        app.cursor = 0;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.word_end();
+            seen.push(app.cursor);
+        }
+        assert_eq!(seen, [2, 7, 9, 9]);
+        app.cursor = 3; // on whitespace
+        app.word_end();
+        assert_eq!(app.cursor, 7);
+        app.input.clear();
+        app.cursor = 0;
+        app.word_end();
+        assert_eq!(app.cursor, 0);
+    }
 
     #[test]
     fn paste_turns_cr_line_breaks_into_newlines() {
