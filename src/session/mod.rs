@@ -11,6 +11,8 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+pub mod claude_code;
+
 // ── Metadata ──────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -41,6 +43,16 @@ pub struct SessionMeta {
     /// it can run ahead of the transcript, never behind it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timeline: Vec<TurnMark>,
+    /// The directory the session ran in, when recorded (imported sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The model that wrote the last reply, when recorded (imported sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The Claude Code session this one was imported from
+    /// (`config import-claude --sessions`), so a re-run skips it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_session: Option<String>,
     /// Turns /undo took off the conversation, the next one to /redo last.
     /// Any new turn clears it. Never part of the `.meta`: it holds whole
     /// messages (tool output, file contents), which `Session::list` would
@@ -152,6 +164,9 @@ impl Session {
             undo_position: 0,
             base_commit: None,
             timeline: Vec::new(),
+            cwd: None,
+            model: None,
+            claude_code_session: None,
             redo: Vec::new(),
         };
         meta.save_in(dir).await?;
@@ -179,6 +194,9 @@ impl Session {
                 undo_position: 0,
                 base_commit: None,
                 timeline: Vec::new(),
+                cwd: None,
+                model: None,
+                claude_code_session: None,
                 redo: Vec::new(),
             },
             dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -1233,6 +1251,9 @@ mod continue_tests {
             undo_position: 0,
             base_commit: None,
             timeline: Vec::new(),
+            cwd: None,
+            model: None,
+            claude_code_session: None,
             redo: Vec::new(),
         };
         std::fs::write(
@@ -1407,6 +1428,9 @@ mod resolve_tests {
             undo_position: 0,
             base_commit: None,
             timeline: Vec::new(),
+            cwd: None,
+            model: None,
+            claude_code_session: None,
             redo: Vec::new(),
         };
         let body = serde_json::to_string(&meta).unwrap();
