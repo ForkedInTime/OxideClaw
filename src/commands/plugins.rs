@@ -50,9 +50,9 @@ pub(super) fn cmd_plugin(args: &str) -> CommandAction {
             let path = rest.trim();
             if path.is_empty() {
                 CommandAction::Message(
-                    "Usage: /plugin validate [path]\n\
-                     Validates a plugin's package.json and MCP server configuration.\n\
-                     Without a path, validates all installed plugins."
+                    "Usage: /plugin validate <path>\n\
+                     Validates a plugin directory's package.json (or the package.json \
+                     file itself)."
                         .into(),
                 )
             } else {
@@ -72,7 +72,7 @@ pub(super) fn cmd_plugin(args: &str) -> CommandAction {
                 "  /plugin remove <name>                — uninstall plugin\n",
                 "  /plugin enable <name>                — enable a disabled plugin\n",
                 "  /plugin disable <name>               — disable a plugin\n",
-                "  /plugin validate [path]              — validate plugin configuration\n",
+                "  /plugin validate <path>              — validate plugin configuration\n",
                 "  /plugin manage                       — show all plugins with status\n",
                 "  /plugin marketplace add <repo>       — install from GitHub marketplace\n",
                 "  /plugin marketplace remove <name>    — remove marketplace plugin\n",

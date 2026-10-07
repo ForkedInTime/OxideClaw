@@ -448,7 +448,7 @@ After writing the skill file(s), inform the user:
 
 pub(super) fn cmd_autofix_pr(args: &str) -> CommandAction {
     let pr_ref = args.trim();
-    if pr_ref.is_empty() {
+    if matches!(pr_ref, "help" | "--help" | "-h") {
         return CommandAction::Message(
             "Auto-fix PR review comments.\n\n\
              Usage: /autofix-pr [<pr-number-or-url>]\n\
@@ -458,6 +458,14 @@ pub(super) fn cmd_autofix_pr(args: &str) -> CommandAction {
                 .into(),
         );
     }
+    // The bare form is the documented "current branch" mode; it used to
+    // print the usage text and do nothing.
+    let pr_ref = if pr_ref.is_empty() {
+        "for the current branch (find it with `gh pr view --json number,url`; \
+         if there is none, say so and stop)"
+    } else {
+        pr_ref
+    };
     CommandAction::SendPrompt(format!(
         "Using the gh CLI, read all review comments on PR {pr_ref}.\n\
          For each actionable comment:\n\
@@ -525,6 +533,24 @@ mod prompt_command_tests {
             assert!(c.ends_with("2>&1"), "{c}");
         }
         assert!(checks.contains(&"npm test 2>&1"));
+    }
+
+    /// The bare form promised to target the current branch's PR but only
+    /// printed the usage.
+    #[test]
+    fn bare_autofix_pr_targets_the_current_branch() {
+        let CommandAction::SendPrompt(p) = cmd_autofix_pr("") else {
+            panic!("expected a prompt");
+        };
+        assert!(p.contains("current branch"), "{p}");
+        assert!(matches!(
+            cmd_autofix_pr("--help"),
+            CommandAction::Message(_)
+        ));
+        let CommandAction::SendPrompt(p) = cmd_autofix_pr("42") else {
+            panic!("expected a prompt");
+        };
+        assert!(p.contains("PR 42."), "{p}");
     }
 
     #[test]
