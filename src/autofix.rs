@@ -881,7 +881,8 @@ mod tests {
                 td.path(),
                 "read -r pid comm state ppid pgrp sid rest < /proc/$$/stat; \
                  test \"$sid\" = \"$$\" && test \"$pgrp\" = \"$$\"",
-                10
+                10,
+                &NOT_CANCELLED
             ),
             CommandResult::Pass
         ));
