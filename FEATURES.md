@@ -297,7 +297,7 @@ Sessions save automatically; resume, search, and export them.
 /export              # export the current session to markdown
 ```
 
-Sessions are stored in `$XDG_DATA_HOME/oxideclaw/sessions/` (default: `~/.local/share/oxideclaw/sessions/`).
+Sessions are stored in the data directory's `sessions/` folder: `~/.claude/sessions/` by default, or `$XDG_DATA_HOME/oxideclaw/sessions/` when `XDG_DATA_HOME` is set (see [XDG Base Directories](#xdg-base-directories)). `/status` prints the resolved path.
 
 ---
 
@@ -411,7 +411,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 
 ### Settings File
 
-`~/.config/oxideclaw/settings.json` (or `$XDG_CONFIG_HOME/oxideclaw/settings.json`):
+`settings.json` in the config directory: `~/.claude/settings.json` by default, `$XDG_CONFIG_HOME/oxideclaw/settings.json` when `XDG_CONFIG_HOME` is set (see [XDG Base Directories](#xdg-base-directories)), or `$CLAUDE_CONFIG_DIR/settings.json`. `/status` prints the config directory in use:
 
 ```json
 {
@@ -446,11 +446,14 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 
 ### XDG Base Directories
 
-| Purpose | Variable | Default |
-|---------|----------|---------|
-| Config | `$XDG_CONFIG_HOME/oxideclaw/` | `~/.config/oxideclaw/` |
-| Data | `$XDG_DATA_HOME/oxideclaw/` | `~/.local/share/oxideclaw/` |
-| Cache | `$XDG_CACHE_HOME/oxideclaw/` | `~/.cache/oxideclaw/` |
+XDG paths are opt-in: they are used only when the matching variable is set. Otherwise everything lives in `~/.claude/`, shared with Claude Code.
+
+| Purpose | When the variable is set | Default (variable unset) |
+|---------|--------------------------|--------------------------|
+| Config (`settings.json`, MCP, output styles) | `$XDG_CONFIG_HOME/oxideclaw/`, if it exists or `~/.claude/` does not | `~/.claude/` |
+| Data (sessions, XTTS server files) | `$XDG_DATA_HOME/oxideclaw/`, if it exists or `<config dir>/sessions/` does not | the config directory |
+
+`$CLAUDE_CONFIG_DIR` overrides the config directory outright. To move an existing `~/.claude/` setup to XDG paths, create `$XDG_CONFIG_HOME/oxideclaw/` (and `$XDG_DATA_HOME/oxideclaw/`) and copy your files in; `/status` shows which directories are in use.
 
 ---
 
@@ -482,9 +485,9 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 | `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix; shell only, not `.env`) |
 | `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |
 | `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |
-| `XDG_CONFIG_HOME` | Config directory base |
-| `XDG_DATA_HOME` | Data directory base |
-| `XDG_CACHE_HOME` | Cache directory base |
+| `CLAUDE_CONFIG_DIR` | Config directory, overriding `~/.claude` and `XDG_CONFIG_HOME` |
+| `XDG_CONFIG_HOME` | Opt-in config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
+| `XDG_DATA_HOME` | Opt-in data directory base (`$XDG_DATA_HOME/oxideclaw`) |
 
 ---
 

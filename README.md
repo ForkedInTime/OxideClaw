@@ -207,7 +207,7 @@ Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; s
 
 ### 📁 &nbsp; Respects your config like a native tool
 
-XDG Base Directory compliant (`$XDG_CONFIG_HOME/oxideclaw`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME`). Reads **both** `CLAUDE.md` and `AGENTS.md` (3,518 upvotes on the Claude Code repo). Hot-reload with `/reload` — no restart.
+XDG Base Directory support, opt-in: set `$XDG_CONFIG_HOME` or `$XDG_DATA_HOME` and config or sessions move to `…/oxideclaw`; otherwise they stay in `~/.claude`. Reads **both** `CLAUDE.md` and `AGENTS.md` (3,518 upvotes on the Claude Code repo). Hot-reload with `/reload` — no restart.
 
 See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ slash commands, every config knob).
 
