@@ -203,7 +203,10 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
         "Commits, PRs, reviews, diffs",
         &[
             ("/diff", "uncommitted changes, incl. staged and new files"),
-            ("/branch", "show/switch branches"),
+            (
+                "/branch",
+                "show current branch, recent commits, status and branches",
+            ),
             ("/commit", "generate & run a git commit"),
             ("/commit-push-pr", "commit, push, and create PR"),
             ("/review", "code review"),
@@ -217,7 +220,10 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
                 "auto-detect and run lint + tests, fix errors in loop",
             ),
             ("/pr_comments", "show PR comments"),
-            ("/issue", "work on a GitHub issue"),
+            (
+                "/issue <description>",
+                "draft and file a new GitHub issue via gh",
+            ),
             ("/autofix-pr", "auto-fix PR review comments"),
         ],
     ),
@@ -650,5 +656,21 @@ mod stale_text_tests {
             );
         }
         assert_eq!(taught, 3);
+    }
+
+    /// /branch only prints status (it takes no arguments) and /issue files a
+    /// new issue; /help claimed switching branches and working on an issue.
+    #[test]
+    fn help_describes_branch_and_issue_as_they_behave() {
+        let desc = |name: &str| {
+            HELP_CATEGORIES
+                .iter()
+                .flat_map(|(_, _, cmds)| cmds.iter())
+                .find(|(cmd, _)| cmd.split_whitespace().next() == Some(name))
+                .map(|(_, d)| *d)
+                .unwrap()
+        };
+        assert!(!desc("/branch").contains("switch"));
+        assert!(desc("/issue").contains("new GitHub issue"));
     }
 }
