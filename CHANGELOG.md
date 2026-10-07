@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`oai:` uses OpenAI's Responses API.** Requests go to `/v1/responses`
+  with `store: false`, so nothing is kept on OpenAI's side. On reasoning
+  models (o-series, GPT-5 and later, Codex) the encrypted reasoning behind
+  each tool call comes back and is replayed with the next request of the
+  tool loop, so the model keeps its train of thought between calls (not
+  across `/model` or a resumed session). `effort` goes out as
+  `reasoning.effort` (`xhigh` on GPT-5.2+ and gpt-5.1-codex-max, at least
+  `high` on the GPT-5 `-pro` models), and `showThinkingSummaries` shows the
+  reasoning summaries; when OpenAI refuses them (an organization that is
+  not verified), OxideClaw says so once and carries on without them.
+  `"openaiApi": "chat"` in settings.json or `OXIDECLAW_OPENAI_API=chat`
+  goes back to Chat Completions; `"responses"` also uses the Responses API
+  for `openai-compat:` and `lmstudio:`. The named cloud presets (Groq,
+  OpenRouter, Gemini, ...) keep Chat Completions.
+- **OpenAI list prices.** `/cost` and `/budget` price `oai:` models per
+  family (GPT-5.x with its mini, nano and pro tiers, o1, o3, o3-pro,
+  o4-mini, GPT-4.1, GPT-4o) with each family's cached-input rate, instead
+  of GPT-4o's rate for every model. A model newer than the table is billed
+  at the dearest known rate of its tier and flagged as an estimate.
+
 ### Added
 
 - **Claude Code sessions import.** `oxideclaw config import-claude --sessions
