@@ -166,8 +166,13 @@ impl Tool for BrowserNavigateTool {
             }
         };
 
+        let status = match status {
+            Some(code @ 400..) => format!("\nStatus: {code} (error page)"),
+            Some(code) => format!("\nStatus: {code}"),
+            None => String::new(),
+        };
         Ok(ToolOutput::success(format!(
-            "Navigated to: {final_url}\nTitle: {title}\nStatus: {status}{dialogs}\n\nAccessibility snapshot:\n{tree}"
+            "Navigated to: {final_url}\nTitle: {title}{status}{dialogs}\n\nAccessibility snapshot:\n{tree}"
         )))
     }
 }

@@ -114,11 +114,16 @@ async fn landed_url_verdict(href: &str) -> Result<()> {
     Ok(())
 }
 
-/// Navigate to a URL. Returns (title, status). Does NOT mutate session state —
+/// Navigate to a URL. Returns the title and, when the browser reports one,
+/// the document's HTTP status. Does NOT mutate session state —
 /// the caller is responsible for updating `current_url` / `current_title`
 /// after this returns, so the session lock can be released while we wait on
 /// the page load event (bounded by `timeout_ms`).
-pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<(String, u16)> {
+pub async fn navigate(
+    client: &CdpClient,
+    url: &str,
+    timeout_ms: u64,
+) -> Result<(String, Option<u16>)> {
     preflight_navigation_url(url).await?;
     // Subscribe BEFORE navigating so we don't miss Page.loadEventFired on fast loads.
     let mut events = client.subscribe();
@@ -157,7 +162,30 @@ pub async fn navigate(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<
         .await?;
     let title = eval["result"]["value"].as_str().unwrap_or("").to_string();
 
-    Ok((title, 200))
+    // Page.navigate fails only on network errors, so a 404 or 500 page
+    // loads like any other; the status has to be read from the page. It is
+    // absent for a same-document navigation (the entry is the original
+    // load's) and before Chrome 109, so no status beats a made-up 200.
+    let status = if same_document {
+        None
+    } else {
+        client
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression":
+                        "(performance.getEntriesByType('navigation')[0] || {}).responseStatus",
+                    "returnByValue": true,
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|r| r["result"]["value"].as_u64())
+            .and_then(|s| u16::try_from(s).ok())
+            .filter(|s| (100..600).contains(s))
+    };
+
+    Ok((title, status))
 }
 
 /// Query the current page URL via `document.location.href`. Returns `None`
@@ -755,8 +783,10 @@ mod cdp_request_tests {
             while let Some(Ok(Message::Text(t))) = ws.next().await {
                 let cmd: Value = serde_json::from_str(&t).unwrap();
                 let method = cmd["method"].as_str().unwrap_or("").to_string();
-                let r = reply(&method, &cmd["params"]);
+                let mut r = reply(&method, &cmd["params"]);
                 seen.lock().unwrap().push((method, cmd["params"].clone()));
+                // `"_load": true` in a reply fires Page.loadEventFired after it.
+                let load = r.as_object_mut().and_then(|o| o.remove("_load")).is_some();
                 let msg = match r.get("error") {
                     Some(e) => json!({"id": cmd["id"], "error": e}),
                     None => json!({"id": cmd["id"], "result": r}),
@@ -767,6 +797,12 @@ mod cdp_request_tests {
                     .is_err()
                 {
                     break;
+                }
+                if load {
+                    let ev = json!({"method": "Page.loadEventFired", "params": {}});
+                    if ws.send(Message::Text(ev.to_string().into())).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -810,6 +846,66 @@ mod cdp_request_tests {
         .await
         .expect("navigate waited for a load event that never comes");
         res.unwrap();
+    }
+
+    /// navigate returned a literal 200, so a 404 or 500 page reached the
+    /// model as "Status: 200".
+    #[tokio::test]
+    async fn navigate_reports_the_documents_real_status() {
+        fn reply(method: &str, params: &Value) -> Value {
+            let expr = params["expression"].as_str().unwrap_or("");
+            match method {
+                "Page.navigate" => json!({"frameId": "F1", "loaderId": "L1", "_load": true}),
+                "Runtime.evaluate" if expr.contains("responseStatus") => {
+                    json!({"result": {"type": "number", "value": 404}})
+                }
+                "Runtime.evaluate" if expr == "document.title" => {
+                    json!({"result": {"type": "string", "value": "Not Found"}})
+                }
+                _ => page(method, params),
+            }
+        }
+        let (ws, _) = scripted_cdp(reply).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let (title, status) = navigate(&client, "http://127.0.0.1:3000/missing", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(title, "Not Found");
+        assert_eq!(status, Some(404));
+    }
+
+    /// No navigation entry (old Chrome, a fragment change): no status at all.
+    #[tokio::test]
+    async fn navigate_reports_no_status_when_the_page_has_none() {
+        fn reply(method: &str, params: &Value) -> Value {
+            let expr = params["expression"].as_str().unwrap_or("");
+            match method {
+                "Page.navigate" => json!({"frameId": "F1", "loaderId": "L1", "_load": true}),
+                "Runtime.evaluate" if expr.contains("responseStatus") => {
+                    json!({"result": {"type": "undefined"}})
+                }
+                _ => page(method, params),
+            }
+        }
+        let (ws, _) = scripted_cdp(reply).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let (_, status) = navigate(&client, "http://127.0.0.1:3000/", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(status, None);
+
+        let (ws, log) = scripted_cdp(page).await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let (_, status) = navigate(&client, "http://127.0.0.1:3000/#/x", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(status, None);
+        assert!(sent(&log, "Runtime.evaluate").iter().all(|p| {
+            !p["expression"]
+                .as_str()
+                .unwrap_or("")
+                .contains("responseStatus")
+        }));
     }
 
     #[tokio::test]
