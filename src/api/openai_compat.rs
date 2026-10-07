@@ -240,7 +240,10 @@ pub(crate) struct OaiDelta {
 
 #[derive(Deserialize)]
 pub(crate) struct OaiToolCallDelta {
-    pub index: usize,
+    /// Required by the OpenAI spec, but some compat servers (Gemini's among
+    /// them) omit it; a hard field failed the whole chunk and lost the call.
+    #[serde(default)]
+    pub index: Option<usize>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -565,6 +568,7 @@ pub(crate) async fn parse_oai_stream(
     let mut text_buf = String::new();
     let mut thinking_buf = String::new();
     let mut tool_bufs: HashMap<usize, (String, String, String)> = HashMap::new();
+    let mut last_tool_idx: Option<usize> = None;
     let mut finish_reason: Option<String> = None;
     let mut saw_done = false;
 
@@ -623,8 +627,24 @@ pub(crate) async fn parse_oai_stream(
             // Tool call deltas
             if let Some(tc_deltas) = delta.tool_calls {
                 for tc in tc_deltas {
+                    // Without an index, a new id starts a new call and an
+                    // id-less delta continues the previous one.
+                    let idx = match (tc.index, last_tool_idx) {
+                        (Some(i), _) => i,
+                        (None, Some(last))
+                            if tc.id.as_deref().is_none_or(|id| {
+                                tool_bufs
+                                    .get(&last)
+                                    .is_none_or(|e| e.0.is_empty() || e.0 == id)
+                            }) =>
+                        {
+                            last
+                        }
+                        (None, _) => tool_bufs.keys().max().map_or(0, |m| m + 1),
+                    };
+                    last_tool_idx = Some(idx);
                     let entry = tool_bufs
-                        .entry(tc.index)
+                        .entry(idx)
                         .or_insert_with(|| (String::new(), String::new(), String::new()));
 
                     if let Some(id) = tc.id {
@@ -1319,6 +1339,38 @@ mod stream_error_tests {
         .await
         .unwrap();
         assert_eq!(r.content, vec![ContentBlock::Text { text: "hi".into() }]);
+    }
+
+    /// Gemini's compat endpoint omits `index`; the chunk used to fail to
+    /// parse, losing both the calls and the finish_reason.
+    #[tokio::test]
+    async fn tool_call_deltas_without_index_still_parse() {
+        let r = parse(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[\
+             {\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\"}},\
+             {\"function\":{\"arguments\":\"\\\"a.rs\\\"}\"}},\
+             {\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"Glob\",\"arguments\":\"{}\"}}\
+             ]},\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(
+            r.content,
+            vec![
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "a.rs"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "Glob".into(),
+                    input: serde_json::json!({}),
+                },
+            ]
+        );
     }
 }
 
