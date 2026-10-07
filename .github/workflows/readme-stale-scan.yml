@@ -21,6 +21,9 @@ jobs:
 
       - name: Run readme-lint
         id: lint
+        # Explicit bash adds pipefail; the default `bash -e` takes tee's exit
+        # status, so the step never failed and the issue step never ran.
+        shell: bash
         run: bash scripts/readme-lint.sh 2>&1 | tee /tmp/scan.log
         continue-on-error: true
 
