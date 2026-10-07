@@ -478,8 +478,10 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        tx2.send(AppEvent::Error(format!("Recording failed: {e}")));
+                                    drop(stop_rx);
+                                    let _ = tx2.send(AppEvent::RecordingFailed(format!(
+                                        "Recording failed: {e}"
+                                    )));
                                 }
                             }
                         });

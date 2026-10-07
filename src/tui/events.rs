@@ -32,8 +32,13 @@ pub enum AppEvent {
         messages: Vec<Message>,
         model_used: String,
     },
-    /// An API-level error
+    /// An error from a background task that is not part of a turn (voice
+    /// preview, transcription). Never touches the loading state: a turn
+    /// started meanwhile keeps running and stays cancellable.
     Error(String),
+    /// The recorder failed to start. Clears the recording state so Ctrl+R
+    /// starts a new recording instead of "stopping" one that never ran.
+    RecordingFailed(String),
     /// The running API turn stopped early (API error, iteration cap,
     /// failed compaction). What it did so far is in `App::turn_history`.
     TurnFailed(String),
@@ -54,8 +59,8 @@ pub enum AppEvent {
         /// mid-turn compaction, which the turn already continued from.
         base: Option<(String, Vec<Message>)>,
     },
-    /// A background compaction failed. Separate from `Error`, which ends the
-    /// running turn's loading state.
+    /// A background compaction failed. Separate from `Error`, which carries
+    /// no state to reset.
     CompactFailed(String),
     /// Informational notice from the harness (not from Claude)
     SystemMessage(String),

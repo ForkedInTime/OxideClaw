@@ -1403,7 +1403,22 @@ impl App {
                 self.cache_write_tokens = cache_write;
                 self.scroll_to_bottom();
             }
-            AppEvent::Error(msg) | AppEvent::TurnFailed(msg) => {
+            AppEvent::Error(msg) => {
+                self.entries.push(ChatEntry::error(msg));
+                self.scroll_to_bottom();
+            }
+            AppEvent::RecordingFailed(msg) => {
+                // Only if the failed recorder is still the current one: its
+                // task drops the stop receiver before reporting.
+                if self.voice_stop_tx.as_ref().is_some_and(|t| t.is_closed()) {
+                    self.voice_recording = false;
+                    self.voice_task = None;
+                    self.voice_stop_tx = None;
+                }
+                self.entries.push(ChatEntry::error(msg));
+                self.scroll_to_bottom();
+            }
+            AppEvent::TurnFailed(msg) => {
                 self.flush_streaming();
                 self.finish_loading_with_stats(0);
                 self.api_task = None;
@@ -1715,5 +1730,50 @@ mod trim_entries_tests {
             (MAX_ENTRIES * 3 - 1).to_string(),
             "newest content must always be retained"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_event_tests {
+    use super::*;
+
+    /// An app mid-turn: loading, with a live API task to cancel.
+    fn app_in_turn() -> (App, tokio::task::JoinHandle<()>) {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.start_loading();
+        let turn = tokio::spawn(std::future::pending());
+        app.api_task = Some(turn.abort_handle());
+        (app, turn)
+    }
+
+    #[tokio::test]
+    async fn background_error_leaves_the_running_turn_alone() {
+        let (mut app, turn) = app_in_turn();
+        app.apply(AppEvent::Error("Voice preview failed: boom".into()));
+        assert!(app.is_loading, "input would unlock mid-turn");
+        assert!(app.turn_start.is_some());
+        assert!(
+            app.api_task.is_some(),
+            "Esc could no longer cancel the turn"
+        );
+        turn.abort();
+    }
+
+    #[tokio::test]
+    async fn recording_failure_resets_only_its_own_recording() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        app.voice_recording = true;
+        app.voice_stop_tx = Some(stop_tx);
+        drop(stop_rx);
+        app.apply(AppEvent::RecordingFailed("Recording failed: no mic".into()));
+        assert!(!app.voice_recording && app.voice_stop_tx.is_none());
+
+        // A late failure must not stop a newer, working recording.
+        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
+        app.voice_recording = true;
+        app.voice_stop_tx = Some(stop_tx);
+        app.apply(AppEvent::RecordingFailed("Recording failed: no mic".into()));
+        assert!(app.voice_recording && app.voice_stop_tx.is_some());
     }
 }
