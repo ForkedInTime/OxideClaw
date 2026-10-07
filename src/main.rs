@@ -823,136 +823,9 @@ async fn run() -> Result<()> {
             Commands::Update => {
                 return self_update().await;
             }
-            Commands::Browse {
-                goal,
-                yolo,
-                ask,
-                max_steps,
-            } => {
-                use crate::browser::browse_loop::{
-                    BrowsePolicy, BrowseProgress, BrowseRequest, run_browse,
-                };
-                use tokio::sync::mpsc;
-
-                let goal_str = goal.join(" ");
-                if goal_str.trim().is_empty() {
-                    eprintln!("Error: browse requires a goal argument");
-                    std::process::exit(1);
-                }
-
-                let config = Config::load_with(None, flag_settings())?;
-                warn_settings_load_errors(&config);
-
-                // Determine policy: --yolo > --ask > settings.browseDefaultPolicy > Pattern.
-                let policy = if *yolo {
-                    // First-time --yolo: write acknowledgment file if not yet present
-                    if !crate::browser::yolo_ack::is_acknowledged() {
-                        eprintln!(
-                            "Warning: --yolo disables all approval prompts. \
-                             The browser agent will execute destructive actions without confirmation.\n\
-                             To proceed, this acknowledgment is recorded in your XDG state directory."
-                        );
-                        if let Err(e) = crate::browser::yolo_ack::acknowledge() {
-                            eprintln!("Warning: could not write yolo-ack file: {e}");
-                        }
-                    }
-                    BrowsePolicy::Yolo
-                } else if *ask {
-                    BrowsePolicy::Ask
-                } else {
-                    BrowsePolicy::from_settings_str(&config.browse_default_policy)
-                };
-
-                let req = BrowseRequest {
-                    goal: goal_str.clone(),
-                    policy,
-                    max_steps: *max_steps,
-                    voice: false,
-                };
-
-                let is_non_anthropic = crate::api::is_ollama_model(&config.model)
-                    || crate::api::is_openai_compat_model(&config.model);
-                if !is_non_anthropic && config.api_key.is_empty() {
-                    eprintln!(
-                        "Error: ANTHROPIC_API_KEY not set for model: {}",
-                        config.model
-                    );
-                    std::process::exit(1);
-                }
-                let (tools, shared_state) = crate::tools::all_tools_with_state(&config);
-                let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-                let browser_session = shared_state.browser_session.clone();
-
-                let (progress_tx, mut progress_rx) = mpsc::channel::<BrowseProgress>(64);
-                // Approval channel: in CLI mode auto-deny (user must use --yolo or --ask interactively)
-                let (approval_tx, mut approval_rx) =
-                    mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(8);
-
-                // Prompt on stderr, read the answer from stdin. A plain OS
-                // thread, not a tokio task: a read left blocked by Ctrl-C or
-                // the gate's timeout would keep the runtime from shutting
-                // down, and the process would hang at exit until Enter.
-                // Returning from main ends this thread.
-                std::thread::spawn(move || {
-                    use std::io::Write;
-                    while let Some(prompt) = approval_rx.blocking_recv() {
-                        eprint!(
-                            "Approval needed [step {}]: {} on '{}' at {}\n  Reason: {}\nAllow? [y/N] ",
-                            prompt.step,
-                            prompt.tool_name,
-                            prompt.target_text,
-                            prompt.url,
-                            prompt.reason
-                        );
-                        let _ = std::io::stderr().flush();
-                        let mut line = String::new();
-                        let allowed = if std::io::stdin().read_line(&mut line).is_ok() {
-                            matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
-                        } else {
-                            false
-                        };
-                        // The gate stopped waiting while we read: say so,
-                        // rather than let the answer look like it counted.
-                        if prompt.reply.send(allowed).is_err() {
-                            eprintln!("Approval prompt had already expired; answer ignored.");
-                        }
-                    }
-                });
-
-                // Spawn task to print progress as NDJSON
-                let progress_task = tokio::spawn(async move {
-                    while let Some(event) = progress_rx.recv().await {
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            println!("{json}");
-                        }
-                    }
-                });
-
-                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let cancel_clone = cancel.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    cancel_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                });
-                let channels = crate::browser::browse_loop::BrowseChannels {
-                    progress_tx,
-                    approval_tx,
-                    cancel,
-                    usage_sink: None,
-                };
-                let result =
-                    run_browse(req, &config, tools, current_url, browser_session, channels).await?;
-                progress_task.await.ok();
-
-                // Print final result as JSON. A goal not reached (a setup
-                // failure such as a missing key included) is a non-zero
-                // exit for scripts and CI.
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                if !result.achieved {
-                    std::process::exit(1);
-                }
-                return Ok(());
-            }
+            // Needs the full config so --model, --settings and the other
+            // global flags apply; handled below.
+            Commands::Browse { .. } => {}
         }
     }
 
@@ -1127,7 +1000,13 @@ async fn run() -> Result<()> {
     }
 
     // The TUI shows these in the transcript; the other modes only have stderr.
-    if cli.print || cli.headless || matches!(cli.command, Some(Commands::Acp)) {
+    if cli.print
+        || cli.headless
+        || matches!(
+            cli.command,
+            Some(Commands::Acp) | Some(Commands::Browse { .. })
+        )
+    {
         warn_settings_load_errors(&config);
     }
 
@@ -1142,6 +1021,132 @@ async fn run() -> Result<()> {
         .await
         {
             r?;
+        }
+        return Ok(());
+    }
+
+    // `oxideclaw browse`: the browser agent, once and exit
+    if let Some(Commands::Browse {
+        goal,
+        yolo,
+        ask,
+        max_steps,
+    }) = &cli.command
+    {
+        use crate::browser::browse_loop::{
+            BrowsePolicy, BrowseProgress, BrowseRequest, run_browse,
+        };
+        use tokio::sync::mpsc;
+
+        let goal_str = goal.join(" ");
+        if goal_str.trim().is_empty() {
+            eprintln!("Error: browse requires a goal argument");
+            std::process::exit(1);
+        }
+
+        // Determine policy: --yolo > --ask > settings.browseDefaultPolicy > Pattern.
+        let policy = if *yolo {
+            // First-time --yolo: write acknowledgment file if not yet present
+            if !crate::browser::yolo_ack::is_acknowledged() {
+                eprintln!(
+                    "Warning: --yolo disables all approval prompts. \
+                     The browser agent will execute destructive actions without confirmation.\n\
+                     To proceed, this acknowledgment is recorded in your XDG state directory."
+                );
+                if let Err(e) = crate::browser::yolo_ack::acknowledge() {
+                    eprintln!("Warning: could not write yolo-ack file: {e}");
+                }
+            }
+            BrowsePolicy::Yolo
+        } else if *ask {
+            BrowsePolicy::Ask
+        } else {
+            BrowsePolicy::from_settings_str(&config.browse_default_policy)
+        };
+
+        let req = BrowseRequest {
+            goal: goal_str.clone(),
+            policy,
+            max_steps: *max_steps,
+            voice: false,
+        };
+
+        let is_non_anthropic = crate::api::is_ollama_model(&config.model)
+            || crate::api::is_openai_compat_model(&config.model);
+        if !is_non_anthropic && config.api_key.is_empty() {
+            eprintln!(
+                "Error: ANTHROPIC_API_KEY not set for model: {}",
+                config.model
+            );
+            std::process::exit(1);
+        }
+        let (tools, shared_state) = crate::tools::all_tools_with_state(&config);
+        let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let browser_session = shared_state.browser_session.clone();
+
+        let (progress_tx, mut progress_rx) = mpsc::channel::<BrowseProgress>(64);
+        // Approval channel: in CLI mode auto-deny (user must use --yolo or --ask interactively)
+        let (approval_tx, mut approval_rx) =
+            mpsc::channel::<crate::browser::approval_gate::ApprovalPrompt>(8);
+
+        // Prompt on stderr, read the answer from stdin. A plain OS
+        // thread, not a tokio task: a read left blocked by Ctrl-C or
+        // the gate's timeout would keep the runtime from shutting
+        // down, and the process would hang at exit until Enter.
+        // Returning from main ends this thread.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            while let Some(prompt) = approval_rx.blocking_recv() {
+                eprint!(
+                    "Approval needed [step {}]: {} on '{}' at {}\n  Reason: {}\nAllow? [y/N] ",
+                    prompt.step, prompt.tool_name, prompt.target_text, prompt.url, prompt.reason
+                );
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                let allowed = if std::io::stdin().read_line(&mut line).is_ok() {
+                    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+                } else {
+                    false
+                };
+                // The gate stopped waiting while we read: say so,
+                // rather than let the answer look like it counted.
+                if prompt.reply.send(allowed).is_err() {
+                    eprintln!("Approval prompt had already expired; answer ignored.");
+                }
+            }
+        });
+
+        // Spawn task to print progress as NDJSON
+        let progress_task = tokio::spawn(async move {
+            while let Some(event) = progress_rx.recv().await {
+                if let Ok(json) = serde_json::to_string(&event) {
+                    println!("{json}");
+                }
+            }
+        });
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancel_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let channels = crate::browser::browse_loop::BrowseChannels {
+            progress_tx,
+            approval_tx,
+            cancel,
+            usage_sink: None,
+        };
+        let result =
+            run_browse(req, &config, tools, current_url, browser_session, channels).await?;
+        progress_task.await.ok();
+
+        // Print final result as JSON. A goal not reached (a setup
+        // failure such as a missing key included) is a non-zero
+        // exit for scripts and CI.
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        if !result.achieved {
+            std::process::exit(1);
         }
         return Ok(());
     }
