@@ -66,7 +66,7 @@ fn check_capacity(registry: &SpawnRegistry) -> Result<()> {
     if running >= MAX_CONCURRENT_SPAWNS {
         anyhow::bail!(
             "{running} agents are already running (limit {MAX_CONCURRENT_SPAWNS}). \
-             Wait for one to finish or /kill one first."
+             Wait for one to finish or /spawn kill one first."
         );
     }
     Ok(())
@@ -96,7 +96,7 @@ fn spawn_slug(description: &str, id: &str) -> String {
     }
 }
 
-/// Record the task's outcome. A `Cancelled` status set by `/kill` is kept —
+/// Record the task's outcome. A `Cancelled` status set by `/spawn kill` is kept —
 /// the task's own error ("cancelled by user") must not relabel it `Failed`.
 /// Returns the status the agent ended in.
 fn finalize(
@@ -254,31 +254,13 @@ pub async fn spawn_agent(
     tokio::spawn(async move {
         let result = run_spawned_agent(agent_config, &desc, cancel_rx, usage_sink).await;
 
-        // Collect the diff (committed + uncommitted changes since base)
-        let diff = Command::new("git")
-            .args(["diff", &base_sha])
-            .current_dir(&wt_path)
-            .output()
-            .await
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-
-        // Also get a stat summary
-        let stat = Command::new("git")
-            .args(["diff", "--stat", &base_sha])
-            .current_dir(&wt_path)
-            .output()
-            .await
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
+        let (diff, stat) = collect_agent_diff(&wt_path, &base_sha).await;
 
         let status = finalize(&reg, &agent_id, &result, diff);
         match (&status, &result) {
             (SpawnStatus::Completed, _) => {
                 let _ = event_tx.send(AppEvent::SystemMessage(format!(
-                    "🏁 Agent [{agent_id}] completed: {desc}\n{stat}\nUse /review {agent_id} to inspect changes, /merge {agent_id} to apply them.",
+                    "🏁 Agent [{agent_id}] completed: {desc}\n{stat}\nUse /spawn review {agent_id} to inspect changes, /spawn merge {agent_id} to apply them.",
                 )));
             }
             (SpawnStatus::Cancelled, _) => {
@@ -319,6 +301,32 @@ fn spawn_budget(engine_cap: Option<f64>, budget_left: Option<f64>) -> Result<Opt
         Some(left) => Ok(Some(engine_cap.map_or(left, |cap| cap.min(left)))),
         None => Ok(engine_cap),
     }
+}
+
+/// Everything the agent changed since `base_sha`, as (diff, stat).
+///
+/// Files the agent created are untracked in the worktree's index, and plain
+/// `git diff <commit>` skips untracked paths, so stage first: otherwise new
+/// files are missing from `/spawn review` yet still land on `/spawn merge`,
+/// which stages everything with `git add -A` anyway.
+async fn collect_agent_diff(wt_path: &std::path::Path, base_sha: &str) -> (String, String) {
+    let _ = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(wt_path)
+        .output()
+        .await;
+    async fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+    let diff = git_out(wt_path, &["diff", base_sha]).await;
+    let stat = git_out(wt_path, &["diff", "--stat", base_sha]).await;
+    (diff, stat)
 }
 
 /// Run the actual agent loop. Returns the final summary text.
@@ -620,7 +628,7 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
         let out = String::from_utf8_lossy(&merge.stdout);
         anyhow::bail!(
             "Merge failed and was aborted; the worktree and branch '{branch}' are kept. \
-             Resolve by hand (git merge {branch}) or /discard {id}.\n{out}{err}"
+             Resolve by hand (git merge {branch}) or /spawn discard {id}.\n{out}{err}"
         );
     }
 
@@ -660,7 +668,7 @@ pub async fn discard_agent(
         let agent = find_agent(&reg, id)?;
         if agent.status == SpawnStatus::Running {
             anyhow::bail!(
-                "Agent [{}] is still running. Use /kill {} first.",
+                "Agent [{}] is still running. Use /spawn kill {} first.",
                 agent.id,
                 agent.id
             );
@@ -704,7 +712,7 @@ fn find_agent<'a>(reg: &'a HashMap<String, SpawnedAgent>, id: &str) -> Result<&'
     let matches: Vec<&SpawnedAgent> = reg.values().filter(|a| a.id.starts_with(id)).collect();
 
     match matches.len() {
-        0 => anyhow::bail!("No agent found matching '{id}'. Use /agents to list."),
+        0 => anyhow::bail!("No agent found matching '{id}'. Use /spawn list to list."),
         1 => Ok(matches[0]),
         _ => anyhow::bail!(
             "Ambiguous id '{id}' — matches {} agents. Be more specific.",
@@ -720,12 +728,12 @@ fn find_agent_mut<'a>(
     let matching_ids: Vec<String> = reg.keys().filter(|k| k.starts_with(id)).cloned().collect();
 
     match matching_ids.len() {
-        0 => anyhow::bail!("No agent found matching '{id}'. Use /agents to list."),
+        0 => anyhow::bail!("No agent found matching '{id}'. Use /spawn list to list."),
         1 => {
             // The key came from reg.keys() a moment ago and the registry is
             // held under the caller's lock, so a get_mut miss is unreachable
             // in practice — but surface it as an error instead of panicking
-            // to avoid crashing /agents on a concurrent-modification bug.
+            // to avoid crashing /spawn list on a concurrent-modification bug.
             let only = &matching_ids[0];
             reg.get_mut(only).ok_or_else(|| {
                 anyhow::anyhow!("agent '{only}' vanished from registry between lookup and get")
@@ -1004,6 +1012,49 @@ mod tests {
     async fn exit_cleanup_is_silent_with_no_agents() {
         let reg = new_registry();
         assert!(cleanup_on_exit(&reg, &PathBuf::from(".")).await.is_none());
+    }
+
+    /// Files the agent created are untracked; review must still show them,
+    /// since merge commits them.
+    #[tokio::test]
+    async fn agent_diff_includes_new_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        git(wt, &["init", "-q"]).await;
+        git(wt, &["config", "user.email", "t@t"]).await;
+        git(wt, &["config", "user.name", "t"]).await;
+        git(wt, &["config", "commit.gpgsign", "false"]).await;
+        git(wt, &["config", "core.autocrlf", "false"]).await;
+        std::fs::write(wt.join("a.txt"), "base\n").unwrap();
+        git(wt, &["add", "-A"]).await;
+        git(wt, &["commit", "-q", "-m", "base"]).await;
+        let base = git(wt, &["rev-parse", "HEAD"]).await;
+
+        std::fs::write(wt.join("a.txt"), "edited\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "brand new\n").unwrap();
+
+        let (diff, stat) = collect_agent_diff(wt, &base).await;
+        assert!(diff.contains("+brand new"), "{diff}");
+        assert!(diff.contains("+edited"), "{diff}");
+        assert!(stat.contains("new.txt"), "{stat}");
+        assert!(stat.contains("a.txt"), "{stat}");
+    }
+
+    #[test]
+    fn lookup_errors_point_at_real_spawn_subcommands() {
+        let reg = registry_with(vec![entry("abc", SpawnStatus::Running)]);
+        let r = reg.lock().unwrap();
+        let err = find_agent(&r, "zzz").unwrap_err().to_string();
+        assert!(err.contains("/spawn list"), "{err}");
+        drop(r);
+        let mut many = Vec::new();
+        for i in 0..MAX_CONCURRENT_SPAWNS {
+            many.push(entry(&format!("r{i}"), SpawnStatus::Running));
+        }
+        let err = check_capacity(&registry_with(many))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/spawn kill"), "{err}");
     }
 
     /// A conflicting merge must not leave the user's checkout mid-merge, and
