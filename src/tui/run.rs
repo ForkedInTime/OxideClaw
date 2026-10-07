@@ -547,6 +547,7 @@ fn backend_for_model(config: &Config, model: &str) -> Result<ApiBackend> {
         &config.api_key,
         config.auth_is_oauth,
         &config.ollama_host,
+        config.openai_api,
     )
 }
 

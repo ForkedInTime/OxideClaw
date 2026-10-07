@@ -538,6 +538,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 Some(l) if crate::api::thinking::supports_effort(&config.model) => {
                     format!("Effort set to '{l}' (sent as output_config.effort).")
                 }
+                Some(l)
+                    if crate::api::openai_compat::responses_reasoning_model(
+                        &config.model,
+                        config.openai_api,
+                    ) =>
+                {
+                    format!("Effort set to '{l}' (sent as reasoning.effort).")
+                }
                 Some(l) => format!(
                     "Effort set to '{l}'. {} has no effort parameter, so it is applied as a prompt nudge.",
                     config.model
@@ -1056,6 +1064,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 reloaded.push("autoFixLoop");
             }
 
+            // OXIDECLAW_OPENAI_API, when set, still wins over the file.
+            let openai_api = settings
+                .openai_api
+                .as_deref()
+                .and_then(crate::api::OpenAiApi::parse)
+                .unwrap_or_default();
+            let openai_api_changed =
+                crate::config::app_env("OPENAI_API").is_none() && openai_api != config.openai_api;
+            if openai_api_changed {
+                config.openai_api = openai_api;
+                reloaded.push("openaiApi");
+            }
             if let Some(model) = reloaded_model(
                 settings.model.as_deref(),
                 &mut config.settings_model,
@@ -1075,6 +1095,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         "Backend error: {e}\n\nModel unchanged: {}",
                         config.model
                     ))),
+                }
+            }
+            // The API is fixed when the client is built.
+            if openai_api_changed
+                && !reloaded.contains(&"model")
+                && matches!(client, ApiBackend::OpenAiCompat(_))
+            {
+                match backend_for_model(config, &config.model) {
+                    Ok(new_client) => *client = new_client,
+                    Err(e) => app
+                        .entries
+                        .push(ChatEntry::error(format!("Backend error: {e}"))),
                 }
             }
             if let Some(ref theme) = settings.theme {

@@ -1,0 +1,1354 @@
+//! OpenAI Responses API (`POST /v1/responses`), used for the `oai:` preset.
+//!
+//! Chat Completions drops a reasoning model's reasoning between tool calls;
+//! the Responses API hands it back as `reasoning` output items. With
+//! `store: false` and `include: ["reasoning.encrypted_content"]` each item
+//! carries its encrypted reasoning, and sending the items back in the next
+//! request's `input` lets the model continue a tool loop from where it was.
+//!
+//! Wire format: the OpenAI API reference for "Create a model response" and
+//! "Streaming events" (https://platform.openai.com/docs/api-reference/responses,
+//! https://platform.openai.com/docs/api-reference/responses-streaming), as
+//! generated into openai-python's `src/openai/types/responses/` (checked
+//! 2026-10-07: `response_create_params.py`, `response_input_item_param.py`,
+//! `response_stream_event.py`, `response_usage.py`, `response_reasoning_item.py`).
+
+use super::*;
+use std::collections::BTreeMap;
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+/// `gpt-<major>[.<minor>]` → `(major, minor)`.
+fn gpt_version(model: &str) -> Option<(u32, u32)> {
+    let rest = model.strip_prefix("gpt-")?;
+    let mut nums = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .take(2)
+        .map(|n| n.parse::<u32>().ok());
+    let major = nums.next()??;
+    // Only a dot separates a minor version: `gpt-5-mini` is 5.0.
+    let minor = if rest[major.to_string().len()..].starts_with('.') {
+        nums.next().flatten().unwrap_or(0)
+    } else {
+        0
+    };
+    Some((major, minor))
+}
+
+/// OpenAI's reasoning models: the o-series, GPT-5 and later, and Codex. They
+/// take `reasoning.effort` and return reasoning items. The `-chat` variants
+/// (`gpt-5-chat-latest`) are not reasoning models, and o1-mini / o1-preview
+/// reject the `reasoning` parameter.
+pub(crate) fn is_reasoning_model(bare: &str) -> bool {
+    let m = bare.to_ascii_lowercase();
+    if m.contains("chat") || m.starts_with("o1-mini") || m.starts_with("o1-preview") {
+        return false;
+    }
+    ["o1", "o3", "o4", "codex-"]
+        .iter()
+        .any(|p| m.starts_with(p))
+        || gpt_version(&m).is_some_and(|(major, _)| major >= 5)
+}
+
+/// The `reasoning.effort` to send for the configured `level`, or `None`
+/// for a level OxideClaw does not know. Every reasoning model takes
+/// `low`/`medium`/`high`; `xhigh` arrived with gpt-5.1-codex-max and
+/// GPT-5.2, so older models get `high` instead of a 400. `max` is sent as
+/// the highest of those two the model takes: OpenAI documents it per model,
+/// and a wrong guess is a failed request.
+pub(crate) fn reasoning_effort(bare: &str, level: &str) -> Option<&'static str> {
+    let m = bare.to_ascii_lowercase();
+    let xhigh = m.contains("codex-max") || gpt_version(&m).is_some_and(|v| v >= (5, 2));
+    match level.trim().to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "max" if xhigh => Some("xhigh"),
+        "xhigh" | "max" => Some("high"),
+        _ => None,
+    }
+}
+
+// ─── Reasoning carried between requests ──────────────────────────────────────
+
+/// One output item of a finished turn, in the order the model produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TurnItem {
+    /// A `reasoning` item with `encrypted_content`, sent back verbatim.
+    Reasoning(serde_json::Value),
+    /// An assistant `message`; its text is in the history.
+    Message { phase: Option<String> },
+    /// A `function_call` by `call_id`; its name and arguments are in the
+    /// history.
+    Call(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredTurn {
+    /// [`turn_key`] of the assistant message the turn became.
+    key: String,
+    /// Bare model id: encrypted reasoning is only valid for the model that
+    /// produced it, so a `/model` switch leaves it out.
+    model: String,
+    items: Vec<TurnItem>,
+}
+
+/// Recent turns' reasoning, oldest first, capped at [`MAX_STORED_TURNS`].
+/// A resumed session or another model's history finds nothing here, and
+/// those turns go out without reasoning, as Chat Completions sends them.
+pub(crate) type TurnStore = VecDeque<StoredTurn>;
+
+/// Only the current tool loop's reasoning matters to most models; the cap
+/// keeps a long session from growing without bound.
+const MAX_STORED_TURNS: usize = 128;
+
+fn remember_turn(store: &mut TurnStore, turn: StoredTurn) {
+    store.retain(|t| t.key != turn.key);
+    store.push_back(turn);
+    let excess = store.len().saturating_sub(MAX_STORED_TURNS);
+    store.drain(..excess);
+}
+
+/// Identifies an assistant message across requests: its first tool call id,
+/// else a hash of its text. The same blocks are stored in history, so the
+/// key computed from the parsed reply finds the turn again.
+fn turn_key(content: &[ContentBlock]) -> Option<String> {
+    if let Some(id) = content.iter().find_map(|b| match b {
+        ContentBlock::ToolUse { id, .. } => Some(id),
+        _ => None,
+    }) {
+        return Some(format!("call:{id}"));
+    }
+    let text = joined_text(content);
+    (!text.is_empty()).then(|| format!("text:{:016x}", fnv1a(&text)))
+}
+
+fn joined_text(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ─── Request ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ResponsesRequest {
+    model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    instructions: String,
+    input: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<serde_json::Value>,
+    stream: bool,
+    /// Nothing is kept server-side; the reasoning comes back encrypted
+    /// instead (`include`), so this works under Zero Data Retention too.
+    store: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<serde_json::Value>,
+}
+
+/// The `input` items for `messages`. User turns become `message` and
+/// `function_call_output` items, assistant turns `message` and
+/// `function_call` items paired with them by `call_id`, preceded by the
+/// turn's stored reasoning when `model` produced it. Thinking blocks (from
+/// Claude, or this API's own summaries) are display only and never sent.
+pub(super) fn translate_input(
+    messages: &[Message],
+    model: &str,
+    store: &TurnStore,
+) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match msg.role {
+            Role::User => {
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = block
+                    {
+                        let output = content
+                            .iter()
+                            .map(|c| {
+                                let ToolResultContent::Text { text } = c;
+                                text.as_str()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        out.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": output,
+                        }));
+                    }
+                }
+                let text = joined_text(&msg.content);
+                let images: Vec<serde_json::Value> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Image { source } => {
+                            let url = match source {
+                                ImageSource::Base64 { media_type, data } => {
+                                    format!("data:{media_type};base64,{data}")
+                                }
+                                ImageSource::Url { url } => url.clone(),
+                            };
+                            Some(json!({ "type": "input_image", "image_url": url, "detail": "auto" }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let has_text = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. }));
+                if images.is_empty() {
+                    if has_text {
+                        out.push(json!({ "type": "message", "role": "user", "content": text }));
+                    }
+                } else {
+                    let mut parts = Vec::with_capacity(images.len() + 1);
+                    if !text.is_empty() {
+                        parts.push(json!({ "type": "input_text", "text": text }));
+                    }
+                    parts.extend(images);
+                    out.push(json!({ "type": "message", "role": "user", "content": parts }));
+                }
+            }
+            Role::Assistant => {
+                let text = joined_text(&msg.content);
+                let calls: Vec<(&String, &String, &serde_json::Value)> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+                        _ => None,
+                    })
+                    .collect();
+                let message = |phase: Option<&str>| {
+                    let mut m = json!({ "type": "message", "role": "assistant", "content": text });
+                    if let Some(p) = phase {
+                        m["phase"] = p.into();
+                    }
+                    m
+                };
+                let call = |(id, name, input): (&String, &String, &serde_json::Value)| {
+                    json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+                    })
+                };
+                let stored = turn_key(&msg.content).and_then(|key| {
+                    store
+                        .iter()
+                        .rev()
+                        .find(|t| t.key == key && t.model == model)
+                });
+
+                // Replay the turn in the order the model produced it: each
+                // reasoning item must be followed by the item it led to.
+                let mut turn = Vec::new();
+                let mut text_sent = text.is_empty();
+                let mut calls_sent = vec![false; calls.len()];
+                for item in stored.map(|t| t.items.as_slice()).unwrap_or_default() {
+                    match item {
+                        TurnItem::Reasoning(r) => turn.push(r.clone()),
+                        TurnItem::Message { phase } if !text_sent => {
+                            turn.push(message(phase.as_deref()));
+                            text_sent = true;
+                        }
+                        TurnItem::Message { .. } => {}
+                        TurnItem::Call(call_id) => {
+                            if let Some(i) = calls.iter().position(|c| c.0 == call_id)
+                                && !calls_sent[i]
+                            {
+                                calls_sent[i] = true;
+                                turn.push(call(calls[i]));
+                            }
+                        }
+                    }
+                }
+                if !text_sent {
+                    turn.push(message(None));
+                }
+                for (c, sent) in calls.iter().zip(calls_sent) {
+                    if !sent {
+                        turn.push(call(*c));
+                    }
+                }
+                // Reasoning with nothing after it is rejected.
+                while turn.last().is_some_and(|i| i["type"] == "reasoning") {
+                    turn.pop();
+                }
+                out.extend(turn);
+            }
+        }
+    }
+    out
+}
+
+/// Function tools. `strict` defaults to true on this API, which requires
+/// every property to be listed in `required`; the tool schemas are written
+/// for the non-strict mode Chat Completions uses.
+fn translate_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+                "strict": false,
+            })
+        })
+        .collect()
+}
+
+// ─── Streaming response ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    /// Every prompt token, cache hits included.
+    #[serde(default)]
+    input_tokens: u64,
+    /// Includes `output_tokens_details.reasoning_tokens`, which are billed
+    /// as output.
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<OaiPromptTokensDetails>,
+}
+
+impl From<ResponsesUsage> for Usage {
+    /// Cache hits are counted inside `input_tokens`; `Usage` keeps them
+    /// apart so cost prices them at the cached rate, as for Chat Completions.
+    fn from(u: ResponsesUsage) -> Self {
+        let cached = u
+            .input_tokens_details
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0)
+            .min(u.input_tokens);
+        Usage {
+            input_tokens: u.input_tokens - cached,
+            output_tokens: u.output_tokens,
+            cache_read_input_tokens: cached,
+            cache_creation_input_tokens: 0,
+        }
+    }
+}
+
+/// `"<message> (<code>)"` from an `error` event or a failed response's
+/// `error` object. The code (`context_length_exceeded`, `rate_limit_exceeded`)
+/// stays in the text so `is_context_overflow` and the retry checks see it.
+fn error_text(err: &serde_json::Value, fallback: &str) -> String {
+    let msg = err["message"].as_str().unwrap_or(fallback);
+    match err["code"].as_str() {
+        Some(code) => format!("{msg} ({code})"),
+        None => msg.to_string(),
+    }
+}
+
+/// How the response ended.
+enum End {
+    Completed,
+    /// `response.incomplete` with its `incomplete_details.reason`.
+    Incomplete(String),
+}
+
+/// Parse a Responses SSE stream. Also returns the turn's items to replay
+/// (empty unless the response completed). As with Chat Completions, a
+/// failure after the 200 is an `Err`, never a short reply that looks done.
+pub(super) async fn parse_responses_stream(
+    resp: reqwest::Response,
+    mut on_text: impl FnMut(&str),
+) -> Result<(StreamedResponse, Vec<TurnItem>)> {
+    let mut stream = crate::api::idle_bounded(resp.bytes_stream()).eventsource();
+    let mut result = StreamedResponse::default();
+    let mut text_buf = String::new();
+    let mut thinking_buf = String::new();
+    // (output_index, summary or content index) of the last reasoning delta:
+    // a new summary part starts a new paragraph.
+    let mut thinking_part: Option<(u64, u64)> = None;
+    // output_index → (call_id, name, arguments)
+    let mut calls: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
+    let mut items: BTreeMap<u64, TurnItem> = BTreeMap::new();
+    let mut refusal = false;
+    let mut end: Option<End> = None;
+
+    while let Some(event) = crate::api::next_sse_event(&mut stream).await? {
+        if event.data == "[DONE]" {
+            break;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&event.data) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to parse Responses event: {e}: {}", event.data);
+                continue;
+            }
+        };
+        let idx = v["output_index"].as_u64().unwrap_or(0);
+        let delta = v["delta"].as_str().unwrap_or("");
+        match v["type"].as_str().unwrap_or("") {
+            "response.output_text.delta" | "response.refusal.delta" => {
+                refusal |= v["type"] == "response.refusal.delta";
+                if !delta.is_empty() {
+                    on_text(delta);
+                    text_buf.push_str(delta);
+                }
+            }
+            // Summaries (OpenAI) and raw reasoning text (gpt-oss servers).
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let part = (
+                    idx,
+                    v["summary_index"]
+                        .as_u64()
+                        .or(v["content_index"].as_u64())
+                        .unwrap_or(0),
+                );
+                if !thinking_buf.is_empty() && thinking_part != Some(part) {
+                    thinking_buf.push_str("\n\n");
+                }
+                thinking_part = Some(part);
+                thinking_buf.push_str(delta);
+            }
+            t @ ("response.output_item.added" | "response.output_item.done") => {
+                let done = t == "response.output_item.done";
+                let item = &v["item"];
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        let entry = calls.entry(idx).or_default();
+                        if let Some(id) = item["call_id"].as_str() {
+                            entry.0 = id.to_string();
+                        }
+                        if let Some(name) = item["name"].as_str() {
+                            entry.1 = name.to_string();
+                        }
+                        // The finished item has the whole arguments string.
+                        if let Some(args) = item["arguments"].as_str()
+                            && (done || entry.2.is_empty())
+                        {
+                            entry.2 = args.to_string();
+                        }
+                        if done {
+                            items.insert(idx, TurnItem::Call(entry.0.clone()));
+                        }
+                    }
+                    // `encrypted_content` is complete only on the done event.
+                    // Without it the item cannot be replayed under
+                    // `store: false` (the server would look up its id).
+                    Some("reasoning")
+                        if done
+                            && item["encrypted_content"]
+                                .as_str()
+                                .is_some_and(|c| !c.is_empty()) =>
+                    {
+                        items.insert(idx, TurnItem::Reasoning(item.clone()));
+                    }
+                    Some("message") if done => {
+                        let phase = item["phase"].as_str().map(str::to_string);
+                        items.insert(idx, TurnItem::Message { phase });
+                    }
+                    _ => {}
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                calls.entry(idx).or_default().2.push_str(delta);
+            }
+            "response.function_call_arguments.done" => {
+                if let Some(args) = v["arguments"].as_str() {
+                    calls.entry(idx).or_default().2 = args.to_string();
+                }
+            }
+            t @ ("response.completed" | "response.incomplete") => {
+                if let Ok(usage) =
+                    serde_json::from_value::<ResponsesUsage>(v["response"]["usage"].clone())
+                {
+                    result.usage = usage.into();
+                }
+                end = Some(if t == "response.completed" {
+                    End::Completed
+                } else {
+                    End::Incomplete(
+                        v["response"]["incomplete_details"]["reason"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                });
+                break;
+            }
+            "response.failed" => {
+                return Err(anyhow!(
+                    "provider stream error: {}",
+                    error_text(&v["response"]["error"], "the response failed")
+                ));
+            }
+            "error" => {
+                return Err(anyhow!(
+                    "provider stream error: {}",
+                    error_text(&v, "unknown error")
+                ));
+            }
+            // A proxy's or compat server's own `{"error": ...}` chunk.
+            "" => {
+                if let Some(msg) = chunk_error(&v) {
+                    return Err(anyhow!("provider stream error: {msg}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(end) = end else {
+        return Err(anyhow!(
+            "provider stream ended before the reply finished (no response.completed)"
+        ));
+    };
+
+    if !thinking_buf.is_empty() {
+        result.content.push(ContentBlock::Thinking {
+            thinking: thinking_buf,
+            signature: String::new(),
+        });
+    }
+    if !text_buf.is_empty() {
+        result.content.push(ContentBlock::Text { text: text_buf });
+    }
+    let mut has_calls = false;
+    for (id, name, args) in calls.into_values() {
+        if id.is_empty() || name.is_empty() {
+            continue;
+        }
+        has_calls = true;
+        let input =
+            serde_json::from_str(&args).unwrap_or(serde_json::Value::Object(Default::default()));
+        result
+            .content
+            .push(ContentBlock::ToolUse { id, name, input });
+    }
+
+    let items = match end {
+        End::Completed => {
+            result.stop_reason = Some(if has_calls {
+                StopReason::ToolUse
+            } else if refusal {
+                StopReason::Refusal
+            } else {
+                StopReason::EndTurn
+            });
+            items.into_values().collect()
+        }
+        // `max_output_tokens` is the usual reason; tool calls cut off with
+        // it are dropped by the caller (`drop_unanswerable_tool_calls`).
+        End::Incomplete(reason) => {
+            result.stop_reason = Some(if reason == "content_filter" {
+                StopReason::Refusal
+            } else {
+                StopReason::MaxTokens
+            });
+            Vec::new()
+        }
+    };
+    Ok((result, items))
+}
+
+// ─── Client ──────────────────────────────────────────────────────────────────
+
+impl OpenAiCompatClient {
+    /// `messages_stream` over `POST {base_url}/responses`.
+    pub(super) async fn responses_stream(
+        &self,
+        request: MessagesRequest,
+        on_text: impl FnMut(&str),
+        store: &Mutex<TurnStore>,
+    ) -> Result<StreamedResponse> {
+        let model = request
+            .model
+            .split_once(':')
+            .map_or(request.model.as_str(), |(_, bare)| bare)
+            .to_string();
+        let url = format!("{}/responses", self.base_url);
+        debug!(
+            "POST {url} model={model} (via {}, Responses API)",
+            self.provider_name
+        );
+
+        let no_tools = self.no_tools.load(Ordering::Relaxed);
+        let mut instructions = system_to_string(&request.system);
+        if no_tools {
+            instructions = patch_system_no_tools(&instructions);
+        }
+        let input = translate_input(
+            &request.messages,
+            &model,
+            &store.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        let reasoning_model = is_reasoning_model(&model);
+        // `output_config.effort` and a summarized `thinking` are set only for
+        // reasoning models on this API; see `thinking::request_knobs`.
+        let effort = request.output_config.as_ref().map(|o| o.effort.as_str());
+        let summary = matches!(
+            request.thinking,
+            Some(ThinkingConfig::Adaptive { summarized: true })
+        );
+        let reasoning = (reasoning_model && (effort.is_some() || summary)).then(|| {
+            let mut r = serde_json::json!({});
+            if let Some(effort) = effort {
+                r["effort"] = effort.into();
+            }
+            if summary {
+                r["summary"] = "auto".into();
+            }
+            r
+        });
+        let body = ResponsesRequest {
+            model: model.clone(),
+            instructions,
+            input,
+            tools: if no_tools {
+                vec![]
+            } else {
+                translate_tools(&request.tools)
+            },
+            stream: true,
+            store: false,
+            // Other models return no reasoning, and some reject the field.
+            include: if reasoning_model {
+                vec!["reasoning.encrypted_content"]
+            } else {
+                vec![]
+            },
+            // As on Chat Completions: only a cap the user set.
+            max_output_tokens: request.explicit_max_tokens.then_some(request.max_tokens),
+            reasoning,
+        };
+
+        let resp = super::super::retry::send_with_retry(
+            || self.post(&url, &body),
+            self.retry_notifier.as_ref(),
+            false,
+            &format!("{} request failed", self.provider_name),
+        )
+        .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("{} error {status}: {text}", self.provider_name));
+        }
+
+        let (result, items) = parse_responses_stream(resp, on_text).await?;
+        let worth_keeping = items.iter().any(|i| {
+            matches!(
+                i,
+                TurnItem::Reasoning(_) | TurnItem::Message { phase: Some(_) }
+            )
+        });
+        if worth_keeping && let Some(key) = turn_key(&result.content) {
+            remember_turn(
+                &mut store.lock().unwrap_or_else(|e| e.into_inner()),
+                StoredTurn { key, model, items },
+            );
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::max_tokens_tests::{client, request};
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Event stream in the shape the API sends: `event:` names the type,
+    /// `data:` carries the event with its `sequence_number`.
+    fn sse(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut e = e.clone();
+                e["sequence_number"] = i.into();
+                format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())
+            })
+            .collect()
+    }
+
+    /// Answers one request with `body` as an event stream; the handle yields
+    /// the request line and the JSON body the client sent.
+    async fn serve(body: String) -> (String, tokio::task::JoinHandle<(String, serde_json::Value)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let body_start = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection closed before the body");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
+            let len: usize = head
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().to_string())
+                })
+                .unwrap()
+                .parse()
+                .unwrap();
+            while buf.len() < body_start + len {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection closed mid-body");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            let request_line = head.lines().next().unwrap_or_default().to_string();
+            let json = serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();
+            (request_line, json)
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn responses_client(base_url: String) -> OpenAiCompatClient {
+        let mut c = client(base_url);
+        c.responses = Some(Default::default());
+        c
+    }
+
+    fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> serde_json::Value {
+        json!({
+            "input_tokens": input,
+            "input_tokens_details": { "cached_tokens": cached },
+            "output_tokens": output,
+            "output_tokens_details": { "reasoning_tokens": reasoning },
+            "total_tokens": input + output,
+        })
+    }
+
+    fn completed(usage: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "response.completed",
+            "response": { "id": "resp_1", "object": "response", "status": "completed", "usage": usage },
+        })
+    }
+
+    fn text_turn() -> String {
+        sse(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress", "output": []}}),
+            json!({"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress", "output": []}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}}),
+            json!({"type": "response.content_part.added", "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                   "part": {"type": "output_text", "text": "", "annotations": []}}),
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                   "delta": "Hello", "logprobs": []}),
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                   "delta": " world", "logprobs": []}),
+            json!({"type": "response.output_text.done", "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                   "text": "Hello world", "logprobs": []}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Hello world", "annotations": []}]}}),
+            completed(usage(120, 0, 5, 0)),
+        ])
+    }
+
+    fn reasoning_item() -> serde_json::Value {
+        json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "**Reading a.rs** first."}],
+            "encrypted_content": "gAAAAB-ENCRYPTED",
+        })
+    }
+
+    /// Reasoning (with a streamed summary), then a function call whose
+    /// arguments arrive in pieces.
+    fn tool_turn() -> String {
+        sse(&[
+            json!({"type": "response.created", "response": {"id": "resp_2", "status": "in_progress", "output": []}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": []}}),
+            json!({"type": "response.reasoning_summary_part.added", "item_id": "rs_1", "output_index": 0,
+                   "summary_index": 0, "part": {"type": "summary_text", "text": ""}}),
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0,
+                   "summary_index": 0, "delta": "**Reading a.rs**"}),
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0,
+                   "summary_index": 0, "delta": " first."}),
+            json!({"type": "response.reasoning_summary_text.done", "item_id": "rs_1", "output_index": 0,
+                   "summary_index": 0, "text": "**Reading a.rs** first."}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item()}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "status": "in_progress",
+                            "call_id": "call_1", "name": "Read", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 1,
+                   "delta": "{\"file_pa"}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 1,
+                   "delta": "th\":\"a.rs\"}"}),
+            json!({"type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 1,
+                   "arguments": "{\"file_path\":\"a.rs\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "status": "completed",
+                            "call_id": "call_1", "name": "Read", "arguments": "{\"file_path\":\"a.rs\"}"}}),
+            completed(usage(900, 0, 140, 96)),
+        ])
+    }
+
+    #[tokio::test]
+    async fn text_turn_streams_to_the_transcript() {
+        let (url, req) = serve(text_turn()).await;
+        let mut shown = String::new();
+        let r = responses_client(url)
+            .messages_stream(request("oai:gpt-4.1"), |t| shown.push_str(t))
+            .await
+            .unwrap();
+        assert_eq!(shown, "Hello world");
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::Text {
+                text: "Hello world".into()
+            }]
+        );
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!((r.usage.input_tokens, r.usage.output_tokens), (120, 5));
+        let (line, _) = req.await.unwrap();
+        assert!(line.starts_with("POST /responses "), "{line}");
+    }
+
+    #[tokio::test]
+    async fn function_call_arguments_are_assembled_into_a_tool_use() {
+        let (url, _req) = serve(tool_turn()).await;
+        let r = responses_client(url)
+            .messages_stream(request("oai:gpt-5"), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(
+            r.content,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "**Reading a.rs** first.".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "Read".into(),
+                    input: json!({"file_path": "a.rs"}),
+                },
+            ]
+        );
+        // Reasoning tokens are part of output_tokens, billed as output.
+        assert_eq!(r.usage.output_tokens, 140);
+    }
+
+    /// The request after a tool call: history plus the tool's result.
+    fn follow_up(model: &str, first: Vec<ContentBlock>) -> MessagesRequest {
+        let mut req = request(model);
+        req.messages.push(Message {
+            role: Role::Assistant,
+            content: first,
+        });
+        req.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: vec![ToolResultContent::Text {
+                    text: "fn main() {}".into(),
+                }],
+                is_error: None,
+            }],
+        });
+        req
+    }
+
+    /// The point of this API: the reasoning behind a tool call goes back,
+    /// encrypted and verbatim, ahead of the call it led to, from a clone of
+    /// the client as each TUI turn runs on.
+    #[tokio::test]
+    async fn reasoning_items_go_back_in_the_next_request() {
+        let (url, _req) = serve(tool_turn()).await;
+        let mut c = responses_client(url);
+        let first = c
+            .clone()
+            .messages_stream(request("oai:gpt-5"), |_| {})
+            .await
+            .unwrap();
+
+        let (url, req) = serve(text_turn()).await;
+        c.base_url = url;
+        c.clone()
+            .messages_stream(follow_up("oai:gpt-5", first.content.clone()), |_| {})
+            .await
+            .unwrap();
+        let (_, body) = req.await.unwrap();
+        assert_eq!(
+            body["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "hi"},
+                reasoning_item(),
+                {"type": "function_call", "call_id": "call_1", "name": "Read",
+                 "arguments": "{\"file_path\":\"a.rs\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "fn main() {}"},
+            ]),
+            "{body}"
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["store"], false);
+
+        // Another model cannot read that reasoning: after /model it is left
+        // out and the call goes on alone.
+        let (url, req) = serve(text_turn()).await;
+        c.base_url = url;
+        c.clone()
+            .messages_stream(follow_up("oai:gpt-5-mini", first.content.clone()), |_| {})
+            .await
+            .unwrap();
+        let (_, body) = req.await.unwrap();
+        let types: Vec<_> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            types,
+            ["message", "function_call", "function_call_output"],
+            "{body}"
+        );
+
+        // A resumed session (a new client) has none on record either.
+        let (url, req) = serve(text_turn()).await;
+        responses_client(url)
+            .messages_stream(follow_up("oai:gpt-5", first.content), |_| {})
+            .await
+            .unwrap();
+        let (_, body) = req.await.unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| i["type"] != "reasoning"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn stored_turns_are_bounded_and_replace_their_key() {
+        let turn = |key: String| StoredTurn {
+            key,
+            model: "gpt-5".into(),
+            items: vec![TurnItem::Reasoning(reasoning_item())],
+        };
+        let mut store = TurnStore::new();
+        for i in 0..MAX_STORED_TURNS + 10 {
+            remember_turn(&mut store, turn(format!("call:{i}")));
+        }
+        assert_eq!(store.len(), MAX_STORED_TURNS);
+        assert_eq!(store.front().unwrap().key, "call:10");
+        remember_turn(&mut store, turn("call:10".into()));
+        assert_eq!(store.len(), MAX_STORED_TURNS);
+        assert_eq!(store.back().unwrap().key, "call:10");
+    }
+
+    /// A reasoning item must be followed by the item it led to; one whose
+    /// call is no longer in the history is dropped rather than sent last.
+    #[test]
+    fn reasoning_is_never_sent_without_a_following_item() {
+        let store = TurnStore::from([StoredTurn {
+            key: "text:".to_string() + &format!("{:016x}", fnv1a("done")),
+            model: "gpt-5".into(),
+            items: vec![
+                TurnItem::Reasoning(reasoning_item()),
+                TurnItem::Message {
+                    phase: Some("final_answer".into()),
+                },
+            ],
+        }]);
+        let msgs = [Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        }];
+        let input = translate_input(&msgs, "gpt-5", &store);
+        assert_eq!(input[0], reasoning_item());
+        assert_eq!(
+            input[1],
+            json!({"type": "message", "role": "assistant", "content": "done", "phase": "final_answer"})
+        );
+
+        let store = TurnStore::from([StoredTurn {
+            key: "call:call_9".into(),
+            model: "gpt-5".into(),
+            items: vec![
+                TurnItem::Call("call_9".into()),
+                TurnItem::Reasoning(reasoning_item()),
+                TurnItem::Call("call_gone".into()),
+            ],
+        }]);
+        let msgs = [Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_9".into(),
+                name: "Glob".into(),
+                input: json!({}),
+            }],
+        }];
+        let input = translate_input(&msgs, "gpt-5", &store);
+        assert_eq!(input.len(), 1, "{input:?}");
+        assert_eq!(input[0]["call_id"], "call_9");
+    }
+
+    /// `cached_tokens` is part of `input_tokens`; it is billed at the cached
+    /// rate through the same cost path as Chat Completions.
+    #[tokio::test]
+    async fn cached_tokens_are_billed_as_cache_reads() {
+        let body = sse(&[
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
+                   "content_index": 0, "delta": "ok", "logprobs": []}),
+            completed(usage(10_000, 8_000, 300, 200)),
+        ]);
+        let (url, _req) = serve(body).await;
+        let u = responses_client(url)
+            .messages_stream(request("oai:gpt-4o"), |_| {})
+            .await
+            .unwrap()
+            .usage;
+        assert_eq!(
+            (u.input_tokens, u.cache_read_input_tokens, u.output_tokens),
+            (2_000, 8_000, 300)
+        );
+        assert_eq!(u.context_tokens(), 10_000);
+
+        let mut t = crate::cost::CostTracker::new();
+        t.record_with_cache(
+            "oai:gpt-4o",
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
+        // 2K in at $2.50 + 8K cached at $1.25 + 300 out at $10, per MTok.
+        assert!(
+            (t.total_cost_usd - 0.018).abs() < 1e-12,
+            "{}",
+            t.total_cost_usd
+        );
+    }
+
+    async fn stream_error(events: &[serde_json::Value]) -> String {
+        let (url, _req) = serve(sse(events)).await;
+        responses_client(url)
+            .messages_stream(request("oai:gpt-5"), |_| {})
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn error_events_and_failed_responses_are_errors() {
+        let err = stream_error(&[
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
+                   "content_index": 0, "delta": "Hal", "logprobs": []}),
+            json!({"type": "error", "code": "server_error", "message": "The server had an error", "param": null}),
+        ])
+        .await;
+        assert!(
+            err.contains("The server had an error (server_error)"),
+            "{err}"
+        );
+
+        let err = stream_error(&[json!({"type": "response.failed", "response": {
+            "id": "resp_1", "status": "failed",
+            "error": {"code": "rate_limit_exceeded", "message": "Rate limit reached for gpt-5"}}})])
+        .await;
+        assert!(err.contains("Rate limit reached for gpt-5"), "{err}");
+
+        // A prompt over the window is recognised, so the TUI compacts and
+        // retries instead of failing the turn.
+        let err = stream_error(&[json!({"type": "error", "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            "param": "input"})])
+        .await;
+        assert!(crate::api::is_context_overflow(&err), "{err}");
+
+        // A stream cut off before response.completed is not a finished reply.
+        let err = stream_error(&[
+            json!({"type": "response.output_text.delta", "item_id": "msg_1",
+            "output_index": 0, "content_index": 0, "delta": "Half an ans", "logprobs": []}),
+        ])
+        .await;
+        assert!(err.contains("before the reply finished"), "{err}");
+    }
+
+    /// `max_output_tokens` ends the response as incomplete: the partial text
+    /// is kept, the cut-off tool call is dropped, and the turn reports
+    /// max_tokens so the existing continuation handling runs.
+    #[tokio::test]
+    async fn incomplete_response_is_a_max_tokens_stop() {
+        let body = sse(&[
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
+                   "content_index": 0, "delta": "Writing it now", "logprobs": []}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1",
+                            "name": "Write", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                   "output_index": 1, "delta": "{\"file_path\":\"a.rs\",\"cont"}),
+            json!({"type": "response.incomplete", "response": {
+                "id": "resp_1", "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": usage(500, 0, 64, 0)}}),
+        ]);
+        let (url, _req) = serve(body).await;
+        let backend = crate::api::ApiBackend::OpenAiCompat(responses_client(url));
+        let r = backend
+            .messages_stream(request("oai:gpt-5"), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::Text {
+                text: "Writing it now".into()
+            }]
+        );
+        assert_eq!(r.usage.output_tokens, 64);
+    }
+
+    #[tokio::test]
+    async fn request_has_the_responses_shape() {
+        let (url, req) = serve(text_turn()).await;
+        let mut r = request("oai:gpt-5");
+        r.system = SystemContent::Plain("You are terse.".into());
+        r.tools = vec![ToolDefinition {
+            name: "Read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({"type": "object", "properties": {"file_path": {"type": "string"}}}),
+            cache_control: None,
+        }];
+        r.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "what is this?".into(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "iVBORw0KGgo=".into(),
+                        },
+                    },
+                ],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    // Claude's signed thinking from before a /model switch.
+                    ContentBlock::Thinking {
+                        thinking: "hmm".into(),
+                        signature: "sig".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "Let me look.".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_01".into(),
+                        name: "Read".into(),
+                        input: json!({"file_path": "a.png"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_01".into(),
+                        content: vec![ToolResultContent::Text {
+                            text: "binary".into(),
+                        }],
+                        is_error: None,
+                    },
+                    ContentBlock::Text {
+                        text: "go on".into(),
+                    },
+                ],
+            },
+        ];
+        r.output_config = Some(OutputConfig {
+            effort: "high".into(),
+        });
+        r.thinking = Some(ThinkingConfig::Adaptive { summarized: true });
+        responses_client(url)
+            .messages_stream(r, |_| {})
+            .await
+            .unwrap();
+        let (_, body) = req.await.unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "model": "gpt-5",
+                "instructions": "You are terse.",
+                "input": [
+                    {"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "what is this?"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=", "detail": "auto"},
+                    ]},
+                    {"type": "message", "role": "assistant", "content": "Let me look."},
+                    {"type": "function_call", "call_id": "toolu_01", "name": "Read",
+                     "arguments": "{\"file_path\":\"a.png\"}"},
+                    {"type": "function_call_output", "call_id": "toolu_01", "output": "binary"},
+                    {"type": "message", "role": "user", "content": "go on"},
+                ],
+                "tools": [{"type": "function", "name": "Read", "description": "Read a file",
+                           "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                           "strict": false}],
+                "stream": true,
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+                "max_output_tokens": 12345,
+                "reasoning": {"effort": "high", "summary": "auto"},
+            })
+        );
+
+        // A non-reasoning model gets neither reasoning field, and an unset
+        // maxTokens leaves the server default.
+        let (url, req) = serve(text_turn()).await;
+        let mut r = request("oai:gpt-4.1");
+        r.explicit_max_tokens = false;
+        responses_client(url)
+            .messages_stream(r, |_| {})
+            .await
+            .unwrap();
+        let (_, body) = req.await.unwrap();
+        for field in ["include", "reasoning", "max_output_tokens", "instructions"] {
+            assert!(body.get(field).is_none(), "{field}: {body}");
+        }
+    }
+
+    fn env_with_key(k: &str) -> Option<String> {
+        match k {
+            "OPENAI_API_KEY" => Some("sk-test".into()),
+            "OPENAI_BASE_URL" => Some("http://10.0.0.5:8000/v1".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn only_official_openai_uses_responses_by_default() {
+        let oai = PROVIDERS.iter().find(|p| p.prefix == "oai").unwrap();
+        assert_eq!(oai.base_url, "https://api.openai.com/v1");
+        let uses = |model: &str, api| {
+            OpenAiCompatClient::from_model_env(model, api, |k| {
+                env_with_key(k).or_else(|| Some("key".into()))
+            })
+            .unwrap()
+            .responses
+            .is_some()
+        };
+        assert!(uses("oai:gpt-5", OpenAiApi::Auto));
+        // The opt-out.
+        assert!(!uses("oai:gpt-5", OpenAiApi::Chat));
+        // A non-official base URL keeps Chat Completions unless forced.
+        assert!(!uses("openai-compat:gpt-5", OpenAiApi::Auto));
+        assert!(uses("openai-compat:gpt-5", OpenAiApi::Responses));
+        // Named third-party presets never switch.
+        for model in [
+            "groq:llama-3.3-70b",
+            "gemini:gemini-2.5-flash",
+            "deepseek:deepseek-chat",
+            "openrouter:openai/gpt-5",
+            "lmstudio:qwen",
+        ] {
+            assert!(!uses(model, OpenAiApi::Auto), "{model}");
+            assert!(!uses(model, OpenAiApi::Responses), "{model}");
+        }
+        assert!(!uses_responses_api("claude-sonnet-5", OpenAiApi::Responses));
+        assert_eq!(OpenAiApi::parse(" Chat "), Some(OpenAiApi::Chat));
+        assert_eq!(OpenAiApi::parse("responses"), Some(OpenAiApi::Responses));
+        assert_eq!(OpenAiApi::parse("auto"), Some(OpenAiApi::Auto));
+        assert_eq!(OpenAiApi::parse("completions"), None);
+    }
+
+    /// `openaiApi: "chat"` sends oai: back to /chat/completions, end to end.
+    #[tokio::test]
+    async fn chat_opt_out_posts_to_chat_completions() {
+        let (url, req) = serve(String::from("data: [DONE]\n\n")).await;
+        let mut c =
+            OpenAiCompatClient::from_model_env("oai:gpt-5", OpenAiApi::Chat, env_with_key).unwrap();
+        c.base_url = url;
+        let _ = c.messages_stream(request("oai:gpt-5"), |_| {}).await;
+        let (line, body) = req.await.unwrap();
+        assert!(line.starts_with("POST /chat/completions "), "{line}");
+        assert!(body.get("messages").is_some(), "{body}");
+    }
+
+    #[test]
+    fn reasoning_models_and_their_effort_levels() {
+        for m in [
+            "o1",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "o3-pro",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.1",
+            "gpt-5.1-codex-max",
+            "gpt-5.2",
+            "gpt-5.5-pro",
+            "gpt-6-sol",
+            "codex-mini-latest",
+        ] {
+            assert!(is_reasoning_model(m), "{m}");
+        }
+        for m in [
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-5-chat-latest",
+            "gpt-5.3-chat-latest",
+            "chatgpt-4o-latest",
+            "o1-mini",
+            "gpt-oss-120b",
+        ] {
+            assert!(!is_reasoning_model(m), "{m}");
+        }
+        assert_eq!(reasoning_effort("gpt-5", " HIGH "), Some("high"));
+        assert_eq!(reasoning_effort("o4-mini", "xhigh"), Some("high"));
+        assert_eq!(reasoning_effort("gpt-5.1", "max"), Some("high"));
+        assert_eq!(reasoning_effort("gpt-5.2", "xhigh"), Some("xhigh"));
+        assert_eq!(reasoning_effort("gpt-5.1-codex-max", "max"), Some("xhigh"));
+        assert_eq!(reasoning_effort("gpt-6-sol", "xhigh"), Some("xhigh"));
+        assert_eq!(reasoning_effort("gpt-5", "ultra"), None);
+        assert_eq!(gpt_version("gpt-5-mini"), Some((5, 0)));
+        assert_eq!(gpt_version("gpt-5.2-codex"), Some((5, 2)));
+    }
+}

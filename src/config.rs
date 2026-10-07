@@ -201,6 +201,11 @@ pub struct Config {
     /// Ollama server base URL.  Overridable via OLLAMA_HOST env var or settings.json.
     pub ollama_host: String,
 
+    /// Chat Completions or Responses for OpenAI (`openaiApi` in
+    /// settings.json, overridden by `OXIDECLAW_OPENAI_API`).
+    #[serde(skip)]
+    pub openai_api: crate::api::OpenAiApi,
+
     /// Extended thinking budget in tokens (0 = disabled).
     pub thinking_budget_tokens: Option<u32>,
     /// Display thinking summaries in the chat UI. Off by default per v2.1.89 upstream change.
@@ -489,6 +494,7 @@ impl Default for Config {
             agentsmd: String::new(),
             geminimd: String::new(),
             ollama_host: "http://localhost:11434".into(),
+            openai_api: crate::api::OpenAiApi::Auto,
             thinking_budget_tokens: None,
             show_thinking_summaries: false,
             prompt_cache: false,
@@ -733,6 +739,7 @@ impl Config {
         if let Ok(host) = std::env::var("OLLAMA_HOST") {
             cfg.ollama_host = normalize_ollama_host(&host);
         }
+        cfg.apply_openai_api_env(app_env("OPENAI_API"));
         if let Some(v) = app_env("VERBOSE") {
             cfg.verbose = v == "1" || v.eq_ignore_ascii_case("true");
         }
@@ -741,6 +748,17 @@ impl Config {
         }
 
         Ok(cfg)
+    }
+
+    /// `OXIDECLAW_OPENAI_API`, which wins over `openaiApi` in settings.json.
+    pub(crate) fn apply_openai_api_env(&mut self, value: Option<String>) {
+        let Some(v) = value else { return };
+        match crate::api::OpenAiApi::parse(&v) {
+            Some(api) => self.openai_api = api,
+            None => self
+                .settings_notices
+                .push(unknown_openai_api_notice(&v, "OXIDECLAW_OPENAI_API")),
+        }
     }
 
     /// Point a config built for the launch directory at another project, as
@@ -784,6 +802,7 @@ impl Config {
             max_tokens: unless_overridden!(max_tokens),
             verbose: unless_overridden!(verbose),
             ollama_host: unless_overridden!(ollama_host),
+            openai_api: unless_overridden!(openai_api),
             thinking_budget_tokens: unless_overridden!(thinking_budget_tokens),
             effort: unless_overridden!(effort),
             disable_all_hooks: unless_overridden!(disable_all_hooks),
@@ -1067,6 +1086,14 @@ impl Config {
         self.project_trusted = settings.project_trusted;
         self.settings_load_errors = settings.load_errors;
         self.settings_notices = settings.notices;
+        self.openai_api = match settings.openai_api.as_deref() {
+            None => crate::api::OpenAiApi::Auto,
+            Some(v) => crate::api::OpenAiApi::parse(v).unwrap_or_else(|| {
+                self.settings_notices
+                    .push(unknown_openai_api_notice(v, "openaiApi in settings.json"));
+                crate::api::OpenAiApi::Auto
+            }),
+        };
         self.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
         // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
         // everything immediately?). Warn and treat as unset.
@@ -2154,6 +2181,13 @@ fn cache_dir_in(xdg: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
             .filter(|h| h.is_absolute())
             .map(|h| app_dir(&h.join(".cache"))),
     }
+}
+
+fn unknown_openai_api_notice(value: &str, source: &str) -> String {
+    format!(
+        "Unknown {source} \"{value}\", ignored. Valid values: auto (Responses for oai:, \
+         Chat Completions elsewhere), chat, responses."
+    )
 }
 
 /// `OXIDECLAW_<suffix>`, or `RUSTYCLAW_<suffix>` if only the old name is set.
@@ -3286,6 +3320,51 @@ mod flag_settings_retarget_tests {
             );
         }
         assert_eq!(cfg.model, "cli-model", "overrides are kept");
+    }
+
+    /// `openaiApi` in settings.json picks the OpenAI API, the shell
+    /// variable wins over it, and an unknown value is reported, not guessed.
+    #[test]
+    fn openai_api_comes_from_settings_and_the_environment() {
+        use crate::api::OpenAiApi;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let load = |settings: &str| {
+            std::fs::write(home.path().join("settings.json"), settings).unwrap();
+            let mut cfg = Config {
+                cwd: project.path().into(),
+                config_dir_override: Some(home.path().into()),
+                ..Config::default()
+            };
+            cfg.load_project();
+            cfg
+        };
+        assert_eq!(load("{}").openai_api, OpenAiApi::Auto);
+        let mut cfg = load(r#"{"openaiApi": "chat"}"#);
+        assert_eq!(cfg.openai_api, OpenAiApi::Chat);
+        cfg.apply_openai_api_env(None);
+        assert_eq!(cfg.openai_api, OpenAiApi::Chat);
+        cfg.apply_openai_api_env(Some("responses".into()));
+        assert_eq!(cfg.openai_api, OpenAiApi::Responses);
+        cfg.apply_openai_api_env(Some("v2".into()));
+        assert_eq!(cfg.openai_api, OpenAiApi::Responses);
+        assert!(
+            cfg.settings_notices
+                .iter()
+                .any(|n| n.contains("OXIDECLAW_OPENAI_API") && n.contains("v2")),
+            "{:?}",
+            cfg.settings_notices
+        );
+
+        let cfg = load(r#"{"openaiApi": "completions"}"#);
+        assert_eq!(cfg.openai_api, OpenAiApi::Auto);
+        assert!(
+            cfg.settings_notices
+                .iter()
+                .any(|n| n.contains("openaiApi") && n.contains("completions")),
+            "{:?}",
+            cfg.settings_notices
+        );
     }
 
     /// /reload re-read only the settings files and wrote them over the

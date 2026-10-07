@@ -314,22 +314,44 @@ pub fn request_knobs(
     max_tokens: u32,
     system: &mut String,
 ) -> (Option<ThinkingConfig>, Option<OutputConfig>, Vec<String>) {
-    let output_config = match effort_for(model, config.effort.as_deref()) {
-        Some(EffortWire::Param(oc)) => Some(oc),
-        Some(EffortWire::Prompt(nudge)) => {
-            system.push_str("\n\n");
-            system.push_str(&nudge);
-            None
-        }
-        None => None,
+    let (thinking, output_config) = if let Some(bare) =
+        crate::api::openai_compat::responses_reasoning_model(model, config.openai_api)
+            .then(|| model.split_once(':').map_or(model, |(_, bare)| bare))
+    {
+        // An OpenAI reasoning model on the Responses API: the effort goes
+        // out as `reasoning.effort` and a summarized `thinking` asks for
+        // `reasoning.summary`; see `openai_compat::responses`.
+        let effort = config
+            .effort
+            .as_deref()
+            .and_then(|e| crate::api::openai_compat::responses::reasoning_effort(bare, e));
+        (
+            config
+                .show_thinking_summaries
+                .then_some(ThinkingConfig::Adaptive { summarized: true }),
+            effort.map(|e| OutputConfig {
+                effort: e.to_string(),
+            }),
+        )
+    } else {
+        let output_config = match effort_for(model, config.effort.as_deref()) {
+            Some(EffortWire::Param(oc)) => Some(oc),
+            Some(EffortWire::Prompt(nudge)) => {
+                system.push_str("\n\n");
+                system.push_str(&nudge);
+                None
+            }
+            None => None,
+        };
+        let thinking = thinking_for(
+            model,
+            config.thinking_budget_tokens,
+            max_tokens,
+            config.effort.as_deref(),
+            config.show_thinking_summaries,
+        );
+        (thinking, output_config)
     };
-    let thinking = thinking_for(
-        model,
-        config.thinking_budget_tokens,
-        max_tokens,
-        config.effort.as_deref(),
-        config.show_thinking_summaries,
-    );
     let mut betas = thinking_betas(thinking.as_ref());
     for b in &config.extra_betas {
         if !betas.contains(b) {
@@ -818,6 +840,59 @@ mod tests {
         assert_eq!(output.unwrap().effort, "medium");
         assert_eq!(system, "base");
         assert_eq!(betas, ["custom-beta", INTERLEAVED_THINKING_BETA]);
+    }
+
+    /// OpenAI reasoning models on the Responses API take the effort as a
+    /// parameter, not a prompt nudge; Chat Completions and non-reasoning
+    /// models keep the nudge.
+    #[test]
+    fn openai_reasoning_models_on_responses_get_reasoning_effort() {
+        use crate::api::OpenAiApi;
+        let config = |effort: &str, api| crate::config::Config {
+            effort: Some(effort.into()),
+            show_thinking_summaries: true,
+            openai_api: api,
+            ..Default::default()
+        };
+        let knobs = |c: &crate::config::Config, model: &str| {
+            let mut system = "base".to_string();
+            let (thinking, output, betas) = request_knobs(c, model, 16_000, &mut system);
+            (thinking, output.map(|o| o.effort), betas, system)
+        };
+
+        let (thinking, effort, betas, system) =
+            knobs(&config("xhigh", OpenAiApi::Auto), "oai:gpt-5");
+        assert_eq!(
+            thinking,
+            Some(ThinkingConfig::Adaptive { summarized: true })
+        );
+        assert_eq!(effort.as_deref(), Some("high"), "gpt-5 has no xhigh");
+        assert!(betas.is_empty());
+        assert_eq!(system, "base", "no nudge on top of the parameter");
+        let (_, effort, _, _) = knobs(&config("xhigh", OpenAiApi::Auto), "oai:gpt-5.2");
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+
+        // Summaries only when asked for: unverified organizations get a 400.
+        let quiet = crate::config::Config {
+            show_thinking_summaries: false,
+            ..config("low", OpenAiApi::Auto)
+        };
+        let (thinking, effort, _, _) = knobs(&quiet, "oai:o4-mini");
+        assert_eq!((thinking, effort.as_deref()), (None, Some("low")));
+
+        for (model, api) in [
+            ("oai:gpt-4.1", OpenAiApi::Auto),
+            ("oai:gpt-5", OpenAiApi::Chat),
+            ("openai-compat:gpt-5", OpenAiApi::Auto),
+        ] {
+            let (thinking, effort, _, system) = knobs(&config("low", api), model);
+            assert_eq!((thinking, effort), (None, None), "{model}");
+            assert_eq!(
+                system,
+                format!("base\n\n{}", effort_prompt("low")),
+                "{model}"
+            );
+        }
     }
 
     #[test]

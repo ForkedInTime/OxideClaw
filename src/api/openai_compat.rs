@@ -2,7 +2,9 @@
 ///
 /// One client that talks to ANY endpoint implementing the OpenAI
 /// `/v1/chat/completions` API: OpenRouter, Groq, DeepSeek, Gemini, LM Studio,
-/// llama.cpp, Together AI, Mistral, and hundreds more.
+/// llama.cpp, Together AI, Mistral, and hundreds more. OpenAI itself (`oai:`)
+/// is served over the Responses API instead; see [`OpenAiApi`] and the
+/// `responses` submodule.
 ///
 /// Named provider shortcuts give convenient prefixes:
 ///
@@ -34,6 +36,8 @@ use std::sync::{
 use tracing::{debug, warn};
 
 use crate::api::types::*;
+
+pub(crate) mod responses;
 
 // ─── Provider registry ───────────────────────────────────────────────────────
 
@@ -147,6 +151,53 @@ pub fn parse_provider_model(model: &str) -> Option<(&'static ProviderDef, &str)>
     let (prefix, bare) = model.split_once(':')?;
     let provider = PROVIDERS.iter().find(|p| p.prefix == prefix)?;
     Some((provider, bare))
+}
+
+/// Which OpenAI API the `oai:` and `openai-compat:` prefixes speak
+/// (`openaiApi` in settings.json, `OXIDECLAW_OPENAI_API` in the shell).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiApi {
+    /// Responses for `oai:` (always the official https://api.openai.com/v1),
+    /// Chat Completions everywhere else.
+    #[default]
+    Auto,
+    /// Chat Completions for every provider.
+    Chat,
+    /// Responses for `oai:` and for the `openai-compat:` endpoint, which
+    /// must then serve `/responses`.
+    Responses,
+}
+
+impl OpenAiApi {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "chat" => Some(Self::Chat),
+            "responses" => Some(Self::Responses),
+            _ => None,
+        }
+    }
+}
+
+/// Whether requests for `model` go to `/responses` rather than
+/// `/chat/completions`. Named third-party presets (Groq, Gemini, DeepSeek,
+/// ...) always keep Chat Completions.
+pub fn uses_responses_api(model: &str, api: OpenAiApi) -> bool {
+    let Some((provider, _)) = parse_provider_model(model) else {
+        return false;
+    };
+    match api {
+        OpenAiApi::Chat => false,
+        OpenAiApi::Auto => provider.prefix == "oai",
+        OpenAiApi::Responses => matches!(provider.prefix, "oai" | "openai-compat"),
+    }
+}
+
+/// An OpenAI reasoning model reached over the Responses API: the requests
+/// that take `reasoning.effort` and return reasoning items.
+pub fn responses_reasoning_model(model: &str, api: OpenAiApi) -> bool {
+    uses_responses_api(model, api)
+        && parse_provider_model(model).is_some_and(|(_, bare)| responses::is_reasoning_model(bare))
 }
 
 /// List known provider prefixes — used in /model help text.
@@ -572,12 +623,7 @@ fn mistral_tool_id(id: &str) -> String {
     if id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return id.to_string();
     }
-    // FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in id.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    let mut h = fnv1a(id);
     const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     (0..9)
         .map(|_| {
@@ -586,6 +632,16 @@ fn mistral_tool_id(id: &str) -> String {
             c
         })
         .collect()
+}
+
+/// FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// Translate Anthropic `ToolDefinition`s to OpenAI tool format.
@@ -844,6 +900,10 @@ pub struct OpenAiCompatClient {
     /// newest last; see [`gemini_extra_content`]. Shared by the clones each
     /// turn runs on, and capped at [`MAX_THOUGHT_SIGNATURES`].
     thought_signatures: Option<Arc<Mutex<SignatureStore>>>,
+    /// Set when this client speaks the Responses API (see
+    /// [`uses_responses_api`]): the reasoning items of recent turns, replayed
+    /// in the next request's input. Shared by the clones each turn runs on.
+    responses: Option<Arc<Mutex<responses::TurnStore>>>,
     /// See `ClaudeClient::retry_notifier`. Rate limiting is far more common on
     /// these providers than on Anthropic — Groq and OpenRouter throttle hard.
     retry_notifier: Option<super::retry::RetryNotifier>,
@@ -892,11 +952,16 @@ fn provider_api_key(provider: &ProviderDef, env: impl Fn(&str) -> Option<String>
 impl OpenAiCompatClient {
     /// Create a client for a specific provider prefix + model string.
     /// Resolves base_url from the provider registry and API key from env vars.
-    pub fn from_model(model: &str) -> Result<Self> {
-        Self::from_model_env(model, |k| std::env::var(k).ok())
+    /// `api` picks Chat Completions or Responses; see [`uses_responses_api`].
+    pub fn from_model(model: &str, api: OpenAiApi) -> Result<Self> {
+        Self::from_model_env(model, api, |k| std::env::var(k).ok())
     }
 
-    fn from_model_env(model: &str, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
+    fn from_model_env(
+        model: &str,
+        api: OpenAiApi,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
         let (provider, _bare) = parse_provider_model(model)
             .ok_or_else(|| anyhow!("Unknown provider prefix in '{model}'"))?;
 
@@ -916,8 +981,8 @@ impl OpenAiCompatClient {
         } else {
             provider.base_url.to_string()
         };
-        // Requests append "/chat/completions"; a trailing slash made "//"
-        // and a 404 on servers that route on the exact path.
+        // Requests append "/chat/completions" (or "/responses"); a trailing
+        // slash made "//" and a 404 on servers that route on the exact path.
         let base_url = base_url.trim_end_matches('/').to_string();
 
         let api_key = provider_api_key(provider, &env);
@@ -967,7 +1032,21 @@ impl OpenAiCompatClient {
             echo_reasoning: provider.prefix == "deepseek",
             mistral_tool_ids: provider.prefix == "mistral",
             thought_signatures: (provider.prefix == "gemini").then(Default::default),
+            responses: uses_responses_api(model, api).then(Default::default),
         })
+    }
+
+    /// A POST to `url` with this provider's auth and extra headers.
+    fn post(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
+        let mut builder = self.client.post(url).json(body);
+        if !self.api_key.is_empty() {
+            builder = builder.bearer_auth(&self.api_key);
+        }
+        // Provider-specific headers (e.g. OpenRouter's HTTP-Referer)
+        for (k, v) in &self.extra_headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        builder
     }
 
     #[allow(dead_code)]
@@ -991,6 +1070,9 @@ impl OpenAiCompatClient {
         request: MessagesRequest,
         on_text: impl FnMut(&str),
     ) -> Result<StreamedResponse> {
+        if let Some(store) = &self.responses {
+            return self.responses_stream(request, on_text, store).await;
+        }
         let (prefix, bare_model) = request
             .model
             .split_once(':')
@@ -1060,17 +1142,7 @@ impl OpenAiCompatClient {
         // output. `send_with_retry` hands back the final response even on an
         // error status, which keeps the "does not support tools" sniff below
         // working exactly as before.
-        let build = |req: &OaiRequest| {
-            let mut builder = self.client.post(&url).json(req);
-            if !self.api_key.is_empty() {
-                builder = builder.bearer_auth(&self.api_key);
-            }
-            // Provider-specific headers (e.g. OpenRouter's HTTP-Referer)
-            for (k, v) in &self.extra_headers {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
-            builder
-        };
+        let build = |req: &OaiRequest| self.post(&url, req);
 
         let resp = super::retry::send_with_retry(
             || build(&oai_request),
@@ -1262,10 +1334,13 @@ mod api_key_tests {
     #[test]
     fn openai_compat_on_a_lan_host_needs_no_key() {
         let env = |k: &str| (k == "OPENAI_BASE_URL").then(|| "http://10.0.0.5:8000/v1".to_string());
-        let c = OpenAiCompatClient::from_model_env("openai-compat:qwen", env).unwrap();
+        let c =
+            OpenAiCompatClient::from_model_env("openai-compat:qwen", OpenAiApi::Auto, env).unwrap();
         assert_eq!(c.api_key, "");
         // Cloud providers still refuse to start without their key.
-        assert!(OpenAiCompatClient::from_model_env("groq:llama", |_| None).is_err());
+        assert!(
+            OpenAiCompatClient::from_model_env("groq:llama", OpenAiApi::Auto, |_| None).is_err()
+        );
     }
 
     /// "/chat/completions" is appended to the base; a trailing slash made
@@ -1273,10 +1348,11 @@ mod api_key_tests {
     #[test]
     fn trailing_slash_on_base_url_is_dropped() {
         let env = |k: &str| (k == "OPENAI_BASE_URL").then(|| "http://h:8000/v1/".to_string());
-        let c = OpenAiCompatClient::from_model_env("openai-compat:m", env).unwrap();
+        let c =
+            OpenAiCompatClient::from_model_env("openai-compat:m", OpenAiApi::Auto, env).unwrap();
         assert_eq!(c.base_url, "http://h:8000/v1");
         let env = |k: &str| (k == "LM_STUDIO_HOST").then(|| "http://box:1234/v1//".to_string());
-        let c = OpenAiCompatClient::from_model_env("lmstudio:m", env).unwrap();
+        let c = OpenAiCompatClient::from_model_env("lmstudio:m", OpenAiApi::Auto, env).unwrap();
         assert_eq!(c.base_url, "http://box:1234/v1");
     }
 }
@@ -1501,6 +1577,7 @@ mod max_tokens_tests {
             echo_reasoning: false,
             mistral_tool_ids: false,
             thought_signatures: None,
+            responses: None,
             retry_notifier: None,
         }
     }
@@ -1841,7 +1918,8 @@ mod gemini_tests {
         );
 
         let env = env_of(&[("GEMINI_API_KEY", "gem-key")]);
-        let c = OpenAiCompatClient::from_model_env("gemini:gemini-2.5-flash", env).unwrap();
+        let c = OpenAiCompatClient::from_model_env("gemini:gemini-2.5-flash", OpenAiApi::Auto, env)
+            .unwrap();
         // Requests go to <base>/chat/completions.
         assert_eq!(
             c.base_url,
@@ -1873,7 +1951,10 @@ mod gemini_tests {
             ""
         );
 
-        let err = OpenAiCompatClient::from_model_env("gemini:gemini-2.5-flash", |_| None)
+        let err =
+            OpenAiCompatClient::from_model_env("gemini:gemini-2.5-flash", OpenAiApi::Auto, |_| {
+                None
+            })
             .err()
             .unwrap()
             .to_string();

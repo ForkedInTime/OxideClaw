@@ -837,7 +837,10 @@ mod tests {
     #[tokio::test]
     async fn openai_compat_client_retries_a_429() {
         let (url, hits) = scripted_server(vec![RATE_LIMITED, OK]).await;
-        let mut client = match crate::api::OpenAiCompatClient::from_model("lmstudio:test") {
+        let mut client = match crate::api::OpenAiCompatClient::from_model(
+            "lmstudio:test",
+            crate::api::OpenAiApi::Auto,
+        ) {
             Ok(c) => c,
             Err(e) => panic!("lmstudio client should build without credentials: {e}"),
         };

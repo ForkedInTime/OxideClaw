@@ -117,6 +117,7 @@ impl SdkSession {
             &config.api_key,
             config.auth_is_oauth,
             &config.ollama_host,
+            config.openai_api,
         )
         .context("Failed to create API client")?;
         let system_prompt = config.build_system_prompt();

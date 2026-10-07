@@ -131,6 +131,11 @@ pub struct Settings {
     /// Ollama server base URL (default: http://localhost:11434)
     pub ollama_host: Option<String>,
 
+    /// `"auto"` (default: the Responses API for `oai:`, Chat Completions
+    /// for every other provider), `"chat"` (Chat Completions for `oai:`
+    /// too) or `"responses"` (also for the `openai-compat:` endpoint).
+    pub openai_api: Option<String>,
+
     /// Extended thinking budget in tokens (enables interleaved thinking).
     /// Example: 10000
     pub thinking_budget_tokens: Option<u32>,
@@ -978,6 +983,7 @@ impl Settings {
             auto_compact: other.auto_compact.or(self.auto_compact),
             verbose: other.verbose.or(self.verbose),
             ollama_host: other.ollama_host.or(self.ollama_host),
+            openai_api: other.openai_api.or(self.openai_api),
             thinking_budget_tokens: other.thinking_budget_tokens.or(self.thinking_budget_tokens),
             show_thinking_summaries: other
                 .show_thinking_summaries

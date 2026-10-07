@@ -81,6 +81,7 @@ impl QueryEngine {
             &config.api_key,
             config.auth_is_oauth,
             &config.ollama_host,
+            config.openai_api,
         )
         .context("Failed to create API client")?;
         // Headless: retry notices go to stderr so they never contaminate

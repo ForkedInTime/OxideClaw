@@ -17,7 +17,7 @@ pub use ollama::{
     strip_ollama_prefix,
 };
 pub use openai_compat::{
-    OpenAiCompatClient, PROVIDERS, is_openai_compat_model, parse_provider_model,
+    OpenAiApi, OpenAiCompatClient, PROVIDERS, is_openai_compat_model, parse_provider_model,
 };
 pub use types::*;
 
@@ -806,25 +806,34 @@ impl ApiBackend {
     /// `api_key` is the credential secret; `is_oauth` selects the wire format
     /// (`Authorization: Bearer` + oauth beta, vs `x-api-key`). Ignored for
     /// Ollama / OpenAI-compat backends, which carry their own auth.
+    /// `openai_api` is the `openaiApi` setting; see [`OpenAiApi`].
     pub fn new_with_auth(
         model: &str,
         api_key: &str,
         is_oauth: bool,
         ollama_host: &str,
+        openai_api: OpenAiApi,
     ) -> Result<Self> {
         if !is_ollama_model(model) && !is_openai_compat_model(model) && is_oauth {
             return Ok(Self::Anthropic(ClaudeClient::with_credential(
                 &crate::auth::Credential::OAuth(api_key.to_string()),
             )?));
         }
-        Self::new(model, api_key, ollama_host)
+        Self::new(model, api_key, ollama_host, openai_api)
     }
 
-    pub fn new(model: &str, api_key: &str, ollama_host: &str) -> Result<Self> {
+    pub fn new(
+        model: &str,
+        api_key: &str,
+        ollama_host: &str,
+        openai_api: OpenAiApi,
+    ) -> Result<Self> {
         if is_ollama_model(model) {
             Ok(Self::Ollama(OllamaClient::new(ollama_host)?))
         } else if is_openai_compat_model(model) {
-            Ok(Self::OpenAiCompat(OpenAiCompatClient::from_model(model)?))
+            Ok(Self::OpenAiCompat(OpenAiCompatClient::from_model(
+                model, openai_api,
+            )?))
         } else {
             Ok(Self::Anthropic(ClaudeClient::new(api_key)?))
         }
