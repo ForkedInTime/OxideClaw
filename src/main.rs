@@ -737,7 +737,9 @@ async fn run() -> Result<()> {
             deeplink::DeepLinkAction::OpenTui { query, cwd } => {
                 // The link's directory decides which CLAUDE.md, permission
                 // rules and hooks apply, so it goes in before they are read.
-                let config = Config::load_with(cwd.map(std::path::PathBuf::from), None, false)?;
+                let mut config = Config::load_with(cwd.map(std::path::PathBuf::from), None, false)?;
+                let chosen = model_chosen(false, &config);
+                keyless_ollama_start(&mut config, chosen, false).await?;
                 return tui::run_tui(config, None, Some(query), None).await;
             }
         }
@@ -836,6 +838,7 @@ async fn run() -> Result<()> {
     }
 
     let mut config = Config::load_with(None, flag_settings(), cli.bare)?;
+    let chosen = model_chosen(cli.model.is_some(), &config);
 
     // Apply CLI overrides (highest priority)
     if cli.verbose {
@@ -1161,6 +1164,10 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // SDK and ACP hosts pick their own models, so only -p and the TUI get
+    // here.
+    keyless_ollama_start(&mut config, chosen, cli.print).await?;
+
     // --session-id takes priority: resume that exact session if it exists,
     // otherwise start a new one under that ID. --session also takes the short
     // IDs and names the picker shows; an unknown one is an error rather than a
@@ -1311,6 +1318,40 @@ async fn run() -> Result<()> {
 
     // Interactive TUI mode
     tui::run_tui(config, resume_id, None, interactive_prompt(&cli.prompt)).await
+}
+
+/// Whether the user picked the model: `--model`, a non-blank
+/// `ANTHROPIC_MODEL` (a blank one selects nothing), or `model` in a
+/// settings file or `--settings`.
+fn model_chosen(cli_model: bool, config: &Config) -> bool {
+    cli_model
+        || config.settings_model.is_some()
+        || std::env::var("ANTHROPIC_MODEL").is_ok_and(|m| !m.trim().is_empty())
+}
+
+/// No Anthropic credential and no model chosen: start on a local Ollama
+/// model and say why — on stderr for -p (stdout carries the answer), on
+/// the TUI's first screen otherwise.
+async fn keyless_ollama_start(config: &mut Config, chosen: bool, print: bool) -> Result<()> {
+    let Some(name) = config.fall_back_to_local_ollama(chosen).await? else {
+        return Ok(());
+    };
+    let change = if print { "pass --model" } else { "run /model" };
+    let notice = format!(
+        "No Anthropic key found; using local Ollama model {name}. \
+         Set ANTHROPIC_API_KEY or {change} to change."
+    );
+    if print {
+        eprintln!("{notice}");
+        // warn_settings_load_errors leaves these to the missing-credential
+        // error, which no longer comes.
+        for why in &config.api_key_helper_rejected {
+            eprintln!("Warning: {why}");
+        }
+    } else {
+        config.startup_notice = Some(notice);
+    }
+    Ok(())
 }
 
 /// Positional words without `-p` start the TUI with that prompt already

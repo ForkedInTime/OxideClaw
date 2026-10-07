@@ -586,6 +586,9 @@ async fn run_loop(
     for why in &config.api_key_helper_rejected {
         app.entries.push(ChatEntry::system(why.clone()));
     }
+    if let Some(notice) = &config.startup_notice {
+        app.entries.push(ChatEntry::system(notice.clone()));
+    }
     if !config.untrusted_project_config.is_empty() {
         app.entries.push(ChatEntry::system(format!(
             "This project's settings define {} — ignored because the project is not trusted. \

@@ -249,6 +249,11 @@ pub struct Config {
     #[serde(skip)]
     pub api_key_helper_rejected: Vec<String>,
 
+    /// One line the TUI shows on its first screen: why it started on a local
+    /// Ollama model (see [`Config::fall_back_to_local_ollama`]).
+    #[serde(skip)]
+    pub startup_notice: Option<String>,
+
     /// Disable all hooks globally.
     pub disable_all_hooks: bool,
 
@@ -505,6 +510,7 @@ impl Default for Config {
             project_trusted: false,
             settings_load_errors: Vec::new(),
             api_key_helper_rejected: Vec::new(),
+            startup_notice: None,
             sandbox_mode: "strict".to_string(),
             voice_enabled: false,
             voice_api_url: None,
@@ -562,6 +568,35 @@ impl Config {
             msg.push_str(why);
         }
         anyhow::anyhow!(msg)
+    }
+
+    /// First run without an Anthropic credential: when the model needs one
+    /// and the user did not choose it (`model_chosen`: `--model`,
+    /// `ANTHROPIC_MODEL` or settings `model`), start on a model from the
+    /// local Ollama instead of exiting. Returns the bare Ollama model name
+    /// when it switched. Ollama running with nothing pulled is the
+    /// missing-credential error plus what to pull; Ollama not answering
+    /// leaves everything as it was, so startup fails exactly as before.
+    pub async fn fall_back_to_local_ollama(
+        &mut self,
+        model_chosen: bool,
+    ) -> Result<Option<String>> {
+        let needs_key = !crate::api::is_ollama_model(&self.model)
+            && !crate::api::is_openai_compat_model(&self.model);
+        if model_chosen || !needs_key || !self.api_key.is_empty() {
+            return Ok(None);
+        }
+        match crate::api::probe_ollama(&self.ollama_host, OLLAMA_PROBE_BUDGET).await {
+            crate::api::OllamaProbe::Model(name) => {
+                self.model = format!("{}{name}", crate::api::ollama::OLLAMA_PREFIX);
+                Ok(Some(name))
+            }
+            crate::api::OllamaProbe::NoModels => Err(anyhow::anyhow!(
+                "{}\nOllama is running but has no models: run `ollama pull qwen3-coder`",
+                self.missing_credential_error()
+            )),
+            crate::api::OllamaProbe::Unreachable => Ok(None),
+        }
     }
 
     /// Take the API key from `api_key_helper`, if one is set and prints a
@@ -789,6 +824,7 @@ impl Config {
             auth_warnings: old.auth_warnings,
             api_key_helper: old.api_key_helper,
             api_key_helper_rejected: old.api_key_helper_rejected,
+            startup_notice: old.startup_notice,
             dangerously_skip_permissions: old.dangerously_skip_permissions,
             plan_mode: old.plan_mode,
             max_turns: old.max_turns,
@@ -1700,6 +1736,11 @@ pub fn read_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
         ),
     }
 }
+
+/// How long startup may spend asking a local Ollama for a model when there
+/// is no Anthropic credential. A connection refused returns at once; this
+/// bounds a host that accepts and then says nothing.
+const OLLAMA_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// `OLLAMA_HOST` in the form Ollama itself documents (`0.0.0.0:11434`,
 /// `127.0.0.1`, trailing slash) → a base URL requests can be built on.
@@ -2761,5 +2802,93 @@ mod missing_credential_tests {
             msg.ends_with("apiKeyHelper ignored: /x is world-writable"),
             "{msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod keyless_ollama_tests {
+    use super::Config;
+    use crate::api::ollama::fake_server::{self, Show};
+    use std::collections::HashMap;
+
+    /// No credential, the default Anthropic model, Ollama at `host`.
+    fn keyless(host: String) -> Config {
+        Config {
+            ollama_host: host,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_on_a_tool_capable_local_model() {
+        let caps = HashMap::from([
+            ("gemma3:12b", vec!["completion"]),
+            ("qwen3-coder:30b", vec!["completion", "tools"]),
+        ]);
+        let (url, _) =
+            fake_server::start(&["gemma3:12b", "qwen3-coder:30b"], Show::Caps(caps)).await;
+        let mut c = keyless(url);
+        let got = c.fall_back_to_local_ollama(false).await.unwrap();
+        assert_eq!(got.as_deref(), Some("qwen3-coder:30b"));
+        assert_eq!(c.model, "ollama:qwen3-coder:30b");
+    }
+
+    #[tokio::test]
+    async fn a_chosen_model_is_kept_and_ollama_never_asked() {
+        let (url, seen) =
+            fake_server::start(&["qwen3-coder:30b"], Show::Caps(HashMap::new())).await;
+        let mut c = keyless(url);
+        let before = c.model.clone();
+        assert_eq!(c.fall_back_to_local_ollama(true).await.unwrap(), None);
+        assert_eq!(c.model, before);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_credential_keeps_the_anthropic_model() {
+        let (url, seen) =
+            fake_server::start(&["qwen3-coder:30b"], Show::Caps(HashMap::new())).await;
+        let mut c = keyless(url);
+        c.api_key = "sk-ant-test".into();
+        let before = c.model.clone();
+        assert_eq!(c.fall_back_to_local_ollama(false).await.unwrap(), None);
+        assert_eq!(c.model, before);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ollama_with_nothing_pulled_says_what_to_pull() {
+        let (url, _) = fake_server::start(&[], Show::Caps(HashMap::new())).await;
+        let mut c = keyless(url);
+        let msg = c
+            .fall_back_to_local_ollama(false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.starts_with("No Anthropic credential found."), "{msg}");
+        assert!(
+            msg.ends_with("Ollama is running but has no models: run `ollama pull qwen3-coder`"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_ollama_changes_nothing_and_fails_fast() {
+        let mut c = keyless(fake_server::closed_port().await);
+        let before = c.model.clone();
+        let start = std::time::Instant::now();
+        assert_eq!(c.fall_back_to_local_ollama(false).await.unwrap(), None);
+        assert!(start.elapsed() < std::time::Duration::from_millis(800));
+        assert_eq!(c.model, before);
+    }
+
+    #[tokio::test]
+    async fn a_silent_host_holds_startup_no_longer_than_the_budget() {
+        let mut c = keyless(fake_server::silent().await);
+        let start = std::time::Instant::now();
+        assert_eq!(c.fall_back_to_local_ollama(false).await.unwrap(), None);
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(700), "{took:?}");
+        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
     }
 }

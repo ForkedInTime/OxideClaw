@@ -73,6 +73,127 @@ pub async fn list_ollama_models(base_url: &str) -> Vec<String> {
     }
 }
 
+/// What a quick look at the local Ollama found, for starting without an
+/// Anthropic credential.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OllamaProbe {
+    /// Not running, not answering within the budget, or not Ollama.
+    Unreachable,
+    /// Running, but nothing has been pulled.
+    NoModels,
+    /// The installed model to start with, bare (no `ollama:` prefix).
+    Model(String),
+}
+
+/// Families that handle tool calls, best first. Used when `/api/show` does
+/// not report capabilities (older Ollama) or reports `tools` for none.
+const TOOL_FAMILIES: &[&str] = &[
+    "qwen3-coder",
+    "qwen2.5-coder",
+    "qwen3",
+    "llama3.1",
+    "llama3.2",
+    "mistral-nemo",
+    "mistral",
+];
+
+/// Ask Ollama at `base_url` for its models and pick one that can drive
+/// tools. Everything, `/api/show` included, finishes within `budget`: a
+/// dead or firewalled host must not hold up startup. When the capability
+/// lookups run out of time, the choice falls back to the family list.
+pub async fn probe_ollama(base_url: &str, budget: std::time::Duration) -> OllamaProbe {
+    #[derive(Deserialize)]
+    struct OllamaModel {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct TagsResponse {
+        models: Vec<OllamaModel>,
+    }
+    #[derive(Deserialize)]
+    struct ShowResponse {
+        #[serde(default)]
+        capabilities: Option<Vec<String>>,
+    }
+
+    let deadline = tokio::time::Instant::now() + budget;
+    let client = Client::new();
+    let tags = async {
+        let resp = client
+            .get(format!("{base_url}/api/tags"))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<TagsResponse>().await.ok()
+    };
+    let names: Vec<String> = match tokio::time::timeout_at(deadline, tags).await {
+        Ok(Some(t)) => t.models.into_iter().map(|m| m.name).collect(),
+        _ => return OllamaProbe::Unreachable,
+    };
+    if names.is_empty() {
+        return OllamaProbe::NoModels;
+    }
+
+    let show = |name: &str| {
+        let req = client
+            .post(format!("{base_url}/api/show"))
+            .json(&serde_json::json!({ "model": name }));
+        async move {
+            let resp = req.send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json::<ShowResponse>().await.ok()?.capabilities
+        }
+    };
+    let lookups = futures_util::future::join_all(names.iter().map(|n| show(n)));
+    let caps = tokio::time::timeout_at(deadline, lookups)
+        .await
+        .unwrap_or_else(|_| vec![None; names.len()]);
+    let models: Vec<(String, Option<Vec<String>>)> = names.into_iter().zip(caps).collect();
+    match pick_tool_model(&models) {
+        Some(m) => OllamaProbe::Model(m.to_string()),
+        // Only embedding models: nothing that can hold a conversation.
+        None => OllamaProbe::NoModels,
+    }
+}
+
+/// The model to start with: one whose reported capabilities include
+/// `tools`, then a known tool-capable family, then the first model that can
+/// chat. `caps` is `None` where `/api/show` did not report capabilities.
+/// `None` when every model is one that cannot chat (embeddings only).
+fn pick_tool_model(models: &[(String, Option<Vec<String>>)]) -> Option<&str> {
+    let has = |caps: &Option<Vec<String>>, c: &str| {
+        caps.as_ref().is_some_and(|v| v.iter().any(|x| x == c))
+    };
+    // `qwen3-coder:30b`, `library/qwen3:8b` → the family name.
+    fn family(name: &str) -> String {
+        let base = name.split(':').next().unwrap_or(name);
+        base.rsplit('/').next().unwrap_or(base).to_ascii_lowercase()
+    }
+    fn by_family<'a>(pool: &[&'a (String, Option<Vec<String>>)]) -> Option<&'a str> {
+        TOOL_FAMILIES.iter().find_map(|f| {
+            pool.iter()
+                .find(|(name, _)| family(name) == *f)
+                .map(|(name, _)| name.as_str())
+        })
+    }
+
+    let tool_capable: Vec<_> = models.iter().filter(|(_, c)| has(c, "tools")).collect();
+    if let Some((first, _)) = tool_capable.first() {
+        return by_family(&tool_capable).or(Some(first.as_str()));
+    }
+    // An embedding-only model reports capabilities without `completion`.
+    let chat: Vec<_> = models
+        .iter()
+        .filter(|(_, c)| c.is_none() || has(c, "completion"))
+        .collect();
+    by_family(&chat).or_else(|| chat.first().map(|(name, _)| name.as_str()))
+}
+
 /// Check whether `model` (bare, without prefix) exists in Ollama.
 // ─── Ollama client ────────────────────────────────────────────────────────────
 
@@ -196,5 +317,277 @@ impl OllamaClient {
 
         let (result, _) = parse_oai_stream(resp, on_text).await?;
         Ok(result)
+    }
+}
+
+/// A stand-in for Ollama's `/api/tags` and `/api/show`, shared with the
+/// startup fallback tests in `config`.
+#[cfg(test)]
+pub(crate) mod fake_server {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// How `/api/show` answers.
+    #[derive(Clone)]
+    pub(crate) enum Show {
+        /// Capabilities per model; a model not listed gets `{}`, as an
+        /// Ollama too old to report them answers.
+        Caps(HashMap<&'static str, Vec<&'static str>>),
+        /// Never answers: the lookups must give up at the budget.
+        Hang,
+    }
+
+    /// Serve `models` until the test ends. Returns the base URL and the
+    /// request lines seen, so a test can assert Ollama was never asked.
+    pub(crate) async fn start(models: &[&str], show: Show) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let names: Vec<String> = models
+            .iter()
+            .map(|m| format!("{{\"name\":\"{m}\"}}"))
+            .collect();
+        let tags = format!("{{\"models\":[{}]}}", names.join(","));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (tags, show, log) = (tags.clone(), show.clone(), log.clone());
+                tokio::spawn(async move {
+                    let req = read_request(&mut sock).await;
+                    let line = req.lines().next().unwrap_or("").to_string();
+                    log.lock().unwrap().push(line.clone());
+                    let body = if line.starts_with("GET /api/tags") {
+                        tags
+                    } else if line.starts_with("POST /api/show") {
+                        let Show::Caps(caps) = show else {
+                            return std::future::pending::<()>().await;
+                        };
+                        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                        match caps.get(v["model"].as_str().unwrap_or("")) {
+                            Some(c) => serde_json::json!({ "capabilities": c }).to_string(),
+                            None => "{}".to_string(),
+                        }
+                    } else {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Headers plus a `content-length` body, however the reads split them.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let len = text[..end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + len {
+                    return text;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// A port nothing listens on: connections are refused at once.
+    pub(crate) async fn closed_port() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// Accepts connections and never answers, like a host behind a
+    /// firewall that swallows packets after the handshake.
+    pub(crate) async fn silent() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake_server::{self, Show};
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn models(list: &[(&str, Option<&[&str]>)]) -> Vec<(String, Option<Vec<String>>)> {
+        list.iter()
+            .map(|(n, c)| {
+                (
+                    n.to_string(),
+                    c.map(|c| c.iter().map(|s| s.to_string()).collect()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reported_tools_capability_beats_the_family_list() {
+        let m = models(&[
+            ("qwen3-coder:30b", Some(&["completion"])),
+            ("gemma3:12b", Some(&["completion", "vision"])),
+            ("granite3.3:8b", Some(&["completion", "tools"])),
+        ]);
+        assert_eq!(pick_tool_model(&m), Some("granite3.3:8b"));
+        // Among the tool-capable ones, the family order decides.
+        let m = models(&[
+            ("mistral:7b", Some(&["completion", "tools"])),
+            ("llama3.1:8b", Some(&["completion", "tools"])),
+            (
+                "library/qwen3:8b",
+                Some(&["completion", "tools", "thinking"]),
+            ),
+        ]);
+        assert_eq!(pick_tool_model(&m), Some("library/qwen3:8b"));
+    }
+
+    #[test]
+    fn without_capabilities_the_family_order_decides() {
+        let m = models(&[
+            ("gemma3:12b", None),
+            ("llama3.2:3b", None),
+            ("qwen2.5-coder:7b", None),
+            ("qwen3:8b", None),
+        ]);
+        assert_eq!(pick_tool_model(&m), Some("qwen2.5-coder:7b"));
+        // `qwen3` is a family of its own, not a prefix of `qwen3-coder`.
+        let m = models(&[("qwen3:8b", None), ("qwen3-coder:30b", None)]);
+        assert_eq!(pick_tool_model(&m), Some("qwen3-coder:30b"));
+        let m = models(&[("gemma3:12b", None), ("phi4:14b", None)]);
+        assert_eq!(pick_tool_model(&m), Some("gemma3:12b"));
+    }
+
+    #[test]
+    fn embedding_only_models_are_never_picked() {
+        let m = models(&[
+            ("nomic-embed-text:latest", Some(&["embedding"])),
+            ("gemma3:12b", Some(&["completion"])),
+        ]);
+        assert_eq!(pick_tool_model(&m), Some("gemma3:12b"));
+        let m = models(&[("nomic-embed-text:latest", Some(&["embedding"]))]);
+        assert_eq!(pick_tool_model(&m), None);
+    }
+
+    #[tokio::test]
+    async fn probe_prefers_the_model_api_show_says_has_tools() {
+        let caps = HashMap::from([
+            ("qwen3-coder:30b", vec!["completion"]),
+            ("gemma3:12b", vec!["completion"]),
+            ("llama3.2:3b", vec!["completion", "tools"]),
+        ]);
+        let (url, seen) = fake_server::start(
+            &["gemma3:12b", "qwen3-coder:30b", "llama3.2:3b"],
+            Show::Caps(caps),
+        )
+        .await;
+        let got = probe_ollama(&url, Duration::from_millis(800)).await;
+        assert_eq!(got, OllamaProbe::Model("llama3.2:3b".into()));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("POST /api/show"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_falls_back_to_families_on_an_ollama_without_capabilities() {
+        let (url, _) = fake_server::start(
+            &["gemma3:12b", "qwen3-coder:30b"],
+            Show::Caps(HashMap::new()),
+        )
+        .await;
+        let got = probe_ollama(&url, Duration::from_millis(800)).await;
+        assert_eq!(got, OllamaProbe::Model("qwen3-coder:30b".into()));
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_wait_past_the_budget_for_api_show() {
+        let (url, _) = fake_server::start(&["gemma3:12b", "llama3.1:8b"], Show::Hang).await;
+        let start = Instant::now();
+        let got = probe_ollama(&url, Duration::from_millis(400)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(got, OllamaProbe::Model("llama3.1:8b".into()));
+    }
+
+    #[tokio::test]
+    async fn probe_reports_an_ollama_with_nothing_pulled() {
+        let (url, _) = fake_server::start(&[], Show::Caps(HashMap::new())).await;
+        assert_eq!(
+            probe_ollama(&url, Duration::from_millis(800)).await,
+            OllamaProbe::NoModels
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_fails_fast_when_nothing_listens() {
+        let url = fake_server::closed_port().await;
+        let start = Instant::now();
+        assert_eq!(
+            probe_ollama(&url, Duration::from_millis(800)).await,
+            OllamaProbe::Unreachable
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gives_up_on_a_host_that_never_answers() {
+        let url = fake_server::silent().await;
+        let start = Instant::now();
+        assert_eq!(
+            probe_ollama(&url, Duration::from_millis(300)).await,
+            OllamaProbe::Unreachable
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

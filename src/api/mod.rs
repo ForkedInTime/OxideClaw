@@ -12,7 +12,10 @@ use reqwest::{Client, header};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
-pub use ollama::{OllamaClient, is_ollama_model, list_ollama_models, strip_ollama_prefix};
+pub use ollama::{
+    OllamaClient, OllamaProbe, is_ollama_model, list_ollama_models, probe_ollama,
+    strip_ollama_prefix,
+};
 pub use openai_compat::{
     OpenAiCompatClient, PROVIDERS, is_openai_compat_model, parse_provider_model,
 };
