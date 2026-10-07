@@ -415,7 +415,14 @@ fn rule_matches(
     // the tools resolve them, so `Edit(prefix:/proj/src/)` does not cover
     // `/proj/src/../../.bashrc`, a deny on `~/.ssh/` is not dodged by
     // `~/./.ssh/id_rsa`, and a relative `.env` is the project's `.env`.
-    let path = normalize_lexically(&cwd.join(raw).to_string_lossy());
+    // The tools expand a leading `~`, so the rules must too: otherwise
+    // `~/.aws/credentials` is checked as `<cwd>/~/.aws/credentials`, dodging
+    // a deny on `~/.aws/**` and matching an allow on `./**`.
+    let joined = match crate::tools::file_read::expand_home(raw) {
+        Ok(Some(h)) => h,
+        _ => cwd.join(raw),
+    };
+    let path = normalize_lexically(&joined.to_string_lossy());
     let home = dirs::home_dir().unwrap_or_default();
     let lexical_hit = path_rule_hit(inner, &path, cwd, &home, deny);
     if lexical_hit && deny {
@@ -1457,6 +1464,46 @@ mod tests {
         assert!(matches!(
             check(&st, "Read", json!({ "file_path": sneaky })),
             CheckResult::Deny
+        ));
+    }
+
+    /// The tools expand a leading `~`; the rules compared `<cwd>/~/...`, so
+    /// a `~/` path dodged a home deny rule and matched a project allow rule.
+    #[test]
+    fn tilde_paths_are_checked_as_the_home_paths_the_tools_open() {
+        use serde_json::json;
+        if dirs::home_dir().is_none_or(|h| h.starts_with("/proj")) {
+            return;
+        }
+        let st = at_proj(&[], &["Read(~/.secret/**)"]);
+        assert!(matches!(
+            check(&st, "Read", json!({ "file_path": "~/.secret/x" })),
+            CheckResult::Deny
+        ));
+        let st = at_proj(&["Edit(./**)", "Write(./**)"], &[]);
+        for tool in ["Edit", "Write"] {
+            assert!(
+                matches!(
+                    check(&st, tool, json!({ "file_path": "~/.zshrc" })),
+                    CheckResult::Ask
+                ),
+                "{tool}"
+            );
+        }
+        let st = at_proj(&["MultiEdit(./**)"], &[]);
+        assert!(matches!(
+            check(
+                &st,
+                "MultiEdit",
+                json!({ "edits": [{ "file_path": "~/.zshrc" }] })
+            ),
+            CheckResult::Ask
+        ));
+        // A real project path is still allowed.
+        let st = at_proj(&["Edit(./**)"], &[]);
+        assert!(matches!(
+            check(&st, "Edit", json!({ "file_path": "src/main.rs" })),
+            CheckResult::Allow
         ));
     }
 
