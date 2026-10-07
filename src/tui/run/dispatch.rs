@@ -2313,6 +2313,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let all_tools = tools.to_vec();
             let browser_session = app.browser_session.clone();
             let usage_sink = Some(crate::tui::events::forward_usage(tx.clone()));
+            let err_tx = tx.clone();
 
             let browse_req = crate::browser::browse_loop::BrowseRequest {
                 goal,
@@ -2338,8 +2339,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     channels,
                 )
                 .await;
+                // stderr would be drawn over the inline viewport.
                 if let Err(e) = result {
-                    eprintln!("Browse error: {e}");
+                    let _ = err_tx.send(AppEvent::SystemMessage(format!("⚠ /browse error: {e:#}")));
                 }
             });
         }

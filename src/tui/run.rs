@@ -997,8 +997,25 @@ async fn run_loop(
         // ── Poll browse progress events ──────────────────────────────────────
         if let Some(mut rx) = app.browse_progress_rx.take() {
             let mut done = false;
-            while let Ok(event) = rx.try_recv() {
+            loop {
                 use crate::browser::browse_loop::BrowseProgress;
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    // The run ended without Completed (a panic or an early
+                    // error). Kept, the receiver left the spinner running
+                    // and voice /browse refused for the rest of the session.
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        app.entries
+                            .push(ChatEntry::system("⚠ /browse ended without a result."));
+                        app.scroll_to_bottom();
+                        app.finish_loading();
+                        app.browse_approval_rx = None;
+                        app.browse_cancel = None;
+                        done = true;
+                        break;
+                    }
+                };
                 match event {
                     BrowseProgress::Started { .. } => {
                         // Already shown at dispatch time
@@ -1413,6 +1430,7 @@ async fn run_loop(
                             let all_tools = tools.to_vec();
                             let browser_session = app.browser_session.clone();
                             let usage_sink = Some(crate::tui::events::forward_usage(tx.clone()));
+                            let err_tx = tx.clone();
                             let browse_req = crate::browser::browse_loop::BrowseRequest {
                                 goal: goal_str,
                                 policy: crate::browser::browse_loop::BrowsePolicy::Pattern,
@@ -1426,8 +1444,9 @@ async fn run_loop(
                                 let result = crate::browser::browse_loop::run_browse(
                                     browse_req, &cfg, all_tools, current_url, browser_session, channels,
                                 ).await;
+                                // stderr would be drawn over the inline viewport.
                                 if let Err(e) = result {
-                                    eprintln!("Voice browse error: {e}");
+                                    let _ = err_tx.send(AppEvent::SystemMessage(format!("⚠ /browse (voice) error: {e:#}")));
                                 }
                             });
                         }

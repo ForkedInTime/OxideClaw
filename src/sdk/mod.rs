@@ -477,9 +477,8 @@ impl SdkServer {
                         channels,
                     )
                     .await;
-                    // run_browse only reports Completed itself on the Ok path;
-                    // without this a setup failure (e.g. no credential) left
-                    // the host waiting forever after browse/started.
+                    // An Err means run_browse sent no Completed; without this
+                    // the host would wait forever after browse/started.
                     if let Err(e) = outcome {
                         let _ = run_notif_tx.send(SdkNotification::BrowseCompleted {
                             session_id: session_id.clone(),

@@ -324,9 +324,27 @@ pub async fn run_browse(
     browse_config.max_turns = req.max_steps;
 
     // 9. Create the browse-mode query engine.
+    // A setup failure (no credential, a /model whose client cannot be
+    // built) ends the run like any other error: frontends wait for
+    // Completed after Started, and the TUI spinner ran on until Esc.
     let mut engine =
-        QueryEngine::new_for_browse(browse_config, browser_tools, system_prompt, middlewares)?
-            .with_usage_sink(usage_sink);
+        match QueryEngine::new_for_browse(browse_config, browser_tools, system_prompt, middlewares)
+        {
+            Ok(engine) => engine.with_usage_sink(usage_sink),
+            Err(e) => {
+                let result = BrowseResult {
+                    achieved: false,
+                    summary: format!("Browse agent error: {e:#}"),
+                    reason: BrowseReason::Bailed,
+                    steps_used: 0,
+                    final_url: None,
+                };
+                let _ = progress_tx
+                    .send(BrowseProgress::Completed(result.clone()))
+                    .await;
+                return Ok(result);
+            }
+        };
 
     // 10. Spawn a task to forward nudges as BrowseProgress events.
     let progress_tx_nudge = progress_tx.clone();
@@ -523,4 +541,57 @@ pub async fn run_browse(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After Started, a setup failure sent nothing more: the TUI spinner ran
+    /// until Esc and voice /browse stayed refused for the session.
+    #[tokio::test]
+    async fn a_setup_failure_still_completes_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "claude-sonnet-4-5".into(),
+            api_key: String::new(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let (progress_tx, mut progress_rx) = mpsc::channel(16);
+        let (approval_tx, _approval_rx) = mpsc::channel(4);
+        let channels = BrowseChannels {
+            progress_tx,
+            approval_tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            usage_sink: None,
+        };
+        let req = BrowseRequest {
+            goal: "open example.com".into(),
+            policy: BrowsePolicy::Pattern,
+            max_steps: 5,
+            voice: false,
+        };
+        let current_url = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let result = run_browse(req, &config, Vec::new(), current_url, None, channels)
+            .await
+            .unwrap();
+        assert!(!result.achieved);
+        assert_eq!(result.reason, BrowseReason::Bailed);
+
+        let mut events = Vec::new();
+        while let Some(ev) = progress_rx.recv().await {
+            events.push(ev);
+        }
+        assert!(matches!(
+            events.first(),
+            Some(BrowseProgress::Started { .. })
+        ));
+        match events.last() {
+            Some(BrowseProgress::Completed(r)) => {
+                assert!(r.summary.starts_with("Browse agent error"), "{}", r.summary)
+            }
+            other => panic!("expected Completed last, got {other:?}"),
+        }
+    }
 }

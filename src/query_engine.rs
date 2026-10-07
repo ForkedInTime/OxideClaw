@@ -137,18 +137,34 @@ impl QueryEngine {
             .filter(|b| self.cumulative_cost_usd >= *b)
     }
 
-    /// A quiet engine runs under the TUI (/browse), where stderr lands on
-    /// the viewport.
-    fn note_budget_stop(&self, budget: f64) {
-        let note = format!(
-            "Budget limit reached: ${:.4} / ${:.4} — stopping.",
-            self.cumulative_cost_usd, budget
-        );
+    /// A quiet engine runs inside a frontend that owns the terminal (the
+    /// TUI's raw-mode viewport for /browse, SDK NDJSON): stderr there is
+    /// drawn over the screen, so notes go to the log instead.
+    fn notice(&self, note: colored::ColoredString) {
         if self.quiet {
-            tracing::warn!("{note}");
+            tracing::warn!("{}", &*note);
         } else {
-            eprintln!("{}", note.yellow());
+            eprintln!("{note}");
         }
+    }
+
+    fn go_quiet(&mut self) {
+        self.quiet = true;
+        self.client.set_retry_notifier(std::sync::Arc::new(
+            |n: &crate::api::retry::RetryNotice| {
+                tracing::warn!("{}", n.message());
+            },
+        ));
+    }
+
+    fn note_budget_stop(&self, budget: f64) {
+        self.notice(
+            format!(
+                "Budget limit reached: ${:.4} / ${:.4} — stopping.",
+                self.cumulative_cost_usd, budget
+            )
+            .yellow(),
+        );
     }
 
     /// Count what sub-agents spent during the last tool round, and pass it
@@ -167,16 +183,10 @@ impl QueryEngine {
     /// replaces any tool_use whose results are still to come.
     async fn auto_summarise(&mut self) {
         if !self.config.auto_compact_enabled {
-            eprintln!(
-                "{}",
-                "Context critically full. Enable auto_compact or run /compact now.".red()
-            );
+            self.notice("Context critically full. Enable auto_compact or run /compact now.".red());
             return;
         }
-        eprintln!(
-            "{}",
-            "Auto-compacting: summarising conversation (summarizeCompact)…".yellow()
-        );
+        self.notice("Auto-compacting: summarising conversation (summarizeCompact)…".yellow());
         // Billed like any other call: it carries the whole history, so it
         // is often the session's largest.
         let bill = |u: &Usage| {
@@ -188,16 +198,12 @@ impl QueryEngine {
         match summarize_compact(&self.client, &self.messages, &self.config, bill).await {
             Ok(replacement) => {
                 self.messages = replacement;
-                eprintln!(
-                    "{}",
-                    "Compaction complete. Conversation history replaced with summary.".green()
+                self.notice(
+                    "Compaction complete. Conversation history replaced with summary.".green(),
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "{}",
-                    format!("Compact failed: {e}. Falling back to snip.").red()
-                );
+                self.notice(format!("Compact failed: {e}. Falling back to snip.").red());
                 snip_compact(&mut self.messages, &self.config.model);
             }
         }
@@ -298,12 +304,7 @@ impl QueryEngine {
         else {
             return Err(err);
         };
-        let note = format!("Model overloaded — retrying with {fb}");
-        if self.quiet {
-            tracing::warn!("{note}");
-        } else {
-            eprintln!("{}", note.yellow());
-        }
+        self.notice(format!("Model overloaded — retrying with {fb}").yellow());
         // Thinking shape, effort and max_tokens are per model: Opus 5
         // settings can be a 400 on an older fallback.
         let fb_req = self.request_for(fb, request.tools);
@@ -363,7 +364,7 @@ impl QueryEngine {
             turn += 1;
             self.turns = turn;
             if turn > max_turns {
-                eprintln!("{}", format!("Stopped after {max_turns} turns.").yellow());
+                self.notice(format!("Stopped after {max_turns} turns.").yellow());
                 break;
             }
             // Build tool definitions for this turn
@@ -421,7 +422,7 @@ impl QueryEngine {
             }
 
             // Log token usage in verbose mode
-            if self.config.verbose {
+            if self.config.verbose && !self.quiet {
                 eprintln!(
                     "[tokens] in={} out={} cache_read={} cache_create={}",
                     response.usage.input_tokens,
@@ -452,8 +453,7 @@ impl QueryEngine {
             match compact_needed(response.usage.input_tokens, window) {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
-                    eprintln!(
-                        "{}",
+                    self.notice(
                         format!(
                             "Warning: context is {:.0}% full ({} / {} tokens). \
                              Use /compact or enable auto_compact.",
@@ -461,22 +461,20 @@ impl QueryEngine {
                             response.usage.input_tokens,
                             window
                         )
-                        .yellow()
+                        .yellow(),
                     );
                 }
                 CompactNeeded::Snip => {
                     if self.config.auto_compact_enabled {
-                        eprintln!(
-                            "{}",
-                            "Auto-compacting: stripping old tool results (snipCompact)…".yellow()
+                        self.notice(
+                            "Auto-compacting: stripping old tool results (snipCompact)…".yellow(),
                         );
                         if snip_compact(&mut self.messages, &self.config.model) {
                             self.forget_reads();
                         }
                     } else {
-                        eprintln!(
-                            "{}",
-                            "Context near limit. Enable auto_compact or run /compact.".yellow()
+                        self.notice(
+                            "Context near limit. Enable auto_compact or run /compact.".yellow(),
                         );
                     }
                 }
@@ -496,11 +494,11 @@ impl QueryEngine {
             match &response.stop_reason {
                 Some(StopReason::EndTurn) | Some(StopReason::Other) | None => break,
                 Some(StopReason::MaxTokens) | Some(StopReason::ModelContextWindowExceeded) => {
-                    eprintln!("{}", "Warning: max tokens reached".yellow());
+                    self.notice("Warning: max tokens reached".yellow());
                     break;
                 }
                 Some(StopReason::Refusal) => {
-                    eprintln!("{}", "The model declined this request.".yellow());
+                    self.notice("The model declined this request.".yellow());
                     break;
                 }
                 Some(StopReason::ToolUse) => {
@@ -780,7 +778,7 @@ impl QueryEngine {
         // Both callers (Agent tool, /spawn) run inside a frontend that owns
         // stdout/stderr: the TUI's raw-mode viewport, SDK NDJSON, ACP
         // JSON-RPC or `-p --output-format json`. Any print here corrupts it.
-        self.quiet = true;
+        self.go_quiet();
         // A sub-agent or /spawn handed a spent budget must not send the
         // one request the per-response check would let through.
         if let Some(budget) = self.spent_budget() {
@@ -788,11 +786,6 @@ impl QueryEngine {
                 "Not started: the budget of ${budget:.2} is already spent."
             )));
         }
-        self.client.set_retry_notifier(std::sync::Arc::new(
-            |n: &crate::api::retry::RetryNotice| {
-                tracing::warn!("{}", n.message());
-            },
-        ));
         self.messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -931,7 +924,9 @@ impl QueryEngine {
         let mut engine = Self::new(config, tools)?;
         engine.system_prompt = system_prompt;
         engine.middlewares = middlewares;
-        engine.quiet = true;
+        // Under the TUI, a 429 retry or the step-cap note printed raw over
+        // the inline viewport.
+        engine.go_quiet();
         // browse_done is the model saying it is finished; carrying on let
         // later actions run and buried its verdict under their results.
         engine.stop_after_tool = Some("browse_done");
