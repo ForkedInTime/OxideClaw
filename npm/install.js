@@ -4,7 +4,9 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const http = require("http");
 const https = require("https");
+const tls = require("tls");
 const crypto = require("crypto");
 
 const pkg = require("./package.json");
@@ -59,12 +61,72 @@ function compareVersions(a, b) {
   return 0;
 }
 
-function get(url, redirects = 0) {
+// Idle limit on every socket: a stalled connection or transfer errors out
+// instead of hanging `npm install` forever.
+const TIMEOUT_MS = 30000;
+
+// Node's https module ignores proxy settings, so on proxy-only networks the
+// postinstall would try (and fail) to reach GitHub directly even though npm
+// itself fetched the package through the proxy. Honor npm's config first,
+// then the usual environment variables.
+function proxyFor(host) {
+  const env = process.env;
+  const noProxy = env.npm_config_noproxy || env.NO_PROXY || env.no_proxy || "";
+  for (let entry of noProxy.split(/[\s,]+/)) {
+    entry = entry.replace(/:\d+$/, "").replace(/^\*?\./, "").toLowerCase();
+    if (!entry) continue;
+    if (entry === "*" || host === entry || host.endsWith(`.${entry}`)) return null;
+  }
+  const raw = [env.npm_config_https_proxy, env.npm_config_proxy, env.HTTPS_PROXY, env.https_proxy]
+    .find((v) => v && v !== "null" && v !== "false");
+  if (!raw) return null;
+  return new URL(raw.includes("://") ? raw : `http://${raw}`);
+}
+
+function tunnel(proxy, host, port) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { "User-Agent": `oxideclaw-npm/${VERSION}` } }, (res) => {
+    const secure = proxy.protocol === "https:";
+    const headers = { Host: `${host}:${port}` };
+    if (proxy.username) {
+      const creds = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
+      headers["Proxy-Authorization"] = `Basic ${Buffer.from(creds).toString("base64")}`;
+    }
+    const req = (secure ? https : http).request({
+      host: proxy.hostname,
+      port: proxy.port || (secure ? 443 : 80),
+      method: "CONNECT",
+      path: `${host}:${port}`,
+      headers,
+      agent: false,
+    });
+    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error(`proxy ${proxy.host}: timed out`)));
+    req.on("connect", (res, socket) => {
+      socket.setTimeout(0);
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return reject(new Error(`proxy ${proxy.host}: CONNECT ${host} returned HTTP ${res.statusCode}`));
+      }
+      resolve(socket);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function get(url, redirects = 0) {
+  const { hostname, port } = new URL(url);
+  const proxy = proxyFor(hostname.toLowerCase());
+  const opts = { headers: { "User-Agent": `oxideclaw-npm/${VERSION}` } };
+  if (proxy) {
+    const socket = await tunnel(proxy, hostname, port || 443);
+    opts.agent = false;
+    opts.createConnection = () => tls.connect({ socket, servername: hostname });
+  }
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, opts, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects < 5) {
         res.resume();
-        return resolve(get(res.headers.location, redirects + 1));
+        return resolve(get(new URL(res.headers.location, url).href, redirects + 1));
       }
       if (res.statusCode !== 200) {
         res.resume();
@@ -74,7 +136,9 @@ function get(url, redirects = 0) {
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => resolve(Buffer.concat(chunks)));
       res.on("error", reject);
-    }).on("error", reject);
+    });
+    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error(`${url}: timed out`)));
+    req.on("error", reject);
   });
 }
 
@@ -100,4 +164,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { assetName };
+module.exports = { assetName, get, proxyFor };
