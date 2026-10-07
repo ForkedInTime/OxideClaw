@@ -481,6 +481,8 @@ The `policy` object on `session/start` controls tool approval:
 | `allow` | Executes silently | None |
 | *(unlisted)* | `ask` if interactive, `deny` if not | Depends |
 
+Without `allowPrivateNetworkFetch`, the browser asks before it opens a loopback service. That question arrives as `tool/approval_needed` for the pseudo-tool `browser_loopback`, with `args` `{"url": ..., "target": "localhost:3000"}`; approving it lets the browser reach that `host:port` for the rest of the session. List `browser_loopback` under `allow` to approve every loopback service, or under `deny` to refuse them. In a `browse/start` run the same question is a `browse/approval_needed` with `tool_name: "browser_loopback"`.
+
 ---
 
 ## Capabilities Reference

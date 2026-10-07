@@ -33,6 +33,13 @@ pub struct BrowserSession {
     /// Policy proxy every connection of a launched Chrome goes through; lives
     /// as long as that Chrome.
     _proxy: Option<crate::net_policy::PolicyProxy>,
+    /// Where the browser may go: `allowPrivateNetworkFetch`, set by the tool
+    /// that launches or attaches the browser. STRICT until then.
+    pub net_policy: crate::net_policy::NetPolicy,
+    /// Loopback services the user let the browser reach. Shared with the
+    /// policy proxy and kept across `/browser close`, so each is asked once
+    /// per session.
+    pub loopback_grants: crate::net_policy::LoopbackGrants,
     /// Element ref map: @e1 -> backend DOM node ID
     refs: HashMap<String, i64>,
     /// Element label map: @e1 -> accessible name (for approval gate pattern matching).
@@ -57,6 +64,16 @@ impl BrowserSession {
         self.client.is_some()
     }
 
+    /// The network policy and loopback grants the page is held to.
+    pub fn net(
+        &self,
+    ) -> (
+        crate::net_policy::NetPolicy,
+        crate::net_policy::LoopbackGrants,
+    ) {
+        (self.net_policy, self.loopback_grants.clone())
+    }
+
     /// Expose the ref map for inspection (debugging, REPL, future /browser diagnostics).
     /// Not currently used by any tool — kept for parity with snapshot.rs, which
     /// mutates this same map via `set_refs`.
@@ -71,7 +88,8 @@ impl BrowserSession {
         })
     }
 
-    /// Launch Chrome and connect via CDP.
+    /// Launch Chrome and connect via CDP. Its traffic is held to
+    /// `self.net_policy` and `self.loopback_grants`.
     pub async fn launch(&mut self, headless: bool, chrome_path: Option<&str>) -> Result<()> {
         if self.client.is_some() {
             return Ok(());
@@ -90,10 +108,14 @@ impl BrowserSession {
         // navigation and resolves DNS on its own, so the preflight on
         // browser_navigate's URL left the metadata service one 302 away.
         // Every connection it makes is resolved, checked and pinned by this
-        // proxy instead. LOCAL_OK: dev servers on loopback and the LAN stay
-        // reachable; link-local never is.
-        let proxy =
-            crate::net_policy::spawn_policy_proxy(crate::net_policy::NetPolicy::LOCAL_OK).await?;
+        // proxy instead, under `allowPrivateNetworkFetch`: without it,
+        // loopback is reachable only for the services the user granted, and
+        // the LAN not at all. Link-local never is.
+        let proxy = crate::net_policy::spawn_policy_proxy_with_grants(
+            self.net_policy,
+            self.loopback_grants.clone(),
+        )
+        .await?;
 
         let no_sandbox = chrome_no_sandbox();
         if no_sandbox {

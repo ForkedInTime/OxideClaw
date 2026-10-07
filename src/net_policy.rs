@@ -15,8 +15,9 @@
 //!   exists.
 //! - **Private** (loopback, RFC 1918, CGNAT, ULA): denied unless the policy
 //!   opts in. Developers do legitimately fetch `localhost:3000`, so the
-//!   opt-in is a plain setting (`allowPrivateNetworkFetch`), and the
-//!   user-driven CDP browser gets it by default.
+//!   opt-in is a plain setting (`allowPrivateNetworkFetch`). The CDP
+//!   browser follows the same setting; without it, an interactive session
+//!   asks once per loopback service it opens ([`LoopbackGrants`]).
 //!
 //! The check happens on the **resolved addresses**, not the hostname, and a
 //! direct connection is pinned to exactly those addresses so a DNS answer
@@ -49,7 +50,8 @@ const METADATA_V6: [Ipv6Addr; 1] = [Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 
 /// Hard cap on redirect hops `fetch` will follow.
 pub const MAX_REDIRECTS: usize = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Defaults to [`NetPolicy::STRICT`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetPolicy {
     /// Allow loopback, RFC 1918, CGNAT and ULA destinations.
     pub allow_private: bool,
@@ -115,6 +117,70 @@ impl NetPolicy {
         Ok(())
     }
 
+    /// `check_ip` for a connection to `addr`, where a loopback `ip:port`
+    /// in `grants` also passes. Grants only lift the private tier, so
+    /// link-local and metadata addresses never pass.
+    pub fn check_addr(&self, addr: SocketAddr, grants: Option<&LoopbackGrants>) -> Result<()> {
+        match self.check_ip(addr.ip()) {
+            Err(_) if grants.is_some_and(|g| g.covers(addr)) => Ok(()),
+            r => r,
+        }
+    }
+
+    /// The CDP browser is about to open `url`; check it the way its policy
+    /// proxy will check the connection. Returns the loopback addresses that
+    /// are refused only for want of a grant (empty: go ahead), so the caller
+    /// can ask the user once and [`LoopbackGrants::grant`] them. A name that
+    /// does not resolve here passes when an upstream proxy would resolve it
+    /// and its shape is allowed, as in the proxy.
+    pub async fn check_browser_url(
+        &self,
+        url: &Url,
+        grants: &LoopbackGrants,
+    ) -> Result<Vec<SocketAddr>> {
+        self.check_browser_url_with(url, grants, Upstream::from_env, &lookup_system)
+            .await
+    }
+
+    async fn check_browser_url_with<L, F>(
+        &self,
+        url: &Url,
+        grants: &LoopbackGrants,
+        upstream: impl FnOnce() -> Option<Upstream>,
+        lookup: &L,
+    ) -> Result<Vec<SocketAddr>>
+    where
+        L: Fn(String, u16) -> F,
+        F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    {
+        let host = url.host_str().unwrap_or("host");
+        let addrs = match addresses(url, lookup).await? {
+            Ok(a) => a,
+            Err(e) => {
+                let chain = upstream().filter(|u| !u.bypasses(host));
+                return match (chain, url.host()) {
+                    (Some(_), Some(Host::Domain(name))) => {
+                        self.check_unresolved_name(name)?;
+                        Ok(Vec::new())
+                    }
+                    _ => Err(e),
+                };
+            }
+        };
+        // The always-denied tier first: no grant can lift it.
+        NetPolicy::LOCAL_OK.check_addrs(url, &addrs, None)?;
+        let mut need = Vec::new();
+        for a in addrs {
+            if let Err(e) = self.check_addr(a, Some(grants)) {
+                if !is_loopback(a.ip()) {
+                    return Err(anyhow!("{host}: {e}"));
+                }
+                need.push(a);
+            }
+        }
+        Ok(need)
+    }
+
     /// Scheme + host + DNS check. Returns every address the host resolved
     /// to, all of which passed `check_ip`, so the caller can pin them.
     pub async fn resolve(&self, url: &Url) -> Result<Vec<SocketAddr>> {
@@ -128,15 +194,20 @@ impl NetPolicy {
         F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
     {
         let addrs = addresses(url, lookup).await??;
-        self.check_addrs(url, &addrs)?;
+        self.check_addrs(url, &addrs, None)?;
         Ok(addrs)
     }
 
     /// Every answer must pass: a mixed public/private answer is the classic
     /// rebinding shape, and the connector may pick any of them.
-    fn check_addrs(&self, url: &Url, addrs: &[SocketAddr]) -> Result<()> {
+    fn check_addrs(
+        &self,
+        url: &Url,
+        addrs: &[SocketAddr],
+        grants: Option<&LoopbackGrants>,
+    ) -> Result<()> {
         for a in addrs {
-            self.check_ip(a.ip())
+            self.check_addr(*a, grants)
                 .map_err(|e| anyhow!("{}: {e}", url.host_str().unwrap_or("host")))?;
         }
         Ok(())
@@ -165,6 +236,47 @@ impl NetPolicy {
         }
         Ok(())
     }
+}
+
+/// Loopback `ip:port` destinations the user let the CDP browser reach this
+/// session, when `allowPrivateNetworkFetch` is off. `browser_navigate` asks
+/// once per service and records the answer here; the browser's policy proxy
+/// reads the same set, so the grant also covers that service's redirects and
+/// subresources, and nothing else on loopback.
+#[derive(Debug, Clone, Default)]
+pub struct LoopbackGrants(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>);
+
+impl LoopbackGrants {
+    /// Allow the loopback addresses among `addrs`; any other is ignored.
+    pub fn grant(&self, addrs: &[SocketAddr]) {
+        let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        set.extend(
+            addrs
+                .iter()
+                .filter(|a| is_loopback(a.ip()))
+                .map(|a| canonical(*a)),
+        );
+    }
+
+    /// `addr` is a loopback address the user allowed.
+    pub fn covers(&self, addr: SocketAddr) -> bool {
+        is_loopback(addr.ip())
+            && self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&canonical(addr))
+    }
+}
+
+/// `addr` with an IPv4-mapped IPv6 address written as the IPv4 one.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// Loopback, `::ffff:127.0.0.1` included.
+pub fn is_loopback(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
 }
 
 /// Look `host` up with the system resolver.
@@ -322,7 +434,7 @@ where
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .user_agent(USER_AGENT);
-        let client = match route(policy, &current, chain, lookup).await? {
+        let client = match route(policy, None, &current, chain, lookup).await? {
             Route::Direct(addrs) => builder.resolve_to_addrs(&host, &addrs),
             Route::Upstream(proxy) => builder.proxy(reqwest::Proxy::all(proxy.as_str())?),
         }
@@ -475,7 +587,16 @@ const MAX_PROXY_HEAD: usize = 64 * 1024;
 /// through the proxy the environment names (see [`Upstream::from_env`]),
 /// after the same policy check.
 pub async fn spawn_policy_proxy(policy: NetPolicy) -> Result<PolicyProxy> {
-    spawn_policy_proxy_with(policy, Upstream::from_env()).await
+    spawn_policy_proxy_with(policy, LoopbackGrants::default(), Upstream::from_env()).await
+}
+
+/// [`spawn_policy_proxy`] that also lets through the loopback services in
+/// `grants`, as they are granted (the CDP browser's proxy).
+pub async fn spawn_policy_proxy_with_grants(
+    policy: NetPolicy,
+    grants: LoopbackGrants,
+) -> Result<PolicyProxy> {
+    spawn_policy_proxy_with(policy, grants, Upstream::from_env()).await
 }
 
 /// An HTTP proxy the policy proxy forwards public destinations through.
@@ -629,6 +750,7 @@ enum Route<P> {
 /// and the address pin cannot apply, since the proxy does its own DNS.
 async fn route<P, L, F>(
     policy: &NetPolicy,
+    grants: Option<&LoopbackGrants>,
     url: &Url,
     chain: Option<P>,
     lookup: &L,
@@ -639,7 +761,7 @@ where
 {
     match addresses(url, lookup).await? {
         Ok(addrs) => {
-            policy.check_addrs(url, &addrs)?;
+            policy.check_addrs(url, &addrs, grants)?;
             Ok(match chain {
                 Some(up)
                     if addrs
@@ -663,6 +785,7 @@ where
 
 async fn spawn_policy_proxy_with(
     policy: NetPolicy,
+    grants: LoopbackGrants,
     upstream: Option<Upstream>,
 ) -> Result<PolicyProxy> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -674,7 +797,7 @@ async fn spawn_policy_proxy_with(
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((sock, _)) => {
-                        conns.spawn(proxy_one(sock, policy, upstream.clone()));
+                        conns.spawn(proxy_one(sock, policy, grants.clone(), upstream.clone()));
                     }
                     Err(_) => break,
                 },
@@ -688,6 +811,7 @@ async fn spawn_policy_proxy_with(
 async fn proxy_one(
     mut client: tokio::net::TcpStream,
     policy: NetPolicy,
+    grants: LoopbackGrants,
     upstream: Option<Upstream>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -739,7 +863,7 @@ async fn proxy_one(
     let port = url.port_or_known_default().unwrap_or(80);
     // NO_PROXY hosts connect directly, after the same check.
     let chain = upstream.filter(|u| !u.bypasses(&host));
-    let route = match route(&policy, &url, chain, &lookup_system).await {
+    let route = match route(&policy, Some(&grants), &url, chain, &lookup_system).await {
         Ok(r) => r,
         Err(e) => {
             let _ = client
@@ -1205,7 +1329,7 @@ mod tests {
     async fn proxy_refuses_hops_the_policy_denies() {
         let (base, hits) = scripted_server(vec![ok("secret")]).await;
         let authority = base.trim_start_matches("http://");
-        let strict = spawn_policy_proxy_with(NetPolicy::STRICT, None)
+        let strict = spawn_policy_proxy_with(NetPolicy::STRICT, LoopbackGrants::default(), None)
             .await
             .unwrap();
         for req in [
@@ -1218,7 +1342,7 @@ mod tests {
             assert!(got.starts_with("HTTP/1.1 403"), "{req:?} -> {got}");
             assert!(!got.contains("secret"));
         }
-        let local = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, None)
+        let local = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, LoopbackGrants::default(), None)
             .await
             .unwrap();
         let got = via_proxy(
@@ -1234,7 +1358,7 @@ mod tests {
     async fn proxy_forwards_allowed_requests_and_tunnels() {
         let (base, hits) = scripted_server(vec![ok("hello")]).await;
         let authority = base.trim_start_matches("http://");
-        let proxy = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, None)
+        let proxy = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, LoopbackGrants::default(), None)
             .await
             .unwrap();
 
@@ -1342,7 +1466,7 @@ mod tests {
     async fn public_destinations_are_chained_through_the_upstream_proxy() {
         let (up, seen) =
             fake_upstream("HTTP/1.1 200 Connection established\r\n\r\ntunnel-data").await;
-        let proxy = spawn_policy_proxy_with(NetPolicy::STRICT, Some(up))
+        let proxy = spawn_policy_proxy_with(NetPolicy::STRICT, LoopbackGrants::default(), Some(up))
             .await
             .unwrap();
         // 93.184.215.14 is a public literal: no DNS needed for the check.
@@ -1476,9 +1600,13 @@ mod tests {
     #[tokio::test]
     async fn the_policy_still_applies_and_lan_targets_stay_direct() {
         let (up, seen) = fake_upstream("HTTP/1.1 200 OK\r\n\r\nfrom-proxy").await;
-        let strict = spawn_policy_proxy_with(NetPolicy::STRICT, Some(up.clone()))
-            .await
-            .unwrap();
+        let strict = spawn_policy_proxy_with(
+            NetPolicy::STRICT,
+            LoopbackGrants::default(),
+            Some(up.clone()),
+        )
+        .await
+        .unwrap();
         for req in [
             "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\n\r\n",
             "CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n",
@@ -1489,9 +1617,10 @@ mod tests {
         }
 
         let (base, hits) = scripted_server(vec![ok("local")]).await;
-        let local = spawn_policy_proxy_with(NetPolicy::LOCAL_OK, Some(up))
-            .await
-            .unwrap();
+        let local =
+            spawn_policy_proxy_with(NetPolicy::LOCAL_OK, LoopbackGrants::default(), Some(up))
+                .await
+                .unwrap();
         let got = via_proxy(&local, &format!("GET {base}/ HTTP/1.1\r\n\r\n")).await;
         assert!(got.ends_with("local"), "{got}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -1561,7 +1690,7 @@ mod tests {
         // Allowed, a LAN name connects directly to the checked address and
         // never through the proxy.
         let url = Url::parse("http://lan.example:8080/").unwrap();
-        match route(&NetPolicy::LOCAL_OK, &url, Some(proxy), &fake_dns)
+        match route(&NetPolicy::LOCAL_OK, None, &url, Some(proxy), &fake_dns)
             .await
             .unwrap()
         {
@@ -1577,7 +1706,7 @@ mod tests {
     async fn unresolvable_names_reach_the_proxy_only_when_they_look_public() {
         let up = || Some("http://proxy:3128");
         let route_of = async |policy: NetPolicy, u: &str| {
-            route(&policy, &Url::parse(u).unwrap(), up(), &fake_dns).await
+            route(&policy, None, &Url::parse(u).unwrap(), up(), &fake_dns).await
         };
         for policy in [NetPolicy::STRICT, NetPolicy::LOCAL_OK] {
             for u in [
@@ -1627,7 +1756,7 @@ mod tests {
         }
         // Without a proxy nothing changes: an unresolvable name fails.
         let url = Url::parse("https://proxy-only.example.com/").unwrap();
-        let err = route(&NetPolicy::STRICT, &url, None::<()>, &fake_dns)
+        let err = route(&NetPolicy::STRICT, None, &url, None::<()>, &fake_dns)
             .await
             .err()
             .unwrap();
@@ -1683,6 +1812,7 @@ mod tests {
 
         match route(
             &NetPolicy::STRICT,
+            None,
             &bypassed,
             env_chain(&env, &bypassed),
             &fake_dns,
@@ -1733,5 +1863,138 @@ mod tests {
                 seen[0]
             );
         }
+    }
+
+    // ── the CDP browser: loopback grants ─────────────────────────────────
+
+    /// The CDP browser's proxy ran under LOCAL_OK, so any page could reach
+    /// every service on loopback and the LAN. Under the strict policy only
+    /// a granted `ip:port` passes, and the grant takes effect on a proxy
+    /// that is already running.
+    #[tokio::test]
+    async fn the_browser_proxy_admits_only_granted_loopback_services() {
+        let (base, hits) = scripted_server(vec![ok("dev server")]).await;
+        let authority = base.trim_start_matches("http://");
+        let (other, other_hits) = scripted_server(vec![ok("redis")]).await;
+        let grants = LoopbackGrants::default();
+        let proxy = spawn_policy_proxy_with(NetPolicy::STRICT, grants.clone(), None)
+            .await
+            .unwrap();
+        let get = |b: &str| format!("GET {b}/ HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        let got = via_proxy(&proxy, &get(&base)).await;
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        grants.grant(&[authority.parse().unwrap()]);
+        let got = via_proxy(&proxy, &get(&base)).await;
+        assert!(got.ends_with("dev server"), "{got}");
+        let got = via_proxy(
+            &proxy,
+            &format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            got.starts_with("HTTP/1.1 200 Connection Established"),
+            "{got}"
+        );
+
+        let got = via_proxy(&proxy, &get(&other)).await;
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A granted dev server (or any page) that redirects to the metadata
+    /// service: Chrome's request for the next hop is refused.
+    #[tokio::test]
+    async fn a_granted_services_redirect_to_metadata_is_refused() {
+        let (base, _) =
+            scripted_server(vec![redirect("http://169.254.169.254/latest/meta-data/")]).await;
+        let grants = LoopbackGrants::default();
+        grants.grant(&[base.trim_start_matches("http://").parse().unwrap()]);
+        for policy in [NetPolicy::STRICT, NetPolicy::LOCAL_OK] {
+            let proxy = spawn_policy_proxy_with(policy, grants.clone(), None)
+                .await
+                .unwrap();
+            let got = via_proxy(&proxy, &format!("GET {base}/ HTTP/1.1\r\nHost: x\r\n\r\n")).await;
+            assert!(got.starts_with("HTTP/1.1 302"), "{got}");
+            let hop = "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n";
+            let got = via_proxy(&proxy, hop).await;
+            assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+            assert!(got.contains("169.254.169.254"), "{got}");
+        }
+    }
+
+    /// Grants lift only the loopback tier: never link-local, never the LAN.
+    #[test]
+    fn grants_cover_only_the_granted_loopback_address() {
+        let grants = LoopbackGrants::default();
+        grants.grant(&[
+            "127.0.0.1:3000".parse().unwrap(),
+            "169.254.169.254:80".parse().unwrap(),
+            "10.0.0.5:80".parse().unwrap(),
+        ]);
+        let p = NetPolicy::STRICT;
+        assert!(
+            p.check_addr("127.0.0.1:3000".parse().unwrap(), Some(&grants))
+                .is_ok()
+        );
+        assert!(
+            p.check_addr("[::ffff:127.0.0.1]:3000".parse().unwrap(), Some(&grants))
+                .is_ok()
+        );
+        assert!(
+            p.check_addr("127.0.0.1:3001".parse().unwrap(), Some(&grants))
+                .is_err()
+        );
+        assert!(
+            p.check_addr("127.0.0.1:3000".parse().unwrap(), None)
+                .is_err()
+        );
+        assert!(
+            p.check_addr("169.254.169.254:80".parse().unwrap(), Some(&grants))
+                .is_err()
+        );
+        assert!(
+            p.check_addr("10.0.0.5:80".parse().unwrap(), Some(&grants))
+                .is_err()
+        );
+    }
+
+    /// The preflight refused every name it could not resolve, though the
+    /// browser's proxy hands public-looking ones to the upstream proxy.
+    #[tokio::test]
+    async fn browser_preflight_matches_the_proxy_on_unresolved_names() {
+        async fn check(url: &str, with_upstream: bool) -> Result<Vec<SocketAddr>> {
+            let upstream = || {
+                with_upstream
+                    .then(|| Upstream::from_vars(vars(&[("HTTPS_PROXY", "http://proxy:3128")])))
+                    .flatten()
+            };
+            NetPolicy::STRICT
+                .check_browser_url_with(
+                    &Url::parse(url).unwrap(),
+                    &LoopbackGrants::default(),
+                    upstream,
+                    &fake_dns,
+                )
+                .await
+        }
+        let name = "https://only-the-proxy-knows.example/";
+        assert!(check(name, true).await.unwrap().is_empty());
+        assert!(check(name, false).await.is_err());
+        assert!(
+            check("http://metadata.google.internal/", true)
+                .await
+                .is_err()
+        );
+        assert!(check("http://intranet/", true).await.is_err());
+        // Resolved names: metadata and the LAN refused, loopback needs a grant.
+        assert!(check("http://imds.example/", true).await.is_err());
+        assert!(check("http://lan.example/", true).await.is_err());
+        assert_eq!(
+            check("http://dev.example:5173/", true).await.unwrap(),
+            vec!["127.0.0.1:5173".parse::<SocketAddr>().unwrap()]
+        );
     }
 }

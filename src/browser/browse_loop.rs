@@ -168,6 +168,46 @@ pub struct BrowseChannels {
     pub usage_sink: Option<crate::tools::UsageSink>,
 }
 
+/// Puts the browser tools' own questions to the user (may the browser reach
+/// this loopback service?) through the run's approval channel, the one
+/// prompt every browse host (TUI, SDK, `oxideclaw browse`) answers. The
+/// run's engine is otherwise headless, so without this a local dev server
+/// could never be approved from a /browse run.
+struct ApprovalChannelAsker {
+    approval_tx: mpsc::Sender<ApprovalPrompt>,
+    step_counter: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl crate::permissions::PermissionAsker for ApprovalChannelAsker {
+    async fn ask(
+        &self,
+        tool_name: &str,
+        description: &str,
+        input: &serde_json::Value,
+    ) -> Option<crate::permissions::PermissionDecision> {
+        use crate::permissions::PermissionDecision;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let prompt = ApprovalPrompt {
+            id: crate::browser::approval_gate::next_prompt_id(),
+            // The step emitter counted this call before the tool ran.
+            step: self.step_counter.load(Ordering::Relaxed),
+            tool_name: tool_name.to_string(),
+            target_text: input["target"].as_str().unwrap_or("").to_string(),
+            url: input["url"].as_str().unwrap_or("").to_string(),
+            // One line: browse hosts show the reason inline.
+            reason: description.split_whitespace().collect::<Vec<_>>().join(" "),
+            reply,
+        };
+        self.approval_tx.send(prompt).await.ok()?;
+        match tokio::time::timeout(crate::browser::approval_gate::APPROVAL_WINDOW, rx).await {
+            Ok(Ok(true)) => Some(PermissionDecision::Allow),
+            Ok(Ok(false)) => Some(PermissionDecision::Deny),
+            _ => None,
+        }
+    }
+}
+
 /// Middleware that syncs the browser session's `current_url` into the
 /// shared `Arc<Mutex<String>>` that the approval gate reads from. Runs
 /// in `after_tool` so URL-pattern matching sees the post-navigation URL.
@@ -300,6 +340,10 @@ pub async fn run_browse(
     // prompt as BrowseProgress::ApprovalNeeded, then forwards it to the caller.
     let gate = ApprovalGate::with_user_patterns(config.browse_approval_patterns.clone());
     let (internal_approval_tx, mut internal_approval_rx) = mpsc::channel::<ApprovalPrompt>(16);
+    let consent_asker = Arc::new(ApprovalChannelAsker {
+        approval_tx: internal_approval_tx.clone(),
+        step_counter: step_counter.clone(),
+    });
     let gate_mw = Arc::new(
         ApprovalGateMiddleware::new(
             gate,
@@ -382,10 +426,17 @@ pub async fn run_browse(
     // A setup failure (no credential, a /model whose client cannot be
     // built) ends the run like any other error: frontends wait for
     // Completed after Started, and the TUI spinner ran on until Esc.
+    // The headless engine's rules, plus someone to ask: browser tools never
+    // need a rule prompt, so only their own questions (a loopback service
+    // to open) reach the user, as approval prompts.
+    let permission_gate =
+        crate::permissions::PermissionGate::headless(&browse_config).with_asker(consent_asker);
     let mut engine =
         match QueryEngine::new_for_browse(browse_config, browser_tools, system_prompt, middlewares)
         {
-            Ok(engine) => engine.with_usage_sink(usage_sink),
+            Ok(engine) => engine
+                .with_usage_sink(usage_sink)
+                .with_permission_gate(permission_gate),
             Err(e) => {
                 let result = BrowseResult {
                     achieved: false,
@@ -608,6 +659,60 @@ pub async fn run_browse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A /browse run's engine had no one to ask, so a local dev server could
+    /// never be approved there. The question now arrives as an approval
+    /// prompt the host answers.
+    #[tokio::test]
+    async fn loopback_questions_reach_the_browse_host_as_approval_prompts() {
+        use crate::permissions::PermissionAsker;
+        for (answer, expected) in [
+            (
+                Some(true),
+                Some(crate::permissions::PermissionDecision::Allow),
+            ),
+            (
+                Some(false),
+                Some(crate::permissions::PermissionDecision::Deny),
+            ),
+            (None, None),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(1);
+            let asker = ApprovalChannelAsker {
+                approval_tx: tx,
+                step_counter: Arc::new(AtomicU32::new(4)),
+            };
+            let host = tokio::spawn(async move {
+                let p = rx.recv().await.unwrap();
+                let seen = (
+                    p.step,
+                    p.tool_name.clone(),
+                    p.target_text.clone(),
+                    p.url.clone(),
+                );
+                match answer {
+                    Some(a) => {
+                        let _ = p.reply.send(a);
+                    }
+                    None => drop(p.reply),
+                }
+                seen
+            });
+            let got = asker
+                .ask(
+                    crate::tools::browser_tools::LOOPBACK_QUESTION,
+                    "Let the browser reach the local service at 127.0.0.1:3000?",
+                    &serde_json::json!({"url": "http://127.0.0.1:3000/", "target": "127.0.0.1:3000"}),
+                )
+                .await;
+            assert_eq!(got, expected);
+            let (step, tool, target, url) = host.await.unwrap();
+            assert_eq!(step, 4);
+            assert_eq!(tool, "browser_loopback");
+            assert_eq!(target, "127.0.0.1:3000");
+            assert_eq!(url, "http://127.0.0.1:3000/");
+        }
+    }
 
     /// The cap was enforced per model turn, so a turn with several browser
     /// calls ran past it; browse_done must still get through at the cap.

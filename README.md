@@ -199,7 +199,7 @@ Native Ollama tool calling, with no Anthropic-compat shim and no login. Tool cal
 
 ### 🌐 &nbsp; Built-in browser automation — no extra server
 
-Nine CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_get_text`, `browser_press_key`, `browser_wait`, `browser_console` — shipped in the binary and enabled by default. Snapshots return a text tree with stable `@eN` element refs you can pass to click/fill, plus the page's own text (about 8k characters, nearest the controls and headings first), fenced and labelled as untrusted page content. Works against any Chromium-based browser (Chrome, Chromium, Brave, Edge) you already have installed. No external automation server, no separate install.
+Nine CDP-driven tools — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_get_text`, `browser_press_key`, `browser_wait`, `browser_console` — shipped in the binary and enabled by default. Snapshots return a text tree with stable `@eN` element refs you can pass to click/fill, plus the page's own text (about 8k characters, nearest the controls and headings first), fenced and labelled as untrusted page content. Chrome reaches a dev server on `localhost` after you approve that `host:port` once (or with `allowPrivateNetworkFetch: true`), never the cloud metadata service. Works against any Chromium-based browser (Chrome, Chromium, Brave, Edge) you already have installed. No external automation server, no separate install.
 
 ### 🤖 &nbsp; Autonomous browser mode — `/browse <goal>`
 

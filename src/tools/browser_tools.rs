@@ -18,8 +18,9 @@
 //! timeout.
 
 use crate::browser::{self, BrowserSession};
+use crate::net_policy::NetPolicy;
 use crate::tools::{Tool, ToolContext, ToolOutput};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -54,6 +55,7 @@ async fn ensure_launched(
     headless: bool,
     chrome_path: Option<&str>,
     cdp_endpoint: Option<&str>,
+    net_policy: NetPolicy,
 ) -> Result<()> {
     let mut s = session.lock().await;
     // A dead socket (Chrome crashed, or the connection dropped) leaves the
@@ -65,6 +67,7 @@ async fn ensure_launched(
         s.close().await;
     }
     if !s.is_connected() {
+        s.net_policy = net_policy;
         if let Some(endpoint) = cdp_endpoint {
             s.connect(endpoint).await?;
         } else {
@@ -80,6 +83,44 @@ async fn ensure_launched(
 async fn clone_client(session: &SharedSession) -> Result<browser::cdp::CdpClient> {
     let s = session.lock().await;
     Ok(s.client()?.clone())
+}
+
+/// Tool name the loopback question is asked under. Not a real tool, so a
+/// host policy for `browser_navigate` (an SDK `allow` list) does not answer
+/// it: SDK hosts can list it on its own.
+pub const LOOPBACK_QUESTION: &str = "browser_loopback";
+
+/// Ask the user whether the browser may reach the loopback service `url`
+/// points at. Only an interactive session can say yes; elsewhere the answer
+/// is `allowPrivateNetworkFetch`.
+async fn ask_loopback_consent(ctx: &ToolContext, url: &str) -> Result<()> {
+    let target = url::Url::parse(url.trim())
+        .ok()
+        .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)))
+        .unwrap_or_else(|| url.to_string());
+    let description = format!(
+        "Let the browser reach the local service at {target}?\n  \
+         Its pages, redirects and requests to it are allowed for the rest of this \
+         session. (allowPrivateNetworkFetch: true allows every local service.)"
+    );
+    let input = json!({ "url": url, "target": target });
+    let answer = match &ctx.permission_gate {
+        Some(gate) => {
+            gate.ask_human(LOOPBACK_QUESTION, &description, &input)
+                .await
+        }
+        None => None,
+    };
+    match answer {
+        Some(true) => Ok(()),
+        Some(false) => bail!(
+            "the user did not allow the browser to reach {target}; do not retry it another way"
+        ),
+        None => bail!(
+            "{target} is on this machine (loopback) and this session cannot ask the user to \
+             allow it; set allowPrivateNetworkFetch: true to let the browser reach local services"
+        ),
+    }
 }
 
 /// Result trailer listing the JavaScript dialogs the action just raised (the
@@ -103,6 +144,8 @@ pub struct BrowserNavigateTool {
     pub cdp_endpoint: Option<String>,
     /// Page-load timeout (ms) applied to `actions::navigate`.
     pub timeout_ms: u64,
+    /// `allowPrivateNetworkFetch`: what the browser may reach.
+    pub net_policy: NetPolicy,
 }
 
 #[async_trait]
@@ -124,20 +167,33 @@ impl Tool for BrowserNavigateTool {
             "required": ["url"]
         })
     }
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let url = required_str(&input, "url")?;
+        // Checked before Chrome starts: a refused URL launches nothing. A
+        // loopback service is asked about once; the grant is shared with
+        // the browser's policy proxy, so its redirects and subresources pass.
+        let grants = self.session.lock().await.loopback_grants.clone();
+        let need =
+            browser::actions::preflight_navigation_url(url, self.net_policy, &grants).await?;
+        if !need.is_empty() {
+            ask_loopback_consent(ctx, url).await?;
+            grants.grant(&need);
+        }
         ensure_launched(
             &self.session,
             self.headless,
             self.chrome_path.as_deref(),
             self.cdp_endpoint.as_deref(),
+            self.net_policy,
         )
         .await?;
 
         // Clone the CdpClient out so Page.navigate + load-event wait
         // (up to timeout_ms) does not hold the session lock.
         let client = clone_client(&self.session).await?;
-        let (title, status) = browser::actions::navigate(&client, url, self.timeout_ms).await?;
+        let (policy, grants) = self.session.lock().await.net();
+        let (title, status) =
+            browser::actions::navigate(&client, url, self.timeout_ms, policy, &grants).await?;
         // Chrome follows redirects itself; record where the page actually
         // landed, which the approval gate's URL patterns match against.
         let final_url = browser::actions::current_url(&client)
@@ -209,7 +265,8 @@ impl Tool for BrowserSnapshotTool {
     }
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let client = clone_client(&self.session).await?;
-        browser::actions::ensure_page_allowed(&client).await?;
+        let (policy, grants) = self.session.lock().await.net();
+        browser::actions::ensure_page_allowed(&client, policy, &grants).await?;
         let snap = browser::snapshot::take_snapshot(&client).await?;
         // A redirect or JS navigation may have moved the page since the last
         // tool recorded its URL.
@@ -269,7 +326,8 @@ impl Tool for BrowserClickTool {
         let dialogs = dialog_trailer(&self.session).await;
         // The click may have navigated somewhere blocked; check before the
         // auto-snapshot reads the new page.
-        browser::actions::ensure_page_allowed(&client).await?;
+        let (policy, grants) = self.session.lock().await.net();
+        browser::actions::ensure_page_allowed(&client, policy, &grants).await?;
 
         // Auto-snapshot uses only the client — no session lock held during
         // the CDP round-trip. If the snapshot fails (e.g. page navigated
@@ -378,7 +436,8 @@ impl Tool for BrowserScreenshotTool {
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let full_page = input["full_page"].as_bool().unwrap_or(false);
         let client = clone_client(&self.session).await?;
-        browser::actions::ensure_page_allowed(&client).await?;
+        let (policy, grants) = self.session.lock().await.net();
+        browser::actions::ensure_page_allowed(&client, policy, &grants).await?;
         let b64 = browser::actions::screenshot(&client, full_page).await?;
 
         use base64::Engine;
@@ -430,7 +489,8 @@ impl Tool for BrowserGetTextTool {
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let element_ref = required_str(&input, "ref")?;
         let client = clone_client(&self.session).await?;
-        browser::actions::ensure_page_allowed(&client).await?;
+        let (policy, grants) = self.session.lock().await.net();
+        browser::actions::ensure_page_allowed(&client, policy, &grants).await?;
         let mut session = self.session.lock().await;
         let text = browser::actions::get_text(&mut session, element_ref).await?;
         Ok(ToolOutput::success(browser::snapshot::wrap_untrusted(

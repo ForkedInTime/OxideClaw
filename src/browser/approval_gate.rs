@@ -253,7 +253,7 @@ fn gate_trip_phrase(tool_name: &str) -> String {
 }
 
 /// How long an approval prompt waits for an answer.
-const APPROVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const APPROVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// One voice recording. Short, so a spoken yes is acted on seconds after it
 /// is said rather than after the whole prompt window plus transcription.
 const VOICE_LISTEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);

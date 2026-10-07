@@ -82,6 +82,29 @@ impl PermissionGate {
         self.state.read_deny(tool_name)
     }
 
+    /// Put prompts to `asker` (a browse run's approval channel).
+    pub fn with_asker(mut self, asker: Arc<dyn PermissionAsker>) -> Self {
+        self.asker = Some(asker);
+        self
+    }
+
+    /// Ask the human behind this gate a yes/no question that no tool rule
+    /// answers: whether the browser may reach a loopback service. `None`
+    /// when nobody can be asked (headless, `/spawn`); an unanswered prompt
+    /// is `Some(false)`.
+    pub async fn ask_human(
+        &self,
+        tool_name: &str,
+        description: &str,
+        input: &serde_json::Value,
+    ) -> Option<bool> {
+        let asker = self.asker.as_ref()?;
+        Some(matches!(
+            asker.ask(tool_name, description, input).await,
+            Some(PermissionDecision::Allow | PermissionDecision::AlwaysAllow)
+        ))
+    }
+
     /// Route every call the deny list lets through to the asker.
     pub fn with_asker_for_all_tools(mut self) -> Self {
         self.ask_every_tool = true;
@@ -278,6 +301,39 @@ mod tests {
             Autonomy::Ask,
             asker.map(|a| a as Arc<dyn PermissionAsker>),
         )
+    }
+
+    /// The browser's loopback question goes to the same human as tool
+    /// prompts; with nobody attached the caller is told so, and a dropped
+    /// prompt is a no.
+    #[tokio::test]
+    async fn ask_human_reaches_the_asker_or_reports_nobody() {
+        let input = json!({"url": "http://127.0.0.1:3000/"});
+        assert_eq!(
+            gate(&[], None)
+                .ask_human("browser_loopback", "q", &input)
+                .await,
+            None
+        );
+        let asker = Scripted::new(vec![
+            Some(PermissionDecision::Allow),
+            Some(PermissionDecision::Deny),
+            None,
+        ]);
+        let g = gate(&[], Some(asker.clone()));
+        assert_eq!(
+            g.ask_human("browser_loopback", "q", &input).await,
+            Some(true)
+        );
+        assert_eq!(
+            g.ask_human("browser_loopback", "q", &input).await,
+            Some(false)
+        );
+        assert_eq!(
+            g.ask_human("browser_loopback", "q", &input).await,
+            Some(false)
+        );
+        assert_eq!(asker.asked().len(), 3);
     }
 
     #[tokio::test]

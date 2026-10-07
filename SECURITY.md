@@ -52,6 +52,8 @@ A name that does not resolve locally (split-horizon DNS where only the proxy can
 
 ### The `browser_*` tools (CDP browser)
 
+A Chrome that OxideClaw launches sends every connection, loopback included, through a local proxy that applies the same checks to each one: redirects, link clicks, script navigation and subresources, not only the URL given to `browser_navigate`. The rules are the ones above, with one addition for local development: without `allowPrivateNetworkFetch`, `browser_navigate` to a loopback `host:port` asks you once (in the TUI, as a `/browse` approval, or as a `tool/approval_needed` for `browser_loopback` to an SDK host), and that service alone stays reachable for the rest of the session. Non-interactive runs (`-p`, `/spawn`) are refused instead. A Chrome attached through `browserCdpEndpoint` has no proxy; OxideClaw re-checks its page's address before reading it and blanks a page that landed somewhere refused.
+
 Snapshot and `browser_get_text` results put the page's text inside a fence labelled as untrusted page data, so instructions printed on a page are presented to the model as content, not commands. The approval gate's visible-price check reads the page's own text nodes at the moment it decides, never text the model supplies.
 
 ## Sandboxing

@@ -282,6 +282,7 @@ async fn navigate_reconnects_after_the_cdp_socket_dies() {
         chrome_path: None,
         cdp_endpoint: Some(url),
         timeout_ms: 5_000,
+        net_policy: oxideclaw::net_policy::NetPolicy::STRICT,
     };
     let tmp = tempfile::tempdir().unwrap();
     let out = tool
@@ -294,4 +295,170 @@ async fn navigate_reconnects_after_the_cdp_socket_dies() {
     let oxideclaw::api::types::ToolResultContent::Text { text } = &out.content[0];
     assert!(!out.is_error && text.contains("Title: Fake"), "{text}");
     assert!(session.lock().await.client().unwrap().is_alive());
+}
+
+/// Answers every permission prompt with `answer` and counts the prompts.
+struct CountingAsker {
+    answer: oxideclaw::permissions::PermissionDecision,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl oxideclaw::permissions::PermissionAsker for CountingAsker {
+    async fn ask(
+        &self,
+        _tool_name: &str,
+        description: &str,
+        _input: &serde_json::Value,
+    ) -> Option<oxideclaw::permissions::PermissionDecision> {
+        self.asked.lock().unwrap().push(description.to_string());
+        Some(self.answer.clone())
+    }
+}
+
+/// A navigate tool on a fake page at a loopback dev server (the fake's
+/// `href`), plus the feed of CDP commands it sent.
+async fn loopback_navigator(
+    href: &'static str,
+) -> (
+    oxideclaw::tools::browser_tools::BrowserNavigateTool,
+    tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+) {
+    use oxideclaw::browser::BrowserSession;
+    use oxideclaw::tools::browser_tools::BrowserNavigateTool;
+    use std::sync::Arc;
+    let page = fake_cdp::Script {
+        results: [
+            ("Runtime.evaluate", json!({ "result": { "value": href } })),
+            (
+                "Accessibility.getFullAXTree",
+                json!({ "nodes": [
+                    {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": "Dev"}},
+                    {"nodeId": "2", "parentId": "1", "role": {"value": "StaticText"},
+                     "name": {"value": "Total: $12.50"}},
+                ]}),
+            ),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let (url, seen) = fake_cdp::serve(vec![page]).await;
+    let tool = BrowserNavigateTool {
+        session: Arc::new(tokio::sync::Mutex::new(BrowserSession::default())),
+        headless: true,
+        chrome_path: None,
+        cdp_endpoint: Some(url),
+        timeout_ms: 5_000,
+        net_policy: oxideclaw::net_policy::NetPolicy::STRICT,
+    };
+    (tool, seen)
+}
+
+fn sent_navigate(
+    seen: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+) -> bool {
+    let mut any = false;
+    while let Ok((method, _)) = seen.try_recv() {
+        any |= method == "Page.navigate";
+    }
+    any
+}
+
+/// The CDP browser reached loopback with no question asked, whatever
+/// allowPrivateNetworkFetch said. Without the setting, browser_navigate to
+/// 127.0.0.1 is refused where nobody can be asked, asks once in an
+/// interactive session, and remembers the answer for that host:port.
+#[tokio::test]
+async fn navigate_to_loopback_needs_consent_once() {
+    use oxideclaw::permissions::{PermissionDecision, PermissionGate};
+    use oxideclaw::tools::{Tool, ToolContext};
+    use std::sync::Arc;
+    let tmp = tempfile::tempdir().unwrap();
+    let target = json!({ "url": "http://127.0.0.1:3000/" });
+
+    // Headless: refused before Chrome is touched.
+    let (tool, mut seen) = loopback_navigator("http://127.0.0.1:3000/").await;
+    let err = tool
+        .execute(target.clone(), &ToolContext::new(tmp.path().to_path_buf()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("allowPrivateNetworkFetch"), "{err}");
+    assert!(!sent_navigate(&mut seen));
+    assert!(!tool.session.lock().await.is_connected());
+
+    // Interactive, and the user says no.
+    let no = Arc::new(CountingAsker {
+        answer: PermissionDecision::Deny,
+        asked: Default::default(),
+    });
+    let mut ctx = ToolContext::new(tmp.path().to_path_buf());
+    ctx.permission_gate =
+        Some(PermissionGate::bypass_with_deny(&[], tmp.path()).with_asker(no.clone()));
+    let err = tool
+        .execute(target.clone(), &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("did not allow"), "{err}");
+    assert_eq!(no.asked.lock().unwrap().len(), 1);
+    assert!(no.asked.lock().unwrap()[0].contains("127.0.0.1:3000"));
+    assert!(!sent_navigate(&mut seen));
+
+    // Interactive, and the user says yes: navigated, and asked only once.
+    let yes = Arc::new(CountingAsker {
+        answer: PermissionDecision::Allow,
+        asked: Default::default(),
+    });
+    ctx.permission_gate =
+        Some(PermissionGate::bypass_with_deny(&[], tmp.path()).with_asker(yes.clone()));
+    for _ in 0..2 {
+        let out = tool.execute(target.clone(), &ctx).await.unwrap();
+        let oxideclaw::api::types::ToolResultContent::Text { text } = &out.content[0];
+        assert!(
+            text.starts_with("Navigated to: http://127.0.0.1:3000/"),
+            "{text}"
+        );
+        // The page's text reaches the model, fenced as page data.
+        let fence = text.find("<page-content id=").unwrap();
+        assert!(text[fence..].contains("[text] \"Total: $12.50\""), "{text}");
+        assert!(text[..fence].contains("not instructions"), "{text}");
+    }
+    assert_eq!(
+        yes.asked.lock().unwrap().len(),
+        1,
+        "one prompt per host:port"
+    );
+    assert!(sent_navigate(&mut seen));
+    // The gate's copy of the page is the DOM text.
+    assert!(tool.session.lock().await.last_page_text.contains("$12.50"));
+}
+
+/// The metadata service is refused before any question, whatever the user
+/// or the settings would say.
+#[tokio::test]
+async fn navigate_never_asks_about_the_metadata_service() {
+    use oxideclaw::permissions::{PermissionDecision, PermissionGate};
+    use oxideclaw::tools::{Tool, ToolContext};
+    use std::sync::Arc;
+    let tmp = tempfile::tempdir().unwrap();
+    let (tool, mut seen) = loopback_navigator("about:blank").await;
+    let yes = Arc::new(CountingAsker {
+        answer: PermissionDecision::Allow,
+        asked: Default::default(),
+    });
+    let mut ctx = ToolContext::new(tmp.path().to_path_buf());
+    ctx.permission_gate =
+        Some(PermissionGate::bypass_with_deny(&[], tmp.path()).with_asker(yes.clone()));
+    let err = tool
+        .execute(
+            json!({ "url": "http://169.254.169.254/latest/meta-data/" }),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("169.254.169.254"), "{err}");
+    assert!(yes.asked.lock().unwrap().is_empty());
+    assert!(!sent_navigate(&mut seen));
 }

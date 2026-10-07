@@ -7,6 +7,7 @@
 //! `&mut BrowserSession` — those are fast, no long awaits.
 use super::BrowserSession;
 use super::cdp::CdpClient;
+use crate::net_policy::{LoopbackGrants, NetPolicy};
 use anyhow::{Result, bail};
 use serde_json::json;
 
@@ -43,23 +44,26 @@ fn validate_navigation_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Everything checked before `Page.navigate` is sent: the scheme allowlist
-/// plus the always-denied address tier (link-local / cloud metadata). The
-/// user's browser may reach loopback and private networks — testing a local
-/// dev server is the primary use of `/browse` — so this uses
-/// `NetPolicy::LOCAL_OK`, not the strict fetch policy.
-pub async fn preflight_navigation_url(url: &str) -> Result<()> {
+/// Everything checked before `Page.navigate` is sent: the scheme allowlist,
+/// then the destination under `policy` (`allowPrivateNetworkFetch`), the
+/// same check the launched browser's policy proxy applies. Link-local and
+/// cloud metadata are refused outright, the LAN unless the policy allows it.
+/// Loopback addresses refused only because the user has not granted them
+/// come back (empty: go ahead): local dev servers are the main use of
+/// `/browse`, so `browser_navigate` asks the user about them once.
+pub async fn preflight_navigation_url(
+    url: &str,
+    policy: NetPolicy,
+    grants: &LoopbackGrants,
+) -> Result<Vec<std::net::SocketAddr>> {
     validate_navigation_url(url)?;
     let trimmed = url.trim();
     if trimmed.to_ascii_lowercase().starts_with("about:") {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let parsed = url::Url::parse(trimmed)
         .map_err(|e| anyhow::anyhow!("navigation URL '{url}' is invalid: {e}"))?;
-    crate::net_policy::NetPolicy::LOCAL_OK
-        .resolve(&parsed)
-        .await?;
-    Ok(())
+    policy.check_browser_url(&parsed, grants).await
 }
 
 /// Refuse to read a page that has moved to a blocked destination, and blank
@@ -68,11 +72,15 @@ pub async fn preflight_navigation_url(url: &str) -> Result<()> {
 /// nothing about where the page is now. A launched Chrome cannot even load
 /// such a page (its traffic goes through the policy proxy); this is what
 /// covers a Chrome attached through `browserCdpEndpoint`, which has no proxy.
-pub async fn ensure_page_allowed(client: &CdpClient) -> Result<()> {
+pub async fn ensure_page_allowed(
+    client: &CdpClient,
+    policy: NetPolicy,
+    grants: &LoopbackGrants,
+) -> Result<()> {
     let Some(href) = current_url(client).await else {
         return Ok(());
     };
-    if let Err(e) = landed_url_verdict(&href).await {
+    if let Err(e) = landed_url_verdict(&href, policy, grants).await {
         let _ = client
             .send("Page.navigate", json!({"url": "about:blank"}))
             .await;
@@ -87,7 +95,7 @@ pub async fn ensure_page_allowed(client: &CdpClient) -> Result<()> {
 /// fail the policy count: a host this machine cannot resolve (a Chrome in a
 /// container sees other DNS) is not evidence of anything, and Chrome's own
 /// schemes (about:, chrome-error:, data:) have no destination.
-async fn landed_url_verdict(href: &str) -> Result<()> {
+async fn landed_url_verdict(href: &str, policy: NetPolicy, grants: &LoopbackGrants) -> Result<()> {
     let Ok(url) = url::Url::parse(href) else {
         return Ok(());
     };
@@ -107,8 +115,8 @@ async fn landed_url_verdict(href: &str) -> Result<()> {
         None => Vec::new(),
     };
     for ip in ips {
-        crate::net_policy::NetPolicy::LOCAL_OK
-            .check_ip(ip)
+        policy
+            .check_addr(std::net::SocketAddr::new(ip, port), Some(grants))
             .map_err(|e| anyhow::anyhow!("{}: {e}", url.host_str().unwrap_or("host")))?;
     }
     Ok(())
@@ -118,13 +126,24 @@ async fn landed_url_verdict(href: &str) -> Result<()> {
 /// the document's HTTP status. Does NOT mutate session state —
 /// the caller is responsible for updating `current_url` / `current_title`
 /// after this returns, so the session lock can be released while we wait on
-/// the page load event (bounded by `timeout_ms`).
+/// the page load event (bounded by `timeout_ms`). A loopback destination
+/// must already be in `grants` (`browser_navigate` asks first).
 pub async fn navigate(
     client: &CdpClient,
     url: &str,
     timeout_ms: u64,
+    policy: NetPolicy,
+    grants: &LoopbackGrants,
 ) -> Result<(String, Option<u16>)> {
-    preflight_navigation_url(url).await?;
+    if !preflight_navigation_url(url, policy, grants)
+        .await?
+        .is_empty()
+    {
+        bail!(
+            "{url} is a loopback address the browser has not been allowed to reach; \
+             set allowPrivateNetworkFetch: true to permit it"
+        );
+    }
     // Subscribe BEFORE navigating so we don't miss Page.loadEventFired on fast loads.
     let mut events = client.subscribe();
 
@@ -151,7 +170,7 @@ pub async fn navigate(
         }
     }
     // A redirect may have taken the page somewhere the preflight would refuse.
-    ensure_page_allowed(client).await?;
+    ensure_page_allowed(client, policy, grants).await?;
 
     // Get page title
     let eval = client
@@ -639,38 +658,100 @@ mod tests {
 #[cfg(test)]
 mod preflight_tests {
     use super::preflight_navigation_url;
+    use crate::net_policy::{LoopbackGrants, NetPolicy};
 
     #[tokio::test]
     async fn metadata_service_is_refused() {
-        let err = preflight_navigation_url("http://169.254.169.254/latest/meta-data/")
+        for policy in [NetPolicy::STRICT, NetPolicy::LOCAL_OK] {
+            let grants = LoopbackGrants::default();
+            let err = preflight_navigation_url(
+                "http://169.254.169.254/latest/meta-data/",
+                policy,
+                &grants,
+            )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("169.254.169.254"), "{err}");
+            assert!(err.to_string().contains("169.254.169.254"), "{err}");
+        }
     }
 
     #[tokio::test]
-    async fn local_dev_server_is_allowed() {
-        preflight_navigation_url("http://localhost:3000/")
+    async fn local_dev_servers_pass_with_allow_private_network_fetch() {
+        let grants = LoopbackGrants::default();
+        for url in ["http://localhost:3000/", "http://127.0.0.1:8080/api"] {
+            let need = preflight_navigation_url(url, NetPolicy::LOCAL_OK, &grants)
+                .await
+                .unwrap();
+            assert!(need.is_empty(), "{url}: {need:?}");
+        }
+    }
+
+    /// The CDP browser reached loopback and the LAN unasked (LOCAL_OK was
+    /// hard-coded), ignoring allowPrivateNetworkFetch. Without it, loopback
+    /// needs the user's grant, and once granted no longer asks.
+    #[tokio::test]
+    async fn loopback_needs_a_grant_without_allow_private_network_fetch() {
+        let grants = LoopbackGrants::default();
+        let url = "http://127.0.0.1:3000/";
+        let need = preflight_navigation_url(url, NetPolicy::STRICT, &grants)
             .await
             .unwrap();
-        preflight_navigation_url("http://127.0.0.1:8080/api")
+        assert_eq!(need, vec!["127.0.0.1:3000".parse().unwrap()]);
+        grants.grant(&need);
+        assert!(
+            preflight_navigation_url(url, NetPolicy::STRICT, &grants)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The grant is for that service, not all of loopback.
+        assert_eq!(
+            preflight_navigation_url("http://127.0.0.1:6379/", NetPolicy::STRICT, &grants)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Only loopback can be granted; a LAN host needs the setting.
+    #[tokio::test]
+    async fn lan_hosts_are_refused_without_the_setting() {
+        let grants = LoopbackGrants::default();
+        let err = preflight_navigation_url("http://192.168.1.10/", NetPolicy::STRICT, &grants)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("allowPrivateNetworkFetch"),
+            "{err}"
+        );
+        assert!(
+            preflight_navigation_url("http://192.168.1.10/", NetPolicy::LOCAL_OK, &grants)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn non_http_schemes_are_still_refused() {
+        let grants = LoopbackGrants::default();
+        let p = NetPolicy::LOCAL_OK;
         assert!(
-            preflight_navigation_url("file:///etc/passwd")
+            preflight_navigation_url("file:///etc/passwd", p, &grants)
                 .await
                 .is_err()
         );
         assert!(
-            preflight_navigation_url("javascript:alert(1)")
+            preflight_navigation_url("javascript:alert(1)", p, &grants)
                 .await
                 .is_err()
         );
-        assert!(preflight_navigation_url("about:blank").await.is_ok());
+        assert!(
+            preflight_navigation_url("about:blank", p, &grants)
+                .await
+                .is_ok()
+        );
     }
 }
 
@@ -737,9 +818,36 @@ mod landed_url_tests {
     async fn a_page_that_landed_on_the_metadata_service_is_blanked() {
         let (ws, navs) = fake_cdp("http://169.254.169.254/latest/meta-data/iam/").await;
         let client = CdpClient::connect(&ws).await.unwrap();
-        let err = ensure_page_allowed(&client).await.unwrap_err().to_string();
+        let err = ensure_page_allowed(&client, NetPolicy::LOCAL_OK, &LoopbackGrants::default())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("169.254.169.254"), "{err}");
         assert_eq!(*navs.lock().unwrap(), vec!["about:blank".to_string()]);
+    }
+
+    /// An attached Chrome (no proxy) that wandered onto a loopback service
+    /// the user never granted is blanked under the strict policy; a granted
+    /// one stays readable.
+    #[tokio::test]
+    async fn an_ungranted_loopback_page_is_blanked_under_the_strict_policy() {
+        let grants = LoopbackGrants::default();
+        let (ws, navs) = fake_cdp("http://127.0.0.1:6379/").await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        let err = ensure_page_allowed(&client, NetPolicy::STRICT, &grants)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("127.0.0.1"), "{err}");
+        assert_eq!(*navs.lock().unwrap(), vec!["about:blank".to_string()]);
+
+        grants.grant(&["127.0.0.1:6379".parse().unwrap()]);
+        let (ws, navs) = fake_cdp("http://127.0.0.1:6379/").await;
+        let client = CdpClient::connect(&ws).await.unwrap();
+        ensure_page_allowed(&client, NetPolicy::STRICT, &grants)
+            .await
+            .unwrap();
+        assert!(navs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -751,7 +859,9 @@ mod landed_url_tests {
         ] {
             let (ws, navs) = fake_cdp(href).await;
             let client = CdpClient::connect(&ws).await.unwrap();
-            ensure_page_allowed(&client).await.unwrap();
+            ensure_page_allowed(&client, NetPolicy::LOCAL_OK, &LoopbackGrants::default())
+                .await
+                .unwrap();
             assert!(navs.lock().unwrap().is_empty(), "{href}");
         }
     }
@@ -841,7 +951,13 @@ mod cdp_request_tests {
         let client = CdpClient::connect(&ws).await.unwrap();
         let res = tokio::time::timeout(
             Duration::from_millis(2_000),
-            navigate(&client, "http://127.0.0.1:3000/#/settings", 5_000),
+            navigate(
+                &client,
+                "http://127.0.0.1:3000/#/settings",
+                5_000,
+                NetPolicy::LOCAL_OK,
+                &LoopbackGrants::default(),
+            ),
         )
         .await
         .expect("navigate waited for a load event that never comes");
@@ -867,9 +983,15 @@ mod cdp_request_tests {
         }
         let (ws, _) = scripted_cdp(reply).await;
         let client = CdpClient::connect(&ws).await.unwrap();
-        let (title, status) = navigate(&client, "http://127.0.0.1:3000/missing", 5_000)
-            .await
-            .unwrap();
+        let (title, status) = navigate(
+            &client,
+            "http://127.0.0.1:3000/missing",
+            5_000,
+            NetPolicy::LOCAL_OK,
+            &LoopbackGrants::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(title, "Not Found");
         assert_eq!(status, Some(404));
     }
@@ -889,16 +1011,28 @@ mod cdp_request_tests {
         }
         let (ws, _) = scripted_cdp(reply).await;
         let client = CdpClient::connect(&ws).await.unwrap();
-        let (_, status) = navigate(&client, "http://127.0.0.1:3000/", 5_000)
-            .await
-            .unwrap();
+        let (_, status) = navigate(
+            &client,
+            "http://127.0.0.1:3000/",
+            5_000,
+            NetPolicy::LOCAL_OK,
+            &LoopbackGrants::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(status, None);
 
         let (ws, log) = scripted_cdp(page).await;
         let client = CdpClient::connect(&ws).await.unwrap();
-        let (_, status) = navigate(&client, "http://127.0.0.1:3000/#/x", 5_000)
-            .await
-            .unwrap();
+        let (_, status) = navigate(
+            &client,
+            "http://127.0.0.1:3000/#/x",
+            5_000,
+            NetPolicy::LOCAL_OK,
+            &LoopbackGrants::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(status, None);
         assert!(sent(&log, "Runtime.evaluate").iter().all(|p| {
             !p["expression"]
@@ -918,9 +1052,15 @@ mod cdp_request_tests {
         }
         let (ws, _) = scripted_cdp(reply).await;
         let client = CdpClient::connect(&ws).await.unwrap();
-        let err = navigate(&client, "http://127.0.0.1:3000/other", 200)
-            .await
-            .unwrap_err();
+        let err = navigate(
+            &client,
+            "http://127.0.0.1:3000/other",
+            200,
+            NetPolicy::LOCAL_OK,
+            &LoopbackGrants::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 
