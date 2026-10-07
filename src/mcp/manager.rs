@@ -90,10 +90,11 @@ impl McpManager {
             match result {
                 Ok(Ok(client)) => {
                     tracing::info!(
-                        "MCP '{}': connected ({} tools via {})",
+                        "MCP '{}': connected ({} tools via {}, protocol {})",
                         name,
                         client.tools.len(),
-                        client.transport_kind
+                        client.transport_kind,
+                        client.protocol_revision()
                     );
                     clients.push(Arc::new(client));
                 }
@@ -162,6 +163,7 @@ impl McpManager {
             .map(|c| McpServerStatus {
                 name: c.server_name.clone(),
                 transport: c.transport_kind,
+                protocol: c.protocol_revision().to_string(),
                 tool_count: c.tools.len(),
             })
             .collect()
@@ -332,13 +334,17 @@ mod startup_tests {
         )
     }
 
-    /// A minimal stdio MCP server: answers initialize (id 1) and tools/list
-    /// (id 2, after the initialized notification) with one `ping` tool.
+    /// A minimal handshake-era stdio MCP server: refuses the
+    /// `server/discover` probe (id 1) as an unknown method, then answers
+    /// initialize (id 2) and tools/list (id 3, after the initialized
+    /// notification) with one `ping` tool.
     fn fake_server(name: &str) -> (String, McpServerConfig) {
         let script = r#"read l
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}'
+read l
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}'
 read l; read l
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"p","inputSchema":{"type":"object"}}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"ping","description":"p","inputSchema":{"type":"object"}}]}}'
 cat >/dev/null"#;
         (
             name.to_string(),

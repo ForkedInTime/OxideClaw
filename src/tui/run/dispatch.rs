@@ -3088,6 +3088,7 @@ mod budget_tests {
         let statuses = [crate::mcp::types::McpServerStatus {
             name: "ctx".into(),
             transport: "stdio",
+            protocol: "2026-07-28".into(),
             tool_count: 1,
         }];
         let turn = |a: CommandAction, input: &str| starts_model_turn(&a, input, &skills, &statuses);
@@ -3130,6 +3131,7 @@ mod budget_tests {
         let status = |name: &str| crate::mcp::types::McpServerStatus {
             name: name.into(),
             transport: "stdio",
+            protocol: "2026-07-28".into(),
             tool_count: 1,
         };
         let statuses = [status("brave_search"), status("my.server"), status("ctx")];

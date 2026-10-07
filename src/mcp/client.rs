@@ -4,7 +4,15 @@
 /// Stdio transport: spawns the server process and communicates via stdin/stdout.
 /// HTTP transport:  POSTs JSON-RPC requests to a URL (streamable HTTP).
 /// SSE transport:   the legacy HTTP+SSE pair (an event stream plus POSTs).
-use crate::mcp::types::{JsonRpcRequest, JsonRpcResponse, McpCallResult, McpResource, McpToolDef};
+///
+/// Two protocol eras. The stateless 2026-07-28 revision ("modern") has no
+/// handshake: every request carries its version, client identity and
+/// capabilities in `_meta`. Earlier revisions ("legacy") open with
+/// `initialize`. A server's era is probed once per connection with
+/// `server/discover` (see `McpClient::handshake`).
+use crate::mcp::types::{
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpCallResult, McpResource, McpToolDef,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -33,7 +41,147 @@ fn cap_output(output: String, max_chars: usize) -> String {
         max_chars
     )
 }
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+// ── Protocol revisions ────────────────────────────────────────────────────────
+
+/// The stateless revision (docs/specification/2026-07-28/basic/versioning.mdx).
+const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Handshake-era revisions this client implements, newest first; the first
+/// is offered in `initialize` and the server's answer is used. 2025-11-25 is
+/// not among them: its Streamable HTTP lets a server end a POST's event
+/// stream before the response and expects a GET with `Last-Event-ID` to
+/// resume it, which this client does not do.
+const LEGACY_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// How long the `server/discover` probe waits before treating the server
+/// as handshake-era: such a server may never answer a method it does not
+/// know (docs/specification/2026-07-28/basic/transports/stdio.mdx,
+/// "Backward Compatibility").
+const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// After a probe timeout the client sends `initialize`. A modern server that
+/// was only slow to start answers the probe first and then rejects
+/// `initialize`; this is how long to look for that late answer.
+const LATE_PROBE_GRACE: Duration = Duration::from_secs(1);
+
+/// Error codes the 2026-07-28 revision reserves
+/// (docs/specification/2026-07-28/basic/index.mdx, "Error Codes"). Only
+/// these mark a server as modern: any other probe error means legacy.
+const HEADER_MISMATCH: i64 = -32020;
+const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// Requests a server may answer with `resultType: "input_required"`
+/// (docs/specification/2026-07-28/basic/patterns/mrtr.mdx, "Supported
+/// Requests").
+const INPUT_REQUIRED_METHODS: [&str; 3] = ["tools/call", "resources/read", "prompts/get"];
+
+/// Bound on multi round-trip retries of one request: a server may ask again
+/// and again, and nothing here ever supplies what it wants.
+const MAX_INPUT_ROUNDS: usize = 8;
+
+fn client_info() -> Value {
+    json!({ "name": "oxideclaw", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// `params` with the per-request fields every modern request must carry
+/// (docs/specification/2026-07-28/basic/index.mdx, "Per-request protocol
+/// fields"). The capabilities are empty: nothing here answers elicitation,
+/// sampling or roots.
+fn with_modern_meta(mut params: Value) -> Value {
+    if let Some(obj) = params.as_object_mut()
+        && let Some(meta) = obj
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    {
+        meta.insert(
+            "io.modelcontextprotocol/protocolVersion".into(),
+            MODERN_PROTOCOL_VERSION.into(),
+        );
+        meta.insert("io.modelcontextprotocol/clientInfo".into(), client_info());
+        meta.insert(
+            "io.modelcontextprotocol/clientCapabilities".into(),
+            json!({}),
+        );
+    }
+    params
+}
+
+/// The protocol version a request's `_meta` declares, if it is a modern one.
+fn modern_version(params: Option<&Value>) -> Option<&str> {
+    params?
+        .pointer("/_meta/io.modelcontextprotocol~1protocolVersion")?
+        .as_str()
+}
+
+/// The revision a connected server speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protocol {
+    /// Not negotiated yet.
+    Pending,
+    /// 2026-07-28: stateless, `_meta` on every request.
+    Modern,
+    /// `initialize` handshake; the version the server answered.
+    Legacy(String),
+}
+
+impl Protocol {
+    pub fn revision(&self) -> &str {
+        match self {
+            Self::Pending => "",
+            Self::Modern => MODERN_PROTOCOL_VERSION,
+            Self::Legacy(v) => v,
+        }
+    }
+}
+
+/// A JSON-RPC error the server sent, kept typed so era detection can tell
+/// the 2026-07-28 errors from everything else.
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub code: i64,
+    pub message: String,
+    pub data: Option<Value>,
+    /// "HTTP MCP <method> failed: <status>" when it came with an HTTP error.
+    pub context: Option<String>,
+}
+
+impl From<JsonRpcError> for RpcError {
+    fn from(e: JsonRpcError) -> Self {
+        Self {
+            code: e.code,
+            message: e.message,
+            data: e.data,
+            context: None,
+        }
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(c) = &self.context {
+            write!(f, "{c} — ")?;
+        }
+        write!(f, "MCP error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+/// The server process exited on the `server/discover` probe. Some
+/// handshake-era servers end the session on any request before
+/// `initialize`; the client starts the server again and skips the probe.
+#[derive(Debug)]
+struct ProbeExited;
+
+impl std::fmt::Display for ProbeExited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MCP server process exited on the server/discover probe")
+    }
+}
+
+impl std::error::Error for ProbeExited {}
 
 // ── Transport trait ───────────────────────────────────────────────────────────
 
@@ -42,8 +190,29 @@ pub(crate) trait McpTransport: Send + Sync {
     /// Send a request and await its response.
     async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value>;
 
+    /// `call` with extra HTTP headers (`Mcp-Param-*`); transports without
+    /// a header layer ignore them.
+    async fn call_with_headers(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        _headers: &[(String, String)],
+    ) -> Result<Value> {
+        self.call(id, method, params).await
+    }
+
     /// Send a notification (fire-and-forget, no response expected).
     async fn notify(&self, _method: &str) {}
+
+    /// The handshake-era version `initialize` settled on, which HTTP sends
+    /// as `MCP-Protocol-Version` on every later request.
+    fn set_protocol_version(&self, _version: &str) {}
+
+    /// Whether the server is gone for good (a stdio process that exited).
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 // ── Stdio transport ───────────────────────────────────────────────────────────
@@ -169,7 +338,7 @@ impl StdioTransport {
                     continue;
                 };
                 let result = if let Some(err) = resp.error {
-                    Err(anyhow!("MCP error {}: {}", err.code, err.message))
+                    Err(RpcError::from(err).into())
                 } else {
                     Ok(resp.result.unwrap_or(Value::Null))
                 };
@@ -255,6 +424,10 @@ impl McpTransport for StdioTransport {
             let _ = self.stdin_tx.send(json);
         }
     }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
 }
 
 /// Our answer to a server-to-client request. We offer no client
@@ -280,6 +453,10 @@ pub(crate) struct HttpTransport {
     /// `initialize`; every later request must echo it or the server
     /// answers 400.
     session_id: std::sync::Mutex<Option<String>>,
+    /// Handshake-era version `initialize` settled on, sent as
+    /// `MCP-Protocol-Version` on every later legacy request (required since
+    /// 2025-06-18). Modern requests carry their own, from `_meta`.
+    protocol_version: std::sync::Mutex<Option<String>>,
     /// Deadline for a whole exchange, body included. `send()` resolves at
     /// the headers, so a server that then stalls would otherwise hang the
     /// tool call forever; reqwest has no default read timeout.
@@ -297,6 +474,7 @@ impl HttpTransport {
             url: url.to_string(),
             client: client_with_headers(headers)?,
             session_id: std::sync::Mutex::new(None),
+            protocol_version: std::sync::Mutex::new(None),
             timeout: REQUEST_TIMEOUT,
         })
     }
@@ -332,7 +510,11 @@ impl HttpTransport {
             .clone()
     }
 
-    async fn post(&self, req: &JsonRpcRequest) -> Result<reqwest::Response> {
+    async fn post(
+        &self,
+        req: &JsonRpcRequest,
+        extra: &[(String, String)],
+    ) -> Result<reqwest::Response> {
         // Streamable-HTTP servers reject (406) a POST that does not accept
         // both; they may answer with plain JSON or an SSE stream.
         let mut builder = self
@@ -340,8 +522,31 @@ impl HttpTransport {
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
-        if let Some(sid) = self.session() {
-            builder = builder.header("Mcp-Session-Id", sid);
+        if let Some(version) = modern_version(req.params.as_ref()) {
+            // Mirrored from the body, so header and body always agree
+            // (docs/specification/2026-07-28/basic/transports/streamable-http.mdx,
+            // "Request Metadata"). No session: the revision has none.
+            builder = builder
+                .header("MCP-Protocol-Version", version)
+                .header("Mcp-Method", &req.method);
+            if let Some(name) = mcp_name(&req.method, req.params.as_ref()) {
+                builder = builder.header("Mcp-Name", encode_header_value(name));
+            }
+        } else {
+            let negotiated = self
+                .protocol_version
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(version) = negotiated {
+                builder = builder.header("MCP-Protocol-Version", version);
+            }
+            if let Some(sid) = self.session() {
+                builder = builder.header("Mcp-Session-Id", sid);
+            }
+        }
+        for (name, value) in extra {
+            builder = builder.header(name, value);
         }
         Ok(builder.json(req).send().await?)
     }
@@ -463,19 +668,147 @@ fn sse_event_response(event: &[u8], id: u64) -> Option<JsonRpcResponse> {
     serde_json::from_value(v).ok()
 }
 
+/// The `Mcp-Name` source: `params.name` or `params.uri` of the requests
+/// that name a target.
+fn mcp_name<'a>(method: &str, params: Option<&'a Value>) -> Option<&'a str> {
+    let key = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        _ => return None,
+    };
+    params?.get(key)?.as_str()
+}
+
+/// A value fit for an `Mcp-Name` or `Mcp-Param-*` header: as-is when it is
+/// plain visible ASCII, else `=?base64?…?=` of its UTF-8 bytes
+/// (docs/specification/2026-07-28/basic/transports/streamable-http.mdx,
+/// "Value Encoding").
+fn encode_header_value(value: &str) -> String {
+    use base64::Engine;
+    let plain = value
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+        && !value.starts_with([' ', '\t'])
+        && !value.ends_with([' ', '\t'])
+        && !(value.starts_with("=?base64?") && value.ends_with("?="));
+    if plain {
+        value.to_string()
+    } else {
+        format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value)
+        )
+    }
+}
+
+/// The `x-mcp-header` annotations of a tool's `inputSchema`: each header
+/// name and the `properties` path of the argument it mirrors. `Err` names
+/// why the definition is invalid, which over HTTP excludes the tool
+/// (docs/specification/2026-07-28/basic/transports/streamable-http.mdx,
+/// "Schema Extension").
+fn x_mcp_headers(schema: &Value) -> std::result::Result<Vec<(String, Vec<String>)>, String> {
+    fn walk(
+        node: &Value,
+        path: Option<&[String]>,
+        out: &mut Vec<(String, Vec<String>)>,
+    ) -> std::result::Result<(), String> {
+        match node {
+            Value::Array(items) => items.iter().try_for_each(|v| walk(v, None, out)),
+            Value::Object(obj) => {
+                if let Some(name) = obj.get("x-mcp-header") {
+                    let Some(path) = path.filter(|p| !p.is_empty()) else {
+                        return Err("x-mcp-header outside a chain of `properties`".into());
+                    };
+                    let name = name
+                        .as_str()
+                        .filter(|n| {
+                            !n.is_empty()
+                                && n.bytes().all(|b| {
+                                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+                                })
+                        })
+                        .ok_or_else(|| format!("x-mcp-header {name} is not a header token"))?;
+                    let primitive = |t: &Value| {
+                        matches!(t.as_str(), Some("string" | "integer" | "boolean" | "null"))
+                    };
+                    let ok_type = match obj.get("type") {
+                        Some(Value::String(t)) => t != "null" && primitive(&obj["type"]),
+                        Some(Value::Array(ts)) => {
+                            ts.iter().all(primitive)
+                                && ts.iter().any(|t| t.as_str() != Some("null"))
+                        }
+                        _ => false,
+                    };
+                    if !ok_type {
+                        return Err(format!(
+                            "x-mcp-header {name} is not on a string, integer or boolean"
+                        ));
+                    }
+                    if out.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                        return Err(format!("x-mcp-header {name} is not unique"));
+                    }
+                    out.push((name.to_string(), path.to_vec()));
+                }
+                for (key, value) in obj {
+                    match key.as_str() {
+                        // Instance data, not schemas.
+                        "default" | "examples" | "const" | "enum" | "x-mcp-header" => {}
+                        "properties" => {
+                            let Some(props) = value.as_object() else {
+                                continue;
+                            };
+                            for (prop, sub) in props {
+                                let next = path.map(|p| {
+                                    let mut p = p.to_vec();
+                                    p.push(prop.clone());
+                                    p
+                                });
+                                walk(sub, next.as_deref(), out)?;
+                            }
+                        }
+                        _ => walk(value, None, out)?,
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(schema, Some(&[]), &mut out)?;
+    Ok(out)
+}
+
 impl HttpTransport {
-    async fn call_inner(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+    async fn call_inner(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        extra: &[(String, String)],
+    ) -> Result<Value> {
         let req = JsonRpcRequest::new(id, method, params);
-        let resp = self.post(&req).await?;
+        let modern = modern_version(req.params.as_ref()).is_some();
+        let resp = self.post(&req, extra).await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND && self.session().is_some() {
+            if status == reqwest::StatusCode::NOT_FOUND && !modern && self.session().is_some() {
                 return Err(anyhow!(
                     "HTTP MCP {method} failed: session expired — restart oxideclaw to reconnect"
                 ));
             }
             let body = Self::bounded_body(resp, method).await.unwrap_or_default();
+            // Modern servers explain a 4xx with a JSON-RPC error; keep it
+            // typed, since its code tells the eras apart.
+            if let Ok(JsonRpcResponse {
+                error: Some(err), ..
+            }) = serde_json::from_slice(&body)
+            {
+                let mut err = RpcError::from(err);
+                err.context = Some(format!("HTTP MCP {method} failed: {status}"));
+                return Err(err.into());
+            }
             let body = String::from_utf8_lossy(&body);
             return Err(anyhow!("HTTP MCP {} failed: {} — {}", method, status, body));
         }
@@ -484,6 +817,7 @@ impl HttpTransport {
             .headers()
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| !modern)
         {
             let mut stored = self.session_id.lock().unwrap_or_else(|e| e.into_inner());
             if stored.is_none() {
@@ -508,7 +842,7 @@ impl HttpTransport {
         };
 
         if let Some(err) = rpc_resp.error {
-            return Err(anyhow!("MCP error {}: {}", err.code, err.message));
+            return Err(RpcError::from(err).into());
         }
 
         Ok(rpc_resp.result.unwrap_or(Value::Null))
@@ -518,7 +852,17 @@ impl HttpTransport {
 #[async_trait]
 impl McpTransport for HttpTransport {
     async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
-        tokio::time::timeout(self.timeout, self.call_inner(id, method, params))
+        self.call_with_headers(id, method, params, &[]).await
+    }
+
+    async fn call_with_headers(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        headers: &[(String, String)],
+    ) -> Result<Value> {
+        tokio::time::timeout(self.timeout, self.call_inner(id, method, params, headers))
             .await
             .map_err(|_| anyhow!("HTTP MCP request timed out ({method})"))?
     }
@@ -527,7 +871,14 @@ impl McpTransport for HttpTransport {
     /// other transport; a notification has no id and its reply is ignored.
     async fn notify(&self, method: &str) {
         let req = JsonRpcRequest::notification(method);
-        let _ = tokio::time::timeout(self.timeout, self.post(&req)).await;
+        let _ = tokio::time::timeout(self.timeout, self.post(&req, &[])).await;
+    }
+
+    fn set_protocol_version(&self, version: &str) {
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(version.to_string());
     }
 }
 
@@ -692,7 +1043,7 @@ impl SseTransport {
         };
         let reply = match serde_json::from_value::<JsonRpcResponse>(msg) {
             Ok(r) => match r.error {
-                Some(err) => Err(anyhow!("MCP error {}: {}", err.code, err.message)),
+                Some(err) => Err(RpcError::from(err).into()),
                 None => Ok(r.result.unwrap_or(Value::Null)),
             },
             Err(e) => Err(anyhow!("malformed MCP response: {e}")),
@@ -760,16 +1111,165 @@ pub struct McpClient {
     pub server_name: String,
     pub tools: Vec<McpToolDef>,
     pub transport_kind: &'static str, // "stdio" | "http" | "sse"
+    /// What the handshake settled on; fixed for the life of the connection.
+    pub protocol: Protocol,
     transport: Box<dyn McpTransport>,
     next_id: AtomicU64,
+    /// `None` skips the `server/discover` probe and goes straight to
+    /// `initialize`.
+    probe_timeout: Option<Duration>,
+}
+
+/// What the `server/discover` probe says about a server.
+enum Era {
+    /// Modern, with the capabilities its `DiscoverResult` lists.
+    Modern(Value),
+    /// Handshake-era; the version to offer in `initialize`.
+    Legacy(&'static str),
 }
 
 impl McpClient {
+    fn new(
+        server_name: String,
+        transport_kind: &'static str,
+        transport: Box<dyn McpTransport>,
+        probe_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            server_name,
+            tools: Vec::new(),
+            transport_kind,
+            protocol: Protocol::Pending,
+            transport,
+            next_id: AtomicU64::new(1),
+            probe_timeout,
+        }
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    async fn send(
+        &self,
+        method: &str,
+        params: Value,
+        headers: &[(String, String)],
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.transport.call(id, method, params).await
+        self.transport
+            .call_with_headers(id, method, params, headers)
+            .await
+    }
+
+    /// One request in the negotiated era. A modern request carries `_meta`,
+    /// and an `input_required` answer is retried with the client's answers
+    /// (docs/specification/2026-07-28/basic/patterns/mrtr.mdx).
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if self.protocol != Protocol::Modern {
+            return self.send(method, params, &[]).await;
+        }
+        let headers = self.param_headers(method, &params);
+        let mut params = with_modern_meta(params);
+        for _ in 0..MAX_INPUT_ROUNDS {
+            let result = self.send(method, params.clone(), &headers).await?;
+            // An absent `resultType` is "complete" (basic/index.mdx,
+            // "ResultType"); any value not defined for this request is
+            // invalid.
+            match result.get("resultType") {
+                None => return Ok(result),
+                Some(t) if t == "complete" => return Ok(result),
+                Some(t) if t == "input_required" && INPUT_REQUIRED_METHODS.contains(&method) => {
+                    self.answer_input_requests(method, &result, &mut params)?;
+                }
+                Some(t) => {
+                    return Err(anyhow!(
+                        "MCP server '{}' answered {method} with an invalid resultType {t}",
+                        self.server_name
+                    ));
+                }
+            }
+        }
+        Err(anyhow!(
+            "MCP server '{}' still wanted more input for {method} after {MAX_INPUT_ROUNDS} rounds",
+            self.server_name
+        ))
+    }
+
+    /// Turn an `InputRequiredResult` into the retry's params. Nothing here
+    /// can ask the user or a model, so an elicitation is declined (the
+    /// server then decides what to return); a sampling or roots request
+    /// ends the call, which needs no reply to the server
+    /// (client/sampling.mdx and client/roots.mdx, "Error Handling").
+    fn answer_input_requests(
+        &self,
+        method: &str,
+        result: &Value,
+        params: &mut Value,
+    ) -> Result<()> {
+        let Some(obj) = params.as_object_mut() else {
+            return Err(anyhow!("MCP {method}: params are not an object"));
+        };
+        obj.remove("inputResponses");
+        obj.remove("requestState");
+        if let Some(requests) = result.get("inputRequests") {
+            let requests = requests.as_object().ok_or_else(|| {
+                anyhow!("MCP server '{}': malformed inputRequests", self.server_name)
+            })?;
+            let mut responses = serde_json::Map::new();
+            for (key, request) in requests {
+                match request.get("method").and_then(Value::as_str) {
+                    Some("elicitation/create") => {
+                        responses.insert(key.clone(), json!({ "action": "decline" }));
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "MCP server '{}' needs {} to finish {method}, which oxideclaw does not provide",
+                            self.server_name,
+                            other.unwrap_or("an unnamed request")
+                        ));
+                    }
+                }
+            }
+            obj.insert("inputResponses".into(), Value::Object(responses));
+        }
+        // Echoed exactly, and only when sent.
+        if let Some(state) = result.get("requestState") {
+            obj.insert("requestState".into(), state.clone());
+        }
+        Ok(())
+    }
+
+    /// `Mcp-Param-*` headers a modern Streamable HTTP `tools/call` must carry
+    /// for the tool's `x-mcp-header` arguments.
+    fn param_headers(&self, method: &str, params: &Value) -> Vec<(String, String)> {
+        if self.transport_kind != "http" || method != "tools/call" {
+            return Vec::new();
+        }
+        let Some(tool) = params
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|n| self.tools.iter().find(|t| t.name == n))
+        else {
+            return Vec::new();
+        };
+        let Ok(annotated) = x_mcp_headers(&tool.input_schema) else {
+            return Vec::new();
+        };
+        let Some(args) = params.get("arguments") else {
+            return Vec::new();
+        };
+        annotated
+            .into_iter()
+            .filter_map(|(name, path)| {
+                let value = path.iter().try_fold(args, |v, k| v.get(k))?;
+                let text = match value {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => return None, // null or absent: no header
+                };
+                Some((format!("Mcp-Param-{name}"), encode_header_value(&text)))
+            })
+            .collect()
     }
 
     /// Call a paginated MCP `*/list` endpoint and accumulate every page.
@@ -816,36 +1316,19 @@ impl McpClient {
         Ok(out)
     }
 
-    /// Run the MCP initialize handshake and populate self.tools.
+    /// Settle the protocol era, then populate self.tools.
     async fn init(&mut self) -> Result<()> {
-        // 1. initialize
-        let params = json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            // Nothing here answers roots/list or sampling/createMessage; a
-            // server told we do waits on them until its own timeout.
-            "capabilities": {},
-            "clientInfo": {
-                "name": "oxideclaw",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-        let init = self
-            .request("initialize", params)
-            .await
-            .map_err(|e| anyhow!("MCP initialize failed for '{}': {}", self.server_name, e))?;
+        let capabilities = self.handshake().await?;
 
-        // 2. Notify server that client is ready (fire-and-forget)
-        self.transport.notify("notifications/initialized").await;
-
-        // 3. Fetch tool list — with cursor pagination so servers that return
-        //    more than one page worth of tools aren't silently truncated.
-        //    A failure leaves the server connected (resource- or prompt-only
-        //    servers answer -32601), but say so when it claims tools: a
-        //    silent "connected (0 tools)" hid real transport errors.
+        // Fetch tool list — with cursor pagination so servers that return
+        // more than one page worth of tools aren't silently truncated.
+        // A failure leaves the server connected (resource- or prompt-only
+        // servers answer -32601), but say so when it claims tools: a
+        // silent "connected (0 tools)" hid real transport errors.
         let pages = match self.list_paginated("tools/list", "tools").await {
             Ok(pages) => pages,
             Err(e) => {
-                if init.pointer("/capabilities/tools").is_some() {
+                if capabilities.get("tools").is_some() {
                     tracing::warn!("MCP '{}': tools/list failed: {}", self.server_name, e);
                 } else {
                     tracing::debug!("MCP '{}': tools/list failed: {}", self.server_name, e);
@@ -853,15 +1336,174 @@ impl McpClient {
                 Vec::new()
             }
         };
+        let modern_http = self.protocol == Protocol::Modern && self.transport_kind == "http";
         self.tools = pages
             .into_iter()
-            .filter_map(|v| serde_json::from_value(v).ok())
+            .filter_map(|v| serde_json::from_value::<McpToolDef>(v).ok())
+            // Over Streamable HTTP a tool with a bad `x-mcp-header` must be
+            // left out, not fail the whole list (streamable-http.mdx,
+            // "Schema Extension").
+            .filter(|t| match x_mcp_headers(&t.input_schema) {
+                Err(why) if modern_http => {
+                    tracing::warn!(
+                        "MCP '{}': tool '{}' left out: {why}",
+                        self.server_name,
+                        t.name
+                    );
+                    false
+                }
+                _ => true,
+            })
             .collect();
 
         Ok(())
     }
 
+    /// Find out which era the server speaks and get it ready for requests;
+    /// returns the server's capabilities. The answer holds for the life of
+    /// the connection (basic/versioning.mdx, "Backward Compatibility with
+    /// Initialization-Based Versions").
+    async fn handshake(&mut self) -> Result<Value> {
+        let (protocol, capabilities) = match self.probe_timeout {
+            None => self.initialize(LEGACY_PROTOCOL_VERSIONS[0]).await?,
+            Some(wait) => self.probe_then_handshake(wait).await?,
+        };
+        self.protocol = protocol;
+        Ok(capabilities)
+    }
+
+    /// Probe with `server/discover` carrying the modern version
+    /// (basic/transports/stdio.mdx and streamable-http.mdx, "Backward
+    /// Compatibility"): a `DiscoverResult` or a recognized modern error
+    /// means modern; any other error, an HTTP 4xx without a modern error
+    /// body, or silence means legacy, so `initialize` follows.
+    async fn probe_then_handshake(&self, wait: Duration) -> Result<(Protocol, Value)> {
+        let probe = self.send("server/discover", with_modern_meta(json!({})), &[]);
+        tokio::pin!(probe);
+        let offer = match tokio::time::timeout(wait, &mut probe).await {
+            Ok(reply) => match self.read_probe(reply)? {
+                Era::Modern(capabilities) => return Ok((Protocol::Modern, capabilities)),
+                Era::Legacy(offer) => offer,
+            },
+            Err(_) => {
+                let legacy = self.initialize(LEGACY_PROTOCOL_VERSIONS[0]).await;
+                let Err(e) = legacy else {
+                    return legacy;
+                };
+                // A modern server that was slow to start has answered the
+                // probe by now, and rejected `initialize`.
+                return match tokio::time::timeout(LATE_PROBE_GRACE, &mut probe).await {
+                    Ok(reply) => match self.read_probe(reply) {
+                        Ok(Era::Modern(capabilities)) => Ok((Protocol::Modern, capabilities)),
+                        _ => Err(e),
+                    },
+                    Err(_) => Err(e),
+                };
+            }
+        };
+        self.initialize(offer).await.map_err(|e| {
+            if self.transport.is_closed() {
+                ProbeExited.into()
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Classify the probe's answer.
+    fn read_probe(&self, reply: Result<Value>) -> Result<Era> {
+        let error = match reply {
+            Ok(result) => {
+                return match result.get("supportedVersions").and_then(Value::as_array) {
+                    Some(versions) => self.pick_version(
+                        versions,
+                        result.get("capabilities").cloned().unwrap_or(json!({})),
+                    ),
+                    // Not a DiscoverResult: a server that answers anything.
+                    None => Ok(Era::Legacy(LEGACY_PROTOCOL_VERSIONS[0])),
+                };
+            }
+            Err(e) => e,
+        };
+        match error.downcast_ref::<RpcError>() {
+            // Modern, but not this version: use one it lists.
+            Some(rpc) if rpc.code == UNSUPPORTED_PROTOCOL_VERSION => {
+                let supported = rpc
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("supported"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                self.pick_version(&supported, json!({}))
+            }
+            Some(rpc)
+                if rpc.code == HEADER_MISMATCH
+                    || rpc.code == MISSING_REQUIRED_CLIENT_CAPABILITY =>
+            {
+                Err(anyhow!(
+                    "MCP server '{}' rejected server/discover: {rpc}",
+                    self.server_name
+                ))
+            }
+            // The fallback must not key on one code (stdio.mdx).
+            _ => Ok(Era::Legacy(LEGACY_PROTOCOL_VERSIONS[0])),
+        }
+    }
+
+    /// The newest revision both sides speak, from the server's list.
+    fn pick_version(&self, supported: &[Value], capabilities: Value) -> Result<Era> {
+        let has = |v: &str| supported.iter().any(|s| s.as_str() == Some(v));
+        if has(MODERN_PROTOCOL_VERSION) {
+            return Ok(Era::Modern(capabilities));
+        }
+        if let Some(v) = LEGACY_PROTOCOL_VERSIONS.iter().find(|v| has(v)) {
+            return Ok(Era::Legacy(v));
+        }
+        Err(anyhow!(
+            "MCP server '{}' speaks protocol versions {}; oxideclaw speaks {MODERN_PROTOCOL_VERSION}, {}",
+            self.server_name,
+            Value::Array(supported.to_vec()),
+            LEGACY_PROTOCOL_VERSIONS.join(", ")
+        ))
+    }
+
+    /// The handshake-era `initialize` / `notifications/initialized` pair,
+    /// offering `offer` and taking the version the server answers.
+    async fn initialize(&self, offer: &str) -> Result<(Protocol, Value)> {
+        let params = json!({
+            "protocolVersion": offer,
+            // Nothing here answers roots/list or sampling/createMessage; a
+            // server told we do waits on them until its own timeout.
+            "capabilities": {},
+            "clientInfo": client_info()
+        });
+        let init = self
+            .send("initialize", params, &[])
+            .await
+            .map_err(|e| anyhow!("MCP initialize failed for '{}': {}", self.server_name, e))?;
+        let version = init
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(offer)
+            .to_string();
+        // A version this client does not know gets no header: the server
+        // would only reject it.
+        if LEGACY_PROTOCOL_VERSIONS.contains(&version.as_str()) {
+            self.transport.set_protocol_version(&version);
+        }
+        // Notify server that client is ready (fire-and-forget)
+        self.transport.notify("notifications/initialized").await;
+        let capabilities = init.get("capabilities").cloned().unwrap_or(json!({}));
+        Ok((Protocol::Legacy(version), capabilities))
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
+
+    /// The negotiated protocol revision, for `/mcp` and `mcp list`.
+    pub fn protocol_revision(&self) -> &str {
+        self.protocol.revision()
+    }
 
     /// Connect to a stdio MCP server.
     pub async fn connect_stdio(
@@ -871,15 +1513,36 @@ impl McpClient {
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
     ) -> Result<Self> {
+        Self::connect_stdio_probing(server_name, command, args, env, cwd, DISCOVER_PROBE_TIMEOUT)
+            .await
+    }
+
+    async fn connect_stdio_probing(
+        server_name: String,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        cwd: &std::path::Path,
+        probe_timeout: Duration,
+    ) -> Result<Self> {
         let transport = StdioTransport::connect(command, args, env, cwd).await?;
-        let mut client = Self {
+        let mut client = Self::new(
             server_name,
-            tools: Vec::new(),
-            transport_kind: "stdio",
-            transport: Box::new(transport),
-            next_id: AtomicU64::new(1),
-        };
-        client.init().await?;
+            "stdio",
+            Box::new(transport),
+            Some(probe_timeout),
+        );
+        match client.init().await {
+            // A handshake-era server that quits on a request before
+            // `initialize`: start it again and go straight to the handshake.
+            Err(e) if e.is::<ProbeExited>() => {
+                client.transport =
+                    Box::new(StdioTransport::connect(command, args, env, cwd).await?);
+                client.probe_timeout = None;
+                client.init().await?;
+            }
+            other => other?,
+        }
         Ok(client)
     }
 
@@ -890,31 +1553,25 @@ impl McpClient {
         headers: &HashMap<String, String>,
     ) -> Result<Self> {
         let transport = HttpTransport::new(url, headers)?;
-        let mut client = Self {
+        let mut client = Self::new(
             server_name,
-            tools: Vec::new(),
-            transport_kind: "http",
-            transport: Box::new(transport),
-            next_id: AtomicU64::new(1),
-        };
+            "http",
+            Box::new(transport),
+            Some(DISCOVER_PROBE_TIMEOUT),
+        );
         client.init().await?;
         Ok(client)
     }
 
-    /// Connect to an MCP server over the legacy HTTP+SSE transport.
+    /// Connect to an MCP server over the legacy HTTP+SSE transport. It
+    /// predates the stateless revision, so there is nothing to probe.
     pub async fn connect_sse(
         server_name: String,
         url: &str,
         headers: &HashMap<String, String>,
     ) -> Result<Self> {
         let transport = SseTransport::connect(url, headers).await?;
-        let mut client = Self {
-            server_name,
-            tools: Vec::new(),
-            transport_kind: "sse",
-            transport: Box::new(transport),
-            next_id: AtomicU64::new(1),
-        };
+        let mut client = Self::new(server_name, "sse", Box::new(transport), None);
         client.init().await?;
         Ok(client)
     }
@@ -1089,13 +1746,7 @@ mod tests {
     }
 
     fn client_with_mock(mock: MockTransport) -> McpClient {
-        McpClient {
-            server_name: "mock".into(),
-            tools: Vec::new(),
-            transport_kind: "stdio",
-            transport: Box::new(mock),
-            next_id: AtomicU64::new(1),
-        }
+        McpClient::new("mock".into(), "stdio", Box::new(mock), None)
     }
 
     #[tokio::test]
@@ -1165,13 +1816,7 @@ mod tests {
             }
         }
 
-        let client = McpClient {
-            server_name: "mock".into(),
-            tools: Vec::new(),
-            transport_kind: "stdio",
-            transport: Box::new(ArcAdapter(mock)),
-            next_id: AtomicU64::new(1),
-        };
+        let client = McpClient::new("mock".into(), "stdio", Box::new(ArcAdapter(mock)), None);
 
         let all = client
             .list_paginated("tools/list", "tools")
@@ -1229,13 +1874,12 @@ mod tests {
             }
         }
 
-        let client = McpClient {
-            server_name: "mock".into(),
-            tools: Vec::new(),
-            transport_kind: "stdio",
-            transport: Box::new(ArcAdapter(Arc::clone(&mock))),
-            next_id: AtomicU64::new(1),
-        };
+        let client = McpClient::new(
+            "mock".into(),
+            "stdio",
+            Box::new(ArcAdapter(Arc::clone(&mock))),
+            None,
+        );
 
         // Should return Ok (graceful cap), not hang or Err.
         let all = client
@@ -1310,13 +1954,7 @@ mod hardening_tests {
     }
 
     fn client(resp: Value) -> McpClient {
-        McpClient {
-            server_name: "mock".into(),
-            tools: Vec::new(),
-            transport_kind: "stdio",
-            transport: Box::new(Canned(resp)),
-            next_id: AtomicU64::new(1),
-        }
+        McpClient::new("mock".into(), "stdio", Box::new(Canned(resp)), None)
     }
 
     /// `tools/call` output is capped at 25K chars; `resources/read` was not,
@@ -1388,16 +2026,25 @@ mod hardening_tests {
     /// Stateful Streamable-HTTP servers (the SDK default) need both media
     /// types accepted, the session id from `initialize` echoed on every later
     /// request, and may answer in SSE with notifications before the response.
+    /// Such a server refuses the `server/discover` probe the way the
+    /// TypeScript SDK does (a 400 without a modern error), and gets the
+    /// legacy handshake, then the negotiated `MCP-Protocol-Version`.
     #[tokio::test]
     async fn http_transport_speaks_streamable_http() {
-        let init = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}}}}"#;
+        let refused = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}"#;
+        let init = r#"{"jsonrpc":"2.0","id":2,"result":{"capabilities":{"tools":{}}}}"#;
         let sse = "event: message\r\n\
                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\r\n\r\n\
                    data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n\
                    event: message\n\
-                   data: {\"jsonrpc\":\"2.0\",\"id\":2,\n\
+                   data: {\"jsonrpc\":\"2.0\",\"id\":3,\n\
                    data: \"result\":{\"tools\":[{\"name\":\"echo\"}]}}\n\n";
         let (base, seen) = recording_server(vec![
+            format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{refused}",
+                refused.len()
+            ),
             format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: sess-42\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{init}",
@@ -1421,17 +2068,37 @@ mod hardening_tests {
         let err = client.call_tool("echo", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("session expired"), "{err}");
 
+        assert_eq!(client.protocol, Protocol::Legacy("2025-06-18".into()));
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.len(), 5);
         for req in seen.iter() {
             assert!(
                 req.contains("accept: application/json, text/event-stream"),
                 "{req}"
             );
         }
-        assert!(!seen[0].contains("mcp-session-id"), "{}", seen[0]);
-        for req in &seen[1..] {
+        assert!(
+            seen[0].contains("mcp-method: server/discover"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("mcp-protocol-version: 2026-07-28"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains(r#""protocolversion":"2025-06-18""#),
+            "{}",
+            seen[1]
+        );
+        for req in &seen[..2] {
+            assert!(!req.contains("mcp-session-id"), "{req}");
+            assert!(!req.contains("mcp-protocol-version: 2025"), "{req}");
+        }
+        for req in &seen[2..] {
             assert!(req.contains("mcp-session-id: sess-42"), "{req}");
+            assert!(req.contains("mcp-protocol-version: 2025-06-18"), "{req}");
         }
     }
 
@@ -1867,5 +2534,689 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'"#,
         let tools = crate::mcp::tools_for_config(&cfg).await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"mcp__old__echo"), "{names:?}");
+    }
+}
+
+/// The 2026-07-28 revision and the fallback to the `initialize` handshake,
+/// against fake servers of each era over stdio and Streamable HTTP.
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    const PROBE: Duration = Duration::from_millis(400);
+
+    /// Reads one JSON-RPC message per line; `$id` is the request id (empty
+    /// for a notification) and every line is appended to `seen.log`.
+    #[cfg(unix)]
+    const READ_LOOP: &str = r#"while IFS= read -r l; do
+printf '%s\n' "$l" >> seen.log
+id=$(printf '%s\n' "$l" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),.*/\1/p')
+[ -z "$id" ] && continue
+reply() { printf '{"jsonrpc":"2.0","id":%s,%s}\n' "$id" "$1"; }
+"#;
+
+    /// A server that speaks only 2026-07-28: every request must carry the
+    /// per-request `_meta`, so `initialize` is refused. `echo` echoes its
+    /// `text`; `ask` needs an elicitation answer first and `sample` a
+    /// sampling one.
+    #[cfg(unix)]
+    fn modern_stdio_script() -> String {
+        format!(
+            r#"{READ_LOOP}case "$l" in
+*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;;
+*) reply '"error":{{"code":-32602,"message":"missing _meta"}}'; continue;;
+esac
+case "$l" in
+*'"method":"server/discover"'*) reply '"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"ttlMs":0,"cacheScope":"private"}}';;
+*'"method":"tools/list"'*) reply '"result":{{"resultType":"complete","tools":[{{"name":"echo","inputSchema":{{"type":"object"}}}},{{"name":"ask","inputSchema":{{"type":"object"}}}},{{"name":"sample","inputSchema":{{"type":"object"}}}}],"ttlMs":0,"cacheScope":"private"}}';;
+*'"name":"echo"'*) t=$(printf '%s' "$l" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p'); reply "\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"modern echoed $t\"}}]}}";;
+*'"inputResponses":{{"login":{{"action":"decline"}}}}'*'"name":"ask"'*'"requestState":"st-1"'*) reply '"result":{{"resultType":"complete","content":[{{"type":"text","text":"login declined"}}]}}';;
+*'"name":"ask"'*) reply '"result":{{"resultType":"input_required","inputRequests":{{"login":{{"method":"elicitation/create","params":{{"mode":"form","message":"GitHub user?","requestedSchema":{{"type":"object","properties":{{"name":{{"type":"string"}}}}}}}}}}}},"requestState":"st-1"}}';;
+*'"name":"sample"'*) reply '"result":{{"resultType":"input_required","inputRequests":{{"q":{{"method":"sampling/createMessage","params":{{"messages":[],"maxTokens":5}}}}}}}}';;
+*) reply '"error":{{"code":-32601,"message":"Method not found"}}';;
+esac
+done"#
+        )
+    }
+
+    /// A handshake-era server. `unknown` is what it does with a method it
+    /// does not know: answer -32601, or stay silent.
+    #[cfg(unix)]
+    fn legacy_stdio_script(unknown: &str) -> String {
+        format!(
+            r#"{READ_LOOP}case "$l" in
+*'"method":"initialize"'*) reply '"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"old","version":"1"}}}}';;
+*io.modelcontextprotocol*) reply '"error":{{"code":-32602,"message":"unexpected _meta"}}';;
+*'"method":"tools/list"'*) reply '"result":{{"tools":[{{"name":"echo","inputSchema":{{"type":"object"}}}}]}}';;
+*'"method":"tools/call"'*) t=$(printf '%s' "$l" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p'); reply "\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"legacy echoed $t\"}}]}}";;
+*) {unknown};;
+esac
+done"#
+        )
+    }
+
+    #[cfg(unix)]
+    async fn stdio_client(dir: &std::path::Path, script: String) -> Result<McpClient> {
+        let args = vec!["-c".to_string(), script];
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            McpClient::connect_stdio_probing(
+                "fake".into(),
+                "sh",
+                &args,
+                &HashMap::new(),
+                dir,
+                PROBE,
+            ),
+        )
+        .await
+        .expect("connect hung")
+    }
+
+    #[cfg(unix)]
+    fn seen(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("seen.log")).unwrap_or_default()
+    }
+
+    /// (a) + (d): a modern-only stdio server is used statelessly: one
+    /// `server/discover`, no `initialize`, `_meta` on every request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_modern_server_is_used_without_a_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = stdio_client(dir.path(), modern_stdio_script())
+            .await
+            .unwrap();
+        assert_eq!(client.protocol, Protocol::Modern);
+        assert_eq!(client.protocol_revision(), "2026-07-28");
+        assert_eq!(client.tools.len(), 3, "{:?}", client.tools);
+        let out = client
+            .call_tool("echo", json!({"text": "hi"}))
+            .await
+            .unwrap();
+        assert_eq!(out, "modern echoed hi");
+
+        let log = seen(dir.path());
+        assert!(
+            log.lines().next().unwrap().contains("server/discover"),
+            "{log}"
+        );
+        assert!(!log.contains("initialize"), "{log}");
+        for line in log.lines() {
+            let msg: Value = serde_json::from_str(line).unwrap();
+            let meta = &msg["params"]["_meta"];
+            assert_eq!(
+                meta["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            assert_eq!(
+                meta["io.modelcontextprotocol/clientInfo"]["name"],
+                "oxideclaw"
+            );
+            assert_eq!(
+                meta["io.modelcontextprotocol/clientCapabilities"],
+                json!({})
+            );
+        }
+    }
+
+    /// (b) + (d): a legacy-only server refuses the probe and gets today's
+    /// handshake, offered the newest legacy revision; its answer is kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_legacy_server_gets_the_initialize_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let script =
+            legacy_stdio_script(r#"reply '"error":{"code":-32601,"message":"Method not found"}'"#);
+        let client = stdio_client(dir.path(), script).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
+        let out = client
+            .call_tool("echo", json!({"text": "yo"}))
+            .await
+            .unwrap();
+        assert_eq!(out, "legacy echoed yo");
+
+        let log = seen(dir.path());
+        let methods: Vec<String> = log
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "server/discover",
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+        let init: Value = serde_json::from_str(log.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(init["params"]["protocolVersion"], "2025-06-18");
+        assert_eq!(init["params"]["capabilities"], json!({}));
+    }
+
+    /// (c): a legacy server that never answers an unknown method costs the
+    /// probe timeout, not the connection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_silent_on_unknown_methods_falls_back_within_the_probe_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let client = stdio_client(dir.path(), legacy_stdio_script(":"))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
+        let out = client
+            .call_tool("echo", json!({"text": "x"}))
+            .await
+            .unwrap();
+        assert_eq!(out, "legacy echoed x");
+    }
+
+    /// A legacy server that quits on a request before `initialize` is
+    /// started again and spoken to without the probe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_that_exits_on_the_probe_is_restarted_for_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = legacy_stdio_script("exit 1");
+        let client = stdio_client(dir.path(), script).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
+        assert_eq!(
+            client
+                .call_tool("echo", json!({"text": "again"}))
+                .await
+                .unwrap(),
+            "legacy echoed again"
+        );
+        let log = seen(dir.path());
+        assert_eq!(log.matches("server/discover").count(), 1, "{log}");
+        assert_eq!(log.matches(r#""method":"initialize""#).count(), 1, "{log}");
+    }
+
+    /// A modern server slow to start answers the probe only after the
+    /// timeout, then refuses `initialize`: it is still recognized.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_modern_server_slow_to_start_is_still_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!("sleep 1\n{}", modern_stdio_script());
+        let client = stdio_client(dir.path(), script).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Modern);
+        assert_eq!(
+            client
+                .call_tool("echo", json!({"text": "late"}))
+                .await
+                .unwrap(),
+            "modern echoed late"
+        );
+    }
+
+    /// (e): an elicitation in an `input_required` result is declined and
+    /// the call retried with the server's `requestState`; a sampling
+    /// request, which nothing here can serve, fails the call at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_input_required_requests_are_declined_not_hung_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = stdio_client(dir.path(), modern_stdio_script())
+            .await
+            .unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(10), client.call_tool("ask", json!({})))
+            .await
+            .expect("hung on input_required")
+            .unwrap();
+        assert_eq!(out, "login declined");
+        let calls: Vec<Value> = seen(dir.path())
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|m: &Value| m["params"]["name"] == "ask")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0]["params"].get("inputResponses").is_none());
+        assert_ne!(calls[0]["id"], calls[1]["id"], "a retry is a new request");
+        assert_eq!(
+            calls[1]["params"]["inputResponses"],
+            json!({"login": {"action": "decline"}})
+        );
+        assert_eq!(calls[1]["params"]["requestState"], "st-1");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.call_tool("sample", json!({})),
+        )
+        .await
+        .expect("hung on sampling")
+        .unwrap_err();
+        assert!(err.to_string().contains("sampling/createMessage"), "{err}");
+        assert_eq!(seen(dir.path()).matches(r#""name":"sample""#).count(), 1);
+    }
+
+    /// The manager reports each server's revision for `/mcp`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn statuses_name_the_negotiated_revision() {
+        use crate::mcp::types::{McpServerConfig, StdioServerConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let server = |script: String| {
+            McpServerConfig::Stdio(StdioServerConfig {
+                command: "sh".into(),
+                args: vec!["-c".into(), script],
+                env: Default::default(),
+                disabled: false,
+                literal: false,
+            })
+        };
+        let legacy = legacy_stdio_script(r#"reply '"error":{"code":-32601,"message":"no"}'"#);
+        let extra: HashMap<_, _> = [
+            ("new".to_string(), server(modern_stdio_script())),
+            ("old".to_string(), server(legacy)),
+        ]
+        .into();
+        let m = crate::mcp::McpManager::start_with_extra_timeout(
+            &crate::settings::Settings::default(),
+            &extra,
+            Duration::from_secs(15),
+            dir.path(),
+        )
+        .await;
+        let got: Vec<(String, String)> = m
+            .statuses()
+            .into_iter()
+            .map(|s| (s.name, s.protocol))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("new".to_string(), "2026-07-28".to_string()),
+                ("old".to_string(), "2024-11-05".to_string())
+            ]
+        );
+    }
+
+    // ── Streamable HTTP ──────────────────────────────────────────────────────
+
+    type Seen = Arc<StdMutex<Vec<(String, Value)>>>;
+
+    /// An HTTP MCP endpoint. `handler` gets the lowercased request head and
+    /// the JSON body and returns a status and body, or `None` to hold the
+    /// request open without answering. Connections are served concurrently.
+    async fn http_server<F>(handler: F) -> (String, Seen)
+    where
+        F: Fn(&str, &Value) -> Option<(u16, String)> + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let seen = Seen::default();
+        let (log, handler) = (seen.clone(), Arc::new(handler));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, handler) = (log.clone(), handler.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let (head, body) = loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&tmp[..n]);
+                        let text = String::from_utf8_lossy(&req).into_owned();
+                        let Some(h) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = text[..h].to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= h + 4 + len {
+                            break (head, text[h + 4..].to_string());
+                        }
+                    };
+                    let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    log.lock().unwrap().push((head.clone(), body.clone()));
+                    let Some((status, out)) = handler(&head, &body) else {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{out}",
+                        out.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .map(str::trim)
+    }
+
+    fn ok(id: &Value, result: Value) -> Option<(u16, String)> {
+        Some((
+            200,
+            json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+        ))
+    }
+
+    fn rpc_err(status: u16, id: &Value, code: i64, data: Value) -> Option<(u16, String)> {
+        let e = json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": "no", "data": data}});
+        Some((status, e.to_string()))
+    }
+
+    async fn http_client(url: &str) -> Result<McpClient> {
+        let transport = HttpTransport::new(url, &HashMap::new())?;
+        let mut client = McpClient::new("web".into(), "http", Box::new(transport), Some(PROBE));
+        tokio::time::timeout(Duration::from_secs(20), client.init())
+            .await
+            .expect("connect hung")?;
+        Ok(client)
+    }
+
+    /// A modern Streamable HTTP server that checks what the revision makes
+    /// it check: `MCP-Protocol-Version` equal to `_meta`, `Mcp-Method`,
+    /// `Mcp-Name`, and `Mcp-Param-*` for `x-mcp-header` arguments.
+    fn modern_http(head: &str, body: &Value) -> Option<(u16, String)> {
+        let id = &body["id"];
+        let meta = body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str();
+        if meta != Some("2026-07-28") || header(head, "mcp-protocol-version") != meta {
+            return rpc_err(400, id, -32602, json!(null));
+        }
+        let method = body["method"].as_str().unwrap_or_default();
+        if header(head, "mcp-method") != Some(method) || head.contains("mcp-session-id") {
+            return rpc_err(400, id, -32020, json!(null));
+        }
+        match method {
+            "server/discover" => ok(
+                id,
+                json!({
+                    "resultType": "complete", "supportedVersions": ["2025-11-25", "2026-07-28"],
+                    "capabilities": {"tools": {}}, "ttlMs": 60000, "cacheScope": "public"
+                }),
+            ),
+            "tools/list" => ok(
+                id,
+                json!({"resultType": "complete", "ttlMs": 0, "cacheScope": "private", "tools": [
+                    {"name": "execute_sql", "inputSchema": {"type": "object", "properties": {
+                        "region": {"type": "string", "x-mcp-header": "Region"},
+                        "opts": {"type": "object", "properties": {"dry": {"type": "boolean", "x-mcp-header": "Dry"}}},
+                        "query": {"type": "string"}}}},
+                    {"name": "bad", "inputSchema": {"type": "object", "properties": {
+                        "rows": {"type": "array", "items": {"type": "string", "x-mcp-header": "Row"}}}}},
+                    {"name": "ask", "inputSchema": {"type": "object"}}
+                ]}),
+            ),
+            "tools/call" => {
+                let name = body["params"]["name"].as_str().unwrap_or_default();
+                if header(head, "mcp-name") != Some(name) {
+                    return rpc_err(400, id, -32020, json!(null));
+                }
+                if name == "ask" {
+                    return match body["params"]["inputResponses"]["confirm"]["action"].as_str() {
+                        Some(action) => ok(
+                            id,
+                            json!({"resultType": "complete",
+                            "content": [{"type": "text", "text": format!("ask {action}")}]}),
+                        ),
+                        None => ok(
+                            id,
+                            json!({"resultType": "input_required", "inputRequests": {
+                            "confirm": {"method": "elicitation/create", "params": {
+                                "mode": "form", "message": "Sure?", "requestedSchema": {"type": "object"}}}}}),
+                        ),
+                    };
+                }
+                let args = &body["params"]["arguments"];
+                let expect = |h: &str, v: &Value| match v {
+                    Value::Null => header(head, h).is_none(),
+                    Value::String(s) => header(head, h) == Some(s.to_ascii_lowercase().as_str()),
+                    other => header(head, h) == Some(other.to_string().as_str()),
+                };
+                if !expect("mcp-param-region", &args["region"])
+                    || !expect("mcp-param-dry", &args["opts"]["dry"])
+                {
+                    return rpc_err(400, id, -32020, json!(null));
+                }
+                ok(
+                    id,
+                    json!({"resultType": "complete", "content": [{"type": "text",
+                    "text": format!("ran {} in {}", args["query"].as_str().unwrap_or(""), args["region"])}]}),
+                )
+            }
+            _ => rpc_err(404, id, -32601, json!(null)),
+        }
+    }
+
+    /// (a) + (d) + (e) over HTTP: modern headers on every POST, the bad
+    /// `x-mcp-header` tool left out, the good one's arguments mirrored, and
+    /// an elicitation declined.
+    #[tokio::test]
+    async fn http_modern_server_gets_stateless_requests_with_mirrored_headers() {
+        let (url, seen) = http_server(modern_http).await;
+        let client = http_client(&url).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Modern);
+        let names: Vec<&str> = client.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["execute_sql", "ask"],
+            "invalid x-mcp-header tool must go"
+        );
+
+        let out = client
+            .call_tool(
+                "execute_sql",
+                json!({"region": "us-west1", "opts": {"dry": true}, "query": "SELECT 1"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, r#"ran SELECT 1 in "us-west1""#);
+        // An absent argument sends no header.
+        client
+            .call_tool("execute_sql", json!({"query": "SELECT 2"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.call_tool("ask", json!({})).await.unwrap(),
+            "ask decline"
+        );
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(_, b)| b["method"] != "initialize"),
+            "{seen:?}"
+        );
+        let (head, _) = seen
+            .iter()
+            .find(|(_, b)| b["params"]["arguments"]["query"] == "SELECT 1")
+            .unwrap();
+        assert_eq!(header(head, "mcp-param-region"), Some("us-west1"));
+        assert_eq!(header(head, "mcp-param-dry"), Some("true"));
+        assert_eq!(header(head, "mcp-name"), Some("execute_sql"));
+    }
+
+    /// (b) + (d) over HTTP: a legacy server (400 without a modern error to
+    /// the probe) gets `initialize`, then its session and its negotiated
+    /// version on every later request.
+    #[tokio::test]
+    async fn http_legacy_server_falls_back_to_the_handshake() {
+        let (url, seen) = http_server(|head, body| {
+            let id = &body["id"];
+            match body["method"].as_str()? {
+                "initialize" => Some((200, format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-03-26","capabilities":{{"tools":{{}}}}}}}}"#
+                ))),
+                "notifications/initialized" => Some((202, String::new())),
+                _ if !head.contains("mcp-protocol-version: 2025-03-26") => {
+                    Some((400, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Bad Request: Server not initialized"}}"#.into()))
+                }
+                "tools/list" => ok(id, json!({"tools": [{"name": "echo"}]})),
+                "tools/call" => ok(id, json!({"content": [{"type": "text",
+                    "text": format!("legacy echoed {}", body["params"]["arguments"]["text"].as_str()?)}]})),
+                _ => rpc_err(200, id, -32601, json!(null)),
+            }
+        })
+        .await;
+        let client = http_client(&url).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Legacy("2025-03-26".into()));
+        assert_eq!(
+            client
+                .call_tool("echo", json!({"text": "hi"}))
+                .await
+                .unwrap(),
+            "legacy echoed hi"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].1["method"], "server/discover");
+        assert_eq!(seen[1].1["params"]["protocolVersion"], "2025-06-18");
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|(_, b)| b["params"].get("_meta").is_none()),
+            "{seen:?}"
+        );
+    }
+
+    /// (c) over HTTP: a server that never answers the probe still gets the
+    /// handshake once the probe timeout passes.
+    #[tokio::test]
+    async fn http_server_silent_on_the_probe_falls_back_within_the_timeout() {
+        let (url, _) = http_server(|_, body| {
+            let id = &body["id"];
+            match body["method"].as_str()? {
+                "server/discover" => None,
+                "initialize" => ok(
+                    id,
+                    json!({"protocolVersion": "2024-11-05", "capabilities": {}}),
+                ),
+                "notifications/initialized" => Some((202, String::new())),
+                "tools/list" => ok(id, json!({"tools": [{"name": "echo"}]})),
+                "tools/call" => ok(id, json!({"content": [{"type": "text", "text": "pong"}]})),
+                _ => None,
+            }
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let client = http_client(&url).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
+        assert_eq!(client.call_tool("echo", json!({})).await.unwrap(), "pong");
+    }
+
+    /// `UnsupportedProtocolVersionError` marks a modern server: the client
+    /// takes a version from its list, and with none in common it stops
+    /// instead of guessing with `initialize`.
+    #[tokio::test]
+    async fn unsupported_version_error_picks_from_the_servers_list() {
+        let (url, seen) = http_server(|_, body| {
+            let id = &body["id"];
+            match body["method"].as_str()? {
+                "server/discover" => rpc_err(400, id, -32022, json!({"supported": ["2099-01-01", "2025-06-18"], "requested": "2026-07-28"})),
+                "initialize" => ok(id, json!({"protocolVersion": body["params"]["protocolVersion"], "capabilities": {}})),
+                "notifications/initialized" => Some((202, String::new())),
+                _ => ok(id, json!({"tools": []})),
+            }
+        })
+        .await;
+        let client = http_client(&url).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Legacy("2025-06-18".into()));
+        assert_eq!(
+            seen.lock().unwrap()[1].1["params"]["protocolVersion"],
+            "2025-06-18"
+        );
+
+        let (url, seen) = http_server(|_, body| {
+            rpc_err(
+                400,
+                &body["id"],
+                -32022,
+                json!({"supported": ["2099-01-01"], "requested": "2026-07-28"}),
+            )
+        })
+        .await;
+        let err = match http_client(&url).await {
+            Ok(_) => panic!("connected with no common version"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("2099-01-01") && err.contains("2026-07-28"),
+            "{err}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "no initialize after a modern error"
+        );
+    }
+
+    #[test]
+    fn header_values_are_encoded_as_the_spec_shows() {
+        // streamable-http.mdx, "Encoding examples".
+        assert_eq!(encode_header_value("us-west1"), "us-west1");
+        assert_eq!(
+            encode_header_value("Hello, 世界"),
+            "=?base64?SGVsbG8sIOS4lueVjA==?="
+        );
+        assert_eq!(encode_header_value(" padded "), "=?base64?IHBhZGRlZCA=?=");
+        assert_eq!(
+            encode_header_value("line1\nline2"),
+            "=?base64?bGluZTEKbGluZTI=?="
+        );
+        assert_eq!(
+            encode_header_value("=?base64?literal?="),
+            "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="
+        );
+    }
+
+    #[test]
+    fn x_mcp_header_annotations_are_validated() {
+        let paths = x_mcp_headers(&json!({"type": "object", "properties": {
+            "region": {"type": "string", "x-mcp-header": "Region"},
+            "n": {"type": ["integer", "null"], "x-mcp-header": "N"},
+            "deep": {"type": "object", "properties": {"on": {"type": "boolean", "x-mcp-header": "On"}}},
+            "x-mcp-header": {"type": "string"},
+            "q": {"type": "string", "default": {"x-mcp-header": "data, not a schema"}}
+        }}))
+        .unwrap();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(paths.contains(&("On".into(), vec!["deep".into(), "on".into()])));
+
+        for bad in [
+            json!({"properties": {"a": {"type": "number", "x-mcp-header": "A"}}}),
+            json!({"properties": {"a": {"type": "string", "x-mcp-header": ""}}}),
+            json!({"properties": {"a": {"type": "string", "x-mcp-header": "A B"}}}),
+            json!({"properties": {"a": {"type": "string", "x-mcp-header": "A"},
+                                  "b": {"type": "string", "x-mcp-header": "a"}}}),
+            json!({"properties": {"a": {"type": "array", "items": {"type": "string", "x-mcp-header": "A"}}}}),
+            json!({"properties": {"a": {"anyOf": [{"type": "string", "x-mcp-header": "A"}]}}}),
+            json!({"$defs": {"d": {"type": "string", "x-mcp-header": "A"}}}),
+            json!({"type": "string", "x-mcp-header": "Root"}),
+        ] {
+            assert!(x_mcp_headers(&bad).is_err(), "{bad}");
+        }
     }
 }

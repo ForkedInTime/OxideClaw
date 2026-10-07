@@ -167,6 +167,8 @@ pub struct McpResource {
 #[derive(Debug, Clone)]
 pub struct McpServerStatus {
     pub name: String,
-    pub transport: &'static str, // "stdio" | "http"
+    pub transport: &'static str, // "stdio" | "http" | "sse"
+    /// Negotiated MCP revision, e.g. "2026-07-28" or "2024-11-05".
+    pub protocol: String,
     pub tool_count: usize,
 }

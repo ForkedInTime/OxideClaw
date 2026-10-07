@@ -54,12 +54,13 @@ fn cmd_mcp_in(args: &str, ctx: &CommandContext, config_dir: &std::path::Path) ->
                     .find(|c| c.name == s.name && c.is_effective())
                     .map_or("", |c| c.scope.as_str());
                 lines.push(format!(
-                    "  {:20} {:7} [{}]  {} tool{}",
+                    "  {:20} {:7} [{}]  {} tool{}  MCP {}",
                     s.name,
                     scope,
                     s.transport,
                     s.tool_count,
-                    if s.tool_count == 1 { "" } else { "s" }
+                    if s.tool_count == 1 { "" } else { "s" },
+                    s.protocol
                 ));
             }
 
@@ -127,7 +128,7 @@ fn cmd_mcp_in(args: &str, ctx: &CommandContext, config_dir: &std::path::Path) ->
             CommandAction::Message(out)
         }
         _ => CommandAction::Message(
-            "MCP commands:\n  /mcp list              — show connected servers\n  \
+            "MCP commands:\n  /mcp list              — show connected servers and protocol revisions\n  \
              /mcp tools             — show tools per server\n  \
              /mcp add <n> <cmd>     — add stdio server (private to you, this project)\n  \
              /mcp add <n> <url>     — add HTTP server\n  \
@@ -333,6 +334,7 @@ mod tests {
         let statuses = [crate::mcp::types::McpServerStatus {
             name: "gh".into(),
             transport: "stdio",
+            protocol: "2026-07-28".into(),
             tool_count: 2,
         }];
         let ctx = CommandContext {
@@ -358,7 +360,7 @@ mod tests {
         let list = msg(cmd_mcp_in("list", &ctx, h));
         assert!(
             list.lines()
-                .any(|l| l.contains("gh") && l.contains("local")),
+                .any(|l| l.contains("gh") && l.contains("local") && l.contains("MCP 2026-07-28")),
             "{list}"
         );
         assert!(
