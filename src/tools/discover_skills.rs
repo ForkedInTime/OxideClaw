@@ -139,8 +139,9 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("SECRET-BODY"), "{out}");
+        let broken = std::path::Path::new("broken").join("SKILL.md");
         assert!(
-            out.contains("broken/SKILL.md — no YAML frontmatter"),
+            out.contains(&format!("{} — no YAML frontmatter", broken.display())),
             "{out}"
         );
     }
