@@ -85,13 +85,23 @@ pub(super) fn cmd_session(args: &str) -> CommandAction {
             }
         }
         "delete" => {
-            if sub_args.is_empty() {
-                CommandAction::Message("Usage: /session delete <id-prefix>".into())
+            // The hint is a copy-pasted `rm -rf`, so the prefix must be one
+            // plain id token: `a /` would print `rm -rf ... /*/`, and `*` or
+            // `../x` would reach every session or outside the sessions dir.
+            let valid = !sub_args.is_empty()
+                && sub_args
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !valid {
+                CommandAction::Message(
+                    "Usage: /session delete <id-prefix>  (letters, digits, '-' and '_' only)"
+                        .into(),
+                )
             } else {
                 // Sessions live under the XDG data dir when XDG_DATA_HOME is
                 // set, so a hard-coded ~/.claude path would point at nothing.
                 let dir = crate::config::Config::sessions_dir();
-                let dir = dir.display();
+                let dir = dir.display().to_string().replace('\'', "'\\''");
                 CommandAction::Message(format!(
                     "To delete session, run:\n  rm -rf '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta '{dir}'/{sub_args}*/\n\nThe directory holds the session's /rewind file snapshots. Use /session list to confirm the ID prefix."
                 ))
@@ -230,7 +240,10 @@ pub(super) fn cmd_share(args: &str) -> CommandAction {
 
 #[cfg(test)]
 mod session_command_tests {
-    use super::{CLIPBOARD_TOOLS, CommandAction, cmd_session, copy_with, pipe_to};
+    use super::{CommandAction, cmd_session};
+    // Only the unix clipboard tests use these.
+    #[cfg(unix)]
+    use super::{CLIPBOARD_TOOLS, copy_with, pipe_to};
 
     /// /share clip only knew wl-copy and xclip, so it always failed on
     /// macOS and Windows; it now shares this list and its fallthrough.
@@ -314,6 +327,27 @@ mod session_command_tests {
                 assert!(m.contains(&format!("'{}'/abc123*/", dir.display())), "{m}");
             }
             _ => panic!("/session delete must only print a hint"),
+        }
+    }
+
+    /// The prefix went into the `rm -rf` hint unquoted: `delete a /` printed
+    /// a command that runs `rm -rf /*/` when pasted.
+    #[test]
+    fn delete_hint_refuses_anything_but_an_id_prefix() {
+        for args in [
+            "delete a /",
+            "delete *",
+            "delete ../x",
+            "delete x ~",
+            "delete",
+        ] {
+            match cmd_session(args) {
+                CommandAction::Message(m) => {
+                    assert!(m.starts_with("Usage: /session delete"), "{args}: {m}");
+                    assert!(!m.contains("rm "), "{args}: {m}");
+                }
+                _ => panic!("{args}: /session delete must only print a message"),
+            }
         }
     }
 }

@@ -386,7 +386,10 @@ impl Session {
             return;
         };
         for (last_active, meta) in list {
-            if last_active >= cutoff || keep == Some(meta.id.as_str()) {
+            if last_active >= cutoff
+                || keep == Some(meta.id.as_str())
+                || !is_safe_session_id(&meta.id)
+            {
                 continue;
             }
             let _ = fs::remove_file(dir.join(format!("{}.jsonl", meta.id))).await;
@@ -397,11 +400,11 @@ impl Session {
 
     /// Remove `<dir>/<id>/`, which holds the per-turn copies of edited files
     /// that /rewind restores. Without this a deleted session kept them
-    /// forever. The id comes from the .meta body, so anything but a single
-    /// plain path component ("", "..", "a/b") is refused rather than letting
-    /// a tampered meta point remove_dir_all at sessions_dir or its parent.
+    /// forever. The id comes from the .meta body, so anything but a plain id
+    /// is refused rather than letting a tampered meta point remove_dir_all
+    /// at sessions_dir, its parent, or (Windows `C:`) a drive's cwd.
     async fn remove_snapshots_in(dir: &std::path::Path, id: &str) {
-        if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
+        if !is_safe_session_id(id) {
             return;
         }
         let _ = fs::remove_dir_all(dir.join(id)).await;
@@ -431,6 +434,9 @@ impl Session {
     }
 
     async fn delete_in(dir: &std::path::Path, id: &str) -> Result<()> {
+        if !is_safe_session_id(id) {
+            anyhow::bail!("invalid session id: {id:?}");
+        }
         let jsonl = dir.join(format!("{id}.jsonl"));
         let meta = dir.join(format!("{id}.meta"));
         if jsonl.exists() {
@@ -568,6 +574,15 @@ pub fn entries_from_messages(messages: &[Message]) -> Vec<ChatEntry> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Session ids are UUIDs; anything else (`..`, `a/b`, a Windows `C:`) must
+/// never become a path component that delete or cleanup removes.
+fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -1283,7 +1298,12 @@ mod continue_tests {
         let d = root.path().join("sessions");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(root.path().join("precious"), "x").unwrap();
-        for (file, id) in [("dotdot", ".."), ("empty", "")] {
+        for (file, id) in [
+            ("dotdot", ".."),
+            ("empty", ""),
+            ("drive", "C:"),
+            ("dot", "."),
+        ] {
             std::fs::write(
                 d.join(format!("{file}.meta")),
                 format!(r#"{{"id":"{id}","name":"n","created_at":1,"preview":""}}"#),
@@ -1293,6 +1313,12 @@ mod continue_tests {
         Session::prune_inactive_in(&d, 5_000, None).await;
         assert!(root.path().join("precious").exists());
         assert!(d.exists());
+        assert!(Session::delete_in(&d, "..").await.is_err());
+        assert!(Session::delete_in(&d, "C:").await.is_err());
+        assert!(d.exists());
+        assert!(super::is_safe_session_id(
+            "0b6c1d2e-3f40-4a5b-8c6d-7e8f9a0b1c2d"
+        ));
     }
 
     #[tokio::test]
