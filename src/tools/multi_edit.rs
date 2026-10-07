@@ -6,7 +6,7 @@
 ///
 /// Using MultiEdit instead of multiple Edit calls lets Claude batch related
 /// changes atomically and reduces round-trips.
-use super::{Tool, ToolContext, ToolOutput, async_trait, snapshot_file};
+use super::{Tool, ToolContext, ToolOutput, async_trait};
 use crate::tools::file_read::resolve_path;
 use anyhow::Result;
 use serde::Deserialize;
@@ -154,9 +154,6 @@ impl Tool for MultiEditTool {
                 had_error = true;
                 continue;
             }
-
-            // Snapshot before first edit to this file
-            snapshot_file(ctx, &path).await;
 
             if !path.exists() {
                 results.push(format!("{} ✗ File not found", label));

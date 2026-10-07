@@ -74,10 +74,6 @@ pub struct ToolContext {
     /// `env` from settings.json, set on every Bash / PowerShell command.
     pub env: std::collections::HashMap<String, String>,
 
-    /// If set, Write/Edit tools snapshot the original file here before modifying it.
-    /// Set to `<data dir>/sessions/<sid>/snapshots/turn-<n>/` by the run loop.
-    pub snapshot_dir: Option<std::path::PathBuf>,
-
     /// Active sandbox mode for the Bash tool ("strict", "bwrap", "firejail").
     /// None means sandbox is disabled.
     pub sandbox_mode: Option<String>,
@@ -146,7 +142,6 @@ impl ToolContext {
             plan_mode_tx: None,
             default_shell: None,
             env: std::collections::HashMap::new(),
-            snapshot_dir: None,
             sandbox_mode: None,
             sandbox_allow_network: true,
             read_cache: None,
@@ -164,46 +159,11 @@ impl ToolContext {
     }
 }
 
-/// Snapshot a file to the ctx.snapshot_dir before it is modified.
-/// The snapshot preserves the file at its current state so /rewind can restore it.
-/// Silently skips if snapshot_dir is None or the file doesn't exist yet (new file).
-pub async fn snapshot_file(ctx: &ToolContext, path: &std::path::Path) {
-    let Some(ref snap_dir) = ctx.snapshot_dir else {
-        return;
-    };
-    if !path.exists() {
-        return;
-    } // new file — nothing to snapshot
-
-    let flat_name = snapshot_name(path);
-
-    if tokio::fs::create_dir_all(snap_dir).await.is_err() {
-        return;
-    }
-    let dest = snap_dir.join(&flat_name);
-    // A name that is not a plain file name would make join() escape snap_dir
-    // (an absolute Windows path replaces it outright, so dest == path).
-    if dest.parent() != Some(snap_dir.as_path()) {
-        return;
-    }
-    // The first snapshot of a turn is the state /rewind must return to; a
-    // second edit in the same turn would otherwise overwrite it.
-    if dest.exists() {
-        return;
-    }
-    let _ = tokio::fs::copy(path, &dest).await;
-}
-
-/// Reversible flat file name for a snapshot of `path`: separators → `_`, with
-/// literal `%` and `_` escaped. (Mapping only `/` → `_` restored
-/// `src/query_engine.rs` to `src/query/engine.rs`.)
-pub fn snapshot_name(path: &std::path::Path) -> String {
+/// Reversible flat file name for `path`: separators → `_`, with literal
+/// `%` and `_` escaped, so two paths never share a name. (Mapping only `/`
+/// → `_` sent `src/query_engine.rs` and `src/query/engine.rs` to one.)
+pub fn flat_file_name(path: &std::path::Path) -> String {
     flatten_path(&path.to_string_lossy(), cfg!(windows))
-}
-
-/// Inverse of [`snapshot_name`].
-pub fn snapshot_path(flat: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(unflatten_path(flat, cfg!(windows)))
 }
 
 /// On Windows both `\` and `/` separate, the drive colon is not a legal file
@@ -224,28 +184,30 @@ fn flatten_path(path: &str, windows: bool) -> String {
     path.replace(':', "%3A").replace(['\\', '/'], "_")
 }
 
-fn unflatten_path(flat: &str, windows: bool) -> String {
-    let parts = flat.split('_').map(|part| {
-        part.replace("%5F", "_")
-            .replace("%3A", ":")
-            .replace("%25", "%")
-    });
-    if windows {
-        parts.collect::<Vec<_>>().join("\\")
-    } else {
-        format!("/{}", parts.collect::<Vec<_>>().join("/"))
-    }
-}
-
 #[cfg(test)]
-mod snapshot_name_tests {
-    use super::{flatten_path, unflatten_path};
+mod flat_file_name_tests {
+    use super::flatten_path;
+
+    /// The inverse of `flatten_path`: names are distinct exactly when they
+    /// map back to distinct paths.
+    fn unflatten_path(flat: &str, windows: bool) -> String {
+        let parts = flat.split('_').map(|part| {
+            part.replace("%5F", "_")
+                .replace("%3A", ":")
+                .replace("%25", "%")
+        });
+        if windows {
+            parts.collect::<Vec<_>>().join("\\")
+        } else {
+            format!("/{}", parts.collect::<Vec<_>>().join("/"))
+        }
+    }
 
     #[test]
     fn names_round_trip_paths_with_underscores() {
         for p in ["/home/u/src/query_engine.rs", "/a/100%_done/b_c", "/x/y.rs"] {
-            let path = std::path::Path::new(p);
-            assert_eq!(super::snapshot_path(&super::snapshot_name(path)), path);
+            let flat = super::flat_file_name(std::path::Path::new(p));
+            assert_eq!(unflatten_path(&flat, false), p);
         }
     }
 

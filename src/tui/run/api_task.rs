@@ -649,7 +649,6 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 ctx.plan_mode_tx = Some(plan_tx.clone());
                 ctx.default_shell = config.default_shell.clone();
                 ctx.env = config.env.clone();
-                ctx.snapshot_dir = config.file_snapshot_dir.clone();
                 if config.sandbox_enabled {
                     ctx.sandbox_mode = Some(config.sandbox_mode.clone());
                 }

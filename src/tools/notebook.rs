@@ -341,9 +341,6 @@ impl Tool for NotebookEditTool {
         }
 
         let updated = serde_json::to_string_pretty(&notebook)?;
-        // Without this /rewind silently skipped notebooks. Taken only once the
-        // edit succeeded so a rejected one leaves no snapshot behind.
-        super::snapshot_file(ctx, &path).await;
         // Atomic like the other file tools: a crash mid-write must not leave
         // a truncated notebook behind.
         super::atomic_write(&path, &updated)
@@ -434,29 +431,6 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(std::fs::read_to_string(&nb).unwrap().contains("y = 2"));
-    }
-
-    /// NotebookEdit took no snapshot, so /rewind never restored a notebook.
-    #[tokio::test]
-    async fn edit_snapshots_the_notebook_for_rewind() {
-        let dir = tempfile::tempdir().unwrap();
-        let nb = dir.path().join("a.ipynb");
-        std::fs::write(&nb, NB).unwrap();
-        let mut c = ctx(dir.path());
-        let snaps = dir.path().join("snaps");
-        c.snapshot_dir = Some(snaps.clone());
-
-        let out = NotebookEditTool
-            .execute(
-                json!({"notebook_path": "a.ipynb", "edit_mode": "delete", "cell_id": "c1"}),
-                &c,
-            )
-            .await
-            .unwrap();
-
-        assert!(!out.is_error, "{}", text(&out));
-        let snap = snaps.join(super::super::snapshot_name(&nb));
-        assert_eq!(std::fs::read_to_string(snap).unwrap(), NB);
     }
 
     /// Inserted cells used to be written as bare {id, cell_type, source},

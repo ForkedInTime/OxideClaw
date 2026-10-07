@@ -334,11 +334,6 @@ pub struct Config {
     /// Active UI theme ("dark", "light", "solarized").
     pub theme: Option<String>,
 
-    /// Per-turn snapshot directory for file history (set by run_loop before each API task).
-    /// Files modified by Write/Edit are backed up here before modification.
-    #[serde(skip)]
-    pub file_snapshot_dir: Option<std::path::PathBuf>,
-
     /// Whether sandbox mode is enabled for Bash tool execution.
     pub sandbox_enabled: bool,
 
@@ -532,7 +527,6 @@ impl Default for Config {
             output_style: None,
             output_style_prompt: None,
             theme: None,
-            file_snapshot_dir: None,
             sandbox_enabled: false,
             untrusted_project_config: Vec::new(),
             project_trusted: false,
@@ -883,7 +877,6 @@ impl Config {
             fork_session: old.fork_session,
             new_session_id: old.new_session_id,
             custom_agents: old.custom_agents,
-            file_snapshot_dir: old.file_snapshot_dir,
             watch_debounce_ms: old.watch_debounce_ms,
             watch_rate_limit_ms: old.watch_rate_limit_ms,
             watch_markers: old.watch_markers,

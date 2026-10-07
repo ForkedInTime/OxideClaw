@@ -838,7 +838,7 @@ impl Settings {
         let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         config_dir
             .join("local-mcp")
-            .join(format!("{}.json", crate::tools::snapshot_name(&cwd)))
+            .join(format!("{}.json", crate::tools::flat_file_name(&cwd)))
     }
 
     /// Load only the mcpServers block from a .mcp.json file.

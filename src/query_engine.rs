@@ -560,7 +560,6 @@ impl QueryEngine {
         let mut ctx = ToolContext::new(self.config.cwd.clone());
         ctx.default_shell = self.config.default_shell.clone();
         ctx.env = self.config.env.clone();
-        ctx.snapshot_dir = self.config.file_snapshot_dir.clone();
         if self.config.sandbox_enabled {
             ctx.sandbox_mode = Some(self.config.sandbox_mode.clone());
         }

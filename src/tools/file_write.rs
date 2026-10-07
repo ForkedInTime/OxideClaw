@@ -1,5 +1,5 @@
 /// FileWriteTool — port of tools/FileWriteTool/FileWriteTool.ts
-use super::{Tool, ToolContext, ToolOutput, async_trait, snapshot_file};
+use super::{Tool, ToolContext, ToolOutput, async_trait};
 use crate::tools::file_read::resolve_path;
 use anyhow::Result;
 use serde::Deserialize;
@@ -58,9 +58,6 @@ impl Tool for FileWriteTool {
         if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Write) {
             return Ok(err);
         }
-
-        // Snapshot the original before overwriting
-        snapshot_file(ctx, &path).await;
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {

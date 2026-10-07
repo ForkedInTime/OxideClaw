@@ -1,6 +1,6 @@
 /// FileEditTool — port of tools/FileEditTool/FileEditTool.ts
 /// Performs exact string replacement in a file (old_string → new_string).
-use super::{Tool, ToolContext, ToolOutput, async_trait, snapshot_file};
+use super::{Tool, ToolContext, ToolOutput, async_trait};
 use crate::tools::file_read::resolve_path;
 use anyhow::Result;
 use serde::Deserialize;
@@ -79,9 +79,6 @@ impl Tool for FileEditTool {
                 "old_string must not be empty — use Write to create or replace a whole file",
             ));
         }
-
-        // Snapshot the original before editing
-        snapshot_file(ctx, &path).await;
 
         if !path.exists() {
             return Ok(ToolOutput::error(format!(
