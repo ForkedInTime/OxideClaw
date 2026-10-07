@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like any other. The client's values are used as sent: `${VAR}` in them is
   not expanded from OxideClaw's environment.
 
+- **Agent Skills.** Skills load in the standard `<name>/SKILL.md` layout
+  from `.agents/skills/`, `.oxideclaw/skills/` and `.claude/skills/` in the
+  project, then the config dir's `skills/` and `~/.claude/skills/`, first
+  match winning. Only each skill's `name` and `description` load at
+  startup; the body is read when it runs. Invalid skills are skipped and
+  named in one startup notice. Flat `.md` skills keep working (not in
+  `.agents/skills/`), and `/init-verifiers` now writes the new layout.
+- **`oxideclaw config import-claude`.** Lists, and with `--hooks`,
+  `--permissions`, `--api-key-helper` or `--mcp` copies, the Claude Code
+  settings the first-run migration leaves behind (see Changed).
+- **Prompt-cache accounting.** OpenAI-compatible backends' cached prompt
+  tokens are billed as cache reads at each provider's cached-input rate
+  (OpenAI, DeepSeek, Gemini); unknown rates price a hit at the full input
+  rate, so `/cost` and `/budget` never undercount. The `-p` JSON result and
+  the SDK's `cost/updated` carry `cache_read_tokens` and
+  `cache_write_tokens`, and library callers can resume an `SdkSession`
+  from a saved history.
 ### Changed
 
 - **`--allowed-tools` / `--disallowed-tools` take permission rules.** Each
@@ -102,6 +119,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-commercial XTTS weights, and config paths as they really resolve.
 - **Rust 1.88 is the minimum** for `cargo install oxideclaw`, declared as
   `rust-version` so older toolchains get a clear error.
+
+- **OxideClaw has its own config directory.** Settings, `/trust`, MCP and
+  plugin registrations, `memory.md` and teams live in
+  `$XDG_CONFIG_HOME/oxideclaw` (default `~/.config/oxideclaw`;
+  `$OXIDECLAW_CONFIG_DIR` overrides) and sessions in
+  `$XDG_DATA_HOME/oxideclaw` (default `~/.local/share/oxideclaw`). Claude
+  Code's `~/.claude` is never written: its `CLAUDE.md`, `AGENTS.md`,
+  skills, agents, output styles and workflows are still read. On the first
+  run OxideClaw copies its own state out of `~/.claude` once (sessions,
+  memory, plugins, the model, the `/trust` list, deny rules and the
+  settings that only tighten) and lists what it left behind.
+  `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning.
+- **Autonomy modes do what they say.** `suggest` prompts for every edit;
+  `ask` (the new default, what `auto-edit` used to do) prompts unless a
+  rule allows; `auto-edit` edits inside the project without asking, except
+  VCS and agent state, `.mcp.json`, `.env*`, hooks, CI and build or test
+  config; `full-auto` runs without prompts only under an installed bwrap
+  sandbox on Linux. Deny rules apply in every mode. A stored `auto-edit` or
+  `full-auto` from an older version is changed to `ask` once, with a
+  message.
+
+### Fixed
+
+Product decisions and standards follow-up (2026-10-07).
+
+- **Tool filters.** `--disallowed-tools mcp__github` removed nothing;
+  `mcp__<server>` and `mcp__<server>__*` now cover every tool of that
+  server, as permission rules do. `/spawn` agents, which run without
+  prompts, ignored `--allowed-tools` / `--disallowed-tools`.
+- **Permission rules.** `~/` paths were matched as `<cwd>/~/…`, so a
+  `Read(~/.aws/**)` deny missed `~/.aws/credentials` and `~/.zshrc`
+  matched an `Edit(./**)` allow.
+- **MCP.** `mcp remove` could hang or exhaust memory on a `.mcp.json`
+  linked to a device, and `/mcp disable` wrote into the shared `.mcp.json`,
+  turning a team server off for everyone.
+- **Auto-fix.** The `cargo clippy` probe ran outside the sandbox, and under
+  bwrap every check in a project with dependencies failed and burned the
+  retries; dependency caches are now mounted read-only and sandbox
+  environment failures are skipped. On Windows, a profile path with a
+  space dropped clippy, and Esc or a timeout left the cargo/npm/pytest tree
+  running.
+- **Startup and updates.** One slow Ollama model discarded every
+  capability the probe had already learned, and an unresolvable
+  `OLLAMA_HOST` held the exit. A `+build` release tag no longer shows
+  every user an update, and `/upgrade` agrees with the update notice and
+  points at `oxideclaw update`.
+- **Prompt cache and compaction.** `-p` and SDK sessions served mostly from
+  cache never compacted, because their context size left out cache reads.
+- **TUI.** The welcome banner no longer gives way to a "Code index off"
+  line outside a project, the first resize no longer pushes a blank
+  screen into scrollback, editor errors from `/edit-claude-md` are
+  cleared, and Enter on `/issue <description>` in the help picker no
+  longer files an issue titled `<description>`.
+- **Sessions and index.** Session ids outside `[A-Za-z0-9_-]` are refused
+  for deletes, so a Windows `C:` id cannot point a delete at a drive. Index
+  paths are stored with `/` on every OS, and `memory.db` is created only
+  when there are memories to keep.
+- **Install and release.** The npm installer really downloads through the
+  configured proxy. A tag push and a manual dispatch no longer delete each
+  other's draft, and a release lands on the commit that was built and
+  attested. The Docker workflow validates the version it is dispatched
+  with.
 
 ### Fixed
 
@@ -453,6 +532,22 @@ Low-severity QA pass (2026-10-07).
 - **Dependency advisories cleared.** `rustls` 0.23.37 → 0.23.45
   (RUSTSEC-2026-0285). `lru` 0.12.5 → 0.18.5 (RUSTSEC-2026-0002, -0253),
   which needed `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29.
+- **Fetches behind an egress proxy.** With `HTTP(S)_PROXY` / `ALL_PROXY`
+  set, a name that did not resolve locally went to the proxy whatever it
+  was. Cloud metadata names (including regional ones such as
+  `instance-data.<region>.compute.internal`) are now always refused, and
+  local-network names (single-label, `.local`, `.internal`, `.lan`, …)
+  only pass with `allowPrivateNetworkFetch`.
+- **Browser and local services.** The CDP browser reached every loopback
+  and LAN service whatever `allowPrivateNetworkFetch` said. A loopback
+  `host:port` now needs your consent once per name (non-interactive runs
+  are refused), so a page cannot rebind its own name onto an approved port,
+  and the LAN needs the setting.
+- **Untrusted page text is fenced.** Snapshots now include the page's
+  visible text, and snapshot, navigate, get_text, dialog and console
+  results put page-derived text inside a fence labelled as untrusted page
+  data. The approval gate reads prices from the page itself, never from
+  tool input.
 - **Untrusted repositories run no code through auto-fix**, and gitignored
   files are never indexed, so secrets kept out of git never reach a model
   (see Changed).
