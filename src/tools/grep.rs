@@ -205,8 +205,38 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
         args.push(g.clone());
     }
 
-    // Exclude VCS metadata and common vendor dirs (v2.1.92: added .jj and .sl).
+    let search_path = match &input.path {
+        Some(p) => {
+            let p = Path::new(p);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                ctx.cwd.join(p)
+            }
+        }
+        None => ctx.cwd.clone(),
+    };
+
+    // rg skips dotfiles by default, which hid .github/, .eslintrc, .vscode/
+    // and the like from every search; the walker fallback searches them.
+    // VCS metadata stays out through the exclusions below.
+    args.push("--hidden".into());
+
+    // Exclude VCS metadata and common vendor dirs (v2.1.92: added .jj and .sl),
+    // except one the search path itself names: `path: "node_modules/react"`
+    // asked for it, and the exclusion would drop every file under it and read
+    // as "No matches found.". rg matches globs against paths relative to its
+    // working directory, so only the components below the cwd count.
+    let named: Vec<String> = search_path
+        .strip_prefix(&ctx.cwd)
+        .unwrap_or(&search_path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
     for excl in EXCLUDED_DIRS {
+        if named.iter().any(|c| c == excl) {
+            continue;
+        }
         args.push("--glob".into());
         args.push(format!("!**/{excl}/**"));
     }
@@ -221,17 +251,6 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
     args.push("--".into());
     args.push(input.pattern.clone());
 
-    let search_path = match &input.path {
-        Some(p) => {
-            let p = Path::new(p);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                ctx.cwd.join(p)
-            }
-        }
-        None => ctx.cwd.clone(),
-    };
     // rg applies `--glob` exclusions only while walking: a denied file named
     // directly (`path: "~/.ssh/id_rsa"`) is searched and printed regardless.
     if let Some(err) = super::check_sensitive_path_resolved(&search_path, super::SensitiveOp::Read)
@@ -349,7 +368,9 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
             }
             // Skip VCS metadata and common vendor dirs — matches rg's default
             // ignore set plus .jj / .sl (v2.1.92 fix).
-            if e.file_type().is_dir() {
+            // The search root itself is what the caller asked for, even when
+            // it is `build` or `node_modules`.
+            if e.depth() > 0 && e.file_type().is_dir() {
                 let name = e.file_name().to_string_lossy();
                 !EXCLUDED_DIRS.contains(&name.as_ref())
             } else {
@@ -520,5 +541,87 @@ mod deny_rule_tests {
         assert!(t.contains("a.txt"), "{t}");
         assert!(!t.contains("prod.yml"), "{t}");
         assert!(!t.contains("creds.txt"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod search_scope_tests {
+    use super::*;
+
+    fn text(out: &ToolOutput) -> String {
+        out.content
+            .iter()
+            .map(|c| {
+                let super::super::ToolResultContent::Text { text } = c;
+                text.as_str()
+            })
+            .collect()
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn has_rg() -> bool {
+        std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Both backends, rg only where it is installed.
+    async fn both(ctx: &ToolContext, input: serde_json::Value) -> Vec<String> {
+        let input: GrepInput = serde_json::from_value(input).unwrap();
+        let mut outs = vec![text(&run_with_regex(&input, ctx).await.unwrap())];
+        if has_rg() {
+            outs.push(text(&run_with_rg(&input, ctx).await.unwrap()));
+        }
+        outs
+    }
+
+    /// rg ran without --hidden, so .github/ and .eslintrc never matched.
+    #[tokio::test]
+    async fn hidden_files_are_searched_but_vcs_metadata_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, ".github/workflows/ci.yml", "needle\n");
+        write(root, ".eslintrc", "needle\n");
+        write(root, ".git/config", "needle\n");
+        write(root, "src/a.rs", "needle\n");
+        let ctx = ToolContext::new(root.to_path_buf());
+        for t in both(&ctx, json!({"pattern": "needle"})).await {
+            assert!(t.contains("ci.yml") && t.contains(".eslintrc"), "{t}");
+            assert!(t.contains("a.rs") && !t.contains("config"), "{t}");
+        }
+    }
+
+    /// A search rooted in node_modules/ or build/ answered "No matches
+    /// found." on both backends; a project under /build/ must still work.
+    #[tokio::test]
+    async fn an_explicit_vendor_dir_path_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("build/app");
+        write(&proj, "node_modules/react/index.js", "useState\n");
+        write(&proj, "build/out.js", "useState\n");
+        write(&proj, "src/app.js", "useState\n");
+        let ctx = ToolContext::new(proj.clone());
+
+        for t in both(&ctx, json!({"pattern": "useState"})).await {
+            assert!(t.contains("app.js"), "{t}");
+            assert!(!t.contains("index.js") && !t.contains("out.js"), "{t}");
+        }
+        for t in both(
+            &ctx,
+            json!({"pattern": "useState", "path": "node_modules/react"}),
+        )
+        .await
+        {
+            assert!(t.contains("index.js"), "{t}");
+        }
+        for t in both(&ctx, json!({"pattern": "useState", "path": "build"})).await {
+            assert!(t.contains("out.js"), "{t}");
+        }
     }
 }
