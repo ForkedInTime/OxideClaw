@@ -243,8 +243,11 @@ pub fn parse_skill_invocation(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     let rest = &input[1..];
-    if let Some(sp) = rest.find(' ') {
-        Some((&rest[..sp], rest[sp + 1..].trim()))
+    // Any whitespace, as commands::dispatch splits the name: Shift+Enter
+    // puts a newline right after it, and splitting on ' ' alone made the
+    // key "fix\nthe" and reported a real skill as an unknown command.
+    if let Some(sp) = rest.find(char::is_whitespace) {
+        Some((&rest[..sp], rest[sp..].trim()))
     } else {
         Some((rest, ""))
     }
@@ -374,5 +377,23 @@ mod frontmatter_tests {
             .unwrap();
         assert_eq!(s.name, "é");
         assert!(s.expand("x").starts_with("日本語"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_skill_invocation;
+
+    #[test]
+    fn skill_name_ends_at_any_whitespace() {
+        assert_eq!(
+            parse_skill_invocation("/fix\nthe login button\ndoes nothing"),
+            Some(("fix", "the login button\ndoes nothing"))
+        );
+        assert_eq!(parse_skill_invocation("/fix\targs"), Some(("fix", "args")));
+        assert_eq!(parse_skill_invocation("/fix  a b"), Some(("fix", "a b")));
+        assert_eq!(parse_skill_invocation("/fix\u{3000}x"), Some(("fix", "x")));
+        assert_eq!(parse_skill_invocation("/fix"), Some(("fix", "")));
+        assert_eq!(parse_skill_invocation("fix"), None);
     }
 }
