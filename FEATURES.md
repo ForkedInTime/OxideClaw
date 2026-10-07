@@ -494,9 +494,9 @@ Every hook also receives `CLAUDE_HOOK_EVENT`, `CLAUDE_SESSION_ID`, and `CLAUDE_C
 }
 ```
 
-**Exit codes:** `0` allow and continue · `2` block (the tool is not run, or the turn stops; stdout or `stopReason` is shown) · anything else is logged and ignored.
+**Exit codes:** `0` allow and continue · `2` block (the tool is not run, or the turn stops; `stopReason`, stdout or stderr is shown) · anything else is logged and ignored.
 
-**JSON on stdout (optional):** `{ "decision": "block", "reason": "...", "continue": false, "stopReason": "...", "systemMessage": "...", "additionalContext": "..." }`. A hook can only block: `"decision": "approve"` is ignored, and the call still goes through the normal permission check.
+**JSON on stdout (optional):** `{ "decision": "block", "reason": "...", "continue": false, "stopReason": "...", "systemMessage": "...", "additionalContext": "..." }`. Claude Code's `{ "hookSpecificOutput": { "permissionDecision": "deny", "permissionDecisionReason": "...", "additionalContext": "..." } }` works too: `deny` blocks, and `ask` blocks as well, since a hook cannot force a prompt here. A hook can only block: `"decision": "approve"` and `"permissionDecision": "allow"` are ignored, and the call still goes through the normal permission check.
 
 Each hook has a 60-second timeout and runs in its own process group, so a timed-out hook cannot leave children behind. `"disableAllHooks": true` in settings or `--bare` on the command line skips every hook.
 

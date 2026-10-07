@@ -15,10 +15,15 @@
 ///     "systemMessage": "...", "reason": "..." }
 /// `"decision": "approve"` parses but grants nothing: hooks can only block,
 /// and an approved call still goes through the permission gate.
+/// Claude Code's `{"hookSpecificOutput": {"permissionDecision": "deny",
+/// "permissionDecisionReason": "...", "additionalContext": "..."}}` is read
+/// too: `deny` blocks, and so does `ask`, since a hook cannot force a prompt
+/// here and full-auto or an allow rule would otherwise run the call.
 ///
 /// Exit codes:
 ///   0   — success (allow, continue)
-///   2   — blocking error (block tool/continue, show stopReason or stdout)
+///   2   — blocking error (block tool/continue, show stopReason, stdout or
+///         stderr)
 ///   other — non-blocking error (logged, execution continues)
 use crate::settings::{HookEntry, HooksConfig};
 use serde::Deserialize;
@@ -64,6 +69,19 @@ struct HookOutput {
     system_message: Option<String>,
     decision: Option<String>,
     reason: Option<String>,
+    #[serde(rename = "additionalContext")]
+    additional_context: Option<String>,
+    #[serde(rename = "hookSpecificOutput", default)]
+    hook_specific_output: Option<HookSpecificOutput>,
+}
+
+/// Claude Code's per-event output object.
+#[derive(Debug, Deserialize, Default)]
+struct HookSpecificOutput {
+    #[serde(rename = "permissionDecision")]
+    permission_decision: Option<String>,
+    #[serde(rename = "permissionDecisionReason")]
+    permission_decision_reason: Option<String>,
     #[serde(rename = "additionalContext")]
     additional_context: Option<String>,
 }
@@ -593,17 +611,30 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     // If stdout is JSON, extract a human-readable reason from it instead of dumping raw JSON.
     if exit_code == 2 {
         let trimmed = stdout.trim();
+        // Claude Code hooks write the exit-2 reason to stderr.
+        let fallback = || {
+            Some(stderr.trim())
+                .filter(|e| !e.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Hook '{}' blocked execution (exit 2)", hook.command))
+        };
         let stop_reason = if trimmed.starts_with('{') {
             if let Ok(hook_out) = serde_json::from_str::<HookOutput>(trimmed) {
-                hook_out.stop_reason.or(hook_out.reason).unwrap_or_else(|| {
-                    format!("Hook '{}' blocked execution (exit 2)", hook.command)
-                })
+                hook_out
+                    .stop_reason
+                    .or(hook_out.reason)
+                    .or_else(|| {
+                        hook_out
+                            .hook_specific_output
+                            .and_then(|h| h.permission_decision_reason)
+                    })
+                    .unwrap_or_else(fallback)
             } else {
                 // Malformed JSON — show raw so the hook author can debug
                 trimmed.to_string()
             }
         } else if trimmed.is_empty() {
-            format!("Hook '{}' blocked execution (exit 2)", hook.command)
+            fallback()
         } else {
             trimmed.to_string()
         };
@@ -629,28 +660,51 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     if trimmed.starts_with('{')
         && let Ok(hook_out) = serde_json::from_str::<HookOutput>(trimmed)
     {
-        let decision = match hook_out.decision.as_deref() {
+        let specific = hook_out.hook_specific_output.unwrap_or_default();
+        let mut reason = hook_out.reason;
+        let mut decision = match hook_out.decision.as_deref() {
             Some("approve") => Some(HookDecision::Approve),
             Some("block") => Some(HookDecision::Block),
             _ => None,
         };
+        // An imported Claude Code guard answers in `hookSpecificOutput`.
+        // Reading only the top-level fields turned its deny into an allow.
+        match specific.permission_decision.as_deref() {
+            Some("deny") => {
+                decision = Some(HookDecision::Block);
+                reason = specific.permission_decision_reason.or(reason);
+            }
+            Some("ask") => {
+                decision = Some(HookDecision::Block);
+                let why = specific
+                    .permission_decision_reason
+                    .or(reason)
+                    .unwrap_or_else(|| format!("Hook '{}' asked for confirmation", hook.command));
+                reason = Some(format!(
+                    "{why} (the hook asked for confirmation, which OxideClaw hooks cannot \
+                     request, so the call is blocked)"
+                ));
+            }
+            _ => {}
+        }
+        let additional_context = hook_out.additional_context.or(specific.additional_context);
 
         if !hook_out.continue_ {
             return HookResult {
                 should_continue: false,
                 stop_reason: hook_out
                     .stop_reason
-                    .or(hook_out.reason)
+                    .or(reason)
                     .or_else(|| Some(format!("Hook '{}' requested stop", hook.command))),
                 system_message: hook_out.system_message,
                 decision,
-                additional_context: hook_out.additional_context,
+                additional_context,
             };
         }
 
         // A block carries its `reason` so the model is told why.
         let stop_reason = if decision == Some(HookDecision::Block) {
-            hook_out.reason
+            reason
         } else {
             None
         };
@@ -659,7 +713,7 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
             stop_reason,
             system_message: hook_out.system_message,
             decision,
-            additional_context: hook_out.additional_context,
+            additional_context,
         };
     }
 
@@ -1084,6 +1138,65 @@ mod tests {
         let r = prompt_hooks(&[r#"echo '{"continue":false,"stopReason":"frozen"}'"#]).await;
         assert!(!r.should_continue);
         assert_eq!(r.stop_reason.as_deref(), Some("frozen"));
+    }
+
+    /// Claude Code's PreToolUse guards answer in `hookSpecificOutput` with
+    /// exit 0; reading only the top-level fields let their deny run the call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_code_permission_decision_deny_and_ask_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |out: &'static str| {
+            let path = dir.path().to_path_buf();
+            async move {
+                let cmd = format!("echo '{out}'");
+                run_pre_tool_hooks(&cfg_pre(&cmd), "Bash", "{}", "sess", &path).await
+            }
+        };
+        let r = run(r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"no force push"}}"#).await;
+        assert!(!r.should_continue);
+        assert_eq!(r.stop_reason.as_deref(), Some("no force push"));
+
+        let r = run(r#"{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"confirm push"}}"#).await;
+        assert!(!r.should_continue, "ask must not run the call unconfirmed");
+        assert!(
+            r.stop_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("confirm push"),
+            "{:?}",
+            r.stop_reason
+        );
+
+        let r = run(r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#).await;
+        assert!(r.should_continue);
+        assert_eq!(r.decision, None, "allow grants nothing");
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_specific_additional_context_is_kept() {
+        let r = prompt_hooks(&[
+            r#"echo '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"branch: main"}}'"#,
+        ])
+        .await;
+        assert!(r.should_continue);
+        assert_eq!(r.additional_context.as_deref(), Some("branch: main"));
+    }
+
+    /// Claude Code hooks print the exit-2 reason on stderr.
+    #[tokio::test]
+    async fn exit_two_reason_falls_back_to_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = run_pre_tool_hooks(
+            &cfg_pre("echo 'nope, dangerous' >&2; exit 2"),
+            "Bash",
+            "{}",
+            "sess",
+            dir.path(),
+        )
+        .await;
+        assert!(!r.should_continue);
+        assert_eq!(r.stop_reason.as_deref(), Some("nope, dangerous"));
     }
 
     #[tokio::test]
