@@ -150,6 +150,8 @@ Every API call streams a `cost/updated` notification:
   "budget_remaining_usd": 4.985,
   "input_tokens": 1200,
   "output_tokens": 85,
+  "cache_read_tokens": 18000,
+  "cache_write_tokens": 0,
   "model": "claude-sonnet-4-6"
 }
 ```

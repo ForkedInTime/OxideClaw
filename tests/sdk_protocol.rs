@@ -144,11 +144,15 @@ fn test_cost_updated_serialize() {
         budget_remaining_usd: Some(4.88),
         input_tokens: 1500,
         output_tokens: 800,
+        cache_read_tokens: 12000,
+        cache_write_tokens: 400,
         model: "claude-sonnet-4-6-20250514".into(),
     };
     let json = serde_json::to_string(&notif).unwrap();
     assert!(json.contains(r#""type":"cost/updated""#));
     assert!(json.contains(r#""budget_remaining_usd":4.88"#));
+    assert!(json.contains(r#""cache_read_tokens":12000"#));
+    assert!(json.contains(r#""cache_write_tokens":400"#));
 }
 
 #[test]

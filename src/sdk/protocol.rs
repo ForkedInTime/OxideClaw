@@ -356,8 +356,12 @@ pub enum SdkNotification {
         session_total_usd: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_remaining_usd: Option<f64>,
+        /// Uncached prompt tokens; the full prompt is this plus the two
+        /// cache fields.
         input_tokens: u64,
         output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
         model: String,
     },
 

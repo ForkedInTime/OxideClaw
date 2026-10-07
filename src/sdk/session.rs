@@ -90,6 +90,8 @@ pub struct SdkSession {
     child_usage_rx: mpsc::UnboundedReceiver<(String, Usage)>,
     /// Sub-agent (input, output) tokens recorded since the last CostUpdated.
     child_tokens: (u64, u64),
+    /// Sub-agent (cache read, cache write) tokens, likewise.
+    child_cache_tokens: (u64, u64),
     /// The last turn ended with the context critically full. Summarised when
     /// the next prompt arrives (ACP), not at once: a one-shot SDK session
     /// never sends one, and the summary would be a call nobody reads.
@@ -151,6 +153,7 @@ impl SdkSession {
             child_usage_tx,
             child_usage_rx,
             child_tokens: (0, 0),
+            child_cache_tokens: (0, 0),
             summarise_pending: false,
         })
     }
@@ -396,6 +399,8 @@ impl SdkSession {
                 budget_remaining_usd: self.cost_tracker.remaining(),
                 input_tokens: input_tok,
                 output_tokens: output_tok,
+                cache_read_tokens: response.usage.cache_read_input_tokens,
+                cache_write_tokens: response.usage.cache_creation_input_tokens,
                 model: self.config.model.clone(),
             });
 
@@ -475,7 +480,9 @@ impl SdkSession {
                     });
 
                     let (child_in, child_out) = std::mem::take(&mut self.child_tokens);
-                    if child_in + child_out > 0 {
+                    let (child_cache_read, child_cache_write) =
+                        std::mem::take(&mut self.child_cache_tokens);
+                    if child_in + child_out + child_cache_read + child_cache_write > 0 {
                         turn_input_tokens += child_in;
                         turn_output_tokens += child_out;
                         self.send_notif(SdkNotification::CostUpdated {
@@ -485,6 +492,8 @@ impl SdkSession {
                             budget_remaining_usd: self.cost_tracker.remaining(),
                             input_tokens: child_in,
                             output_tokens: child_out,
+                            cache_read_tokens: child_cache_read,
+                            cache_write_tokens: child_cache_write,
                             model: self.config.model.clone(),
                         });
                     }
@@ -869,6 +878,8 @@ impl SdkSession {
                 );
                 self.child_tokens.0 += u.input_tokens;
                 self.child_tokens.1 += u.output_tokens;
+                self.child_cache_tokens.0 += u.cache_read_input_tokens;
+                self.child_cache_tokens.1 += u.cache_creation_input_tokens;
             }
             ctx.budget_remaining_usd = self.cost_tracker.remaining();
 
@@ -1332,7 +1343,8 @@ mod guard_tests {
                 let usage = Usage {
                     input_tokens: 1_000,
                     output_tokens: 1_000_000,
-                    ..Default::default()
+                    cache_read_input_tokens: 5_000,
+                    cache_creation_input_tokens: 7,
                 };
                 let sink = ctx
                     .usage_sink
@@ -1848,6 +1860,8 @@ mod guard_tests {
         assert!(s.cost_tracker.total_cost_usd > 1.0);
         assert!(s.cost_tracker.over_budget());
         assert_eq!(s.child_tokens, (1_000, 1_000_000));
+        // Without these, CostUpdated hid the child's cached prompt.
+        assert_eq!(s.child_cache_tokens, (5_000, 7));
     }
 }
 

@@ -292,11 +292,13 @@ Token usage and cost after each API call.
   "budget_remaining_usd": 4.985,
   "input_tokens": 1200,
   "output_tokens": 85,
+  "cache_read_tokens": 18000,
+  "cache_write_tokens": 0,
   "model": "claude-sonnet-5"
 }
 ```
 
-`budget_remaining_usd` is `null` if no budget was set.
+`budget_remaining_usd` is `null` if no budget was set. `input_tokens` excludes prompt-cache hits and writes; the full prompt is `input_tokens + cache_read_tokens + cache_write_tokens`.
 
 ---
 

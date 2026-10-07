@@ -413,13 +413,7 @@ impl QueryEngine {
             }
             // JSON / stream-json mode: emit result object at end of turn
             if (self.json_output || self.stream_json_output) && !full_text.is_empty() {
-                let result = serde_json::json!({
-                    "type": "result",
-                    "text": full_text,
-                    "tokens_in": response.usage.input_tokens,
-                    "tokens_out": response.usage.output_tokens,
-                });
-                println!("{}", result);
+                println!("{}", result_json(&full_text, &response.usage));
                 full_text.clear();
             }
 
@@ -1028,6 +1022,20 @@ impl QueryEngine {
     fn replay_user_messages(&self) -> bool {
         self.config.replay_user_messages
     }
+}
+
+/// The `-p --output-format json|stream-json` result object. `tokens_in`
+/// excludes prompt-cache reads and writes, as on the wire, so they are
+/// reported alongside: their sum is the full prompt size.
+fn result_json(text: &str, usage: &Usage) -> serde_json::Value {
+    serde_json::json!({
+        "type": "result",
+        "text": text,
+        "tokens_in": usage.input_tokens,
+        "tokens_out": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_input_tokens,
+        "cache_write_tokens": usage.cache_creation_input_tokens,
+    })
 }
 
 /// Per-call cost in USD, from the same price table as `/cost`.
@@ -2074,6 +2082,26 @@ mod permission_wiring_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tokens_in` excludes cache hits (OpenAI-compatible backends now
+    /// report them as cache reads), so without the cache fields a script
+    /// could not rebuild the prompt size.
+    #[test]
+    fn result_json_reports_cache_tokens() {
+        let usage = Usage {
+            input_tokens: 2_000,
+            output_tokens: 50,
+            cache_read_input_tokens: 8_000,
+            cache_creation_input_tokens: 300,
+        };
+        let v = result_json("hi", &usage);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v["tokens_in"], 2_000);
+        assert_eq!(v["tokens_out"], 50);
+        assert_eq!(v["cache_read_tokens"], 8_000);
+        assert_eq!(v["cache_write_tokens"], 300);
+    }
 
     /// `-c -p --no-session-persistence` never writes the history back, so
     /// a summary after the final turn would be billed and thrown away.
