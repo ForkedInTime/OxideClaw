@@ -1297,9 +1297,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         } => {
             // Plugin slash commands → invoke as a prompt so Claude calls
             // the matching MCP tool (e.g. ctx_doctor → mcp__…__ctx_doctor).
-            let is_connected = mcp_statuses.iter().any(|s| s.name == plugin);
-            if is_connected {
-                let prompt = plugin_command_prompt(&plugin, &command, &args);
+            if let Some(server) = plugin_server(mcp_statuses, &plugin) {
+                let prompt = plugin_command_prompt(&server.name, &command, &args);
                 app.entries.push(ChatEntry::user(input.clone()));
                 app.scroll_to_bottom();
                 app.start_loading();
@@ -2730,6 +2729,26 @@ fn plugin_command_prompt(plugin: &str, command: &str, args: &str) -> String {
     prompt
 }
 
+/// The connected server a `/plugin:command` names. Tab completion builds
+/// the slug from the sanitized tool prefix with `_` turned into `-`, so a
+/// server called `brave_search` (or `my.server`) is offered as
+/// `brave-search:` and never matched its real name exactly.
+fn plugin_server<'a>(
+    statuses: &'a [crate::mcp::types::McpServerStatus],
+    plugin: &str,
+) -> Option<&'a crate::mcp::types::McpServerStatus> {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    };
+    let want = norm(plugin);
+    statuses
+        .iter()
+        .find(|s| s.name == plugin)
+        .or_else(|| statuses.iter().find(|s| norm(&s.name) == want))
+}
+
 /// Commands that send a prompt to the model, mirroring the arms below that
 /// spawn `run_api_task` or the browse loop. /budget is checked against these
 /// before they run, as it is for typed messages.
@@ -2745,7 +2764,7 @@ fn starts_model_turn(
         | CommandAction::BrowserScreenshot
         | CommandAction::Browse { .. } => true,
         CommandAction::PluginCommand { plugin, .. } => {
-            mcp_statuses.iter().any(|s| &s.name == plugin)
+            plugin_server(mcp_statuses, plugin).is_some()
         }
         CommandAction::Unknown(_) => {
             parse_skill_invocation(input).is_some_and(|(name, _)| skills.contains_key(name))
@@ -2884,6 +2903,33 @@ mod budget_tests {
         assert!(budget_blocks(&mut app, "/summary"));
         assert_eq!(app.input.iter().collect::<String>(), "/summary");
         assert!(app.entries.last().unwrap().text.contains("not sending"));
+    }
+
+    /// Tab completion offers `brave_search` as `/brave-search:...`, which
+    /// then reported the connected server as "not active".
+    #[test]
+    fn completed_plugin_slug_finds_server_with_underscores() {
+        let status = |name: &str| crate::mcp::types::McpServerStatus {
+            name: name.into(),
+            transport: "stdio",
+            tool_count: 1,
+        };
+        let statuses = [status("brave_search"), status("my.server"), status("ctx")];
+        let found = |p: &str| plugin_server(&statuses, p).map(|s| s.name.as_str());
+        assert_eq!(found("brave-search"), Some("brave_search"));
+        assert_eq!(found("brave_search"), Some("brave_search"));
+        assert_eq!(found("my-server"), Some("my.server"));
+        assert_eq!(found("ctx"), Some("ctx"));
+        assert_eq!(found("gone"), None);
+
+        let skills = std::collections::HashMap::new();
+        let action = dispatch_action("/brave-search:brave-web-search rust");
+        assert!(starts_model_turn(
+            &action,
+            "/brave-search:brave-web-search rust",
+            &skills,
+            &statuses
+        ));
     }
 
     /// `/github:search_issues label:bug is:open` used to drop everything
