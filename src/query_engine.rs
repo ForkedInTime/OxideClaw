@@ -939,7 +939,9 @@ impl QueryEngine {
     pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
         self.session_id = Some(session_id);
         self.messages = messages;
-        self.history_saved = true;
+        // Nothing is written back under --no-session-persistence, so a
+        // post-final-turn summary would be a billed call nobody reads.
+        self.history_saved = !self.config.no_session_persistence;
     }
 
     /// The conversation so far, to save it.
@@ -2054,6 +2056,23 @@ mod permission_wiring_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-c -p --no-session-persistence` never writes the history back, so
+    /// a summary after the final turn would be billed and thrown away.
+    #[test]
+    fn resumed_history_without_persistence_is_not_summarised() {
+        let config = Config {
+            model: "ollama:test-model".into(),
+            no_session_persistence: true,
+            ..Config::default()
+        };
+        let mut engine = QueryEngine::new(config, Vec::new()).unwrap();
+        engine.resume_history("s".into(), Vec::new());
+        assert!(!engine.history_saved);
+        engine.config.no_session_persistence = false;
+        engine.resume_history("s".into(), Vec::new());
+        assert!(engine.history_saved);
+    }
 
     /// Sub-agents used to println! "Tool: ..." for every child tool call
     /// straight into the TUI / SDK / ACP stdout stream.

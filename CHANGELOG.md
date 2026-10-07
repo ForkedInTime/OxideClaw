@@ -181,8 +181,8 @@ Follow-up QA pass (medium-severity findings, 2026-10-07).
   before the answer (Claude 4.5+ default to 32k output tokens when
   `maxTokens` is unset); thinking off with max effort on Opus 5 no longer
   400s; `showThinkingSummaries` shows reasoning again. `-p`, sub-agents, SDK
-  and ACP honour `--thinking`, `--effort`, `--betas` and `--fallback-model`,
-  and retry overloads. A dropped connection mid-stream is retried, a
+  and ACP honour `--thinking`, `--effort` and `--betas` and retry
+  overloads; `-p` and sub-agents also honour `--fallback-model`. A dropped connection mid-stream is retried, a
   provider error mid-stream is reported instead of a truncated reply, and
   SSE keepalives no longer trip the stall timer. `/model` accepts Opus 5.5,
   Sonnet 5.5 and Opus 4.7/4.8, and switching to an unusable backend no
