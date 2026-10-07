@@ -105,7 +105,7 @@ impl TierHealth {
         self.0.lock().ok()?.get(model).cloned()
     }
 
-    fn set(&self, model: &str, health: Result<(), String>) {
+    pub(crate) fn set(&self, model: &str, health: Result<(), String>) {
         if let Ok(mut m) = self.0.lock() {
             m.insert(model.to_string(), health);
         }
@@ -136,13 +136,16 @@ impl TierHealth {
 /// Model assignments per complexity tier.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
-    /// Model for low-complexity tasks (default: claude-haiku-4-5)
+    /// Model for low-complexity tasks (default: claude-haiku-4-5, or the
+    /// session model when that is not a Claude model)
     pub low_model: String,
-    /// Model for medium-complexity tasks (default: claude-sonnet-5)
+    /// Model for medium-complexity tasks (default: claude-sonnet-5, or the
+    /// session model when that is not a Claude model)
     pub medium_model: String,
     /// Model for high-complexity tasks (default: whatever the user configured)
     pub high_model: String,
-    /// Model for super-high tasks needing 1M context (default: claude-opus-5)
+    /// Model for super-high tasks needing 1M context (default: claude-opus-5,
+    /// or the session model when that is not a Claude model)
     pub super_high_model: String,
     /// Whether the router is enabled
     pub enabled: bool,
@@ -151,6 +154,9 @@ pub struct RouterConfig {
     /// How long the model classifier may take before the heuristic answers.
     pub classifier_timeout: Duration,
     pub health: TierHealth,
+    /// Tiers set by settings.json or `/router <tier>`, by rank: these keep
+    /// their model when the session model changes.
+    pinned: [bool; 4],
 }
 
 impl Default for RouterConfig {
@@ -164,22 +170,39 @@ impl Default for RouterConfig {
             classifier: Classifier::Heuristic,
             classifier_timeout: CLASSIFIER_TIMEOUT,
             health: TierHealth::default(),
+            pinned: [false; 4],
         }
     }
 }
 
+/// The model a tier gets when nothing sets one. The Claude defaults apply
+/// to Claude sessions only: a local or OpenAI-compatible session keeps its
+/// own model on every unset tier, so turning the router on sends prompts to
+/// no provider the user did not name.
+pub fn default_tier_model(tier: Complexity, session_model: &str) -> String {
+    let defaults = RouterConfig::default();
+    if tier == Complexity::High
+        || crate::api::is_ollama_model(session_model)
+        || crate::api::is_openai_compat_model(session_model)
+    {
+        return session_model.to_string();
+    }
+    defaults.model_for(tier).to_string()
+}
+
 impl RouterConfig {
-    /// Create a new router config, inheriting the user's configured model as the high tier.
+    /// Create a new router config with every tier at its default for the
+    /// session model `user_model` (see [`default_tier_model`]).
     pub fn new(user_model: &str) -> Self {
-        Self {
-            high_model: user_model.to_string(),
-            ..Default::default()
+        let mut r = Self::default();
+        for tier in Complexity::ALL {
+            *r.model_mut(tier) = default_tier_model(tier, user_model);
         }
+        r
     }
 
     /// The router as settings.json and the defaults describe it: tiers the
-    /// settings leave out keep their default (the high tier is the
-    /// session model).
+    /// settings leave out keep their default for the session model.
     pub fn from_config(config: &Config) -> Self {
         let mut r = Self::new(&config.model);
         r.enabled = config.router_enabled;
@@ -207,12 +230,43 @@ impl RouterConfig {
         }
     }
 
-    pub fn set_model(&mut self, complexity: Complexity, model: String) {
+    fn model_mut(&mut self, complexity: Complexity) -> &mut String {
         match complexity {
-            Complexity::Low => self.low_model = model,
-            Complexity::Medium => self.medium_model = model,
-            Complexity::High => self.high_model = model,
-            Complexity::SuperHigh => self.super_high_model = model,
+            Complexity::Low => &mut self.low_model,
+            Complexity::Medium => &mut self.medium_model,
+            Complexity::High => &mut self.high_model,
+            Complexity::SuperHigh => &mut self.super_high_model,
+        }
+    }
+
+    /// Whether a turn can go to `tier`: not skipped this session and, if not
+    /// checked yet, its credential is there. A host not checked yet counts
+    /// as up.
+    pub fn may_route_to(&self, config: &Config, tier: Complexity) -> bool {
+        let model = self.model_for(tier);
+        if model.is_empty() {
+            return false;
+        }
+        match self.health.get(model) {
+            Some(verdict) => verdict.is_ok(),
+            None => model == config.model || config.has_credential_for(model),
+        }
+    }
+
+    /// Pin `complexity` to `model`: it no longer follows the session model.
+    pub fn set_model(&mut self, complexity: Complexity, model: String) {
+        self.pinned[complexity.rank()] = true;
+        *self.model_mut(complexity) = model;
+    }
+
+    /// The session model changed from `old` to `new` (`/model`): every tier
+    /// still on its default for `old` moves to its default for `new`. Tiers
+    /// set in settings.json or with `/router <tier>` stay.
+    pub fn follow_session_model(&mut self, old: &str, new: &str) {
+        for tier in Complexity::ALL {
+            if !self.pinned[tier.rank()] && self.model_for(tier) == default_tier_model(tier, old) {
+                *self.model_mut(tier) = default_tier_model(tier, new);
+            }
         }
     }
 }
@@ -1309,6 +1363,53 @@ mod tests {
             out.classifier_usage.is_some(),
             "a garbage answer is still billed"
         );
+    }
+
+    /// `routerEnabled` with no tiers on a local session must not start
+    /// sending its prompts to the Claude defaults: every unset tier is the
+    /// session model, so nothing is routed anywhere new and nothing is
+    /// skipped. Only a tier the user names crosses providers.
+    #[tokio::test]
+    async fn a_local_session_with_no_tiers_routes_nowhere_new() {
+        let (host, seen) = fake_chat::start(|_, _| Reply::Text("ok")).await;
+        let config = Config {
+            model: "ollama:qwen3-coder".into(),
+            ollama_host: host.clone(),
+            api_key: String::new(),
+            router_enabled: true,
+            ..Config::default()
+        };
+        let router = RouterConfig::from_config(&config);
+        assert!(router.enabled);
+        for tier in Complexity::ALL {
+            assert_eq!(router.model_for(tier), "ollama:qwen3-coder", "{tier}");
+        }
+        let client = session(&config);
+        for prompt in ["yes", "analyze the entire codebase for dead code"] {
+            let out = router.route(&config, &client, prompt, 0).await;
+            assert_eq!(out.route.unwrap().model, "ollama:qwen3-coder");
+            assert!(out.notices.is_empty(), "{:?}", out.notices);
+        }
+        assert!(seen.lock().unwrap().is_empty(), "no classifier call");
+
+        let compat = RouterConfig::new("groq:llama-3.3-70b-versatile");
+        assert_eq!(compat.low_model, "groq:llama-3.3-70b-versatile");
+        assert_eq!(compat.super_high_model, "groq:llama-3.3-70b-versatile");
+
+        // A named tier still crosses providers; the rest stay local.
+        let named = Config {
+            router_medium_model: Some("claude-sonnet-5".into()),
+            ..config
+        };
+        let r = RouterConfig::from_config(&named);
+        assert_eq!(r.medium_model, "claude-sonnet-5");
+        assert_eq!(r.low_model, "ollama:qwen3-coder");
+
+        // A Claude session keeps the Claude defaults.
+        let claude = RouterConfig::new("claude-opus-5");
+        assert_eq!(claude.low_model, "claude-haiku-4-5");
+        assert_eq!(claude.medium_model, "claude-sonnet-5");
+        assert_eq!(claude.high_model, "claude-opus-5");
     }
 
     /// A tier without its credential is never routed to; the turn takes the

@@ -605,6 +605,18 @@ impl Config {
         anyhow::anyhow!(msg)
     }
 
+    /// Whether [`Config::backend_for`] has a credential for `model`, checked
+    /// without building a client (Ollama needs none).
+    pub fn has_credential_for(&self, model: &str) -> bool {
+        if crate::api::is_ollama_model(model) {
+            true
+        } else if crate::api::is_openai_compat_model(model) {
+            crate::api::openai_compat::has_credential(model)
+        } else {
+            !self.api_key.is_empty()
+        }
+    }
+
     /// A client for `model` with this config's credentials: the Anthropic
     /// key or OAuth token, the Ollama host, the provider's own key variable.
     pub fn backend_for(&self, model: &str) -> anyhow::Result<crate::api::ApiBackend> {
@@ -1155,8 +1167,9 @@ impl Config {
         self.disable_skill_shell_execution =
             settings.disable_skill_shell_execution.unwrap_or(false);
 
-        // Smart model router settings. The `router` block wins over the
-        // flat `router*` keys it replaces.
+        // Smart model router settings. Within each settings file the
+        // `router` block wins over the flat `router*` keys it replaces;
+        // `Settings::merge` folds them per file, so a later file still wins.
         self.router_budget = settings.router_budget;
         let block = settings.router.clone().unwrap_or_default();
         // Tier models go to the API verbatim, so "haiku" must become a real id.
@@ -3534,6 +3547,20 @@ mod flag_settings_retarget_tests {
         assert_eq!(both.router_low_model.as_deref(), Some("ollama:b"));
         assert_eq!(both.router_medium_model.as_deref(), Some("ollama:a"));
         assert_eq!(both.router_super_high_model.as_deref(), Some("ollama:c"));
+        // A later file's flat keys beat an earlier file's block: the block
+        // wins only within its own file.
+        let later = router_config(
+            r#"{"router": {"enabled": true, "low": "ollama:a", "high": "ollama:h"}}"#,
+            Some(r#"{"routerEnabled": false, "routerLowModel": "haiku"}"#),
+        );
+        assert!(!later.router_enabled);
+        assert_eq!(later.router_low_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(later.router_high_model.as_deref(), Some("ollama:h"));
+        let same_file = router_config(
+            r#"{"routerLowModel": "haiku", "router": {"low": "ollama:b"}}"#,
+            None,
+        );
+        assert_eq!(same_file.router_low_model.as_deref(), Some("ollama:b"));
         let medium = router_config(r#"{"router": {"medium": "ollama:m"}}"#, None);
         assert_eq!(medium.router_medium_model.as_deref(), Some("ollama:m"));
 

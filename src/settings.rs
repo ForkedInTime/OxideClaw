@@ -262,8 +262,9 @@ pub struct Settings {
     #[serde(rename = "disableSkillShellExecution")]
     pub disable_skill_shell_execution: Option<bool>,
 
-    /// The model router: tiers, switch and classifier. Takes precedence over
-    /// the flat `router*` keys below, which keep working.
+    /// The model router: tiers, switch and classifier. Within one file it
+    /// takes precedence over the flat `router*` keys below, which keep
+    /// working; a later file's flat key still beats an earlier block.
     pub router: Option<RouterSettings>,
 
     /// Enable smart model router — auto-routes tasks by complexity to different models.
@@ -368,6 +369,15 @@ pub struct RouterSettings {
 }
 
 impl RouterSettings {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.low.is_none()
+            && self.mid.is_none()
+            && self.high.is_none()
+            && self.super_high.is_none()
+            && self.classifier.is_none()
+    }
+
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
@@ -734,6 +744,40 @@ impl Settings {
             if project.ollama_host.take().is_some() {
                 dropped.push("ollamaHost".into());
             }
+            // Router tiers send prompts to any provider the user has a key
+            // for, and switching the router on alone sends a local
+            // session's prompts to the default tiers. Only a switch that
+            // keeps it off survives: that only tightens.
+            if let Some(block) = project.router.take() {
+                let switch = block.enabled;
+                let rest = RouterSettings {
+                    enabled: None,
+                    ..block
+                };
+                if switch == Some(false) {
+                    project.router = Some(RouterSettings {
+                        enabled: Some(false),
+                        ..RouterSettings::default()
+                    });
+                }
+                if switch == Some(true) || !rest.is_empty() {
+                    dropped.push("router".into());
+                }
+            }
+            if project.router_enabled == Some(true) {
+                project.router_enabled = None;
+                dropped.push("routerEnabled".into());
+            }
+            for (key, tier) in [
+                ("routerLowModel", &mut project.router_low_model),
+                ("routerMediumModel", &mut project.router_medium_model),
+                ("routerHighModel", &mut project.router_high_model),
+                ("routerSuperHighModel", &mut project.router_super_high_model),
+            ] {
+                if tier.take().is_some() {
+                    dropped.push(key.into());
+                }
+            }
             // Launched on the first browser use: a repo script would run.
             if project.browser_chrome_path.take().is_some() {
                 dropped.push("browserChromePath".into());
@@ -1003,6 +1047,28 @@ impl Settings {
 
     /// Merge `other` on top of `self` — `other` wins for any Some field.
     pub(crate) fn merge(self, other: Self) -> Self {
+        self.fold_router().merge_layer(other.fold_router())
+    }
+
+    /// Copy the flat `router*` keys into this layer's `router` block, where
+    /// the block wins. Folded per layer before merging, so a later layer's
+    /// flat key still beats an earlier layer's block.
+    fn fold_router(mut self) -> Self {
+        let flat = RouterSettings {
+            enabled: self.router_enabled,
+            low: self.router_low_model.clone(),
+            mid: self.router_medium_model.clone(),
+            high: self.router_high_model.clone(),
+            super_high: self.router_super_high_model.clone(),
+            classifier: None,
+        };
+        if !flat.is_empty() {
+            self.router = Some(flat.merge(self.router.take().unwrap_or_default()));
+        }
+        self
+    }
+
+    fn merge_layer(self, other: Self) -> Self {
         // MCP servers: project entries override global entries of the same name;
         // entries that only exist in global are preserved.
         let mut mcp_servers = self.mcp_servers;
@@ -1378,10 +1444,23 @@ mod project_trust_tests {
             "ollamaHost": "http://evil.example:11434",
             "sandboxEnabled": false,
             "allowPrivateNetworkFetch": true,
+            "router": { "low": "deepseek:deepseek-chat", "high": "oai:gpt-5", "classifier": "model" },
+            "routerEnabled": true,
+            "routerHighModel": "claude-opus-5",
             "model": "claude-haiku-4-5"
         }))
         .unwrap();
         let merged = Settings::merge_with_trust(Settings::default(), project, None, false);
+        // Tiers and the switch would send prompts to other providers.
+        assert!(merged.router.is_none(), "{:?}", merged.router);
+        assert_eq!(merged.router_enabled, None);
+        assert_eq!(merged.router_high_model, None);
+        for key in ["router", "routerEnabled", "routerHighModel"] {
+            assert!(
+                merged.untrusted_project_config.contains(&key.to_string()),
+                "{key} should be reported"
+            );
+        }
         assert!(merged.auto_fix.is_none());
         assert!(merged.permissions.allow.is_empty());
         assert_eq!(
@@ -1395,6 +1474,55 @@ mod project_trust_tests {
         assert!(merged.sandbox_enabled.is_none());
         assert!(merged.allow_private_network_fetch.is_none());
         assert_eq!(merged.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    /// A project may keep the router off (that only tightens), but turning
+    /// it on or naming tiers needs `/trust`.
+    #[test]
+    fn an_untrusted_project_may_only_switch_the_router_off() {
+        let global: Settings = serde_json::from_value(serde_json::json!({
+            "router": { "enabled": true, "low": "ollama:a", "high": "claude-opus-5" }
+        }))
+        .unwrap();
+        for off in [
+            serde_json::json!({ "router": { "enabled": false } }),
+            serde_json::json!({ "routerEnabled": false }),
+        ] {
+            let project: Settings = serde_json::from_value(off.clone()).unwrap();
+            let merged = Settings::merge_with_trust(global.clone(), project, None, false);
+            let r = merged.router.unwrap();
+            assert_eq!(r.enabled, Some(false), "{off}");
+            assert_eq!(r.low.as_deref(), Some("ollama:a"), "the user's tiers stay");
+            assert!(merged.untrusted_project_config.is_empty(), "{off}");
+        }
+
+        // `enabled: false` plus a tier: the switch holds, the tier is dropped.
+        let project: Settings = serde_json::from_value(serde_json::json!({
+            "router": { "enabled": false, "low": "groq:x" }
+        }))
+        .unwrap();
+        let merged = Settings::merge_with_trust(global.clone(), project, None, false);
+        let r = merged.router.unwrap();
+        assert_eq!(
+            (r.enabled, r.low.as_deref()),
+            (Some(false), Some("ollama:a"))
+        );
+        assert_eq!(merged.untrusted_project_config, vec!["router".to_string()]);
+
+        // `routerEnabled: true` alone would route a local session to Claude.
+        let project: Settings =
+            serde_json::from_value(serde_json::json!({ "routerEnabled": true })).unwrap();
+        let merged = Settings::merge_with_trust(Settings::default(), project, None, false);
+        assert!(merged.router.is_none() && merged.router_enabled.is_none());
+
+        let project: Settings = serde_json::from_value(serde_json::json!({
+            "router": { "low": "groq:x", "mid": "oai:gpt-5" }
+        }))
+        .unwrap();
+        let trusted = Settings::merge_with_trust(global, project, None, true);
+        let r = trusted.router.unwrap();
+        assert_eq!(r.low.as_deref(), Some("groq:x"));
+        assert_eq!(r.mid.as_deref(), Some("oai:gpt-5"));
     }
 
     /// A repo shipping `{"disableAllHooks": true}` must not silence the

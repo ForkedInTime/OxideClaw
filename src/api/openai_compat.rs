@@ -954,6 +954,65 @@ fn provider_api_key(provider: &ProviderDef, env: impl Fn(&str) -> Option<String>
         .unwrap_or_default()
 }
 
+/// The provider, base URL and key `model` would use, or why it cannot be
+/// used: an unknown prefix, `openai-compat:` without `OPENAI_BASE_URL`, or a
+/// cloud provider without its key variable.
+fn resolve_endpoint(
+    model: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(&'static ProviderDef, String, String)> {
+    let (provider, _bare) = parse_provider_model(model)
+        .ok_or_else(|| anyhow!("Unknown provider prefix in '{model}'"))?;
+
+    // Resolve base URL
+    let base_url = if provider.prefix == "openai-compat" {
+        // Generic escape hatch: MUST have OPENAI_BASE_URL set
+        env("OPENAI_BASE_URL").ok_or_else(|| {
+            anyhow!(
+                "openai-compat: requires OPENAI_BASE_URL env var.\n\
+                     Set it to your endpoint, e.g.:\n  \
+                     export OPENAI_BASE_URL=http://localhost:8080/v1"
+            )
+        })?
+    } else if provider.prefix == "lmstudio" {
+        // LM Studio: allow override via LM_STUDIO_HOST
+        env("LM_STUDIO_HOST").unwrap_or_else(|| provider.base_url.to_string())
+    } else {
+        provider.base_url.to_string()
+    };
+    // Requests append "/chat/completions" (or "/responses"); a trailing
+    // slash made "//" and a 404 on servers that route on the exact path.
+    let base_url = base_url.trim_end_matches('/').to_string();
+
+    let api_key = provider_api_key(provider, &env);
+
+    // Warn if cloud provider has no key (local providers are fine without).
+    // openai-compat is whatever endpoint the user pointed it at, often a
+    // keyless vLLM/llama.cpp box on the LAN; no key just means no
+    // Authorization header.
+    if api_key.is_empty()
+        && !provider.key_env.is_empty()
+        && provider.prefix != "openai-compat"
+        && !base_url.starts_with("http://localhost")
+        && !base_url.starts_with("http://127.0.0.1")
+    {
+        return Err(anyhow!(
+            "{}: no API key found.\n  Set {} in your environment.\n  \
+                 Example: export {}=your-key-here",
+            provider.name,
+            provider_key_envs(provider).join(" or "),
+            provider.key_env
+        ));
+    }
+    Ok((provider, base_url, api_key))
+}
+
+/// Whether `model`'s provider has what it needs to be called (base URL and
+/// key), without building a client.
+pub fn has_credential(model: &str) -> bool {
+    resolve_endpoint(model, |k| std::env::var(k).ok()).is_ok()
+}
+
 impl OpenAiCompatClient {
     /// Create a client for a specific provider prefix + model string.
     /// Resolves base_url from the provider registry and API key from env vars.
@@ -967,49 +1026,7 @@ impl OpenAiCompatClient {
         api: OpenAiApi,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
-        let (provider, _bare) = parse_provider_model(model)
-            .ok_or_else(|| anyhow!("Unknown provider prefix in '{model}'"))?;
-
-        // Resolve base URL
-        let base_url = if provider.prefix == "openai-compat" {
-            // Generic escape hatch: MUST have OPENAI_BASE_URL set
-            env("OPENAI_BASE_URL").ok_or_else(|| {
-                anyhow!(
-                    "openai-compat: requires OPENAI_BASE_URL env var.\n\
-                     Set it to your endpoint, e.g.:\n  \
-                     export OPENAI_BASE_URL=http://localhost:8080/v1"
-                )
-            })?
-        } else if provider.prefix == "lmstudio" {
-            // LM Studio: allow override via LM_STUDIO_HOST
-            env("LM_STUDIO_HOST").unwrap_or_else(|| provider.base_url.to_string())
-        } else {
-            provider.base_url.to_string()
-        };
-        // Requests append "/chat/completions" (or "/responses"); a trailing
-        // slash made "//" and a 404 on servers that route on the exact path.
-        let base_url = base_url.trim_end_matches('/').to_string();
-
-        let api_key = provider_api_key(provider, &env);
-
-        // Warn if cloud provider has no key (local providers are fine without).
-        // openai-compat is whatever endpoint the user pointed it at, often a
-        // keyless vLLM/llama.cpp box on the LAN; no key just means no
-        // Authorization header.
-        if api_key.is_empty()
-            && !provider.key_env.is_empty()
-            && provider.prefix != "openai-compat"
-            && !base_url.starts_with("http://localhost")
-            && !base_url.starts_with("http://127.0.0.1")
-        {
-            return Err(anyhow!(
-                "{}: no API key found.\n  Set {} in your environment.\n  \
-                 Example: export {}=your-key-here",
-                provider.name,
-                provider_key_envs(provider).join(" or "),
-                provider.key_env
-            ));
-        }
+        let (provider, base_url, api_key) = resolve_endpoint(model, env)?;
 
         let extra_headers: Vec<(String, String)> = provider
             .extra_headers

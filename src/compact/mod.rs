@@ -47,10 +47,13 @@ pub fn thresholds(window: u64) -> (u64, u64, u64) {
 
 /// The window to compact against.
 ///
-/// With the model router on it is the largest tier's: each turn goes to a
-/// tier whose window holds the history (or escalates to one on overflow),
-/// so compacting for the smallest tier would throw away context a 1M model
-/// never needed trimmed. With the phase router on it is the smallest among
+/// With the model router on it is the largest usable tier's: each turn goes
+/// to a tier whose window holds the history (or escalates to one on
+/// overflow), so compacting for the smallest tier would throw away context a
+/// 1M model never needed trimmed. A tier skipped this session (no
+/// credential, host down) never takes a turn, so its window does not count;
+/// with none usable it is the session model's. With the phase router on it
+/// is the smallest among
 /// the configured model and every phase model, since phase routing has no
 /// such fallback: a history that is fine on a 1M model is a prompt-too-long
 /// 400 once a phase routes to Haiku.
@@ -66,9 +69,8 @@ pub fn compaction_window(
     let mut w = match router.filter(|r| r.enabled) {
         Some(r) => crate::router::Complexity::ALL
             .iter()
-            .map(|&t| r.model_for(t))
-            .filter(|m| !m.is_empty())
-            .map(window)
+            .filter(|&&t| r.may_route_to(config, t))
+            .map(|&t| window(r.model_for(t)))
             .max()
             .unwrap_or_else(|| window(&config.model)),
         None => window(&config.model),
@@ -567,7 +569,10 @@ mod tests {
 
     #[test]
     fn routed_sessions_compact_for_the_largest_tier() {
-        let cfg = config();
+        let cfg = Config {
+            api_key: "sk-ant-test".into(),
+            ..config()
+        };
         assert_eq!(compaction_window(&cfg, None, None), 1_000_000);
 
         let mut router = crate::router::RouterConfig::new(&cfg.model);
@@ -594,6 +599,41 @@ mod tests {
         );
         // Headless and SDK sessions never phase-route.
         assert_eq!(compaction_window(&phased, None, None), 1_000_000);
+    }
+
+    /// Every turn goes to the Ollama tier when the 1M Claude tier has no
+    /// key or was skipped, so compacting at 85% of 1M let `-p` and SDK
+    /// sessions overflow the 128k model with no tier to escalate to.
+    #[test]
+    fn skipped_tiers_do_not_count_toward_the_window() {
+        let mut cfg = Config {
+            model: "ollama:llama3".into(),
+            ..config()
+        };
+        let mut router = crate::router::RouterConfig::new(&cfg.model);
+        router.enabled = true;
+        router.medium_model = "claude-sonnet-5".into();
+        assert_eq!(
+            compaction_window(&cfg, Some(&router), None),
+            128_000,
+            "no Anthropic key: the Claude tier never takes a turn"
+        );
+
+        cfg.api_key = "sk-ant-test".into();
+        assert_eq!(compaction_window(&cfg, Some(&router), None), 1_000_000);
+        router
+            .health
+            .set("claude-sonnet-5", Err("not reachable".into()));
+        assert_eq!(
+            compaction_window(&cfg, Some(&router), None),
+            128_000,
+            "skipped for the session"
+        );
+
+        // Nothing usable at all: the session model's own window.
+        router.health.set("ollama:llama3", Err("down".into()));
+        cfg.model = "ollama:gemma3:1b".into();
+        assert_eq!(compaction_window(&cfg, Some(&router), None), 32_768);
     }
 
     #[test]

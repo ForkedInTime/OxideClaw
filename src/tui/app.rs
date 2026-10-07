@@ -890,12 +890,11 @@ impl App {
 
     /// Update the model and its cached short form together.
     pub fn set_model(&mut self, model: String) {
-        // The router's high tier defaults to the active model; left alone it
+        // The router's high tier defaults to the active model (every unset
+        // tier does on a local or OpenAI-compatible session); left alone it
         // kept routing hard prompts to the startup model after /model. A tier
-        // pinned to something else (routerHighModel, /router high) stays.
-        if self.router.high_model == self.model {
-            self.router.high_model = model.clone();
-        }
+        // pinned to something else (router.high, /router high) stays.
+        self.router.follow_session_model(&self.model, &model);
         self.model_short = pretty_model_name(&model);
         self.model = model;
     }
@@ -2147,6 +2146,28 @@ mod set_model_router_tests {
             app.router.model_for(crate::router::Complexity::High),
             "claude-sonnet-5"
         );
+    }
+
+    /// A local session's unset tiers are the session model, so after
+    /// /model to Claude they become the Claude defaults, and back again.
+    #[test]
+    fn unset_tiers_follow_a_switch_between_providers() {
+        use crate::router::Complexity;
+        let mut app = App::new("ollama:qwen3-coder", std::path::Path::new("/tmp"));
+        app.router
+            .set_model(Complexity::Medium, "groq:llama-3.3-70b".into());
+        for t in [Complexity::Low, Complexity::High, Complexity::SuperHigh] {
+            assert_eq!(app.router.model_for(t), "ollama:qwen3-coder");
+        }
+        app.set_model("claude-sonnet-5".into());
+        assert_eq!(app.router.low_model, "claude-haiku-4-5");
+        assert_eq!(app.router.medium_model, "groq:llama-3.3-70b", "pinned");
+        assert_eq!(app.router.high_model, "claude-sonnet-5");
+        assert_eq!(app.router.super_high_model, "claude-opus-5");
+        app.set_model("ollama:llama3".into());
+        assert_eq!(app.router.low_model, "ollama:llama3");
+        assert_eq!(app.router.medium_model, "groq:llama-3.3-70b");
+        assert_eq!(app.router.super_high_model, "ollama:llama3");
     }
 
     #[test]
