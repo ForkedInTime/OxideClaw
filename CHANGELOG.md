@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Full QA pass (2026-10-05). Each item below was reproduced or traced end to end.
 
+- **Dependency advisories cleared (2026-10).** `rustls` 0.23.37 → 0.23.45
+  (RUSTSEC-2026-0285). `lru` 0.12.5 → 0.18.5 (RUSTSEC-2026-0002, -0253),
+  which needed `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29. Building
+  from source (`cargo install oxideclaw`) now needs Rust 1.88 or newer;
+  `rust-version` is set in Cargo.toml, so older toolchains get a clear error.
 - **Cost and `/budget`.** The TUI billed only the last API call of a turn,
   so a turn with N tool round-trips cost about 1/N of what was shown.
   Every call is now recorded, prompt-cache reads/writes are priced, Opus

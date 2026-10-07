@@ -2,8 +2,9 @@
 name = "oxideclaw"
 version = "0.4.0"
 edition = "2024"
-# let-chains and several locked deps (image, time, zip, self_update) need 1.88;
-# README.md quotes this number and scripts/readme-lint.sh checks it.
+# let-chains and several locked deps (ratatui 0.30, image, time, zip,
+# self_update) need 1.88; README.md quotes this number and
+# scripts/readme-lint.sh checks it.
 rust-version = "1.88"
 description = "Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning. Claude, Ollama, and OpenAI-compatible backends."
 license = "Apache-2.0"
