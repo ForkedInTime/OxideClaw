@@ -38,12 +38,12 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 - **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `oxideclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
 - **ACP `session/load` + editor HTTP MCP (2026-10-07)** — ACP sessions are saved after each turn in the shared sessions dir; `session/load` replays one (or a TUI session) as `session/update`s and continues it. `http` (Streamable HTTP) and `sse` (legacy HTTP+SSE) MCP servers from the editor start with its headers, used literally.
 - **Agent Skills (2026-10-07)** — Standard `<name>/SKILL.md` layout from `.agents/skills/`, `.oxideclaw/skills/`, `.claude/skills/`, the config dir and `~/.claude/skills/`, first match winning; name + description load up front, the body on use. Flat `.md` skills still load outside `.agents/skills/`.
+- **MCP 2026-07-28 (2026-10-07)** — Stateless revision, found with a `server/discover` probe; older servers get the `initialize` handshake (`2025-06-18` offered, `2024-11-05` still works).
 
 Also shipped: the auto-fix trust gate (lint/test runners run only in `/trust`ed projects), index hygiene (the walk honours gitignore rules, auto-indexing needs a git work tree, the index lives in the cache dir) and the config namespace (see XDG above).
 
 ### NEXT UP
-1. **MCP 2026-07-28** — Move off the `2024-11-05` protocol revision.
-2. **Task-success benchmark** — Measure finished tasks, not just startup time.
+1. **Task-success benchmark** — Measure finished tasks, not just startup and time to first frame.
 
 ### THE PITCH
 "A ~19 MB Rust binary that indexes your repo, caps your spend, and works offline with Ollama. No account, no gateway, no telemetry: your keys go straight to your provider."
