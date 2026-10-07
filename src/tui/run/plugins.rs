@@ -25,37 +25,36 @@ pub(super) async fn upgrade_check_task(tx: tokio::sync::mpsc::UnboundedSender<Ap
     let _ = tx.send(AppEvent::UpgradeCheckDone { message });
 }
 
-/// `v0.4.1` / `0.4.1` / `0.4.1-rc1` -> (0, 4, 1); None for anything else.
-fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
-    let core = v.trim().trim_start_matches('v');
-    let core = core.split(['-', '+']).next()?;
-    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
-    let v = (parts.next()??, parts.next()??, parts.next()??);
-    parts.next().is_none().then_some(v)
-}
-
 /// The /upgrade report. No commit hash: the only one available at runtime
-/// was the user's own project HEAD, not this binary's. The update steps are
-/// the install.sh / release route most users installed through, not a
-/// developer's source checkout.
+/// was the user's own project HEAD, not this binary's. "Newer" is decided by
+/// the same comparator as the daily notice, and the update route is the same
+/// verified self-updater it names (install.sh does not run on Windows).
 fn upgrade_message(current: &str, latest: Option<&str>) -> String {
     let status = match latest {
         None => "Could not reach GitHub — check your connection.".to_string(),
-        Some(tag) => match (parse_version(current), parse_version(tag)) {
-            (Some(c), Some(l)) if l > c => format!("Update available: v{current} → {tag}"),
-            (Some(c), Some(l)) if l == c => "You are on the latest release.".to_string(),
-            (Some(_), Some(_)) => format!("This build is newer than the latest release ({tag})."),
-            _ => format!("Latest release: {tag}"),
-        },
+        Some(tag) => {
+            let l = tag.trim().trim_start_matches('v');
+            if crate::update_check::is_newer(l, current) {
+                format!("Update available: v{current} → {tag}")
+            } else {
+                match self_update::version::cmp_versions(current, l) {
+                    Ok(std::cmp::Ordering::Equal) => "You are on the latest release.".to_string(),
+                    Ok(std::cmp::Ordering::Greater) => {
+                        format!("This build is newer than the latest release ({tag}).")
+                    }
+                    _ => format!("Latest release: {tag}"),
+                }
+            }
+        }
     };
     format!(
         "Upgrade Check\n\n\
          oxideclaw v{current}\n\
          {status}\n\n\
-         To update:\n\
-           curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash\n\
+         To update: oxideclaw update\n\
          or download a binary from https://github.com/ForkedInTime/OxideClaw/releases\n\
-         (from a source checkout: git pull && cargo build --release)"
+         (Linux/macOS: curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash;\n\
+         from a source checkout: git pull && cargo build --release)"
     )
 }
 
@@ -823,7 +822,7 @@ mod upgrade_tests {
             newer.contains("Update available: v0.4.0 → v0.4.1"),
             "{newer}"
         );
-        assert!(newer.contains("install.sh"), "{newer}");
+        assert!(newer.contains("oxideclaw update"), "{newer}");
         assert!(!newer.contains("~/Projects"), "{newer}");
 
         let same = upgrade_message("0.4.0", Some("v0.4.0"));
@@ -836,8 +835,29 @@ mod upgrade_tests {
 
         assert!(upgrade_message("0.4.0", None).contains("Could not reach GitHub"));
         assert!(upgrade_message("0.4.0", Some("nightly")).contains("Latest release: nightly"));
-        assert_eq!(parse_version("v1.2.3-rc1"), Some((1, 2, 3)));
-        assert_eq!(parse_version("1.2"), None);
+    }
+
+    /// /upgrade and the daily notice must agree: a pre-release build of the
+    /// latest version is behind it, and the update route is the self-updater.
+    #[test]
+    fn upgrade_report_agrees_with_the_daily_notice() {
+        let rc = upgrade_message("0.5.0-rc.1", Some("v0.5.0"));
+        assert!(
+            crate::update_check::is_newer("0.5.0", "0.5.0-rc.1"),
+            "notice comparator"
+        );
+        assert!(
+            rc.contains("Update available: v0.5.0-rc.1 → v0.5.0"),
+            "{rc}"
+        );
+        assert!(rc.contains("To update: oxideclaw update"), "{rc}");
+
+        let same = upgrade_message("0.5.0", Some("v0.5.0"));
+        assert!(same.contains("You are on the latest release."), "{same}");
+
+        // A pre-release tag never counts as an update, as in the notice.
+        let pre = upgrade_message("0.4.0", Some("v0.5.0-rc.1"));
+        assert!(!pre.contains("Update available"), "{pre}");
     }
 }
 
