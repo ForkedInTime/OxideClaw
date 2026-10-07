@@ -14,8 +14,8 @@ pub(super) fn cmd_status(ctx: &CommandContext) -> CommandAction {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "not a git repo".into());
 
-    let api_key_status = if ctx.config.api_key.len() >= 4 {
-        format!("set ({}...)", &ctx.config.api_key[..4])
+    let api_key_status = if ctx.config.api_key.chars().count() >= 4 {
+        format!("set ({}...)", key_prefix(&ctx.config.api_key))
     } else if !ctx.config.api_key.is_empty() {
         "set".into()
     } else {
@@ -45,6 +45,13 @@ pub(super) fn cmd_status(ctx: &CommandContext) -> CommandAction {
         },
     );
     CommandAction::Message(text)
+}
+
+/// First four characters of the API key. Chars, not bytes: a byte slice
+/// panics (and `panic = "abort"` kills the TUI) when a pasted key has a
+/// multi-byte character such as a smart quote near the start.
+fn key_prefix(key: &str) -> String {
+    key.chars().take(4).collect()
 }
 
 pub(super) fn cmd_cost(ctx: &CommandContext) -> CommandAction {
@@ -432,10 +439,7 @@ pub(super) fn cmd_env(ctx: &CommandContext) -> CommandAction {
         if ctx.config.api_key.is_empty() {
             "not set".to_string()
         } else {
-            format!(
-                "{}...",
-                &ctx.config.api_key[..4.min(ctx.config.api_key.len())]
-            )
+            format!("{}...", key_prefix(&ctx.config.api_key))
         }
     ));
 
@@ -593,6 +597,22 @@ mod status_command_tests {
             CommandAction::Message(m) => m,
             _ => panic!("expected a message"),
         }
+    }
+
+    /// A pasted key with a smart quote in its first four bytes made the
+    /// byte slice panic, which aborts the whole process.
+    #[test]
+    fn status_and_env_handle_a_non_ascii_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: "sk-\u{201c}abcdef".into(),
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let status = with_ctx(&config, |_| {}, |c| message(cmd_status(c)));
+        assert!(status.contains("set (sk-\u{201c}...)"), "{status}");
+        let env = with_ctx(&config, |_| {}, |c| message(cmd_env(c)));
+        assert!(env.contains("ANTHROPIC_API_KEY: sk-\u{201c}..."), "{env}");
     }
 
     /// A first turn stopped by /budget or Esc, or any spend before /clear,
