@@ -154,8 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently.
 - **Router settings from an untrusted project are ignored.** The `router`
   block, `routerEnabled: true` and the `router*Model` keys in a project's
-  `.claude/settings.json` decide which provider gets your prompts, so they
-  apply only after `/trust`; a project can still switch the router off.
+  `.claude/settings.json` apply only after `/trust`; a project can still
+  switch the router off, and its `routerBudget` can only lower yours.
 - **`oai:` uses OpenAI's Responses API.** Requests go to `/v1/responses`
   with `store: false`, so nothing is kept on OpenAI's side. On reasoning
   models (o-series, GPT-5 and later, Codex) the encrypted reasoning behind
@@ -718,10 +718,10 @@ Low-severity QA pass (2026-10-07).
 - **Untrusted repositories run no code through auto-fix**, language
   servers included, and gitignored files are never indexed, so secrets
   kept out of git never reach a model (see Changed).
-- **Untrusted projects cannot choose your provider.** Router tiers,
+- **Untrusted projects cannot set up the router.** Router tiers,
   `enabled: true` and the classifier in an untrusted project's
-  `.claude/settings.json` are ignored until `/trust`, so a cloned repo
-  cannot send your prompts to a model it picked.
+  `.claude/settings.json` are ignored until `/trust`, and its
+  `routerBudget` may lower your session budget but not raise it.
 - **Session files are owner-only.** Transcripts hold your prompts and
   tool output, so session files are now created 0600 in 0700
   directories, imported Claude Code sessions included.

@@ -318,7 +318,7 @@ The router starts on once two or more tiers are set in the `router` block. `"ena
 
 On a local or OpenAI-compatible session, only the tiers you name go to another provider, so switching the router on never sends prompts somewhere you did not choose. Unset tiers follow `/model`; tiers set in settings.json or with `/router <tier>` stay.
 
-Tiers, `enabled: true` and the classifier in a project's `.claude/settings.json` apply only once the project is `/trust`ed, since they decide which provider gets your prompts. An untrusted project can still switch the router off.
+Tiers, `enabled: true` and the classifier in a project's `.claude/settings.json` apply only once the project is `/trust`ed. An untrusted project can still switch the router off, and its `routerBudget` may lower your budget but not raise it. This covers the router only: a project's `model` and `phaseRouter` settings still apply untrusted.
 
 Compaction measures the history against the largest window among the tiers a turn can still go to; tiers skipped for the session or without a credential do not count, and with none left the session model's window applies. Inside a turn, once the tier is picked, it measures against that tier's window: the tier is picked once per prompt, and Ollama truncates an overflow silently rather than failing over.
 
@@ -565,7 +565,7 @@ Earlier versions accepted `auto-edit` (then the default) and `full-auto` but pro
 | `autonomy` | `suggest` / `ask` / `auto-edit` / `full-auto` | `ask` | What runs without a permission prompt; see [Autonomy Modes](#autonomy-modes) |
 | `router` | `{ "low", "mid", "high", "superHigh", "enabled", "classifier" }` | unset | The [smart model router](#smart-model-router): a model per tier (any provider), `enabled` (unset: on once two tiers are set) and `classifier` (`heuristic` or `model`) |
 | `routerEnabled` | `true` / `false` | unset | Older form of `router.enabled` |
-| `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`) |
+| `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`); an untrusted project's may only lower yours |
 | `routerLowModel` | any model name | `claude-haiku-4-5` (your `model` on a non-Claude session) | Older form of `router.low` |
 | `routerMediumModel` | any model name | `claude-sonnet-5` (your `model` on a non-Claude session) | Older form of `router.mid` |
 | `routerHighModel` | any model name | your `model` | Older form of `router.high` |

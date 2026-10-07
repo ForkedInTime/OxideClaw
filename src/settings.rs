@@ -792,6 +792,17 @@ impl Settings {
                 project.router_enabled = None;
                 dropped.push("routerEnabled".into());
             }
+            // A budget is a cap: a project may add or lower it, never raise it.
+            if let Some(b) = project.router_budget {
+                let tightens = match global.router_budget {
+                    None => b.is_finite() && b >= 0.0,
+                    Some(g) => b <= g,
+                };
+                if !tightens {
+                    project.router_budget = None;
+                    dropped.push("routerBudget".into());
+                }
+            }
             for (key, tier) in [
                 ("routerLowModel", &mut project.router_low_model),
                 ("routerMediumModel", &mut project.router_medium_model),
@@ -1553,6 +1564,34 @@ mod project_trust_tests {
         let r = trusted.router.unwrap();
         assert_eq!(r.low.as_deref(), Some("groq:x"));
         assert_eq!(r.mid.as_deref(), Some("oai:gpt-5"));
+
+        // The session budget: an untrusted project may lower it, not raise it.
+        let capped: Settings =
+            serde_json::from_value(serde_json::json!({ "routerBudget": 5.0 })).unwrap();
+        let raise: Settings =
+            serde_json::from_value(serde_json::json!({ "routerBudget": 1000000 })).unwrap();
+        let merged = Settings::merge_with_trust(capped.clone(), raise.clone(), None, false);
+        assert_eq!(merged.router_budget, Some(5.0));
+        assert_eq!(
+            merged.untrusted_project_config,
+            vec!["routerBudget".to_string()]
+        );
+        let merged = Settings::merge_with_trust(capped.clone(), raise, None, true);
+        assert_eq!(merged.router_budget, Some(1_000_000.0), "trusted");
+        let lower: Settings =
+            serde_json::from_value(serde_json::json!({ "routerBudget": 1.0 })).unwrap();
+        let merged = Settings::merge_with_trust(capped, lower, None, false);
+        assert_eq!(merged.router_budget, Some(1.0));
+        assert!(merged.untrusted_project_config.is_empty());
+        let added: Settings =
+            serde_json::from_value(serde_json::json!({ "routerBudget": 2.0 })).unwrap();
+        let merged = Settings::merge_with_trust(Settings::default(), added, None, false);
+        assert_eq!(
+            merged.router_budget,
+            Some(2.0),
+            "a cap where there was none"
+        );
+        assert!(merged.untrusted_project_config.is_empty());
     }
 
     /// A repo shipping `{"disableAllHooks": true}` must not silence the
