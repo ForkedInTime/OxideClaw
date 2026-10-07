@@ -781,6 +781,9 @@ async fn speak_via_server(
 
     let body = tts_request_body(&speech_text, speaker_wav);
     let wav_out = scratch_path("xtts-server", "wav");
+    let max_time =
+        xtts_request_timeout_secs(speech_text.split_whitespace().count(), cuda_available())
+            .to_string();
 
     let mut curl = Command::new("curl")
         .args([
@@ -796,8 +799,10 @@ async fn speak_via_server(
             &body,
             "--output",
             &wav_out.display().to_string(),
+            "--connect-timeout",
+            "5",
             "--max-time",
-            "30",
+            &max_time,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -828,6 +833,16 @@ async fn speak_via_server(
 
     play_wav(&wav_out, std::pin::Pin::new(stop_rx)).await?;
     Ok(truncated)
+}
+
+/// Upper bound for one non-streaming `/tts` request. A flat 30 s cut off
+/// ordinary replies on the CPU server, which synthesises at about real time
+/// (200 words is ~80 s of audio), and the abandoned synthesis kept the model
+/// lock so the next request failed too. Esc still aborts at once via
+/// `stop_rx`; this only bounds a server that has stopped answering.
+fn xtts_request_timeout_secs(words: usize, gpu: bool) -> u64 {
+    let per_word = if gpu { 1 } else { 6 };
+    (words as u64 * per_word).max(60)
 }
 
 /// Synthesise `text` and play it via XTTS v2.
@@ -1653,6 +1668,21 @@ mod transcription_fallback_tests {
         // Without a key the local result is all there is.
         assert!(local_transcript_is_final(&Err(anyhow!("usage")), false));
         assert!(local_transcript_is_final(&Ok(String::new()), false));
+    }
+}
+
+#[cfg(test)]
+mod xtts_request_timeout_tests {
+    use super::{TTS_WORD_LIMIT, xtts_request_timeout_secs};
+
+    #[test]
+    fn a_full_length_reply_on_cpu_gets_well_over_its_audio_length() {
+        // ~2.5 words per second of speech; CPU XTTS runs at about real time.
+        let audio_secs = TTS_WORD_LIMIT as u64 * 2 / 5;
+        assert!(xtts_request_timeout_secs(TTS_WORD_LIMIT, false) > 3 * audio_secs);
+        assert!(xtts_request_timeout_secs(75, false) > 30);
+        assert_eq!(xtts_request_timeout_secs(3, true), 60);
+        assert_eq!(xtts_request_timeout_secs(3, false), 60);
     }
 }
 
