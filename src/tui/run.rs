@@ -242,11 +242,11 @@ impl PermissionAsker for TuiAsker {
         reply_rx.await.ok()
     }
 }
-use crate::session::{Session, entries_from_messages};
+use crate::session::Session;
 use crate::skills::parse_skill_invocation;
 use crate::tools::todo::TodoState;
 use crate::tools::{DynTool, ToolContext, ToolOutput, all_tools_with_state_and_mcp};
-use crate::tui::app::{App, ChatEntry, Overlay, TurnHistory};
+use crate::tui::app::{App, ChatEntry, Overlay, TurnHistory, entries_from_messages};
 use crate::tui::events::AppEvent;
 use crate::tui::render::draw;
 use anyhow::Result as AResult;

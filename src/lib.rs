@@ -1,6 +1,6 @@
 //! OxideClaw library crate — exposes the SDK module for integration tests and embedding.
 //!
-//! Modules that depend on the TUI (`tui`, `session`, `spawn`) and compile-time
+//! Modules that depend on the TUI (`tui`, `spawn`) and compile-time
 //! binary-only env vars (`deeplink`) are excluded — they only compile as part
 //! of the `oxideclaw` binary.
 
@@ -24,6 +24,7 @@ pub mod query_engine;
 pub mod rag;
 pub mod router;
 pub mod sandbox;
+pub mod session;
 pub mod settings;
 pub mod skills;
 pub mod tools;

@@ -566,8 +566,8 @@ impl SdkServer {
 // ── Session listing (self-contained, no TUI dependency) ─────────────────────
 
 /// List saved sessions by reading `.meta` files from the sessions directory.
-/// This avoids importing `crate::session` which has TUI dependencies not
-/// available in the library crate.
+/// Read-only, unlike `crate::session::Session::list`, which rewrites metas
+/// to backfill missing previews.
 async fn list_sessions(limit: Option<usize>) -> Result<Vec<SessionInfo>> {
     list_sessions_in(&Config::sessions_dir(), limit).await
 }

@@ -1,4 +1,5 @@
 /// App state — all data the render loop needs.
+use crate::api::types::{ContentBlock, Message, Role};
 use crate::permissions::PermissionDecision;
 use crate::tui::events::AppEvent;
 use dirs;
@@ -1592,11 +1593,69 @@ fn compute_cwd_display() -> String {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Extract a human-readable preview from a tool's JSON args.
-pub fn format_tool_preview_pub(name: &str, args: &str) -> String {
-    format_tool_preview(name, args)
+/// Reconstruct ChatEntry display list from a saved message history.
+pub fn entries_from_messages(messages: &[Message]) -> Vec<ChatEntry> {
+    let mut entries = Vec::new();
+    for msg in messages {
+        match msg.role {
+            Role::User => {
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            entries.push(ChatEntry::user(text.clone()));
+                        }
+                        ContentBlock::ToolResult {
+                            content, is_error, ..
+                        } => {
+                            let text = content
+                                .iter()
+                                .map(|c| {
+                                    let crate::api::types::ToolResultContent::Text { text } = c;
+                                    text.as_str()
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            // chars, not bytes: a byte cut can split a code point and panic.
+                            let preview = if text.chars().count() > 300 {
+                                format!("{}…", text.chars().take(300).collect::<String>())
+                            } else {
+                                text
+                            };
+                            if is_error.unwrap_or(false) {
+                                entries.push(ChatEntry::error(preview));
+                            } else {
+                                entries.push(ChatEntry::tool_result(preview));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Role::Assistant => {
+                let mut text_parts: Vec<String> = Vec::new();
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } if !text.trim().is_empty() => {
+                            text_parts.push(text.clone());
+                        }
+                        ContentBlock::ToolUse { id: _, name, input } => {
+                            let args = serde_json::to_string(input).unwrap_or_default();
+                            let preview = format_tool_preview(name, &args);
+                            entries.push(ChatEntry::tool_call(format!("{name}  {preview}")));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text_parts.is_empty() {
+                    entries.push(ChatEntry::assistant(text_parts.join("\n")));
+                }
+            }
+        }
+    }
+    entries
 }
 
+/// Extract a human-readable preview from a tool's JSON args.
 fn format_tool_preview(name: &str, args: &str) -> String {
     let val: serde_json::Value = match serde_json::from_str(args) {
         Ok(v) => v,

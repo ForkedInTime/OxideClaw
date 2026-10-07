@@ -4,10 +4,9 @@
 ///   <uuid>.jsonl  — one Message per line (full API history)
 ///   <uuid>.meta   — JSON with name, created_at, first_preview
 use crate::api::types::{ContentBlock, Message, Role, ToolResultContent};
-use crate::tui::app::ChatEntry;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -40,18 +39,18 @@ pub struct SessionMeta {
 }
 
 impl SessionMeta {
-    fn path_for(id: &str) -> PathBuf {
-        crate::config::Config::sessions_dir().join(format!("{id}.meta"))
+    fn path_in(dir: &Path, id: &str) -> PathBuf {
+        dir.join(format!("{id}.meta"))
     }
 
-    async fn save(&self) -> Result<()> {
-        let path = Self::path_for(&self.id);
+    async fn save_in(&self, dir: &Path) -> Result<()> {
+        let path = Self::path_in(dir, &self.id);
         let body = serde_json::to_string(self)?;
         atomic_write(&path, body.as_bytes()).await
     }
 
-    async fn load(id: &str) -> Result<Self> {
-        let path = Self::path_for(id);
+    async fn load_in(dir: &Path, id: &str) -> Result<Self> {
+        let path = Self::path_in(dir, id);
         let s = fs::read_to_string(&path).await?;
         Ok(serde_json::from_str(&s)?)
     }
@@ -62,12 +61,14 @@ impl SessionMeta {
 pub struct Session {
     pub id: String,
     pub meta: SessionMeta,
+    /// The sessions directory this session's files live in.
+    dir: PathBuf,
     path: PathBuf,
 }
 
 impl Session {
-    fn jsonl_path(id: &str) -> PathBuf {
-        crate::config::Config::sessions_dir().join(format!("{id}.jsonl"))
+    fn jsonl_path(dir: &Path, id: &str) -> PathBuf {
+        dir.join(format!("{id}.jsonl"))
     }
 
     /// Create a new empty session with a human-readable default name.
@@ -78,7 +79,12 @@ impl Session {
     /// A new empty session under a caller-chosen ID (`--session-id`). The
     /// caller validates it as a UUID, which also keeps it a plain file name.
     pub async fn new_with_id(id: String) -> Result<Self> {
-        fs::create_dir_all(crate::config::Config::sessions_dir()).await?;
+        Self::create_in(&crate::config::Config::sessions_dir(), id).await
+    }
+
+    /// `new_with_id` in the sessions directory `dir`.
+    pub async fn create_in(dir: &Path, id: String) -> Result<Self> {
+        fs::create_dir_all(dir).await?;
         let meta = SessionMeta {
             id: id.clone(),
             name: human_session_name(),
@@ -89,11 +95,12 @@ impl Session {
             undo_position: 0,
             base_commit: None,
         };
-        meta.save().await?;
+        meta.save_in(dir).await?;
         Ok(Self {
             id: id.clone(),
             meta,
-            path: Self::jsonl_path(&id),
+            dir: dir.to_path_buf(),
+            path: Self::jsonl_path(dir, &id),
         })
     }
 
@@ -113,13 +120,20 @@ impl Session {
                 undo_position: 0,
                 base_commit: None,
             },
+            dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             path,
         }
     }
 
     /// Is there a saved session with exactly this ID?
     pub fn exists(id: &str) -> bool {
-        SessionMeta::path_for(id).exists()
+        Self::exists_in(&crate::config::Config::sessions_dir(), id)
+    }
+
+    /// `exists` in the sessions directory `dir`. An ID that is not a plain
+    /// file name never exists, so it cannot name a file outside `dir`.
+    pub fn exists_in(dir: &Path, id: &str) -> bool {
+        is_safe_session_id(id) && SessionMeta::path_in(dir, id).exists()
     }
 
     /// Resolve what a user typed to a saved session's ID: the full ID, a
@@ -158,13 +172,20 @@ impl Session {
 
     /// Resume an existing session by ID — loads meta, returns Session + messages.
     pub async fn resume(id: &str) -> Result<(Self, Vec<Message>)> {
-        let meta = SessionMeta::load(id)
+        Self::resume_in(&crate::config::Config::sessions_dir(), id).await
+    }
+
+    /// `resume` from the sessions directory `dir`.
+    pub async fn resume_in(dir: &Path, id: &str) -> Result<(Self, Vec<Message>)> {
+        anyhow::ensure!(is_safe_session_id(id), "invalid session id: {id:?}");
+        let meta = SessionMeta::load_in(dir, id)
             .await
             .with_context(|| format!("Session '{id}' not found"))?;
         let s = Self {
             id: id.to_string(),
             meta,
-            path: Self::jsonl_path(id),
+            dir: dir.to_path_buf(),
+            path: Self::jsonl_path(dir, id),
         };
         let messages = s.load_and_heal().await?;
         Ok((s, messages))
@@ -210,9 +231,9 @@ impl Session {
         self.meta.auto_commits.clear();
         self.meta.undo_position = 0;
         self.meta.base_commit = None;
-        self.path = Self::jsonl_path(&id);
+        self.path = Self::jsonl_path(&self.dir, &id);
         self.id = id;
-        self.meta.save().await?;
+        self.meta.save_in(&self.dir).await?;
         self.overwrite(messages).await
     }
 
@@ -258,7 +279,7 @@ impl Session {
             && let Some(preview) = first_user_preview(new_messages)
         {
             self.meta.preview = preview;
-            self.meta.save().await?;
+            self.meta.save_in(&self.dir).await?;
         }
 
         Ok(())
@@ -279,20 +300,20 @@ impl Session {
     /// Rename the session.
     pub async fn rename(&mut self, name: &str) -> Result<()> {
         self.meta.name = name.to_string();
-        self.meta.save().await
+        self.meta.save_in(&self.dir).await
     }
 
     /// Persist the current `SessionMeta` to disk. Used by the auto-commit loop
     /// to checkpoint updated `auto_commits` / `undo_position` after each turn.
     pub async fn save_meta(&self) -> anyhow::Result<()> {
-        self.meta.save().await
+        self.meta.save_in(&self.dir).await
     }
 
     /// Load all messages from a session file. Returns an empty vec if the
     /// session file does not exist — no TOCTOU race between an exists() check
     /// and the read, because we let the read itself surface the NotFound.
     pub async fn load_messages(id: &str) -> Result<Vec<Message>> {
-        let path = Self::jsonl_path(id);
+        let path = Self::jsonl_path(&crate::config::Config::sessions_dir(), id);
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -452,7 +473,9 @@ impl Session {
     /// Export session to a markdown file, returns the path written.
     pub async fn export(id: &str, dest: &std::path::Path) -> Result<PathBuf> {
         let messages = Self::load_messages(id).await?;
-        let meta = SessionMeta::load(id).await.ok();
+        let meta = SessionMeta::load_in(&crate::config::Config::sessions_dir(), id)
+            .await
+            .ok();
         let name = meta.map(|m| m.name).unwrap_or_else(|| id.to_string());
 
         let mut out = format!("# Session: {name}\n\n");
@@ -485,7 +508,9 @@ impl Session {
     /// Export session to a markdown string (used for clipboard export).
     pub async fn export_to_string(id: &str) -> Result<String> {
         let messages = Self::load_messages(id).await?;
-        let meta = SessionMeta::load(id).await.ok();
+        let meta = SessionMeta::load_in(&crate::config::Config::sessions_dir(), id)
+            .await
+            .ok();
         let name = meta.map(|m| m.name).unwrap_or_else(|| id.to_string());
 
         let mut out = format!("# Session: {name}\n\n");
@@ -509,68 +534,6 @@ impl Session {
         }
         Ok(out)
     }
-}
-
-/// Reconstruct ChatEntry display list from a saved message history.
-pub fn entries_from_messages(messages: &[Message]) -> Vec<ChatEntry> {
-    let mut entries = Vec::new();
-    for msg in messages {
-        match msg.role {
-            Role::User => {
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            entries.push(ChatEntry::user(text.clone()));
-                        }
-                        ContentBlock::ToolResult {
-                            content, is_error, ..
-                        } => {
-                            let text = content
-                                .iter()
-                                .map(|c| {
-                                    let crate::api::types::ToolResultContent::Text { text } = c;
-                                    text.as_str()
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            // chars, not bytes: a byte cut can split a code point and panic.
-                            let preview = if text.chars().count() > 300 {
-                                format!("{}…", text.chars().take(300).collect::<String>())
-                            } else {
-                                text
-                            };
-                            if is_error.unwrap_or(false) {
-                                entries.push(ChatEntry::error(preview));
-                            } else {
-                                entries.push(ChatEntry::tool_result(preview));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Role::Assistant => {
-                let mut text_parts: Vec<String> = Vec::new();
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text } if !text.trim().is_empty() => {
-                            text_parts.push(text.clone());
-                        }
-                        ContentBlock::ToolUse { id: _, name, input } => {
-                            let args = serde_json::to_string(input).unwrap_or_default();
-                            let preview = crate::tui::app::format_tool_preview_pub(name, &args);
-                            entries.push(ChatEntry::tool_call(format!("{name}  {preview}")));
-                        }
-                        _ => {}
-                    }
-                }
-                if !text_parts.is_empty() {
-                    entries.push(ChatEntry::assistant(text_parts.join("\n")));
-                }
-            }
-        }
-    }
-    entries
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
