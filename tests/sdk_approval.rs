@@ -122,8 +122,18 @@ fn autonomy_fills_in_what_the_host_policy_leaves_open() {
     let full = engine(Autonomy::FullAuto, Policy::default(), false);
     assert_eq!(full.evaluate("Bash", &bash), ApprovalDecision::AutoApprove);
     assert_eq!(
-        full.evaluate("Write", &write("/etc/hosts")),
+        full.evaluate("Write", &write("src/a.rs")),
         ApprovalDecision::AutoApprove
+    );
+    // bwrap confines only commands: an in-process edit outside the project
+    // and an MCP tool are not pre-approved (refused here, with no one to ask).
+    assert_eq!(
+        full.evaluate("Write", &write("/etc/hosts")),
+        ApprovalDecision::Deny
+    );
+    assert_eq!(
+        full.evaluate("mcp__fs__write_file", &json!({})),
+        ApprovalDecision::Deny
     );
 
     // suggest prompts for edits the host would auto-approve, and refuses

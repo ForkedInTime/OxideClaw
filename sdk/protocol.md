@@ -473,7 +473,7 @@ The `policy` object on `session/start` controls tool approval:
 }
 ```
 
-**Evaluation order:** deny > ask > auto_approve > allow.
+**Evaluation order:** deny > ask > autonomy `suggest` (edit tools: `ask`, or `deny` if not interactive) > auto_approve > allow > unlisted.
 
 | List | Behavior | Notification |
 |------|----------|-------------|
@@ -481,7 +481,9 @@ The `policy` object on `session/start` controls tool approval:
 | `ask` | Blocks until host responds | `tool/approval_needed` |
 | `auto_approve` | Executes immediately | `tool/started` |
 | `allow` | Executes silently | None |
-| *(unlisted)* | `ask` if interactive, `deny` if not | Depends |
+| *(unlisted)* | Per the user's [autonomy mode](../FEATURES.md#autonomy-modes): `full-auto` auto-approves (`tool/started`) shell commands and in-project, non-protected Write/Edit/MultiEdit/NotebookEdit, but not MCP tools, `ExitPlanMode`, `browser_loopback`, `ExitWorktree` with `discard_changes`, or anything in a project at `$HOME`; `auto-edit` auto-approves in-project, non-protected Write/Edit/MultiEdit/NotebookEdit; everything else is `ask` if interactive, `deny` if not | Depends |
+
+The user's mode never overrides the host's `deny` or `ask`, but under `suggest` edit tools listed in `auto_approve` or `allow` still prompt.
 
 Without `allowPrivateNetworkFetch`, the browser asks before it opens a loopback service. That question arrives as `tool/approval_needed` for the pseudo-tool `browser_loopback`, with `args` `{"url": ..., "target": "localhost:3000", "addresses": ["127.0.0.1:3000"]}` (`addresses`: what the name resolved to); approving it lets the browser reach that `host:port` for the rest of the session. The grant is for that name: another name that resolves to the same address is refused. Its `tool_use_id` is `browser-loopback-<approval_id>`, which matches no assistant tool call, and a `tool/completed` with that id and `success` set to the answer follows, so a client that tracks approvals by tool call can close it. List `browser_loopback` under `allow` to approve every loopback service, or under `deny` to refuse them. In a `browse/start` run the same question is a `browse/approval_needed` with `tool_name: "browser_loopback"`.
 

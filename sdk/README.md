@@ -110,7 +110,7 @@ Full protocol reference: [protocol.md](protocol.md)
 
 ## Tool Approval
 
-By default, the SDK asks for approval before running tools. Control this with the `policy` field on `session/start`:
+Tools the policy does not list follow the user's autonomy mode (see [FEATURES.md](../FEATURES.md#autonomy-modes)); under the default `ask` mode the SDK asks for approval before running them. Control this with the `policy` field on `session/start`:
 
 ```json
 {

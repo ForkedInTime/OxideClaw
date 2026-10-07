@@ -637,6 +637,7 @@ mod tests {
             "pyproject.toml",
             "tox.ini",
             "App.csproj",
+            "jest.config.js",
         ];
         // (call, prompts under: suggest, ask, auto-edit, full-auto)
         let mut calls: Vec<(&str, serde_json::Value, [bool; 4])> = vec![
@@ -652,18 +653,18 @@ mod tests {
                 json!({"notebook_path": "nb.ipynb"}),
                 [true, true, false, false],
             ),
-            ("Write", w(&out_path), [true, true, true, false]),
-            ("Write", w("../escape.rs"), [true, true, true, false]),
+            ("Write", w(&out_path), [true, true, true, true]),
+            ("Write", w("../escape.rs"), [true, true, true, true]),
             (
                 "Bash",
                 json!({"command": "cargo build"}),
                 [true, true, true, false],
             ),
-            ("mcp__fs__write_file", json!({}), [true, true, true, false]),
+            ("mcp__fs__write_file", json!({}), [true, true, true, true]),
             ("ExitPlanMode", json!({}), [true, true, true, true]),
         ];
         for p in protected {
-            calls.push(("Write", w(p), [true, true, true, false]));
+            calls.push(("Write", w(p), [true, true, true, true]));
         }
         let modes = [
             Autonomy::Suggest,

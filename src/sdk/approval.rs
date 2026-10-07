@@ -247,4 +247,35 @@ mod tests {
         );
         assert!(!seen[1].contains("sub-agent"), "{seen:?}");
     }
+    /// full-auto pre-approved every tool name, the browser's loopback
+    /// pseudo-tool included: the SDK asker granted a loopback host:port for
+    /// a Chrome outside the sandbox without sending tool/approval_needed.
+    #[test]
+    fn full_auto_does_not_answer_the_loopback_question() {
+        let proj = tempfile::tempdir().unwrap();
+        let q = crate::tools::browser_tools::LOOPBACK_QUESTION;
+        let input = serde_json::json!({"url": "http://localhost:3000/"});
+        let engine = |interactive: bool, policy: Policy| {
+            PolicyEngine::new(policy, interactive).with_autonomy(Autonomy::FullAuto, proj.path())
+        };
+        let e = engine(true, Policy::default());
+        assert_eq!(e.evaluate(q, &input), ApprovalDecision::Ask);
+        assert_eq!(
+            e.evaluate("Bash", &serde_json::json!({"command": "ls"})),
+            ApprovalDecision::AutoApprove
+        );
+        assert_eq!(
+            engine(false, Policy::default()).evaluate(q, &input),
+            ApprovalDecision::Deny
+        );
+        // The host's own lists still decide it.
+        let allow = Policy {
+            allow: vec![q.to_string()],
+            ..Policy::default()
+        };
+        assert_eq!(
+            engine(false, allow).evaluate(q, &input),
+            ApprovalDecision::Allow
+        );
+    }
 }

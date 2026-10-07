@@ -59,9 +59,8 @@ const PROTECTED_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-/// File names (lowercase) that are hook, CI or build/test-runner config: an
-/// unprompted edit to one becomes code execution on the next auto-fix check
-/// or CI run.
+/// File names (lowercase) that are hook, CI or build/test-runner config: they
+/// change what the auto-fix, git or CI commands run.
 const PROTECTED_FILES: &[&str] = &[
     ".mcp.json",
     ".gitlab-ci.yml",
@@ -96,9 +95,18 @@ const PROTECTED_FILES: &[&str] = &[
     ".justfile",
 ];
 
-/// Name prefixes: `.env`, `.env.local`, `.envrc` (direnv runs it), and the
-/// ESLint configs `npx eslint` executes.
-const PROTECTED_PREFIXES: &[&str] = &[".env", "eslint.config.", ".eslintrc"];
+/// Name prefixes: `.env`, `.env.local`, `.envrc` (direnv runs it), the
+/// ESLint configs `npx eslint` executes, and the JavaScript test-runner and
+/// transpiler configs `npm test` loads.
+const PROTECTED_PREFIXES: &[&str] = &[
+    ".env",
+    "eslint.config.",
+    ".eslintrc",
+    "jest.config.",
+    "vitest.config.",
+    "babel.config.",
+    "karma.conf.",
+];
 
 /// MSBuild projects and the `.props` / `.targets` files they import.
 const PROTECTED_EXTENSIONS: &[&str] = &["csproj", "fsproj", "vbproj", "props", "targets"];
@@ -167,9 +175,38 @@ impl Autonomy {
             Self::AutoEdit if edit && edit_preapproved(tool, input, project, home) => {
                 Verdict::PreApproved
             }
-            // Leaving plan mode is the user's review of the plan, not a
-            // permission: full-auto does not answer it for them.
-            Self::FullAuto if tool == "ExitPlanMode" => Verdict::Rules,
+            // Leaving plan mode is the user's review of the plan, and the
+            // browser's loopback question is a consent question for a Chrome
+            // outside the sandbox: full-auto answers neither for them.
+            Self::FullAuto
+                if tool == "ExitPlanMode"
+                    || tool == crate::tools::browser_tools::LOOPBACK_QUESTION =>
+            {
+                Verdict::Rules
+            }
+            // bwrap confines only shell commands. Edit tools run in-process
+            // and MCP servers run unsandboxed, so full-auto gives edits
+            // auto-edit's rule (in-project, unprotected) and leaves MCP tools
+            // to the rules.
+            Self::FullAuto if edit => {
+                if edit_preapproved(tool, input, project, home) {
+                    Verdict::PreApproved
+                } else {
+                    Verdict::Rules
+                }
+            }
+            Self::FullAuto if tool.starts_with("mcp__") => Verdict::Rules,
+            // Throwing away a worktree's changes is not something the
+            // sandbox can undo.
+            Self::FullAuto
+                if tool == "ExitWorktree"
+                    && input
+                        .get("discard_changes")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false) =>
+            {
+                Verdict::Rules
+            }
             // The sandbox binds the cwd read-write: from `$HOME` a
             // pre-approved command could rewrite every dotfile, so full-auto
             // pre-approves nothing there, edits or commands.
@@ -381,6 +418,10 @@ mod tests {
             "tox.ini",
             "app/App.csproj",
             "Directory.Build.targets",
+            "jest.config.js",
+            "web/vitest.config.ts",
+            "babel.config.json",
+            "karma.conf.js",
             ".cargo/config.toml",
             ".venv/bin/pytest",
             "node_modules/.bin/eslint",
@@ -545,21 +586,80 @@ mod tests {
             Autonomy::Suggest.verdict_with_home("Bash", &json!({"command": "ls"}), root, home),
             Verdict::Rules
         );
-        for tool in ["Bash", "Write", "mcp__fs__write_file", "PowerShell"] {
+        for tool in ["Bash", "PowerShell"] {
             assert_eq!(
                 Autonomy::FullAuto.verdict_with_home(tool, &write("/etc/x"), root, home),
                 Verdict::PreApproved,
                 "{tool}"
             );
         }
+        // bwrap confines only shell commands: in-process edits outside the
+        // project and MCP servers still go through the rules.
+        for tool in ["Write", "mcp__fs__write_file"] {
+            assert_eq!(
+                Autonomy::FullAuto.verdict_with_home(tool, &write("/etc/x"), root, home),
+                Verdict::Rules,
+                "{tool}"
+            );
+        }
+        for tool in [
+            "ExitPlanMode",
+            crate::tools::browser_tools::LOOPBACK_QUESTION,
+        ] {
+            assert_eq!(
+                Autonomy::FullAuto.verdict_with_home(tool, &json!({}), root, home),
+                Verdict::Rules,
+                "{tool}"
+            );
+        }
         assert_eq!(
-            Autonomy::FullAuto.verdict_with_home("ExitPlanMode", &json!({}), root, home),
+            Autonomy::FullAuto.verdict_with_home(
+                "ExitWorktree",
+                &json!({"discard_changes": true}),
+                root,
+                home
+            ),
             Verdict::Rules
+        );
+        assert_eq!(
+            Autonomy::FullAuto.verdict_with_home("ExitWorktree", &json!({}), root, home),
+            Verdict::PreApproved
         );
         for tool in ["Bash", "Write"] {
             assert_eq!(
                 Autonomy::Ask.verdict_with_home(tool, &write("a"), root, home),
                 Verdict::Rules
+            );
+        }
+    }
+
+    #[test]
+    fn full_auto_gives_edits_auto_edits_rule() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let proj = h.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let out_file = outside.path().join("x.rs");
+        let out_file = out_file.to_str().unwrap();
+        // In-project, unprotected: pre-approved.
+        assert_eq!(
+            Autonomy::FullAuto.verdict_with_home("Write", &write("src/a.rs"), &proj, Some(h)),
+            Verdict::PreApproved
+        );
+        // A dotfile in $HOME, an absolute path outside the project, a
+        // relative escape, or a protected file: the rules decide (prompt).
+        for target in [
+            "~/.bashrc",
+            out_file,
+            "../escape.rs",
+            ".mcp.json",
+            "Cargo.toml",
+        ] {
+            assert_eq!(
+                Autonomy::FullAuto.verdict_with_home("Write", &write(target), &proj, Some(h)),
+                Verdict::Rules,
+                "{target}"
             );
         }
     }
