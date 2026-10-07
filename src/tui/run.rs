@@ -1806,6 +1806,11 @@ async fn run_loop(
             if let Some(msg) = crate::spawn::cleanup_on_exit(&spawn_registry, &config.cwd).await {
                 eprintln!("{msg}");
             }
+            // Language servers (the LSP tool's and auto-fix's) get a clean
+            // `shutdown` / `exit` instead of a SIGKILL from the drop.
+            if let Some(pool) = crate::tools::lsp_pool(&tools) {
+                pool.shutdown().await;
+            }
             break;
         }
     }

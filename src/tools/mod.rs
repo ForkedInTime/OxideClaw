@@ -904,6 +904,12 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// The language servers this tool keeps (the LSP tool), for the
+    /// auto-fix diagnostics to share and for shutdown on exit.
+    fn lsp_pool(&self) -> Option<lsp::LspPool> {
+        None
+    }
+
     /// Build the ToolDefinition to include in API requests
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -970,6 +976,13 @@ pub fn session_cwd(tools: &[DynTool], default: &std::path::Path) -> std::path::P
         .iter()
         .find_map(|t| t.session_cwd())
         .unwrap_or_else(|| default.to_path_buf())
+}
+
+/// The session's language servers: `None` without the LSP tool (`--bare`,
+/// or the tool filtered out), which also keeps the auto-fix check from
+/// starting any.
+pub fn lsp_pool(tools: &[DynTool]) -> Option<lsp::LspPool> {
+    tools.iter().find_map(|t| t.lsp_pool())
 }
 
 /// Build the default tool set.

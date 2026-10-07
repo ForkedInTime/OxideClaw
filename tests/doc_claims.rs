@@ -182,6 +182,7 @@ fn autofix_is_gated_on_trust_and_readme_says_so() {
         0,
         &untrusted,
         &std::sync::atomic::AtomicBool::new(false),
+        None,
     );
     assert!(
         matches!(action, oxideclaw::autofix::AutoFixAction::Untrusted),

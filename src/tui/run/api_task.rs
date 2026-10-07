@@ -146,6 +146,24 @@ impl LoopGuard {
     }
 }
 
+/// The files an edit tool call names, before it runs.
+fn edit_targets(name: &str, input: &serde_json::Value) -> Vec<std::path::PathBuf> {
+    let as_path = |v: &serde_json::Value| {
+        v.get("file_path")
+            .and_then(|p| p.as_str())
+            .map(std::path::PathBuf::from)
+    };
+    match name {
+        "Write" | "Edit" => as_path(input).into_iter().collect(),
+        "MultiEdit" => input
+            .get("edits")
+            .and_then(|e| e.as_array())
+            .map(|edits| edits.iter().filter_map(as_path).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// The files an edit tool call wrote, for the auto-fix check. MultiEdit
 /// has no top-level `file_path` (each edit names its own), so turns that
 /// edited only through it never ran lint or tests. It also commits per
@@ -156,30 +174,23 @@ fn edited_paths(
     input: &serde_json::Value,
     output: &crate::tools::ToolOutput,
 ) -> Vec<std::path::PathBuf> {
-    let as_path = |v: &serde_json::Value| {
-        v.get("file_path")
-            .and_then(|p| p.as_str())
-            .map(std::path::PathBuf::from)
-    };
-    match name {
-        "Write" | "Edit" if !output.is_error => as_path(input).into_iter().collect(),
-        "MultiEdit" => {
-            let applied = !output.is_error
-                || output.content.iter().any(|c| {
-                    let ToolResultContent::Text { text } = c;
-                    text.contains('✓')
-                });
-            if !applied {
-                return Vec::new();
-            }
-            input
-                .get("edits")
-                .and_then(|e| e.as_array())
-                .map(|edits| edits.iter().filter_map(as_path).collect())
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
+    let applied = !output.is_error
+        || name == "MultiEdit"
+            && output.content.iter().any(|c| {
+                let ToolResultContent::Text { text } = c;
+                text.contains('✓')
+            });
+    if applied {
+        edit_targets(name, input)
+    } else {
+        Vec::new()
     }
+}
+
+/// `path` as the edit tools resolve it from `cwd`.
+fn absolute_in(cwd: &std::path::Path, path: &std::path::Path) -> std::path::PathBuf {
+    crate::tools::file_read::resolve_path(&path.to_string_lossy(), cwd)
+        .unwrap_or_else(|_| cwd.join(path))
 }
 
 /// Publish the turn's history so far: `messages` plus the results of the
@@ -434,6 +445,13 @@ pub(super) async fn run_api_task(task: ApiTask) {
     // Retries consumed by the auto-fix loop within the current user turn.
     // Reset to 0 on every user prompt; the retry helper enforces the cap.
     let mut auto_fix_retries: u32 = 0;
+    // Each edited file as it was before this turn's first edit to it, so
+    // the language-server step reports only the errors the turn added.
+    let lsp_pool = crate::tools::lsp_pool(&tools);
+    let mut lsp_baselines: std::collections::HashMap<
+        std::path::PathBuf,
+        crate::autofix::LspBaseline,
+    > = std::collections::HashMap::new();
     'turn: loop {
         iterations += 1;
         if iterations > turn_limit {
@@ -979,6 +997,27 @@ pub(super) async fn run_api_task(task: ApiTask) {
 
                         let tool = tools.iter().find(|t| t.name() == name);
                         ctx.cwd = crate::tools::session_cwd(&tools, &config.cwd);
+                        if let Some(pool) = &lsp_pool
+                            && config.project_trusted
+                            && config.auto_fix.lsp.enabled
+                            && crate::autofix::should_trigger(&config.auto_fix, config.autonomy)
+                        {
+                            for path in edit_targets(name, input) {
+                                let path = absolute_in(&ctx.cwd, &path);
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    lsp_baselines.entry(path)
+                                {
+                                    let baseline = crate::autofix::capture_lsp_baseline(
+                                        pool,
+                                        &ctx.cwd,
+                                        e.key(),
+                                        std::env::var_os("PATH").as_deref(),
+                                    )
+                                    .await;
+                                    e.insert(baseline);
+                                }
+                            }
+                        }
                         let output: ToolOutput = match tool {
                             Some(t) => t
                                 .execute(input.clone(), &ctx)
@@ -1175,6 +1214,24 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     }
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let _cancel_on_abort = CancelOnDrop(cancel.clone());
+                    // Language servers for the edited files, the LSP tool's.
+                    let lsp = lsp_pool.clone().map(|pool| {
+                        let files = auto_fix_touched
+                            .iter()
+                            .map(|p| {
+                                let p = absolute_in(&work_cwd, p);
+                                let baseline = lsp_baselines.get(&p).cloned();
+                                (p, baseline)
+                            })
+                            .collect();
+                        crate::autofix::LspDiagnostics {
+                            pool,
+                            root: work_cwd.clone(),
+                            files,
+                            search_path: std::env::var_os("PATH"),
+                            runtime: tokio::runtime::Handle::current(),
+                        }
+                    });
                     let action = match tokio::task::spawn_blocking(move || {
                         crate::autofix::run_auto_fix_check(
                             &work_cwd,
@@ -1183,6 +1240,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             auto_fix_retries,
                             &containment,
                             &cancel,
+                            lsp.as_ref(),
                         )
                     })
                     .await

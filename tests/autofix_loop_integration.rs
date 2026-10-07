@@ -22,6 +22,7 @@ fn base_cfg() -> AutoFixConfig {
         test_command: None,
         max_retries: 3,
         timeout_secs: 10,
+        lsp: Default::default(),
     }
 }
 
@@ -44,6 +45,7 @@ fn empty_dir_no_runners_continues_silently() {
         0,
         &trusted(),
         &AtomicBool::new(false),
+        None,
     );
     assert!(matches!(action, AutoFixAction::Continue { status: None }));
 }
@@ -68,6 +70,7 @@ fn cargo_project_detects_and_passes_with_overrides() {
         0,
         &trusted(),
         &AtomicBool::new(false),
+        None,
     );
     match action {
         AutoFixAction::Continue { status } => {
@@ -92,6 +95,7 @@ fn lint_fail_under_cap_returns_retry_with_anticheat() {
         0,
         &trusted(),
         &AtomicBool::new(false),
+        None,
     );
     match action {
         AutoFixAction::Retry { feedback, status } => {
@@ -119,6 +123,7 @@ fn cap_reached_returns_giveup_with_working_tree_note() {
         3,
         &trusted(),
         &AtomicBool::new(false),
+        None,
     );
     match action {
         AutoFixAction::GiveUp { status } => {
@@ -143,6 +148,7 @@ fn trigger_autonomous_skips_in_suggest_mode() {
         0,
         &trusted(),
         &AtomicBool::new(false),
+        None,
     );
     assert!(matches!(action, AutoFixAction::Continue { status: None }));
 }
@@ -162,6 +168,7 @@ fn trigger_off_short_circuits() {
         0,
         &trusted(),
         &AtomicBool::new(false),
+        None,
     );
     assert!(matches!(action, AutoFixAction::Continue { status: None }));
 }

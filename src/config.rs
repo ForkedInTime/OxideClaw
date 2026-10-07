@@ -1361,6 +1361,19 @@ impl Config {
             if let Some(t) = ar.timeout_secs {
                 af.timeout_secs = t;
             }
+            if let Some(on) = ar.lsp {
+                af.lsp.enabled = on;
+            }
+            if let Some(w) = ar.lsp_warnings {
+                af.lsp.warnings = w;
+            }
+            // A turn waits on the cap, so it stays bounded: 0.1 s to 60 s.
+            if let Some(ms) = ar.lsp_timeout_ms {
+                af.lsp.timeout = std::time::Duration::from_millis(ms.clamp(100, 60_000));
+            }
+            if let Some(ms) = ar.lsp_settle_ms {
+                af.lsp.settle = std::time::Duration::from_millis(ms).min(af.lsp.timeout);
+            }
         }
         self.auto_fix = af;
     }
@@ -2713,12 +2726,33 @@ mod auto_fix_clamp_tests {
             test_command: Some("cargo test".to_string()),
             max_retries: Some(5),
             timeout_secs: Some(30),
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("lintCommand"));
         assert!(json.contains("testCommand"));
         assert!(json.contains("maxRetries"));
         assert!(json.contains("timeoutSecs"));
+    }
+
+    #[test]
+    fn lsp_keys_reach_the_auto_fix_config() {
+        use std::time::Duration;
+        let mut cfg = super::Config::default();
+        assert!(cfg.auto_fix.lsp.enabled, "on by default with auto-fix");
+        assert_eq!(cfg.auto_fix.lsp.settle, Duration::from_secs(2));
+        assert_eq!(cfg.auto_fix.lsp.timeout, Duration::from_secs(10));
+        assert!(!cfg.auto_fix.lsp.warnings);
+        let s: AutoFixSettings = serde_json::from_str(
+            r#"{"lsp": false, "lspSettleMs": 500, "lspTimeoutMs": 999999, "lspWarnings": true}"#,
+        )
+        .unwrap();
+        cfg.apply_auto_fix_settings(Some(&s));
+        assert!(!cfg.auto_fix.lsp.enabled);
+        assert!(cfg.auto_fix.lsp.warnings);
+        assert_eq!(cfg.auto_fix.lsp.settle, Duration::from_millis(500));
+        // The cap bounds every turn, so it is bounded too.
+        assert_eq!(cfg.auto_fix.lsp.timeout, Duration::from_secs(60));
     }
 }
 

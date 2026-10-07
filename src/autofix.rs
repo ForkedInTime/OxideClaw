@@ -12,11 +12,17 @@
 //!   - `run_checks`           — run lint + test together and classify the outcome
 //!   - `format_feedback_message` — build the anti-cheat retry prompt
 //!   - `run_auto_fix_check`   — top-level decision helper returning `AutoFixAction`
+//!   - `LspDiagnostics`       — language-server errors in the edited files, gathered
+//!     while lint and tests run
 
 use crate::permissions::Autonomy;
-use std::path::Path;
+use crate::tools::lsp::{Launch, LspPool};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
@@ -37,6 +43,36 @@ pub struct AutoFixConfig {
     /// Maximum wall-clock seconds to let the test command run before killing
     /// it and returning `CommandResult::Timeout`. `0` means no timeout.
     pub timeout_secs: u64,
+    /// Language-server diagnostics for the edited files (`autoFixLoop.lsp`).
+    pub lsp: LspDiagnosticsConfig,
+}
+
+/// How the check asks language servers about the edited files.
+#[derive(Debug, Clone)]
+pub struct LspDiagnosticsConfig {
+    /// On by default whenever the auto-fix loop is (`autoFixLoop.lsp`).
+    pub enabled: bool,
+    /// How long to keep listening after a file's first diagnostics arrive,
+    /// for the slower semantic pass many servers send after a syntax pass.
+    pub settle: Duration,
+    /// Hard cap on the whole step, server start-up included.
+    pub timeout: Duration,
+    /// Report warnings too, not only errors.
+    pub warnings: bool,
+}
+
+pub const DEFAULT_LSP_SETTLE_MS: u64 = 2_000;
+pub const DEFAULT_LSP_TIMEOUT_MS: u64 = 10_000;
+
+impl Default for LspDiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            settle: Duration::from_millis(DEFAULT_LSP_SETTLE_MS),
+            timeout: Duration::from_millis(DEFAULT_LSP_TIMEOUT_MS),
+            warnings: false,
+        }
+    }
 }
 
 /// Default test timeout if the user hasn't overridden it.
@@ -45,7 +81,7 @@ pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = 60;
 /// Shown once per session when an edit would have started a check in a
 /// project that is not in `trustedProjects`.
 pub const UNTRUSTED_NOTICE: &str = "Auto-fix skipped: this folder is not trusted. \
-     Run /trust to let OxideClaw run its lint and test commands.";
+     Run /trust to let OxideClaw run its lint and test commands and language servers.";
 
 /// What auto-fix may run and how contained. Lint and test commands execute
 /// project code (`build.rs`, `conftest.py`, npm scripts, Makefiles), so an
@@ -107,6 +143,7 @@ impl Default for AutoFixConfig {
             test_command: None,
             max_retries: 3,
             timeout_secs: DEFAULT_TEST_TIMEOUT_SECS,
+            lsp: LspDiagnosticsConfig::default(),
         }
     }
 }
@@ -632,12 +669,15 @@ pub const MAX_FEEDBACK_SECTION_BYTES: usize = 2048;
 /// failed lint/test round. Trims each stderr section to
 /// `MAX_FEEDBACK_SECTION_BYTES` and appends an explicit anti-cheat
 /// clause so the model does not converge on `#[allow(...)]` /
-/// `eslint-disable` / etc.
+/// `eslint-disable` / etc. `lsp` is the language-server section, if any
+/// new errors were reported; when lint and tests did not fail it is the
+/// only section.
 pub fn format_feedback_message(
     lint_cmd: Option<&str>,
     test_cmd: Option<&str>,
     lint_stderr: Option<&str>,
     test_stderr: Option<&str>,
+    lsp: Option<&str>,
 ) -> String {
     let lint_cmd_str = lint_cmd.unwrap_or("(none)");
     let test_cmd_str = test_cmd.unwrap_or("(none)");
@@ -652,19 +692,23 @@ pub fn format_feedback_message(
         None => "(no output)".to_string(),
     };
 
+    let mut sections = Vec::new();
+    if lint_stderr.is_some() || test_stderr.is_some() || lsp.is_none() {
+        sections.push(format!("## Lint ({lint_cmd_str})\n{lint_body}"));
+        sections.push(format!("## Tests ({test_cmd_str})\n{test_body}"));
+    }
+    sections.extend(lsp.map(str::to_string));
+
     format!(
         "Your last edits failed automated checks. Fix the issues below.\n\
          \n\
-         ## Lint ({lint_cmd_str})\n\
-         {lint_body}\n\
+         {}\n\
          \n\
-         ## Tests ({test_cmd_str})\n\
-         {test_body}\n\
-         \n\
-         Make the minimum edits required to make both pass. Do not disable \
+         Make the minimum edits required to make every check pass. Do not disable \
          lints, skip tests, or add `#[allow(...)]` / `# type: ignore` / \
          `eslint-disable` / `//nolint` unless the original code had them. \
-         If a test assertion is genuinely wrong, explain why before changing it."
+         If a test assertion is genuinely wrong, explain why before changing it.",
+        sections.join("\n\n")
     )
 }
 
@@ -766,12 +810,15 @@ pub enum AutoFixAction {
     Untrusted,
 }
 
-/// Run lint + tests and decide what the TUI turn loop should do next.
+/// Run lint + tests, and ask language servers about the edited files, then
+/// decide what the TUI turn loop should do next.
 ///
 /// `autonomy_mode` is the session's current `/autonomy` mode.
 /// `retries_used` is the number of retries *already consumed* by this
 /// user-prompt turn (so the first call passes `0`). Nothing runs unless
-/// `containment.trusted`; what does run goes through its sandbox.
+/// `containment.trusted`; what does run goes through its sandbox. `lsp`
+/// gathers the language-server diagnostics on its own thread while lint
+/// and tests run.
 pub fn run_auto_fix_check(
     cwd: &Path,
     config: &AutoFixConfig,
@@ -779,17 +826,21 @@ pub fn run_auto_fix_check(
     retries_used: u32,
     containment: &Containment,
     cancel: &AtomicBool,
+    lsp: Option<&LspDiagnostics>,
 ) -> AutoFixAction {
     if !should_trigger(config, autonomy_mode) {
         return AutoFixAction::Continue { status: None };
     }
+    let lsp = lsp.filter(|l| config.lsp.enabled && l.would_start());
 
     // Before detection: even the clippy probe below runs a binary in the
     // project (rustup honours its `rust-toolchain.toml`). Only file checks
-    // decide whether there was anything to skip.
+    // decide whether there was anything to skip. Language servers run
+    // project code too (build scripts, proc macros, plugins).
     if !containment.trusted {
         let would_run = detect_lint_command(cwd, &config.lint_command).is_some()
-            || detect_test_command(cwd, &config.test_command).is_some();
+            || detect_test_command(cwd, &config.test_command).is_some()
+            || lsp.is_some();
         return if would_run {
             AutoFixAction::Untrusted
         } else {
@@ -820,7 +871,7 @@ pub fn run_auto_fix_check(
         None => detect_test_command(cwd, &None).and_then(runnable),
     };
 
-    if lint_cmd.is_none() && test_cmd.is_none() {
+    if lint_cmd.is_none() && test_cmd.is_none() && lsp.is_none() {
         return AutoFixAction::Continue { status: None };
     }
 
@@ -835,73 +886,531 @@ pub fn run_auto_fix_check(
         }
     };
 
-    let outcome = run_checks(
-        cwd,
-        lint_run.as_deref(),
-        test_run.as_deref(),
-        config.timeout_secs,
-        cancel,
-    );
+    let (outcome, lsp) = std::thread::scope(|s| {
+        let lsp = lsp.map(|l| {
+            s.spawn(|| {
+                l.runtime
+                    .block_on(l.collect(&config.lsp, containment, cancel))
+            })
+        });
+        let outcome = run_checks(
+            cwd,
+            lint_run.as_deref(),
+            test_run.as_deref(),
+            config.timeout_secs,
+            cancel,
+        );
+        let lsp = lsp.and_then(|h| h.join().ok()).unwrap_or_default();
+        (outcome, lsp)
+    });
 
-    match outcome {
-        CheckOutcome::Pass => AutoFixAction::Continue {
-            status: Some("[auto-fix] checks passed".to_string()),
-        },
-        CheckOutcome::NoRunners => AutoFixAction::Continue { status: None },
-        CheckOutcome::Skipped { reason } => AutoFixAction::Continue {
-            status: Some(format!("[auto-fix] skipped: {reason}")),
-        },
+    // A language server that reported counts as a check that ran.
+    let passed = match outcome {
+        CheckOutcome::Pass => true,
+        CheckOutcome::NoRunners => lsp.checked > 0,
+        _ => false,
+    };
+    let mut notes = Vec::new();
+    let (lint_stderr, test_stderr) = match outcome {
+        CheckOutcome::Pass | CheckOutcome::NoRunners => (None, None),
+        CheckOutcome::Skipped { reason } => {
+            notes.push(format!("[auto-fix] skipped: {reason}"));
+            (None, None)
+        }
         CheckOutcome::Fail {
             lint_stderr,
             test_stderr,
-        } => {
-            if let Some(status) = sandbox_environment_failure(
-                containment,
-                &[
-                    (lint_cmd.as_deref(), &lint_stderr),
-                    (test_cmd.as_deref(), &test_stderr),
-                ],
-            ) {
-                return AutoFixAction::Continue {
-                    status: Some(status),
-                };
+        } => match sandbox_environment_failure(
+            containment,
+            &[
+                (lint_cmd.as_deref(), &lint_stderr),
+                (test_cmd.as_deref(), &test_stderr),
+            ],
+        ) {
+            Some(status) => {
+                notes.push(status);
+                (None, None)
             }
-            if retries_used >= config.max_retries {
-                let lint_tail = lint_stderr
-                    .as_deref()
-                    .map(trim_section)
-                    .unwrap_or_else(|| "(no output)".to_string());
-                let test_tail = test_stderr
-                    .as_deref()
-                    .map(trim_section)
-                    .unwrap_or_else(|| "(skipped: lint failed)".to_string());
-                AutoFixAction::GiveUp {
-                    status: format!(
-                        "[auto-fix] cap reached ({0}/{0}) — giving up, \
-                         working tree left as-is\n\
-                         Final lint output:\n{1}\n\
-                         Final test output:\n{2}",
-                        config.max_retries, lint_tail, test_tail,
-                    ),
-                }
+            None => (lint_stderr, test_stderr),
+        },
+    };
+    notes.extend(lsp.notes.iter().cloned());
+    let lsp_section = lsp.section();
+    let with_notes = |status: String| {
+        std::iter::once(status)
+            .chain(notes.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    if lint_stderr.is_none() && test_stderr.is_none() && lsp_section.is_none() {
+        let status = if passed {
+            Some(with_notes("[auto-fix] checks passed".to_string()))
+        } else {
+            (!notes.is_empty()).then(|| notes.join("\n"))
+        };
+        return AutoFixAction::Continue { status };
+    }
+
+    if retries_used >= config.max_retries {
+        let mut status = format!(
+            "[auto-fix] cap reached ({0}/{0}) — giving up, working tree left as-is",
+            config.max_retries
+        );
+        if lint_stderr.is_some() || test_stderr.is_some() {
+            let lint_tail = lint_stderr
+                .as_deref()
+                .map(trim_section)
+                .unwrap_or_else(|| "(no output)".to_string());
+            let test_tail = test_stderr
+                .as_deref()
+                .map(trim_section)
+                .unwrap_or_else(|| "(skipped: lint failed)".to_string());
+            status.push_str(&format!(
+                "\nFinal lint output:\n{lint_tail}\nFinal test output:\n{test_tail}"
+            ));
+        }
+        if !lsp.errors.is_empty() {
+            status.push_str(&format!(
+                "\nFinal language server errors:\n{}",
+                lsp.errors.join("\n")
+            ));
+        }
+        AutoFixAction::GiveUp {
+            status: with_notes(status),
+        }
+    } else {
+        let feedback = format_feedback_message(
+            lint_cmd.as_deref(),
+            test_cmd.as_deref(),
+            lint_stderr.as_deref(),
+            test_stderr.as_deref(),
+            lsp_section.as_deref(),
+        );
+        AutoFixAction::Retry {
+            feedback,
+            status: with_notes(format!(
+                "[auto-fix] checks failed — retry {}/{}",
+                retries_used + 1,
+                config.max_retries,
+            )),
+        }
+    }
+}
+
+// ── Language-server diagnostics ───────────────────────────────────────────────
+
+/// Lines of language-server errors fed back per check.
+pub const MAX_LSP_LINES: usize = 30;
+
+/// Files above this size keep no pre-edit text (every error in them counts
+/// as new unless a running server had diagnostics for them already).
+const MAX_BASELINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A file as it was before the turn's first edit to it, so errors it
+/// already had are not reported as the edit's.
+#[derive(Debug, Clone, Default)]
+pub struct LspBaseline {
+    /// Its text: empty for a file the edit creates, `None` if unreadable.
+    pub content: Option<String>,
+    /// What a language server that was already running had published for it.
+    pub diagnostics: Option<Vec<Value>>,
+}
+
+/// Record `path` (absolute) before an edit: its text, and the diagnostics a
+/// running server (looked up on `search`, a PATH) already has for it.
+/// Starts nothing.
+pub async fn capture_lsp_baseline(
+    pool: &LspPool,
+    root: &Path,
+    path: &Path,
+    search: Option<&std::ffi::OsStr>,
+) -> LspBaseline {
+    let content = match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        Ok(m) if m.len() <= MAX_BASELINE_BYTES => std::fs::read_to_string(path).ok(),
+        _ => None,
+    };
+    let diagnostics = match crate::tools::lsp::installed_server(path, search) {
+        Some((command, args, _)) => pool
+            .running(command, &args, root)
+            .await
+            .and_then(|c| c.diagnostics(path)),
+        None => None,
+    };
+    LspBaseline {
+        content,
+        diagnostics,
+    }
+}
+
+/// Language-server diagnostics for the files a round of edits wrote. The
+/// servers are the LSP tool's (`pool`), started on first use.
+pub struct LspDiagnostics {
+    pub pool: LspPool,
+    /// Where the servers run: the session's working directory.
+    pub root: PathBuf,
+    /// The edited files (absolute), with their state before the turn's edits.
+    pub files: Vec<(PathBuf, Option<LspBaseline>)>,
+    /// The PATH servers are looked up on.
+    pub search_path: Option<std::ffi::OsString>,
+    /// Runs the server I/O for the blocking check.
+    pub runtime: tokio::runtime::Handle,
+}
+
+/// What the language servers said about one round of edits.
+#[derive(Debug, Default)]
+pub struct LspOutcome {
+    /// Files a server reported on.
+    pub checked: usize,
+    /// The servers that reported.
+    pub servers: Vec<&'static str>,
+    /// New problems, `file:line:col message`, at most `MAX_LSP_LINES`.
+    pub errors: Vec<String>,
+    /// Status lines: a server that could not start or answer in time.
+    pub notes: Vec<String>,
+}
+
+impl LspOutcome {
+    /// The feedback section, when there is anything to fix.
+    pub fn section(&self) -> Option<String> {
+        (!self.errors.is_empty()).then(|| {
+            format!(
+                "## Language server ({})\n{}",
+                self.servers.join(", "),
+                self.errors.join("\n")
+            )
+        })
+    }
+}
+
+/// The edited files one server covers.
+struct ServerFiles<'a> {
+    command: &'static str,
+    args: Vec<String>,
+    exe: PathBuf,
+    files: Vec<&'a (PathBuf, Option<LspBaseline>)>,
+}
+
+/// What one server said: per file, its new problems (`None`: no report).
+#[derive(Default)]
+struct ServerReport {
+    files: Vec<(PathBuf, Option<Vec<Diag>>)>,
+    note: Option<String>,
+}
+
+fn seconds(d: Duration) -> String {
+    format!("{}s", d.as_secs_f64())
+}
+
+impl LspDiagnostics {
+    /// The installed servers for the edited files, skipping any the check
+    /// has given up on this session.
+    fn servers(&self) -> Vec<ServerFiles<'_>> {
+        let mut groups: Vec<ServerFiles> = Vec::new();
+        for file in &self.files {
+            let Some((command, args, exe)) =
+                crate::tools::lsp::installed_server(&file.0, self.search_path.as_deref())
+            else {
+                continue;
+            };
+            if self.pool.gave_up(command, &args, &self.root) {
+                continue;
+            }
+            match groups
+                .iter_mut()
+                .find(|g| g.command == command && g.args == args)
+            {
+                Some(g) => g.files.push(file),
+                None => groups.push(ServerFiles {
+                    command,
+                    args,
+                    exe,
+                    files: vec![file],
+                }),
+            }
+        }
+        groups
+    }
+
+    /// Whether checking would start (or use) a language server.
+    pub fn would_start(&self) -> bool {
+        !self.servers().is_empty()
+    }
+
+    /// Sync the edited files to their servers, wait for what they publish
+    /// (at most `config.timeout` in all), and keep the new problems.
+    pub async fn collect(
+        &self,
+        config: &LspDiagnosticsConfig,
+        containment: &Containment,
+        cancel: &AtomicBool,
+    ) -> LspOutcome {
+        let deadline = tokio::time::Instant::now() + config.timeout;
+        let groups = self.servers();
+        let reports = futures_util::future::join_all(
+            groups
+                .iter()
+                .map(|g| self.ask(g, config, containment, deadline, cancel)),
+        )
+        .await;
+
+        let mut out = LspOutcome::default();
+        let mut lines = Vec::new();
+        for (group, report) in groups.iter().zip(reports) {
+            out.notes.extend(report.note);
+            let mut reported = false;
+            for (path, problems) in report.files {
+                let Some(problems) = problems else { continue };
+                reported = true;
+                out.checked += 1;
+                let shown = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                lines.extend(problems.iter().map(|d| d.render(&shown)));
+            }
+            if reported {
+                out.servers.push(group.command);
+            }
+        }
+        if lines.len() > MAX_LSP_LINES {
+            let more = lines.len() - (MAX_LSP_LINES - 1);
+            lines.truncate(MAX_LSP_LINES - 1);
+            lines.push(format!("... and {more} more"));
+        }
+        out.errors = lines;
+        out
+    }
+
+    /// One server: start it if needed (sandboxed like the lint and test
+    /// commands), send the files, wait. A server that cannot start, exits,
+    /// or does not answer by `deadline` is given up on for the session.
+    async fn ask(
+        &self,
+        group: &ServerFiles<'_>,
+        config: &LspDiagnosticsConfig,
+        containment: &Containment,
+        deadline: tokio::time::Instant,
+        cancel: &AtomicBool,
+    ) -> ServerReport {
+        let command = group.command;
+        let give_up = |why: String| {
+            self.pool.give_up(command, &group.args, &self.root);
+            ServerReport {
+                files: Vec::new(),
+                note: Some(format!(
+                    "[auto-fix] {command} {why}; language-server diagnostics from it are \
+                     off for this session"
+                )),
+            }
+        };
+
+        let plain = std::iter::once(group.exe.display().to_string())
+            .chain(group.args.iter().cloned())
+            .map(|a| crate::sandbox::shell_quote(&a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let launch = match containment.wrap(&plain, &self.root) {
+            Err(reason) => return give_up(format!("was not started: {reason}")),
+            Ok(line) if line == plain => Launch::Program(group.exe.clone()),
+            Ok(line) => Launch::Shell(line),
+        };
+        let client = match tokio::time::timeout_at(
+            deadline,
+            self.pool
+                .client_for(command, &group.args, &self.root, &launch),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return give_up(format!("did not start: {e}")),
+            Err(_) => {
+                return give_up(format!("did not answer within {}", seconds(config.timeout)));
+            }
+        };
+
+        let mut synced = Vec::new();
+        let mut files = Vec::new();
+        for (path, baseline) in &group.files {
+            // A file deleted since is simply not checked.
+            if let Ok(s) = client.sync_document(path).await {
+                synced.push(s);
+                files.push((path, baseline));
+            } else if client.is_dead() {
+                return give_up("exited".into());
+            }
+        }
+        if synced.is_empty() {
+            return ServerReport::default();
+        }
+        let published = client
+            .wait_for_diagnostics(&synced, config.settle, deadline, cancel)
+            .await;
+        if cancel.load(Ordering::SeqCst) {
+            return ServerReport::default();
+        }
+
+        let mut report = ServerReport::default();
+        for ((path, baseline), published) in files.into_iter().zip(published) {
+            let problems = published.map(|diags| {
+                let after = std::fs::read_to_string(path).ok();
+                new_problems(&diags, baseline.as_ref(), after.as_deref(), config.warnings)
+            });
+            report.files.push((path.clone(), problems));
+        }
+        if report.files.iter().any(|(_, p)| p.is_none()) {
+            let why = if client.is_dead() {
+                "exited".to_string()
             } else {
-                let feedback = format_feedback_message(
-                    lint_cmd.as_deref(),
-                    test_cmd.as_deref(),
-                    lint_stderr.as_deref(),
-                    test_stderr.as_deref(),
-                );
-                AutoFixAction::Retry {
-                    feedback,
-                    status: format!(
-                        "[auto-fix] checks failed — retry {}/{}",
-                        retries_used + 1,
-                        config.max_retries,
-                    ),
+                format!("did not report within {}", seconds(config.timeout))
+            };
+            report.note = give_up(why).note;
+        }
+        report
+    }
+}
+
+/// One diagnostic, positions 0-based as LSP sends them.
+#[derive(Debug, Clone, PartialEq)]
+struct Diag {
+    line: usize,
+    col: usize,
+    end_line: usize,
+    warning: bool,
+    message: String,
+    code: Option<String>,
+}
+
+impl Diag {
+    /// Errors, and warnings when `warnings`; a diagnostic with no severity
+    /// is an error, as most editors show it.
+    fn parse(v: &Value, warnings: bool) -> Option<Diag> {
+        let severity = v.get("severity").and_then(Value::as_u64).unwrap_or(1);
+        if !(severity == 1 || warnings && severity == 2) {
+            return None;
+        }
+        let start = &v["range"]["start"];
+        let pos = |p: &Value, k: &str| p.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+        let line = pos(start, "line");
+        Some(Diag {
+            line,
+            col: pos(start, "character"),
+            end_line: pos(&v["range"]["end"], "line").max(line),
+            warning: severity == 2,
+            message: v.get("message").and_then(Value::as_str)?.to_string(),
+            code: match v.get("code") {
+                Some(Value::String(c)) => Some(c.clone()),
+                Some(Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            },
+        })
+    }
+
+    /// `file:line:col message`, 1-based like Read and grep, on one line.
+    fn render(&self, file: &str) -> String {
+        let message: String = self
+            .message
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
+        let kind = if self.warning { "warning: " } else { "" };
+        format!("{file}:{}:{} {kind}{message}", self.line + 1, self.col + 1)
+    }
+
+    /// What identifies the same problem before and after an edit that
+    /// moved it: its message, code, and the text of its line.
+    fn key(&self, text: Option<&str>) -> (String, Option<String>, Option<String>) {
+        let line = text
+            .and_then(|t| t.lines().nth(self.line))
+            .map(|l| l.trim().to_string());
+        (self.message.clone(), self.code.clone(), line)
+    }
+}
+
+/// The diagnostics in `published` that the turn's edits introduced:
+/// measured against what a server had already reported for the file when
+/// there was one, else only those on lines the edits changed.
+fn new_problems(
+    published: &[Value],
+    baseline: Option<&LspBaseline>,
+    after: Option<&str>,
+    warnings: bool,
+) -> Vec<Diag> {
+    let mut problems: Vec<Diag> = published
+        .iter()
+        .filter_map(|v| Diag::parse(v, warnings))
+        .collect();
+    problems.sort_by_key(|d| (d.line, d.col));
+    let Some(baseline) = baseline else {
+        return problems;
+    };
+    if let Some(before) = &baseline.diagnostics {
+        let mut known: HashMap<_, usize> = HashMap::new();
+        for d in before.iter().filter_map(|v| Diag::parse(v, warnings)) {
+            *known.entry(d.key(baseline.content.as_deref())).or_default() += 1;
+        }
+        problems.retain(|d| match known.get_mut(&d.key(after)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        });
+        return problems;
+    }
+    if let (Some(before), Some(after)) = (&baseline.content, after) {
+        let changed = changed_lines(before, after);
+        // A problem past the last line (a missing `}` at EOF) is on it.
+        let last = changed.len().saturating_sub(1);
+        problems.retain(|d| {
+            (d.line.min(last)..=d.end_line.min(last)).any(|l| changed.get(l) == Some(&true))
+        });
+    }
+    problems
+}
+
+/// For each line of `after`, whether the edit from `before` changed it.
+/// Lines outside the common head and tail count as changed unless the old
+/// middle had the same line (a line that only moved). At a pure deletion
+/// the lines either side of it count.
+fn changed_lines(before: &str, after: &str) -> Vec<bool> {
+    let old: Vec<&str> = before.lines().collect();
+    let new: Vec<&str> = after.lines().collect();
+    let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut changed = vec![false; new.len()];
+    let (old_mid, new_mid) = (head..old.len() - tail, head..new.len() - tail);
+    if new_mid.is_empty() {
+        if !old_mid.is_empty() {
+            for l in [head.wrapping_sub(1), head] {
+                if let Some(c) = changed.get_mut(l) {
+                    *c = true;
                 }
             }
         }
+        return changed;
     }
+    let mut unmatched: HashMap<&str, usize> = HashMap::new();
+    for l in &old[old_mid] {
+        *unmatched.entry(*l).or_default() += 1;
+    }
+    for i in new_mid {
+        match unmatched.get_mut(new[i]) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => changed[i] = true,
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -1138,6 +1647,7 @@ mod tests {
             test_command: None,
             max_retries: 3,
             timeout_secs: 10,
+            lsp: Default::default(),
         };
         let action = super::run_auto_fix_check(
             proj.path(),
@@ -1146,6 +1656,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         assert!(
             matches!(action, super::AutoFixAction::Retry { .. }),
@@ -1451,6 +1962,7 @@ mod tests {
             Some("cargo test"),
             Some("warning: unused variable `x`"),
             Some("test foo ... FAILED"),
+            None,
         );
         assert!(msg.contains("Your last edits failed"));
         assert!(msg.contains("## Lint (cargo clippy)"));
@@ -1468,6 +1980,7 @@ mod tests {
             Some("cargo test"),
             Some("warning: dead code"),
             None,
+            None,
         );
         assert!(msg.contains("## Lint (cargo clippy)"));
         assert!(msg.contains("warning: dead code"));
@@ -1481,6 +1994,7 @@ mod tests {
             Some("cargo test"),
             None,
             Some("assertion failed: x == 1"),
+            None,
         );
         assert!(msg.contains("(no output)"));
         assert!(msg.contains("assertion failed"));
@@ -1489,8 +2003,13 @@ mod tests {
     #[test]
     fn format_feedback_message_truncates_lint() {
         let big = "x".repeat(5000);
-        let msg =
-            format_feedback_message(Some("cargo clippy"), Some("cargo test"), Some(&big), None);
+        let msg = format_feedback_message(
+            Some("cargo clippy"),
+            Some("cargo test"),
+            Some(&big),
+            None,
+            None,
+        );
         // Should contain the truncation marker
         assert!(msg.contains("(output trimmed)"));
         // Should not contain all 5000 x's
@@ -1509,6 +2028,7 @@ mod tests {
             Some("cargo test"),
             Some("(lint passed)"),
             Some(&big),
+            None,
         );
         assert!(msg.contains("(output trimmed)"));
         let y_count = msg.matches('y').count();
@@ -1534,6 +2054,7 @@ mod tests {
             test_command: Some("true".to_string()),
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1542,6 +2063,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         assert!(
             matches!(action, AutoFixAction::Continue { .. }),
@@ -1559,6 +2081,7 @@ mod tests {
             test_command: Some("true".to_string()),
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1567,6 +2090,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         match action {
             AutoFixAction::Retry { feedback, status } => {
@@ -1589,6 +2113,7 @@ mod tests {
             test_command: Some("false".to_string()),
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1597,6 +2122,7 @@ mod tests {
             1,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         match action {
             AutoFixAction::Retry { feedback, status } => {
@@ -1617,6 +2143,7 @@ mod tests {
             test_command: Some("true".to_string()),
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1625,6 +2152,7 @@ mod tests {
             3,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         match action {
             AutoFixAction::GiveUp { status } => {
@@ -1646,6 +2174,7 @@ mod tests {
             test_command: Some("false".to_string()),
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1654,6 +2183,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         match action {
             AutoFixAction::Continue { status } => {
@@ -1673,6 +2203,7 @@ mod tests {
             test_command: Some("false".to_string()),
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1681,6 +2212,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
     }
@@ -1710,6 +2242,7 @@ mod tests {
             test_command: None,
             max_retries: 3,
             timeout_secs: 5,
+            lsp: Default::default(),
         };
         let action = run_auto_fix_check(
             dir.path(),
@@ -1718,6 +2251,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
     }
@@ -1732,6 +2266,7 @@ mod tests {
             test_command: Some("touch test.marker".to_string()),
             max_retries: 3,
             timeout_secs: 10,
+            lsp: Default::default(),
         }
     }
 
@@ -1748,6 +2283,7 @@ mod tests {
             0,
             &untrusted,
             &NOT_CANCELLED,
+            None,
         );
         assert!(matches!(action, AutoFixAction::Untrusted), "{action:?}");
         assert!(!dir.path().join("lint.marker").exists());
@@ -1768,6 +2304,7 @@ mod tests {
             0,
             &untrusted,
             &NOT_CANCELLED,
+            None,
         );
         assert!(matches!(action, AutoFixAction::Untrusted), "{action:?}");
 
@@ -1780,6 +2317,7 @@ mod tests {
             0,
             &untrusted,
             &NOT_CANCELLED,
+            None,
         );
         assert!(
             matches!(action, AutoFixAction::Continue { status: None }),
@@ -1796,6 +2334,7 @@ mod tests {
             0,
             &untrusted,
             &NOT_CANCELLED,
+            None,
         );
         assert!(
             matches!(action, AutoFixAction::Continue { status: None }),
@@ -1813,6 +2352,7 @@ mod tests {
             0,
             &trusted(),
             &NOT_CANCELLED,
+            None,
         );
         assert!(
             matches!(action, AutoFixAction::Continue { status: Some(_) }),
@@ -1845,6 +2385,7 @@ mod tests {
             0,
             &strict,
             &NOT_CANCELLED,
+            None,
         );
         match action {
             AutoFixAction::Continue { status: Some(s) } => {
@@ -1865,6 +2406,7 @@ mod tests {
             0,
             &broken,
             &NOT_CANCELLED,
+            None,
         );
         match action {
             AutoFixAction::Continue { status: Some(s) } => assert!(s.contains("bogus"), "{s}"),
@@ -1981,5 +2523,408 @@ mod tests {
                 Err(e) => assert!(e.contains(&format!("{mode} not found")), "{e}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lsp_diff_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn diag(line: u64, severity: u64, message: &str) -> Value {
+        json!({
+            "range": {"start": {"line": line, "character": 4}, "end": {"line": line, "character": 7}},
+            "severity": severity,
+            "message": message
+        })
+    }
+
+    #[test]
+    fn changed_lines_ignore_lines_that_only_moved() {
+        let before = "a\nb\nc\nd\n";
+        // A line inserted at the top, `c` edited.
+        let after = "new\na\nb\nC\nd\n";
+        assert_eq!(
+            changed_lines(before, after),
+            vec![true, false, false, true, false]
+        );
+        // A pure deletion marks the lines either side of it.
+        assert_eq!(changed_lines("a\nb\nc\n", "a\nc\n"), vec![true, true]);
+        // A new file: every line is the edit's.
+        assert_eq!(changed_lines("", "x\ny\n"), vec![true, true]);
+    }
+
+    /// Without a server's earlier report, only errors on changed lines count;
+    /// warnings never do unless asked for.
+    #[test]
+    fn without_a_prior_report_only_changed_lines_count() {
+        let baseline = LspBaseline {
+            content: Some("x = ERR\ny = 1\n".into()),
+            diagnostics: None,
+        };
+        let after = "z = 0\nx = ERR\ny = ERR2\nw = WARN\n";
+        let published = [
+            diag(1, 1, "old"),
+            diag(2, 1, "new"),
+            diag(3, 2, "a warning"),
+        ];
+        let got = new_problems(&published, Some(&baseline), Some(after), false);
+        assert_eq!(
+            got.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            ["new"]
+        );
+        let got = new_problems(&published, Some(&baseline), Some(after), true);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].render("a.py"), "a.py:4:5 warning: a warning");
+    }
+
+    /// With a report from before the edit, a problem it already had is not
+    /// new even where the edit moved it; a second copy of it is.
+    #[test]
+    fn a_prior_report_subtracts_problems_that_were_already_there() {
+        let baseline = LspBaseline {
+            content: Some("x = ERR\n".into()),
+            diagnostics: Some(vec![diag(0, 1, "undefined ERR")]),
+        };
+        let after = "import os\nx = ERR\nx = ERR\n";
+        let published = [diag(1, 1, "undefined ERR"), diag(2, 1, "undefined ERR")];
+        let got = new_problems(&published, Some(&baseline), Some(after), false);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].line, 2);
+    }
+
+    #[test]
+    fn rendered_lines_are_one_based_and_on_one_line() {
+        let d = Diag::parse(&diag(9, 1, "expected `;`\n  found `}`"), false).unwrap();
+        assert_eq!(d.render("src/a.rs"), "src/a.rs:10:5 expected `;` found `}`");
+        assert!(Diag::parse(&diag(0, 3, "info"), true).is_none());
+    }
+}
+
+/// Auto-fix against a stand-in language server (python3 speaking LSP over
+/// stdio): it reports an error on every line containing `ERR` and a
+/// warning on every line containing `WARN`.
+#[cfg(all(test, unix))]
+mod lsp_check_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    static NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+    /// `mode`: `ok`, `hang` (never answers `initialize`).
+    fn fake_server(bin: &Path, log: &Path, mode: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, sys
+LOG, MODE = {log:?}, {mode:?}
+def log(s):
+    with open(LOG, "a") as f:
+        f.write(s + "\n")
+def read():
+    n = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        k, v = line.split(b":", 1)
+        if k.strip().lower() == b"content-length":
+            n = int(v)
+    return json.loads(sys.stdin.buffer.read(n))
+def send(msg):
+    b = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+    sys.stdout.buffer.flush()
+log("start")
+held = []
+while True:
+    m = read()
+    if m is None:
+        break
+    method = m.get("method")
+    if method == "initialize":
+        if MODE != "hang":
+            send({{"jsonrpc": "2.0", "id": m["id"], "result": {{"capabilities": {{"textDocumentSync": 1}}}}}})
+    elif method in ("textDocument/didOpen", "textDocument/didChange"):
+        log(method)
+        doc = m["params"]["textDocument"]
+        text = doc["text"] if "text" in doc else m["params"]["contentChanges"][-1]["text"]
+        diags = []
+        for i, l in enumerate(text.splitlines()):
+            for word, sev in (("ERR", 1), ("WARN", 2)):
+                if word in l:
+                    c = l.index(word)
+                    diags.append({{"range": {{"start": {{"line": i, "character": c}}, "end": {{"line": i, "character": c + 3}}}}, "severity": sev, "message": "bad " + l.strip()}})
+        held.append({{"uri": doc["uri"], "version": doc["version"], "diagnostics": diags}})
+        # Like pyright: ask for configuration and wait for the answer.
+        send({{"jsonrpc": "2.0", "id": 1, "method": "workspace/configuration", "params": {{"items": [{{}}]}}}})
+    elif "method" not in m and m.get("id") == 1:
+        log("configured")
+        for p in held:
+            send({{"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": p}})
+        held = []
+    elif method == "shutdown":
+        log("shutdown")
+        send({{"jsonrpc": "2.0", "id": m["id"], "result": None}})
+    elif method == "exit":
+        log("exit")
+        sys.exit(0)
+"#
+        );
+        let p = bin.join("pyright-langserver");
+        std::fs::write(&p, script).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    struct Fixture {
+        project: tempfile::TempDir,
+        bin: tempfile::TempDir,
+        log: PathBuf,
+        pool: LspPool,
+        rt: tokio::runtime::Runtime,
+    }
+
+    fn fixture(mode: &str) -> Fixture {
+        let project = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("server.log");
+        fake_server(bin.path(), &log, mode);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        Fixture {
+            project,
+            bin,
+            log,
+            pool: LspPool::default(),
+            rt,
+        }
+    }
+
+    impl Fixture {
+        fn file(&self, name: &str) -> PathBuf {
+            self.project.path().join(name)
+        }
+
+        /// The file's state before an edit, as the TUI records it.
+        fn baseline(&self, file: &Path) -> LspBaseline {
+            self.rt.block_on(capture_lsp_baseline(
+                &self.pool,
+                self.project.path(),
+                file,
+                Some(self.bin.path().as_os_str()),
+            ))
+        }
+
+        fn check(
+            &self,
+            files: Vec<(PathBuf, Option<LspBaseline>)>,
+            config: &AutoFixConfig,
+            containment: &Containment,
+        ) -> AutoFixAction {
+            let lsp = LspDiagnostics {
+                pool: self.pool.clone(),
+                root: self.project.path().to_path_buf(),
+                files,
+                search_path: Some(self.bin.path().as_os_str().to_owned()),
+                runtime: self.rt.handle().clone(),
+            };
+            run_auto_fix_check(
+                self.project.path(),
+                config,
+                Autonomy::AutoEdit,
+                0,
+                containment,
+                &NOT_CANCELLED,
+                Some(&lsp),
+            )
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    fn config() -> AutoFixConfig {
+        AutoFixConfig {
+            trigger: AutoFixTrigger::Always,
+            lsp: LspDiagnosticsConfig {
+                settle: Duration::from_millis(200),
+                timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn trusted() -> Containment {
+        Containment {
+            trusted: true,
+            ..Default::default()
+        }
+    }
+
+    /// An edit that adds an error: it reaches the model as
+    /// `file:line:col message`; the warning next to it does not.
+    #[test]
+    fn a_new_error_is_fed_back_and_warnings_are_not() {
+        let f = fixture("ok");
+        let file = f.file("app.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        let before = f.baseline(&file);
+        std::fs::write(&file, "x = 1\ny = ERR\nz = WARN\n").unwrap();
+        let action = f.check(vec![(file, Some(before))], &config(), &trusted());
+        let AutoFixAction::Retry { feedback, .. } = action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(
+            feedback.contains("## Language server (pyright-langserver)\napp.py:2:5 bad y = ERR"),
+            "{feedback}"
+        );
+        assert!(!feedback.contains("WARN"), "{feedback}");
+        assert!(!feedback.contains("## Lint"), "{feedback}");
+        // The server's configuration request was answered.
+        assert!(f.log().contains("configured"));
+    }
+
+    /// An error the file already had is not the edit's: neither on a first
+    /// check (no server ran before it) nor on a later one, where the
+    /// server's earlier report is the baseline.
+    #[test]
+    fn pre_existing_errors_are_not_repeated() {
+        let f = fixture("ok");
+        let file = f.file("app.py");
+        std::fs::write(&file, "x = ERR\n").unwrap();
+        let before = f.baseline(&file);
+        assert!(before.diagnostics.is_none(), "no server was running yet");
+        std::fs::write(&file, "import os\nx = ERR\n").unwrap();
+        let action = f.check(vec![(file.clone(), Some(before))], &config(), &trusted());
+        let AutoFixAction::Continue { status } = &action else {
+            panic!("expected no retry: {action:?}");
+        };
+        assert_eq!(status.as_deref(), Some("[auto-fix] checks passed"));
+
+        // Next turn: the running server's report is the baseline.
+        let before = f.baseline(&file);
+        assert_eq!(before.diagnostics.as_ref().map(Vec::len), Some(1));
+        std::fs::write(&file, "import os\nimport sys\nx = ERR\nw = ERR2\n").unwrap();
+        let action = f.check(vec![(file, Some(before))], &config(), &trusted());
+        let AutoFixAction::Retry { feedback, .. } = action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(feedback.contains("app.py:4:5 bad w = ERR2"), "{feedback}");
+        assert!(!feedback.contains("bad x = ERR"), "{feedback}");
+        assert_eq!(f.log().matches("start").count(), 1, "one server, reused");
+        // The open document gets its new text, not a second didOpen.
+        assert_eq!(f.log().matches("didOpen").count(), 1, "{}", f.log());
+        assert_eq!(f.log().matches("didChange").count(), 1, "{}", f.log());
+    }
+
+    /// Language servers run project code: an untrusted folder starts none,
+    /// and says so through the same notice as lint and tests.
+    #[test]
+    fn an_untrusted_project_starts_no_language_server() {
+        let f = fixture("ok");
+        let file = f.file("app.py");
+        std::fs::write(&file, "y = ERR\n").unwrap();
+        let action = f.check(vec![(file, None)], &config(), &Containment::default());
+        assert!(matches!(action, AutoFixAction::Untrusted), "{action:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!f.log.exists(), "a server started: {}", f.log());
+    }
+
+    #[test]
+    fn the_lsp_opt_out_is_respected() {
+        let f = fixture("ok");
+        let file = f.file("app.py");
+        std::fs::write(&file, "y = ERR\n").unwrap();
+        let mut cfg = config();
+        cfg.lsp.enabled = false;
+        let action = f.check(vec![(file, None)], &cfg, &trusted());
+        assert!(
+            matches!(action, AutoFixAction::Continue { status: None }),
+            "{action:?}"
+        );
+        assert!(!f.log.exists(), "a server started: {}", f.log());
+    }
+
+    /// A server that never answers holds the turn for the cap at most, and
+    /// is not waited on again this session.
+    #[test]
+    fn a_hung_server_hits_the_cap_and_is_given_up() {
+        let f = fixture("hang");
+        let file = f.file("app.py");
+        std::fs::write(&file, "y = ERR\n").unwrap();
+        let mut cfg = config();
+        cfg.lsp.timeout = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let action = f.check(vec![(file.clone(), None)], &cfg, &trusted());
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(4), "took {took:?}");
+        let AutoFixAction::Continue {
+            status: Some(status),
+        } = &action
+        else {
+            panic!("expected a note: {action:?}");
+        };
+        assert!(
+            status.contains("pyright-langserver did not answer within 1s"),
+            "{status}"
+        );
+
+        let started = std::time::Instant::now();
+        let action = f.check(vec![(file, None)], &cfg, &trusted());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            matches!(action, AutoFixAction::Continue { status: None }),
+            "{action:?}"
+        );
+        assert_eq!(f.log().matches("start").count(), 1);
+    }
+
+    /// The feedback stays bounded however many errors a file has.
+    #[test]
+    fn errors_are_capped_at_thirty_lines() {
+        let f = fixture("ok");
+        let file = f.file("gen.py");
+        let body: String = (0..40).map(|i| format!("v{i} = ERR\n")).collect();
+        std::fs::write(&file, &body).unwrap();
+        let action = f.check(
+            vec![(file, Some(LspBaseline::default()))],
+            &config(),
+            &trusted(),
+        );
+        let AutoFixAction::Retry { feedback, .. } = action else {
+            panic!("expected a retry: {action:?}");
+        };
+        let section = feedback.split("## Language server").nth(1).unwrap();
+        let lines: Vec<&str> = section
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), MAX_LSP_LINES, "{section}");
+        assert_eq!(lines.last(), Some(&"... and 11 more"));
+    }
+
+    /// Exit sends `shutdown` and `exit` rather than killing the server.
+    #[test]
+    fn servers_are_shut_down_cleanly() {
+        let f = fixture("ok");
+        let file = f.file("app.py");
+        std::fs::write(&file, "y = 1\n").unwrap();
+        let action = f.check(vec![(file, None)], &config(), &trusted());
+        assert!(
+            matches!(action, AutoFixAction::Continue { .. }),
+            "{action:?}"
+        );
+        f.rt.block_on(f.pool.shutdown());
+        let log = f.log();
+        assert!(log.ends_with("shutdown\nexit\n"), "{log}");
     }
 }

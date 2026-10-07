@@ -406,6 +406,15 @@ pub struct AutoFixSettings {
     /// Max wall-clock seconds the test command may run before being killed.
     /// Defaults to 60 when unset. Set to 0 for no timeout.
     pub timeout_secs: Option<u64>,
+    /// Add language-server errors in the edited files to the checks
+    /// (default: true).
+    pub lsp: Option<bool>,
+    /// How long to keep listening after a file's first diagnostics (default 2000).
+    pub lsp_settle_ms: Option<u64>,
+    /// Cap on the whole language-server step, start-up included (default 10000).
+    pub lsp_timeout_ms: Option<u64>,
+    /// Report warnings as well as errors (default: false).
+    pub lsp_warnings: Option<bool>,
 }
 
 impl HooksConfig {
@@ -458,6 +467,10 @@ impl AutoFixSettings {
             test_command: other.test_command.or(self.test_command),
             max_retries: other.max_retries.or(self.max_retries),
             timeout_secs: other.timeout_secs.or(self.timeout_secs),
+            lsp: other.lsp.or(self.lsp),
+            lsp_settle_ms: other.lsp_settle_ms.or(self.lsp_settle_ms),
+            lsp_timeout_ms: other.lsp_timeout_ms.or(self.lsp_timeout_ms),
+            lsp_warnings: other.lsp_warnings.or(self.lsp_warnings),
         }
     }
 }
@@ -1227,6 +1240,7 @@ mod auto_fix_key_tests {
                 test_command: Some("cargo test".to_string()),
                 max_retries: Some(3),
                 timeout_secs: None,
+                ..Default::default()
             }),
             ..Default::default()
         };

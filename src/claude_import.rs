@@ -662,8 +662,10 @@ fn tightening_value(key: &str, v: &Value, all: &Map<String, Value>) -> Option<Va
                     off.insert("enabled".into(), Value::Bool(false));
                 }
                 Value::Object(o) => {
-                    if o.get("enabled") == Some(&Value::Bool(false)) {
-                        off.insert("enabled".into(), Value::Bool(false));
+                    for key in ["enabled", "lsp"] {
+                        if o.get(key) == Some(&Value::Bool(false)) {
+                            off.insert(key.into(), Value::Bool(false));
+                        }
                     }
                     if o.get("trigger")
                         .and_then(Value::as_str)
@@ -1016,6 +1018,16 @@ mod tests {
         ] {
             assert!(text.contains(key), "{key} named as left behind: {text}");
         }
+    }
+
+    /// Turning the language-server step off only tightens; its timings do not.
+    #[test]
+    fn an_auto_fix_lsp_opt_out_is_kept() {
+        let v = serde_json::json!({"lsp": false, "lspTimeoutMs": 500});
+        assert_eq!(
+            tightening_value("autoFixLoop", &v, &Map::new()),
+            Some(serde_json::json!({"lsp": false}))
+        );
     }
 
     #[test]

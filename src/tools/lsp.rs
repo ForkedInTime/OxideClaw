@@ -6,37 +6,58 @@ use super::{Tool, ToolContext, ToolOutput, async_trait};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
+use tokio::time::Instant;
 
-/// One language server per (command, project root), kept for the life of
-/// the tool set. A fresh server per call meant paying rust-analyzer's full
-/// startup and indexing on every query.
+/// One language server per (command, project root). A fresh server per call
+/// meant paying rust-analyzer's full startup and indexing on every query.
 type ClientCache = Arc<Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>>;
 
-#[derive(Default)]
-pub struct LSPTool {
-    cache: ClientCache,
+/// The session's language servers: the LSP tool and the auto-fix
+/// diagnostics share them, so a server starts once whichever needs it first.
+#[derive(Clone, Default)]
+pub struct LspPool {
+    clients: ClientCache,
+    /// Servers the auto-fix check stopped using for this session: one that
+    /// crashed, did not answer within the cap, or that the sandbox refused.
+    given_up: Arc<std::sync::Mutex<HashSet<(String, PathBuf)>>>,
 }
 
-impl LSPTool {
-    /// The cached, initialised client for this server + root, spawning it
-    /// on first use.
-    async fn client_for(
+/// How to start a server that is not running yet.
+pub(crate) enum Launch {
+    /// The command name, found on the process PATH.
+    Plain,
+    /// This executable (the command resolved on a given PATH).
+    Program(PathBuf),
+    /// This shell line: the command wrapped by the Bash tool's sandbox.
+    Shell(String),
+}
+
+fn cache_key(command: &str, args: &[String], root: &Path) -> (String, PathBuf) {
+    (format!("{command} {}", args.join(" ")), root.to_path_buf())
+}
+
+impl LspPool {
+    /// The cached, initialised client for this server + root, starting it
+    /// with `launch` on first use.
+    pub(crate) async fn client_for(
         &self,
         command: &str,
         args: &[String],
         root: &Path,
+        launch: &Launch,
     ) -> Result<Arc<LspClient>> {
-        let key = (format!("{command} {}", args.join(" ")), root.to_path_buf());
-        let mut cache = self.cache.lock().await;
+        let key = cache_key(command, args, root);
+        let mut cache = self.clients.lock().await;
         if let Some(c) = cache.get(&key) {
             // A server that crashed or was killed would otherwise fail every
             // later call (EPIPE) until OxideClaw restarts: start a new one.
@@ -45,12 +66,82 @@ impl LSPTool {
             }
             cache.remove(&key);
         }
-        let client = LspClient::connect(command, args, root).await?;
+        let client = LspClient::connect(command, args, root, launch).await?;
         client.initialize(root).await?;
         let client = Arc::new(client);
         cache.insert(key, Arc::clone(&client));
         Ok(client)
     }
+
+    /// The running client for this server + root, without starting one.
+    pub(crate) async fn running(
+        &self,
+        command: &str,
+        args: &[String],
+        root: &Path,
+    ) -> Option<Arc<LspClient>> {
+        let cache = self.clients.lock().await;
+        cache
+            .get(&cache_key(command, args, root))
+            .filter(|c| !c.dead.load(Ordering::SeqCst))
+            .cloned()
+    }
+
+    pub(crate) fn give_up(&self, command: &str, args: &[String], root: &Path) {
+        if let Ok(mut g) = self.given_up.lock() {
+            g.insert(cache_key(command, args, root));
+        }
+    }
+
+    pub(crate) fn gave_up(&self, command: &str, args: &[String], root: &Path) -> bool {
+        self.given_up
+            .lock()
+            .is_ok_and(|g| g.contains(&cache_key(command, args, root)))
+    }
+
+    /// Ask every server to shut down (`shutdown`, then `exit`), killing any
+    /// that has not gone within a second or two. For a clean exit.
+    pub async fn shutdown(&self) {
+        let clients: Vec<Arc<LspClient>> =
+            self.clients.lock().await.drain().map(|(_, c)| c).collect();
+        futures_util::future::join_all(clients.iter().map(|c| c.shutdown())).await;
+    }
+}
+
+/// Language servers by file extension, most preferred first. The LSP tool
+/// and the auto-fix diagnostics use the first one that is installed.
+fn servers_for_ext(ext: &str) -> &'static [(&'static str, &'static [&'static str])] {
+    match ext {
+        "rs" => &[("rust-analyzer", &[])],
+        "py" | "pyi" => &[("pyright-langserver", &["--stdio"]), ("pylsp", &[])],
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+            &[("typescript-language-server", &["--stdio"])]
+        }
+        "c" | "cpp" | "cc" | "h" | "hpp" => &[("clangd", &[])],
+        "go" => &[("gopls", &[])],
+        "java" => &[("jdtls", &[])],
+        "rb" => &[("solargraph", &["stdio"])],
+        "lua" => &[("lua-language-server", &[])],
+        _ => &[],
+    }
+}
+
+/// A language server for `path` found on `search` (a PATH value): its
+/// command, arguments and executable.
+pub(crate) fn installed_server(
+    path: &Path,
+    search: Option<&std::ffi::OsStr>,
+) -> Option<(&'static str, Vec<String>, PathBuf)> {
+    let ext = path.extension()?.to_str()?;
+    servers_for_ext(ext).iter().find_map(|(cmd, args)| {
+        let exe = crate::autofix::find_on_path(cmd, search)?;
+        Some((*cmd, args.iter().map(|a| a.to_string()).collect(), exe))
+    })
+}
+
+#[derive(Default)]
+pub struct LSPTool {
+    pool: LspPool,
 }
 
 // ── Input schema ──────────────────────────────────────────────────────────────
@@ -126,6 +217,10 @@ impl Tool for LSPTool {
         })
     }
 
+    fn lsp_pool(&self) -> Option<LspPool> {
+        Some(self.pool.clone())
+    }
+
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: Input = serde_json::from_value(input)?;
 
@@ -158,43 +253,33 @@ impl Tool for LSPTool {
             },
             ext => ext,
         };
-        let server_cmd = match ext {
-            Some("rs") => vec!["rust-analyzer".to_string()],
-            Some("py") | Some("pyi") => {
-                vec!["pyright-langserver".to_string(), "--stdio".to_string()]
-            }
-            Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => {
-                vec![
-                    "typescript-language-server".to_string(),
-                    "--stdio".to_string(),
-                ]
-            }
-            Some("c") | Some("cpp") | Some("cc") | Some("h") | Some("hpp") => {
-                vec!["clangd".to_string()]
-            }
-            Some("go") => vec!["gopls".to_string()],
-            Some("java") => vec!["jdtls".to_string()],
-            Some("rb") => vec!["solargraph".to_string(), "stdio".to_string()],
-            Some("lua") => vec!["lua-language-server".to_string()],
-            ext => {
-                return Ok(ToolOutput::error(format!(
-                    "No language server configured for extension: {:?}. \
-                    Supported: .rs, .py, .ts/.js, .c/.cpp, .go, .java, .rb, .lua",
-                    ext
-                )));
-            }
-        };
+        let candidates = ext.map(servers_for_ext).unwrap_or_default();
+        if candidates.is_empty() {
+            return Ok(ToolOutput::error(format!(
+                "No language server configured for extension: {:?}. \
+                Supported: .rs, .py, .ts/.js, .c/.cpp, .go, .java, .rb, .lua",
+                ext
+            )));
+        }
+        // The first installed server, else the preferred one, whose failure
+        // to start then names what to install.
+        let path_var = std::env::var_os("PATH");
+        let (command, args) = candidates
+            .iter()
+            .find(|(cmd, _)| crate::autofix::find_on_path(cmd, path_var.as_deref()).is_some())
+            .unwrap_or(&candidates[0]);
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
 
         // One initialised server per (command, root), cached across calls.
         let client = match self
-            .client_for(&server_cmd[0], &server_cmd[1..], &ctx.cwd)
+            .pool
+            .client_for(command, &args, &ctx.cwd, &Launch::Plain)
             .await
         {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolOutput::error(format!(
-                    "Could not start language server '{}': {e}\nMake sure it is installed.",
-                    server_cmd[0]
+                    "Could not start language server '{command}': {e}\nMake sure it is installed."
                 )));
             }
         };
@@ -202,24 +287,10 @@ impl Tool for LSPTool {
         // Convert file path to URI
         let uri = path_to_uri(&file_path);
 
-        // Open the document so the server can process it
-        if file_path.exists()
-            && let Ok(content) = tokio::fs::read_to_string(&file_path).await
-        {
-            let lang_id = lang_id_for_ext(file_path.extension().and_then(|e| e.to_str()));
-            client
-                .notify(
-                    "textDocument/didOpen",
-                    json!({
-                        "textDocument": {
-                            "uri": uri,
-                            "languageId": lang_id,
-                            "version": 1,
-                            "text": content
-                        }
-                    }),
-                )
-                .await?;
+        // Open the document (or send its current text if it is already
+        // open) so the server answers about what is on disk.
+        if file_path.is_file() {
+            client.sync_document(&file_path).await?;
             // Small delay to let server process the document
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
@@ -363,38 +434,109 @@ impl Tool for LSPTool {
 
 // ── LSP JSON-RPC Client ───────────────────────────────────────────────────────
 
-struct LspClient {
+/// The diagnostics a server last published for one document.
+#[derive(Clone)]
+struct Published {
+    /// Position in the client's publish sequence.
+    seq: u64,
+    /// The document version they are for, when the server says.
+    version: Option<i64>,
+    diagnostics: Vec<Value>,
+}
+
+/// A document sent to the server by `sync_document`.
+pub(crate) struct Synced {
+    path: PathBuf,
+    version: i64,
+    /// The publish sequence number just before it was sent: later publishes
+    /// for it may describe this text.
+    seq: u64,
+}
+
+pub(crate) struct LspClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     id_counter: Arc<AtomicU64>,
     /// Set once the server's stdout closes or a write to it fails. Writing to
     /// a dead server's stdin raises SIGPIPE, which kills `-p` runs outright.
     dead: Arc<AtomicBool>,
+    /// `textDocument/publishDiagnostics` by document path.
+    published: Arc<std::sync::Mutex<HashMap<PathBuf, Published>>>,
+    /// The latest publish sequence number; closes when the server exits.
+    publish_seq: watch::Receiver<u64>,
+    /// Open documents and the version last sent for each.
+    documents: Mutex<HashMap<String, i64>>,
     /// Owns the language server. `kill_on_drop` means the server lives
     /// exactly as long as this client — previously the handle was dropped at
     /// the end of `connect`, which killed the server before `initialize`.
-    _child: tokio::process::Child,
+    child: std::sync::Mutex<Option<tokio::process::Child>>,
+}
+
+/// How published diagnostics are looked up by path. Windows servers
+/// differ in the drive letter's case (`file:///c%3A/...`).
+fn doc_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&*s).to_lowercase())
+    }
+    #[cfg(not(windows))]
+    path.to_path_buf()
+}
+
+fn frame(msg: &Value) -> Result<String> {
+    let body = serde_json::to_string(msg)?;
+    Ok(format!("Content-Length: {}\r\n\r\n{}", body.len(), body))
+}
+
+/// A JSON-RPC message; `params` is left out when null (`shutdown`, `exit`).
+fn message(id: Option<u64>, method: &str, params: Value) -> Value {
+    let mut msg = json!({ "jsonrpc": "2.0", "method": method });
+    if let Some(id) = id {
+        msg["id"] = json!(id);
+    }
+    if !params.is_null() {
+        msg["params"] = params;
+    }
+    msg
 }
 
 impl LspClient {
-    async fn connect(command: &str, args: &[String], cwd: &Path) -> Result<Self> {
+    async fn connect(command: &str, args: &[String], cwd: &Path, launch: &Launch) -> Result<Self> {
         use tokio::process::Command;
 
-        // npm's typescript-language-server and pyright-langserver (and the
-        // gem/jdtls launchers) are `.cmd`/`.bat` shims on Windows, which
-        // spawning the bare name never finds.
-        #[cfg(windows)]
-        let program = crate::mcp::client::resolve_on_path(
-            command,
-            std::env::var_os("PATH").as_deref(),
-            std::env::var_os("PATHEXT").as_deref(),
-        )
-        .unwrap_or_else(|| command.into());
-        #[cfg(not(windows))]
-        let program = command;
-
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = match launch {
+            Launch::Plain => {
+                // npm's typescript-language-server and pyright-langserver (and
+                // the gem/jdtls launchers) are `.cmd`/`.bat` shims on Windows,
+                // which spawning the bare name never finds.
+                #[cfg(windows)]
+                let program = crate::mcp::client::resolve_on_path(
+                    command,
+                    std::env::var_os("PATH").as_deref(),
+                    std::env::var_os("PATHEXT").as_deref(),
+                )
+                .unwrap_or_else(|| command.into());
+                #[cfg(not(windows))]
+                let program = command;
+                let mut c = Command::new(program);
+                c.args(args);
+                c
+            }
+            Launch::Program(program) => {
+                let mut c = Command::new(program);
+                c.args(args);
+                c
+            }
+            // `exec`, so killing the child kills the sandbox wrapper itself
+            // (bwrap's --die-with-parent then takes the server down).
+            Launch::Shell(line) => {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(format!("exec {line}"));
+                c
+            }
+        };
+        let mut child = cmd
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -405,12 +547,17 @@ impl LspClient {
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stdin = Arc::new(Mutex::new(stdin));
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_clone = pending.clone();
         let dead = Arc::new(AtomicBool::new(false));
         let dead_clone = dead.clone();
+        let published: Arc<std::sync::Mutex<HashMap<PathBuf, Published>>> = Arc::default();
+        let published_clone = published.clone();
+        let (seq_tx, publish_seq) = watch::channel(0u64);
+        let reply_to = stdin.clone();
 
         // Spawn reader task
         tokio::spawn(async move {
@@ -463,33 +610,85 @@ impl LspClient {
                     Err(_) => continue,
                 };
 
-                // Match to pending request
-                if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
-                    let mut p = pending_clone.lock().await;
-                    if let Some(tx) = p.remove(&id) {
-                        let result = if let Some(error) = msg.get("error") {
-                            Err(anyhow!("LSP error: {}", error))
-                        } else {
-                            Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+                match (msg.get("method").and_then(Value::as_str), msg.get("id")) {
+                    // A request from the server (workDoneProgress/create,
+                    // workspace/configuration, ...): servers wait for the
+                    // answer, and its id must not resolve one of ours.
+                    (Some(method), Some(id)) => {
+                        let result = match method {
+                            "workspace/configuration" => {
+                                let n = msg["params"]["items"].as_array().map_or(0, Vec::len);
+                                Value::Array(vec![Value::Null; n])
+                            }
+                            _ => Value::Null,
                         };
-                        let _ = tx.send(result);
+                        let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                        if let Ok(f) = frame(&reply) {
+                            let mut w = reply_to.lock().await;
+                            let _ = w.write_all(f.as_bytes()).await;
+                            let _ = w.flush().await;
+                        }
+                    }
+                    (Some("textDocument/publishDiagnostics"), None) => {
+                        let params = &msg["params"];
+                        let Some(path) = params["uri"]
+                            .as_str()
+                            .and_then(|u| url::Url::parse(u).ok())
+                            .and_then(|u| u.to_file_path().ok())
+                            .map(|p| doc_key(&p))
+                        else {
+                            continue;
+                        };
+                        let seq = *seq_tx.borrow() + 1;
+                        if let Ok(mut p) = published_clone.lock() {
+                            p.insert(
+                                path,
+                                Published {
+                                    seq,
+                                    version: params["version"].as_i64(),
+                                    diagnostics: params["diagnostics"]
+                                        .as_array()
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                },
+                            );
+                        }
+                        seq_tx.send_replace(seq);
+                    }
+                    (Some(_), None) => {}
+                    // Match to pending request
+                    (None, id) => {
+                        let Some(id) = id.and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let mut p = pending_clone.lock().await;
+                        if let Some(tx) = p.remove(&id) {
+                            let result = if let Some(error) = msg.get("error") {
+                                Err(anyhow!("LSP error: {}", error))
+                            } else {
+                                Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            let _ = tx.send(result);
+                        }
                     }
                 }
             }
         });
 
         Ok(Self {
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             pending,
             id_counter: Arc::new(AtomicU64::new(1)),
             dead,
-            _child: child,
+            published,
+            publish_seq,
+            documents: Mutex::default(),
+            child: std::sync::Mutex::new(Some(child)),
         })
     }
 
     async fn send_raw(&self, msg: Value) -> Result<()> {
-        let body = serde_json::to_string(&msg)?;
-        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let frame = frame(&msg)?;
         if self.dead.load(Ordering::SeqCst) {
             return Err(anyhow!("language server exited"));
         }
@@ -514,15 +713,7 @@ impl LspClient {
             pending.insert(id, tx);
         }
 
-        if let Err(e) = self
-            .send_raw(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params
-            }))
-            .await
-        {
+        if let Err(e) = self.send_raw(message(Some(id), method, params)).await {
             self.pending.lock().await.remove(&id);
             return Err(e);
         }
@@ -535,12 +726,7 @@ impl LspClient {
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.send_raw(json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params
-        }))
-        .await
+        self.send_raw(message(None, method, params)).await
     }
 
     async fn initialize(&self, root: &Path) -> Result<()> {
@@ -553,6 +739,8 @@ impl LspClient {
                 "rootPath": root.to_string_lossy(),
                 "capabilities": {
                     "textDocument": {
+                        "synchronization": { "dynamicRegistration": false },
+                        "publishDiagnostics": { "versionSupport": true },
                         "definition": { "dynamicRegistration": false },
                         "references": { "dynamicRegistration": false },
                         "hover": { "dynamicRegistration": false, "contentFormat": ["plaintext"] },
@@ -571,6 +759,136 @@ impl LspClient {
 
         self.notify("initialized", json!({})).await?;
         Ok(())
+    }
+
+    /// Send the file's current text: `didOpen` the first time, a full-text
+    /// `didChange` after. A second `didOpen` of an open document is a
+    /// protocol error, and without the change the server keeps answering
+    /// about the text it was first given.
+    pub(crate) async fn sync_document(&self, path: &Path) -> Result<Synced> {
+        let text = tokio::fs::read_to_string(path).await?;
+        let uri = path_to_uri(path);
+        let mut docs = self.documents.lock().await;
+        let seq = *self.publish_seq.borrow();
+        let version = match docs.get(&uri) {
+            Some(v) => {
+                let version = v + 1;
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri, "version": version },
+                        "contentChanges": [{ "text": text }]
+                    }),
+                )
+                .await?;
+                version
+            }
+            None => {
+                let lang_id = lang_id_for_ext(path.extension().and_then(|e| e.to_str()));
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": lang_id,
+                            "version": 1,
+                            "text": text
+                        }
+                    }),
+                )
+                .await?;
+                1
+            }
+        };
+        docs.insert(uri, version);
+        Ok(Synced {
+            path: path.to_path_buf(),
+            version,
+            seq,
+        })
+    }
+
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
+    /// The diagnostics last published for `path`, if any.
+    pub(crate) fn diagnostics(&self, path: &Path) -> Option<Vec<Value>> {
+        self.published_for(path).map(|p| p.diagnostics)
+    }
+
+    fn published_for(&self, path: &Path) -> Option<Published> {
+        let published = self.published.lock().ok()?;
+        // Servers may answer with the resolved path (`/tmp` → `/private/tmp`).
+        published
+            .get(&doc_key(path))
+            .or_else(|| published.get(&doc_key(&std::fs::canonicalize(path).ok()?)))
+            .cloned()
+    }
+
+    /// Diagnostics published for this text of the document since it was
+    /// synced, if any yet.
+    fn fresh(&self, synced: &Synced) -> Option<Vec<Value>> {
+        self.published_for(&synced.path)
+            .filter(|p| p.seq > synced.seq && p.version.is_none_or(|v| v >= synced.version))
+            .map(|p| p.diagnostics)
+    }
+
+    /// Wait until every synced document has diagnostics for its new text,
+    /// then `settle` longer for the follow-ups servers send (a fast syntax
+    /// pass, then a semantic one); never past `deadline`, and not after
+    /// `cancel` is set. Returns each document's diagnostics by then, `None`
+    /// for one with nothing new.
+    pub(crate) async fn wait_for_diagnostics(
+        &self,
+        synced: &[Synced],
+        settle: Duration,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Vec<Option<Vec<Value>>> {
+        let mut seq = self.publish_seq.clone();
+        let mut settled_at: Option<Instant> = None;
+        loop {
+            let now = Instant::now();
+            if settled_at.is_none() && synced.iter().all(|s| self.fresh(s).is_some()) {
+                settled_at = Some(now + settle);
+            }
+            if now >= deadline
+                || settled_at.is_some_and(|t| now >= t)
+                || cancel.load(Ordering::SeqCst)
+                || self.dead.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            // Short slices, so Esc is noticed.
+            let wake = settled_at
+                .unwrap_or(deadline)
+                .min(deadline)
+                .min(now + Duration::from_millis(100));
+            if let Ok(Err(_)) = tokio::time::timeout_at(wake, seq.changed()).await {
+                // The reader is gone: the server exited.
+                break;
+            }
+        }
+        synced.iter().map(|s| self.fresh(s)).collect()
+    }
+
+    /// `shutdown`, then `exit`; the process is killed if it has not exited
+    /// within a second of that.
+    async fn shutdown(&self) {
+        if !self.dead.load(Ordering::SeqCst) {
+            let second = Duration::from_secs(1);
+            let _ = tokio::time::timeout(second, self.request("shutdown", Value::Null)).await;
+            let _ = self.notify("exit", Value::Null).await;
+        }
+        let child = self.child.lock().ok().and_then(|mut c| c.take());
+        if let Some(mut child) = child
+            && tokio::time::timeout(Duration::from_secs(1), child.wait())
+                .await
+                .is_err()
+        {
+            let _ = child.kill().await;
+        }
     }
 }
 
@@ -816,7 +1134,9 @@ mod lifecycle_tests {
     async fn server_survives_connect_and_answers_initialize() {
         let (cmd, args) = fake_server();
         let dir = tempfile::tempdir().unwrap();
-        let client = LspClient::connect(&cmd, &args, dir.path()).await.unwrap();
+        let client = LspClient::connect(&cmd, &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
         let init = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             client.initialize(dir.path()),
@@ -834,9 +1154,14 @@ mod lifecycle_tests {
     async fn a_dead_server_fails_requests_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let script = "read -r _line; exit 0".to_string();
-        let client = LspClient::connect("sh", &["-c".to_string(), script], dir.path())
-            .await
-            .unwrap();
+        let client = LspClient::connect(
+            "sh",
+            &["-c".to_string(), script],
+            dir.path(),
+            &Launch::Plain,
+        )
+        .await
+        .unwrap();
         let started = std::time::Instant::now();
         let r = client.request("initialize", json!({})).await;
         assert!(r.is_err());
@@ -977,7 +1302,11 @@ mod cache_tests {
         );
         let tool = LSPTool::default();
         let args = vec!["-c".to_string(), script];
-        let a = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        let a = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !a.dead.load(Ordering::SeqCst) {
             assert!(std::time::Instant::now() < deadline, "exit never noticed");
@@ -985,7 +1314,11 @@ mod cache_tests {
         }
         assert!(a.notify("initialized", json!({})).await.is_err());
         assert!(a.pending.lock().await.is_empty());
-        let b = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        let b = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
         assert!(
             !Arc::ptr_eq(&a, &b),
             "the dead server came back from the cache"
@@ -1008,8 +1341,16 @@ mod cache_tests {
         );
         let tool = LSPTool::default();
         let args = vec!["-c".to_string(), script];
-        let a = tool.client_for("sh", &args, dir.path()).await.unwrap();
-        let b = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        let a = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
+        let b = tool
+            .pool
+            .client_for("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &b), "second call must hit the cache");
         let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(starts, 1, "server spawned {starts} times");
