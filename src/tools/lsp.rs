@@ -210,10 +210,35 @@ pub(crate) fn installed_server(
     })
 }
 
-#[derive(Default)]
 pub struct LSPTool {
     pool: LspPool,
+    /// Cap on one query: syncing the file and every request it makes.
+    timeout: Duration,
 }
+
+/// Long enough for two requests at their own 15 s timeout.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(40);
+
+impl Default for LSPTool {
+    fn default() -> Self {
+        Self {
+            pool: LspPool::default(),
+            timeout: QUERY_TIMEOUT,
+        }
+    }
+}
+
+const OPERATIONS: &[&str] = &[
+    "goToDefinition",
+    "findReferences",
+    "hover",
+    "documentSymbol",
+    "workspaceSymbol",
+    "goToImplementation",
+    "prepareCallHierarchy",
+    "incomingCalls",
+    "outgoingCalls",
+];
 
 // ── Input schema ──────────────────────────────────────────────────────────────
 
@@ -294,6 +319,12 @@ impl Tool for LSPTool {
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: Input = serde_json::from_value(input)?;
+        if !OPERATIONS.contains(&input.operation.as_str()) {
+            return Ok(ToolOutput::error(format!(
+                "Unknown operation: {}",
+                input.operation
+            )));
+        }
 
         // Resolve file path
         let file_path = match &input.file_path {
@@ -393,148 +424,164 @@ impl Tool for LSPTool {
             }
         };
 
-        // Convert file path to URI
-        let uri = path_to_uri(&file_path);
+        // A server that stops reading its input blocks the write of a file
+        // larger than the pipe buffer forever, and request timeouts cover
+        // only the reply: headless (-p, SDK, ACP) there is no Esc.
+        let query = async {
+            // Convert file path to URI
+            let uri = path_to_uri(&file_path);
 
-        // Open the document (or send its current text if it is already
-        // open) so the server answers about what is on disk.
-        // A file that is not UTF-8 (Latin-1 C, legacy Python) is queried
-        // without syncing, as before: the server reads it from disk.
-        if file_path.is_file() && client.sync_document(&file_path).await.is_ok() {
-            // Small delay to let server process the document
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
+            // Open the document (or send its current text if it is already
+            // open) so the server answers about what is on disk.
+            // A file that is not UTF-8 (Latin-1 C, legacy Python) is queried
+            // without syncing, as before: the server reads it from disk.
+            if file_path.is_file() && client.sync_document(&file_path).await.is_ok() {
+                // Small delay to let server process the document
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
 
-        let position = json!({
-            "line": input.line.unwrap_or(0),
-            "character": input.character.unwrap_or(0)
-        });
+            let position = json!({
+                "line": input.line.unwrap_or(0),
+                "character": input.character.unwrap_or(0)
+            });
 
-        let result = match input.operation.as_str() {
-            "goToDefinition" => {
-                client
-                    .request(
-                        "textDocument/definition",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position
-                        }),
-                    )
-                    .await?
-            }
-            "findReferences" => {
-                client
-                    .request(
-                        "textDocument/references",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position,
-                            "context": { "includeDeclaration": true }
-                        }),
-                    )
-                    .await?
-            }
-            "hover" => {
-                client
-                    .request(
-                        "textDocument/hover",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position
-                        }),
-                    )
-                    .await?
-            }
-            "documentSymbol" => {
-                client
-                    .request(
-                        "textDocument/documentSymbol",
-                        json!({
-                            "textDocument": { "uri": uri }
-                        }),
-                    )
-                    .await?
-            }
-            "workspaceSymbol" => {
-                client
-                    .request(
-                        "workspace/symbol",
-                        json!({
-                            "query": input.query.as_deref().unwrap_or("")
-                        }),
-                    )
-                    .await?
-            }
-            "goToImplementation" => {
-                client
-                    .request(
-                        "textDocument/implementation",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position
-                        }),
-                    )
-                    .await?
-            }
-            "prepareCallHierarchy" => {
-                client
-                    .request(
-                        "textDocument/prepareCallHierarchy",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position
-                        }),
-                    )
-                    .await?
-            }
-            "incomingCalls" => {
-                // First prepare
-                let items = client
-                    .request(
-                        "textDocument/prepareCallHierarchy",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position
-                        }),
-                    )
-                    .await?;
-                if let Some(item) = items.as_array().and_then(|a| a.first()) {
+            let result = match input.operation.as_str() {
+                "goToDefinition" => {
                     client
                         .request(
-                            "callHierarchy/incomingCalls",
+                            "textDocument/definition",
                             json!({
-                                "item": item
+                                "textDocument": { "uri": uri },
+                                "position": position
                             }),
                         )
                         .await?
-                } else {
-                    Value::Null
                 }
-            }
-            "outgoingCalls" => {
-                let items = client
-                    .request(
-                        "textDocument/prepareCallHierarchy",
-                        json!({
-                            "textDocument": { "uri": uri },
-                            "position": position
-                        }),
-                    )
-                    .await?;
-                if let Some(item) = items.as_array().and_then(|a| a.first()) {
+                "findReferences" => {
                     client
                         .request(
-                            "callHierarchy/outgoingCalls",
+                            "textDocument/references",
                             json!({
-                                "item": item
+                                "textDocument": { "uri": uri },
+                                "position": position,
+                                "context": { "includeDeclaration": true }
                             }),
                         )
                         .await?
-                } else {
-                    Value::Null
                 }
+                "hover" => {
+                    client
+                        .request(
+                            "textDocument/hover",
+                            json!({
+                                "textDocument": { "uri": uri },
+                                "position": position
+                            }),
+                        )
+                        .await?
+                }
+                "documentSymbol" => {
+                    client
+                        .request(
+                            "textDocument/documentSymbol",
+                            json!({
+                                "textDocument": { "uri": uri }
+                            }),
+                        )
+                        .await?
+                }
+                "workspaceSymbol" => {
+                    client
+                        .request(
+                            "workspace/symbol",
+                            json!({
+                                "query": input.query.as_deref().unwrap_or("")
+                            }),
+                        )
+                        .await?
+                }
+                "goToImplementation" => {
+                    client
+                        .request(
+                            "textDocument/implementation",
+                            json!({
+                                "textDocument": { "uri": uri },
+                                "position": position
+                            }),
+                        )
+                        .await?
+                }
+                "prepareCallHierarchy" => {
+                    client
+                        .request(
+                            "textDocument/prepareCallHierarchy",
+                            json!({
+                                "textDocument": { "uri": uri },
+                                "position": position
+                            }),
+                        )
+                        .await?
+                }
+                "incomingCalls" => {
+                    // First prepare
+                    let items = client
+                        .request(
+                            "textDocument/prepareCallHierarchy",
+                            json!({
+                                "textDocument": { "uri": uri },
+                                "position": position
+                            }),
+                        )
+                        .await?;
+                    if let Some(item) = items.as_array().and_then(|a| a.first()) {
+                        client
+                            .request(
+                                "callHierarchy/incomingCalls",
+                                json!({
+                                    "item": item
+                                }),
+                            )
+                            .await?
+                    } else {
+                        Value::Null
+                    }
+                }
+                "outgoingCalls" => {
+                    let items = client
+                        .request(
+                            "textDocument/prepareCallHierarchy",
+                            json!({
+                                "textDocument": { "uri": uri },
+                                "position": position
+                            }),
+                        )
+                        .await?;
+                    if let Some(item) = items.as_array().and_then(|a| a.first()) {
+                        client
+                            .request(
+                                "callHierarchy/outgoingCalls",
+                                json!({
+                                    "item": item
+                                }),
+                            )
+                            .await?
+                    } else {
+                        Value::Null
+                    }
+                }
+                other => return Err(anyhow!("Unknown operation: {other}")),
+            };
+            anyhow::Ok(result)
+        };
+        let result = match tokio::time::timeout(self.timeout, query).await {
+            Ok(result) => result?,
+            Err(_) => {
+                client.mark_dead();
+                return Ok(ToolOutput::error(format!(
+                    "LSP: '{command}' did not answer within {}s; it is restarted on the next query.",
+                    self.timeout.as_secs()
+                )));
             }
-            other => return Ok(ToolOutput::error(format!("Unknown operation: {other}"))),
         };
 
         let formatted = format_lsp_result(&input.operation, &result);
@@ -891,11 +938,13 @@ impl LspClient {
             return Err(e);
         }
 
-        // Wait up to 15 seconds
-        tokio::time::timeout(tokio::time::Duration::from_secs(15), rx)
-            .await
-            .map_err(|_| anyhow!("LSP request '{}' timed out", method))?
-            .map_err(|_| anyhow!("LSP request '{}' cancelled", method))?
+        match tokio::time::timeout(tokio::time::Duration::from_secs(15), rx).await {
+            Ok(reply) => reply.map_err(|_| anyhow!("LSP request '{}' cancelled", method))?,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(anyhow!("LSP request '{}' timed out", method))
+            }
+        }
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -1887,6 +1936,36 @@ while True:
         assert!(!out.is_error, "{}", text(&out));
         let seen = std::fs::read_to_string(&log).unwrap();
         assert!(seen.contains("textDocument/hover"), "{seen}");
+    }
+
+    /// A server that stops reading its input held a large file's sync (and
+    /// with it the whole headless run) forever.
+    #[tokio::test]
+    async fn a_server_that_stops_reading_cannot_hang_a_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = fake_server(dir.path(), "deaf");
+        std::fs::write(dir.path().join("big.lua"), "local x = 1\n".repeat(400_000)).unwrap();
+        let tool = LSPTool {
+            pool: LspPool::default(),
+            timeout: Duration::from_secs(1),
+        };
+        let client = lua_server(&tool, dir.path(), &server).await;
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.project_trusted = true;
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"operation": "hover", "file_path": "big.lua"}), &ctx),
+        )
+        .await
+        .expect("the query hung")
+        .unwrap();
+        assert!(out.is_error);
+        assert!(
+            text(&out).contains("did not answer within 1s"),
+            "{}",
+            text(&out)
+        );
+        assert!(client.is_dead(), "the next query must start a new server");
     }
 
     /// The tool starts servers the way auto-fix does: the executable itself
