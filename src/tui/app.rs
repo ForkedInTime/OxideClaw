@@ -1540,6 +1540,18 @@ fn format_tool_preview(name: &str, args: &str) -> String {
         "Read" => s("file_path").unwrap_or_default(),
         "Write" => s("file_path").unwrap_or_default(),
         "Edit" => s("file_path").unwrap_or_default(),
+        "MultiEdit" => val
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .map(|edits| {
+                edits
+                    .iter()
+                    .filter_map(|e| e.get("file_path").and_then(|p| p.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        "NotebookEdit" => s("notebook_path").unwrap_or_default(),
         "Glob" => s("pattern").unwrap_or_default(),
         "Grep" => {
             let pat = s("pattern").unwrap_or_default();

