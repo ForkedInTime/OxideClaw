@@ -396,6 +396,10 @@ fn is_dotenv(file_name: &str) -> bool {
 /// **Permissions are carried over from the original.** Renaming replaces the
 /// inode, so without this an edit to a `0600` file would silently republish it
 /// at the default `0644` — turning a routine edit into a disclosure.
+///
+/// An existing file that can be written but not replaced (single-file bind
+/// mount, non-writable directory) is written in place instead, as `fs::write`
+/// would.
 pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -408,9 +412,10 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
 
     // rename only needs a writable directory, so without this a 0444 file
     // that fs::write would have refused gets silently replaced.
-    if tokio::fs::metadata(path)
-        .await
-        .is_ok_and(|m| m.permissions().readonly())
+    let existing = tokio::fs::metadata(path).await.ok();
+    if existing
+        .as_ref()
+        .is_some_and(|m| m.permissions().readonly())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -428,16 +433,35 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
 
     // Mode of the file we are replacing, if it exists.
     #[cfg(unix)]
-    let mode = {
+    let mode = existing.as_ref().map(|m| {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::metadata(path)
-            .await
-            .ok()
-            .map(|m| m.permissions().mode())
+        m.permissions().mode()
+    });
+    #[cfg(not(unix))]
+    let mode = None;
+
+    // Some existing files can be written but not replaced: a single-file bind
+    // mount (`docker -v ./config.yml:/work/config.yml`, /etc/hosts) refuses
+    // rename with EBUSY/EXDEV, and a writable file in a non-writable
+    // directory refuses the temp file. fs::write handled those, so fall back
+    // to it there rather than failing an edit the user can plainly make.
+    let in_place = |e: &std::io::Error| {
+        use std::io::ErrorKind::*;
+        existing.is_some()
+            && matches!(
+                e.kind(),
+                PermissionDenied | ResourceBusy | CrossesDevices | ReadOnlyFilesystem
+            )
     };
 
-    let write_result = async {
-        let mut f = tokio::fs::File::create(&tmp).await?;
+    let mut f = match create_temp(&tmp, mode).await {
+        Ok(f) => f,
+        Err(e) if in_place(&e) => return write_in_place(path, content).await,
+        // Not ours (create_new refused an existing name), so not removed.
+        Err(e) => return Err(e),
+    };
+
+    let staged = async {
         tokio::io::AsyncWriteExt::write_all(&mut f, content.as_bytes()).await?;
         // Durability: without this the rename can land before the data does, so
         // a crash yields a present-but-empty file — the exact outcome this is
@@ -445,21 +469,60 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
         f.sync_all().await?;
         drop(f);
 
+        // umask may have cleared bits the original had; restore them exactly.
         #[cfg(unix)]
         if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await?;
         }
-
-        tokio::fs::rename(&tmp, path).await
+        Ok(())
     }
     .await;
 
-    if write_result.is_err() {
-        // Never leave a stray temp file behind on failure.
-        let _ = tokio::fs::remove_file(&tmp).await;
+    let renamed = match staged {
+        Ok(()) => tokio::fs::rename(&tmp, path).await,
+        Err(e) => {
+            // Never leave a stray temp file behind on failure.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+    };
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if in_place(&e) {
+                return write_in_place(path, content).await;
+            }
+            Err(e)
+        }
     }
-    write_result
+}
+
+/// Create `tmp` already at the replaced file's mode. Creating it at the
+/// default 0644 and chmod-ing afterwards left a 0600 file's new contents
+/// world-readable for the whole write+fsync, and an fd opened in that window
+/// keeps read access after the chmod and the rename.
+async fn create_temp(tmp: &std::path::Path, mode: Option<u32>) -> std::io::Result<tokio::fs::File> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    // create_new: never reuse or follow something already at the temp name.
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(mode.map_or(0o666, |m| m & 0o777));
+    #[cfg(not(unix))]
+    let _ = mode;
+    opts.open(tmp).await
+}
+
+/// Non-atomic fallback for files that can be written but not replaced.
+async fn write_in_place(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    tokio::io::AsyncWriteExt::write_all(&mut f, content.as_bytes()).await?;
+    f.sync_all().await
 }
 
 #[cfg(all(test, unix))]
@@ -576,6 +639,55 @@ mod atomic_write_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "orig");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// The temp file was created 0644 and only chmod-ed to 0600 after the
+    /// new contents were written and fsynced.
+    #[tokio::test]
+    async fn the_temp_file_is_born_with_the_original_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".secrets.tmp");
+
+        let f = super::create_temp(&tmp, Some(0o100600)).await.unwrap();
+
+        let mode = f.metadata().await.unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        // Something already at the temp name is never reused.
+        assert!(super::create_temp(&tmp, None).await.is_err());
+    }
+
+    /// A writable file in a non-writable directory could not be edited at
+    /// all, because the temp file had nowhere to go.
+    #[tokio::test]
+    async fn a_writable_file_in_a_locked_directory_is_written_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let f = locked.join("config.yml");
+        std::fs::write(&f, "orig").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory permissions, so there is nothing to test.
+        let probe = locked.join("probe");
+        let enforced = std::fs::write(&probe, "").is_err();
+        let _ = std::fs::remove_file(&probe);
+
+        let res = atomic_write(&f, "new").await;
+        let entries = std::fs::read_dir(&locked).unwrap().count();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            return;
+        }
+
+        res.unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new");
+        assert_eq!(entries, 1);
+        // A new file there still fails: there is nothing to write in place.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = atomic_write(&locked.join("new.txt"), "x")
+            .await
+            .unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }
 
