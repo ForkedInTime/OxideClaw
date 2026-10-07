@@ -1360,26 +1360,45 @@ impl LspDiagnostics {
         let mut report = ServerReport::default();
         let (mut silent, mut partial) = (0, 0);
         for ((path, baseline), published) in files.into_iter().zip(published) {
+            // Errors the edit caused off its own lines are unknown when
+            // the pre-edit text got no report in time.
+            let mut complete = !matches!(
+                &baseline,
+                Some(LspBaseline { content: Some(t), diagnostics: None }) if !t.is_empty()
+            );
             let problems = published.map(|r| {
+                let mut diagnostics = r.diagnostics;
                 // A set the server published for an older text is read
                 // against that text: its line numbers belong to it.
                 let text = match r.stale_text {
-                    Some(stale) => Some(stale),
+                    Some(stale) => {
+                        // The server has not re-checked the lines the edit
+                        // changed since: what it said about them (an error
+                        // the model has just fixed) is not fed back again.
+                        if let Ok(now) = std::fs::read_to_string(path) {
+                            let gone = line_changes(&now, &stale, false);
+                            let last = gone.len().saturating_sub(1);
+                            diagnostics.retain(|v| {
+                                let Some(d) = Diag::parse(v, config.warnings) else {
+                                    return true;
+                                };
+                                let edited = (d.line.min(last)..=d.end_line.min(last))
+                                    .any(|l| gone.get(l) == Some(&true));
+                                complete &= !edited;
+                                !edited
+                            });
+                        }
+                        Some(stale)
+                    }
                     None => std::fs::read_to_string(path).ok(),
                 };
                 new_problems(
-                    &r.diagnostics,
+                    &diagnostics,
                     baseline.as_ref(),
                     text.as_deref(),
                     config.warnings,
                 )
             });
-            // Errors the edit caused off its own lines are unknown when
-            // the pre-edit text got no report in time.
-            let complete = !matches!(
-                &baseline,
-                Some(LspBaseline { content: Some(t), diagnostics: None }) if !t.is_empty()
-            );
             silent += usize::from(problems.is_none());
             partial += usize::from(problems.is_some() && !complete);
             report.files.push((path.clone(), problems, complete));
@@ -1391,8 +1410,8 @@ impl LspDiagnostics {
             }),
             (partial > 0).then(|| {
                 format!(
-                    "[auto-fix] {command} reported only on the edited lines of {partial} \
-                     edited file(s) within {within}"
+                    "[auto-fix] {command} had not finished checking {partial} edited \
+                     file(s) within {within}; only part of its report was used"
                 )
             }),
         ]
@@ -1534,6 +1553,12 @@ fn new_problems(
 /// middle had the same line (a line that only moved). At a pure deletion
 /// the lines either side of it count.
 fn changed_lines(before: &str, after: &str) -> Vec<bool> {
+    line_changes(before, after, true)
+}
+
+/// `changed_lines`, with the lines either side of a pure deletion counting
+/// as changed only when `at_deletions`.
+fn line_changes(before: &str, after: &str, at_deletions: bool) -> Vec<bool> {
     let old: Vec<&str> = before.lines().collect();
     let new: Vec<&str> = after.lines().collect();
     let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
@@ -1546,7 +1571,7 @@ fn changed_lines(before: &str, after: &str) -> Vec<bool> {
     let mut changed = vec![false; new.len()];
     let (old_mid, new_mid) = (head..old.len() - tail, head..new.len() - tail);
     if new_mid.is_empty() {
-        if !old_mid.is_empty() {
+        if at_deletions && !old_mid.is_empty() {
             for l in [head.wrapping_sub(1), head] {
                 if let Some(c) = changed.get_mut(l) {
                     *c = true;
@@ -2724,8 +2749,12 @@ mod lsp_diff_tests {
             changed_lines(before, after),
             vec![true, false, false, true, false]
         );
-        // A pure deletion marks the lines either side of it.
+        // A pure deletion marks the lines either side of it, unless asked not to.
         assert_eq!(changed_lines("a\nb\nc\n", "a\nc\n"), vec![true, true]);
+        assert_eq!(
+            line_changes("a\nb\nc\n", "a\nc\n", false),
+            vec![false, false]
+        );
         // A new file: every line is the edit's.
         assert_eq!(changed_lines("", "x\ny\n"), vec![true, true]);
     }
@@ -3339,9 +3368,10 @@ y = 2
         )
         .unwrap();
         let action = f.check(vec![(file.clone(), Some(before))], &config(), &trusted());
+        // Not "checks passed" either: the server has not seen the fix.
         assert!(
             matches!(&action, AutoFixAction::Continue { status: Some(s) }
-                if s == "[auto-fix] checks passed"),
+                if s.contains("had not finished checking 1 edited file(s)")),
             "{action:?}"
         );
         // The set is for the first text, which is gone after a further
@@ -3366,6 +3396,40 @@ y = 2
             "{action:?}"
         );
         assert_eq!(f.log().matches("lagging").count(), 2, "{}", f.log());
+    }
+
+    /// Within one turn the baseline is the file before the turn. A server
+    /// still re-analysing the retry left its set for the first round's
+    /// text, and the error the retry fixed was fed back as still there.
+    #[test]
+    fn a_fixed_error_is_not_fed_back_from_a_stale_set() {
+        let f = fixture("lag");
+        let file = f.file("app.py");
+        let before = LspBaseline {
+            content: Some("x = 1\nz = 3\n".into()),
+            diagnostics: Some(Vec::new()),
+        };
+        std::fs::write(&file, "x = 1\ny = ERR\nz = 3\nw = ERR2\n").unwrap();
+        let action = f.check(
+            vec![(file.clone(), Some(before.clone()))],
+            &config(),
+            &trusted(),
+        );
+        let AutoFixAction::Retry { feedback, .. } = &action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(feedback.contains("app.py:2:5 bad y = ERR"), "{feedback}");
+
+        // The retry fixes the first error only.
+        std::fs::write(&file, "x = 1\ny = 2\nz = 3\nw = ERR2\n").unwrap();
+        let action = f.check(vec![(file, Some(before))], &config(), &trusted());
+        let AutoFixAction::Retry { feedback, status } = &action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(!feedback.contains("bad y = ERR"), "{feedback}");
+        assert!(feedback.contains("app.py:4:5 bad w = ERR2"), "{feedback}");
+        assert!(status.contains("had not finished checking"), "{status}");
+        assert!(f.log().contains("lagging"), "{}", f.log());
     }
 
     /// A live server that says nothing by the cap (a slow cold start) is
