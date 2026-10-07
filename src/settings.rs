@@ -337,6 +337,60 @@ pub struct AutoFixSettings {
     pub timeout_secs: Option<u64>,
 }
 
+impl HooksConfig {
+    /// Project hooks run after global ones; a project block must not silently
+    /// drop the user's global guards. Exact duplicates run once.
+    fn merge(mut self, other: Self) -> Self {
+        fn extend(dst: &mut Vec<HookEntry>, src: Vec<HookEntry>) {
+            for h in src {
+                if !dst
+                    .iter()
+                    .any(|d| d.matcher == h.matcher && d.command == h.command)
+                {
+                    dst.push(h);
+                }
+            }
+        }
+        extend(&mut self.pre_tool_use, other.pre_tool_use);
+        extend(&mut self.post_tool_use, other.post_tool_use);
+        extend(&mut self.user_prompt_submit, other.user_prompt_submit);
+        extend(&mut self.notification, other.notification);
+        extend(&mut self.stop, other.stop);
+        extend(&mut self.session_start, other.session_start);
+        extend(&mut self.pre_compact, other.pre_compact);
+        extend(&mut self.post_compact, other.post_compact);
+        self
+    }
+}
+
+impl PhaseRouterSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            phases: match (self.phases, other.phases) {
+                (Some(mut a), Some(b)) => {
+                    a.extend(b);
+                    Some(a)
+                }
+                (a, b) => b.or(a),
+            },
+        }
+    }
+}
+
+impl AutoFixSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            trigger: other.trigger.or(self.trigger),
+            lint_command: other.lint_command.or(self.lint_command),
+            test_command: other.test_command.or(self.test_command),
+            max_retries: other.max_retries.or(self.max_retries),
+            timeout_secs: other.timeout_secs.or(self.timeout_secs),
+        }
+    }
+}
+
 // ── Auto-commit runtime config ────────────────────────────────────────────────
 
 /// Default number of session shadow-ref sets to retain on startup prune.
@@ -373,6 +427,16 @@ pub struct AutoCommitSettings {
     pub keep_sessions: Option<u32>,
     /// Commit subject prefix (default: "oxideclaw").
     pub message_prefix: Option<String>,
+}
+
+impl AutoCommitSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            keep_sessions: other.keep_sessions.or(self.keep_sessions),
+            message_prefix: other.message_prefix.or(self.message_prefix),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -809,7 +873,13 @@ impl Settings {
                 .show_thinking_summaries
                 .or(self.show_thinking_summaries),
             prompt_cache: other.prompt_cache.or(self.prompt_cache),
-            hooks: other.hooks.or(self.hooks),
+            // Nested objects merge per key, like env: a project block that
+            // sets one key must not reset the global's others (or, for
+            // hooks, drop the user's global guards).
+            hooks: match (self.hooks, other.hooks) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => b.or(a),
+            },
             effort: other.effort.or(self.effort),
             env,
             mcp_servers,
@@ -845,9 +915,18 @@ impl Settings {
                 .or(self.router_super_high_model),
             autonomy: other.autonomy.or(self.autonomy),
             memory_auto_capture: other.memory_auto_capture.or(self.memory_auto_capture),
-            phase_router: other.phase_router.or(self.phase_router),
-            auto_fix: other.auto_fix.or(self.auto_fix),
-            auto_commit: other.auto_commit.or(self.auto_commit),
+            phase_router: match (self.phase_router, other.phase_router) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => b.or(a),
+            },
+            auto_fix: match (self.auto_fix, other.auto_fix) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => b.or(a),
+            },
+            auto_commit: match (self.auto_commit, other.auto_commit) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => b.or(a),
+            },
             browse_max_steps: other.browse_max_steps.or(self.browse_max_steps),
             browse_approval_patterns: other
                 .browse_approval_patterns
@@ -1251,6 +1330,51 @@ mod project_trust_tests {
         assert_eq!(trusted.env.get("MY_VAR").map(String::as_str), Some("mine"));
     }
 
+    /// A trusted project's hooks block wiped every global hook, guards
+    /// included, and its autoFixLoop block reset the global commands.
+    #[test]
+    fn a_trusted_project_adds_to_global_hooks_and_auto_fix() {
+        let hook = |c: &str| HookEntry {
+            matcher: "Bash".into(),
+            command: c.into(),
+        };
+        let global = Settings {
+            hooks: Some(HooksConfig {
+                pre_tool_use: vec![hook("global-guard")],
+                ..Default::default()
+            }),
+            auto_fix: Some(AutoFixSettings {
+                lint_command: Some("my-lint".into()),
+                test_command: Some("my-test".into()),
+                ..Default::default()
+            }),
+            ..Settings::default()
+        };
+        let project = Settings {
+            hooks: Some(HooksConfig {
+                pre_tool_use: vec![hook("global-guard"), hook("project-guard")],
+                ..Default::default()
+            }),
+            auto_fix: Some(AutoFixSettings {
+                test_command: Some("cargo test".into()),
+                ..Default::default()
+            }),
+            ..Settings::default()
+        };
+        let merged = Settings::merge_with_trust(global, project, None, true);
+        let cmds: Vec<_> = merged
+            .hooks
+            .unwrap()
+            .pre_tool_use
+            .into_iter()
+            .map(|h| h.command)
+            .collect();
+        assert_eq!(cmds, ["global-guard", "project-guard"]);
+        let af = merged.auto_fix.unwrap();
+        assert_eq!(af.lint_command.as_deref(), Some("my-lint"));
+        assert_eq!(af.test_command.as_deref(), Some("cargo test"));
+    }
+
     #[test]
     fn a_trusted_project_is_honoured_in_full() {
         let merged =
@@ -1332,6 +1456,32 @@ mod load_error_tests {
             std::fs::write(repo.path().join(".claude").join("settings.json"), p).unwrap();
         }
         Settings::load_in(home.path(), repo.path())
+    }
+
+    /// Nested objects were replaced wholesale: any project `autoCommit` block
+    /// (honoured even for untrusted repos) re-enabled shadow-ref commits the
+    /// user had turned off globally.
+    #[test]
+    fn a_project_nested_object_inherits_the_global_keys_it_does_not_set() {
+        let s = load(
+            Some(
+                r#"{"autoCommit": {"enabled": false, "keepSessions": 3},
+                    "phaseRouter": {"enabled": true, "phases": {"plan": "opus", "edit": "haiku"}}}"#,
+            ),
+            Some(
+                r#"{"autoCommit": {"messagePrefix": "x"},
+                    "phaseRouter": {"phases": {"edit": "sonnet"}}}"#,
+            ),
+        );
+        let ac = s.auto_commit.unwrap();
+        assert_eq!(ac.enabled, Some(false));
+        assert_eq!(ac.keep_sessions, Some(3));
+        assert_eq!(ac.message_prefix.as_deref(), Some("x"));
+        let pr = s.phase_router.unwrap();
+        assert_eq!(pr.enabled, Some(true));
+        let phases = pr.phases.unwrap();
+        assert_eq!(phases["plan"], "opus");
+        assert_eq!(phases["edit"], "sonnet");
     }
 
     /// A trailing comma or one wrong-typed value used to turn the whole file,
