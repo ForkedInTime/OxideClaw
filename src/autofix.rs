@@ -387,18 +387,34 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool
             }
         }
     };
+    // The leader has exited and been reaped, so `status` is the result. A
+    // process that left the group (setsid, a daemonizing test server) can
+    // hold the pipes open where the group kill cannot reach it: wait a short
+    // grace for the output, in slices that honour Esc, and never turn a
+    // finished check into a Timeout (or, with no timeout, wait forever).
+    let grace = std::time::Duration::from_secs(2);
+    let exit_at = std::time::Instant::now();
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    for _ in 0..2 {
-        let got = if has_timeout {
-            rx.recv_timeout((start + timeout).saturating_duration_since(std::time::Instant::now()))
-        } else {
-            rx.recv()
-                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
-        };
-        match got {
-            Ok((true, buf)) => stdout = buf,
-            Ok((false, buf)) => stderr = buf,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return CommandResult::Timeout,
+    let mut got_n = 0;
+    while got_n < 2 {
+        if cancel.load(Ordering::SeqCst) {
+            return CommandResult::Skipped {
+                reason: "cancelled".to_string(),
+            };
+        }
+        if exit_at.elapsed() >= grace {
+            break;
+        }
+        match rx.recv_timeout(poll) {
+            Ok((true, buf)) => {
+                stdout = buf;
+                got_n += 1;
+            }
+            Ok((false, buf)) => {
+                stderr = buf;
+                got_n += 1;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -913,7 +929,9 @@ mod tests {
     }
 
     /// A job that escaped the process group is out of reach of the kill;
-    /// the timeout still bounds the wait for its pipes.
+    /// a short grace bounds the wait for its pipes, with or without a
+    /// timeout, and the check's own exit status stands (it was reported as
+    /// a Timeout, and with timeout 0 the wait never ended).
     #[cfg(unix)]
     #[test]
     fn a_job_outside_the_group_cannot_outlast_the_timeout() {
@@ -925,22 +943,25 @@ mod tests {
             return;
         }
         let td = tempfile::TempDir::new().unwrap();
-        let started = std::time::Instant::now();
         // Exit only once the job has left the group: exiting first let the
         // group kill reach it before its setsid() under a loaded test run.
-        let r = run_command(
-            td.path(),
-            "setsid sh -c ': > escaped; exec sleep 15' & \
-             while [ ! -e escaped ]; do sleep 0.05; done; exit 0",
-            2,
-            &NOT_CANCELLED,
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "{:?}",
-            started.elapsed()
-        );
-        assert!(matches!(r, CommandResult::Timeout), "{r:?}");
+        for timeout in [2, 0] {
+            let started = std::time::Instant::now();
+            let _ = std::fs::remove_file(td.path().join("escaped"));
+            let r = run_command(
+                td.path(),
+                "setsid sh -c ': > escaped; exec sleep 15' & \
+                 while [ ! -e escaped ]; do sleep 0.05; done; exit 0",
+                timeout,
+                &NOT_CANCELLED,
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(matches!(r, CommandResult::Pass), "timeout {timeout}: {r:?}");
+        }
     }
 
     #[cfg(unix)]
