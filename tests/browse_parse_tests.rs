@@ -57,16 +57,47 @@ fn parses_ask_and_max_steps_combined() {
     }
 }
 
-/// A zero cap used to reach the engine as "no limit" and run 50 turns.
+/// A zero cap used to reach the engine as "no limit" and run 50 turns; it
+/// is now rejected with usage like any other bad cap.
 #[test]
-fn a_zero_max_steps_falls_back_to_the_default() {
-    match parse_browse_command("--max-steps 0 quick check") {
-        CommandAction::Browse {
-            max_steps, goal, ..
-        } => {
-            assert_eq!(max_steps, None);
-            assert_eq!(goal, "quick check");
-        }
-        _ => panic!(),
+fn a_zero_max_steps_never_starts_a_run() {
+    assert_usage("--max-steps 0 quick check");
+}
+
+fn assert_usage(input: &str) {
+    match parse_browse_command(input) {
+        CommandAction::Message(m) => assert!(m.starts_with("Usage: /browse"), "{input:?}: {m}"),
+        CommandAction::Browse { goal, .. } => panic!("{input:?} started a run with goal {goal:?}"),
+        _ => panic!("{input:?}: unexpected action"),
+    }
+}
+
+/// A bare `/browse` (or one with only flags) started an autonomous run with
+/// an empty goal.
+#[test]
+fn a_missing_goal_shows_usage() {
+    for input in [
+        "",
+        "   ",
+        "--yolo",
+        "--ask",
+        "--max-steps 5",
+        "--yolo --max-steps 3",
+    ] {
+        assert_usage(input);
+    }
+}
+
+/// `--max-steps` with no value became the goal; a non-numeric value was
+/// silently dropped, leaving the run uncapped.
+#[test]
+fn a_bad_max_steps_shows_usage() {
+    for input in [
+        "--max-steps",
+        "find it --max-steps",
+        "--max-steps abc find it",
+        "--max-steps -3 x",
+    ] {
+        assert_usage(input);
     }
 }

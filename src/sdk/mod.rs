@@ -347,6 +347,18 @@ impl SdkServer {
                 max_steps,
                 yolo_ack,
             } => {
+                // Same rule as the CLI and /browse: without a goal the agent
+                // would start an aimless run against the model.
+                if goal.trim().is_empty() {
+                    transport
+                        .send_response(SdkResponse::Error {
+                            id,
+                            code: "goal_required".into(),
+                            message: "browse/start requires a non-empty goal".into(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 // Validate yolo_ack requirement
                 if policy == BrowsePolicy::Yolo && !yolo_ack {
                     transport

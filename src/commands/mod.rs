@@ -564,9 +564,11 @@ fn split_first_word(s: &str) -> (&str, &str) {
 /// - `--ask`              → `BrowsePolicy::Ask`
 /// - `--max-steps <N>`    → `max_steps = Some(N)`
 ///
-/// Remaining tokens after flag removal form the `goal` string.
+/// Remaining tokens after flag removal form the `goal` string. A missing goal
+/// or a bad `--max-steps` value yields a usage message instead of a run.
 pub fn parse_browse_command(input: &str) -> CommandAction {
     use crate::browser::browse_loop::BrowsePolicy;
+    const USAGE: &str = "Usage: /browse [--yolo|--ask] [--max-steps N] <goal>";
     let mut policy = BrowsePolicy::Pattern;
     let mut max_steps: Option<u32> = None;
     let mut tokens: Vec<&str> = input.split_whitespace().collect();
@@ -581,9 +583,13 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
                 policy = BrowsePolicy::Ask;
                 tokens.remove(i);
             }
-            "--max-steps" if i + 1 < tokens.len() => {
-                // Zero is no cap at all; treat it like any other bad value.
-                max_steps = tokens[i + 1].parse().ok().filter(|&n: &u32| n > 0);
+            "--max-steps" => {
+                // Zero would mean no cap at all, so it is as bad as a typo;
+                // silently dropping either would start an uncapped run.
+                match tokens.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+                    Some(n) if n > 0 => max_steps = Some(n),
+                    _ => return CommandAction::Message(USAGE.into()),
+                }
                 tokens.drain(i..=i + 1);
             }
             _ => {
@@ -592,6 +598,10 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
         }
     }
     let goal = tokens.join(" ").trim().to_string();
+    // The run loop has no goal guard: an empty goal still starts the agent.
+    if goal.is_empty() {
+        return CommandAction::Message(USAGE.into());
+    }
     CommandAction::Browse {
         goal,
         policy,
