@@ -94,6 +94,12 @@ pub struct Settings {
     #[serde(skip)]
     pub load_errors: Vec<String>,
 
+    /// Why an `apiKeyHelper` was stripped for its file's permissions, as a
+    /// user-facing line. Otherwise the only trace was the log file and the
+    /// user saw just "No Anthropic credential found".
+    #[serde(skip)]
+    pub helper_rejected: Vec<String>,
+
     /// Max tokens per response (global fallback)
     pub max_tokens: Option<u32>,
 
@@ -489,6 +495,52 @@ pub fn read_config_file(path: &Path) -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
+/// Why a settings file with `mode` may not supply an `apiKeyHelper`, if it
+/// may not. Group-write is allowed on the owner's private group: under the
+/// umask 002 that Fedora/RHEL and Ubuntu give users, every hand-made
+/// settings.json is 0664, and nobody else is in that group.
+#[cfg(unix)]
+fn unsafe_helper_mode(mode: u32, private_group: bool) -> Option<&'static str> {
+    if mode & 0o002 != 0 {
+        Some("world-writable")
+    } else if mode & 0o020 != 0 && !private_group {
+        Some("group-writable")
+    } else {
+        None
+    }
+}
+
+/// Is `gid` the user-private group of `uid`: named after the user, with no
+/// other member and no other user's primary group? Unknown (say, NSS-only
+/// accounts) counts as no.
+#[cfg(unix)]
+fn is_private_group(uid: u32, gid: u32) -> bool {
+    let read = |p| std::fs::read_to_string(p).unwrap_or_default();
+    private_group_in(&read("/etc/passwd"), &read("/etc/group"), uid, gid)
+}
+
+#[cfg(unix)]
+fn private_group_in(passwd: &str, group: &str, uid: u32, gid: u32) -> bool {
+    let users: Vec<Vec<&str>> = passwd
+        .lines()
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .filter(|f| f.len() >= 4)
+        .collect();
+    let id = |s: &str| s.parse::<u32>().ok();
+    let Some(user) = users.iter().find(|f| id(f[2]) == Some(uid)).map(|f| f[0]) else {
+        return false;
+    };
+    let others_primary = users.iter().any(|f| f[0] != user && id(f[3]) == Some(gid));
+    !others_primary
+        && group.lines().any(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            f.len() >= 4
+                && id(f[2]) == Some(gid)
+                && f[0] == user
+                && f[3].split(',').all(|m| m.is_empty() || m == user)
+        })
+}
+
 /// User-facing text for `Settings::load_errors`.
 pub fn load_errors_notice(errors: &[String]) -> String {
     format!(
@@ -554,7 +606,10 @@ impl Settings {
             if project.hooks.take().is_some() {
                 dropped.push("hooks".into());
             }
-            if project.api_key_helper.take().is_some() {
+            // A helper already stripped for its file mode would not run
+            // even if trusted; trust is the reason to report.
+            let rejected = !std::mem::take(&mut project.helper_rejected).is_empty();
+            if project.api_key_helper.take().is_some() || rejected {
                 dropped.push("apiKeyHelper".into());
             }
             // `PATH` or `LD_PRELOAD` here picks what every Bash call runs.
@@ -787,10 +842,8 @@ impl Settings {
     /// (`"maxTokens": "8000"`) fails the whole file, deny rules included.
     ///
     /// Security hardening: `apiKeyHelper` is stripped from the parsed settings
-    /// if the source file is world- or group-writable, since the helper is
-    /// executed via `sh -c` and a writable settings file is an obvious
-    /// shell-injection vector on shared hosts. The warning is emitted via
-    /// `tracing::warn` so it shows up in the log file without corrupting TUI.
+    /// if the source file is writable by other users (see
+    /// `sanitize_unsafe_helper`); the reason goes to `helper_rejected`.
     fn from_file(path: &Path) -> Self {
         let text = match read_config_file(path) {
             Ok(Some(text)) => text,
@@ -808,13 +861,12 @@ impl Settings {
         }
     }
 
-    /// If `parsed.api_key_helper` is Some and the source file has unsafe
-    /// permissions (world- or group-writable on unix), strip the helper and
-    /// warn. Windows has no POSIX permission bits so this is a no-op there;
-    /// the threat model (multi-user shared settings) is primarily a unix
-    /// concern anyway.
-    // `parsed` is only mutated on unix (where the ownership/permission check
-    // runs), so `mut` is unused on Windows and trips `-D warnings` there.
+    /// If `parsed.api_key_helper` is Some and the source file is writable by
+    /// other users, strip the helper: it runs via `sh -c`, so a writable
+    /// settings file is a shell-injection vector on shared hosts. Windows has
+    /// no POSIX permission bits so this is a no-op there.
+    // `parsed` is only mutated on unix (where the permission check runs), so
+    // `mut` is unused on Windows and trips `-D warnings` there.
     #[cfg_attr(not(unix), allow(unused_mut))]
     fn sanitize_unsafe_helper(mut parsed: Self, path: &Path) -> Self {
         if parsed.api_key_helper.is_none() {
@@ -825,14 +877,18 @@ impl Settings {
             use std::os::unix::fs::MetadataExt;
             if let Ok(md) = std::fs::metadata(path) {
                 let mode = md.mode() & 0o777;
-                if mode & 0o022 != 0 {
-                    tracing::warn!(
-                        "ignoring apiKeyHelper from {}: file is world/group-writable (mode {:o}); \
-                         refusing to execute it as a shell command. Run `chmod 600 {}` to enable.",
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                let euid = unsafe { libc::geteuid() };
+                let private = md.uid() == euid && is_private_group(md.uid(), md.gid());
+                if let Some(why) = unsafe_helper_mode(mode, private) {
+                    let msg = format!(
+                        "apiKeyHelper ignored: {} is {why} (mode {mode:o}), so it will not \
+                         be run as a shell command. Run `chmod 600 {}` to enable it.",
                         path.display(),
-                        mode,
                         path.display()
                     );
+                    tracing::warn!("{msg}");
+                    parsed.helper_rejected.push(msg);
                     parsed.api_key_helper = None;
                 }
             }
@@ -946,6 +1002,11 @@ impl Settings {
             load_errors: {
                 let mut v = self.load_errors;
                 v.extend(other.load_errors);
+                v
+            },
+            helper_rejected: {
+                let mut v = self.helper_rejected;
+                v.extend(other.helper_rejected);
                 v
             },
             permissions: PermissionsConfig {
@@ -1572,5 +1633,83 @@ mod load_error_tests {
 
         std::fs::write(&path, "{").unwrap();
         assert_eq!(Settings::load_mcp_json(&path).load_errors.len(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod helper_mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Under umask 002 (Fedora/RHEL, Ubuntu) a hand-made settings.json is
+    /// 0664 on the user's private group, and its apiKeyHelper was dropped.
+    #[test]
+    fn group_write_is_allowed_only_on_a_private_group() {
+        assert_eq!(unsafe_helper_mode(0o664, true), None);
+        assert_eq!(unsafe_helper_mode(0o664, false), Some("group-writable"));
+        assert_eq!(unsafe_helper_mode(0o666, true), Some("world-writable"));
+        assert_eq!(unsafe_helper_mode(0o644, false), None);
+        assert_eq!(unsafe_helper_mode(0o600, false), None);
+    }
+
+    #[test]
+    fn a_private_group_is_named_after_its_only_user() {
+        let passwd = "root:x:0:0::/root:/bin/sh\n\
+                      ana:x:1000:1000::/home/ana:/bin/bash\n\
+                      bo:x:1001:100::/home/bo:/bin/bash\n\
+                      cy:x:1002:1003::/home/cy:/bin/bash\n\
+                      dee:x:1004:1003::/home/dee:/bin/bash\n";
+        let group = "root:x:0:\nusers:x:100:ana,bo\nana:x:1000:\n\
+                     cy:x:1003:\nwheel:x:10:ana\nbo:x:1001:bo,ana\n";
+        assert!(private_group_in(passwd, group, 1000, 1000));
+        assert!(!private_group_in(passwd, group, 1000, 100), "shared group");
+        assert!(
+            !private_group_in(passwd, group, 1001, 1001),
+            "another member"
+        );
+        assert!(
+            !private_group_in(passwd, group, 1002, 1003),
+            "another's primary"
+        );
+        assert!(!private_group_in(passwd, group, 4242, 4242), "unknown user");
+    }
+
+    /// The rejection used to reach only the log file; the user saw just
+    /// "No Anthropic credential found".
+    #[test]
+    fn a_rejected_helper_says_why_and_how_to_fix_it() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        std::fs::write(&path, r#"{"apiKeyHelper": "echo k"}"#).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let s = Settings::load_in(home.path(), repo.path());
+        assert!(s.api_key_helper.is_none());
+        assert_eq!(s.helper_rejected.len(), 1, "{:?}", s.helper_rejected);
+        assert!(s.helper_rejected[0].contains("world-writable"));
+        assert!(s.helper_rejected[0].contains("chmod 600"));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let s = Settings::load_in(home.path(), repo.path());
+        assert_eq!(s.api_key_helper.as_deref(), Some("echo k"));
+        assert!(s.helper_rejected.is_empty());
+    }
+
+    /// An untrusted project's helper is reported as untrusted, not as a
+    /// file-mode problem that chmod would not fix.
+    #[test]
+    fn an_untrusted_projects_helper_is_reported_as_untrusted() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".claude");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"apiKeyHelper": "echo k"}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let s = Settings::load_in(home.path(), repo.path());
+        assert!(s.api_key_helper.is_none());
+        assert!(s.helper_rejected.is_empty(), "{:?}", s.helper_rejected);
+        assert_eq!(s.untrusted_project_config, vec!["apiKeyHelper"]);
     }
 }

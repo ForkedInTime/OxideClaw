@@ -1431,13 +1431,20 @@ fn parse_mcp_config_arg(
         .collect()
 }
 
-/// stderr notice for `Config::settings_load_errors` outside the TUI.
+/// stderr notice for `Config::settings_load_errors` (and an ignored
+/// apiKeyHelper) outside the TUI.
 fn warn_settings_load_errors(config: &Config) {
     if !config.settings_load_errors.is_empty() {
         eprintln!(
             "Warning: {}",
             settings::load_errors_notice(&config.settings_load_errors)
         );
+    }
+    // With no key at all the missing-credential error already says why.
+    if !config.api_key.is_empty() {
+        for why in &config.api_key_helper_rejected {
+            eprintln!("Warning: {why}");
+        }
     }
 }
 

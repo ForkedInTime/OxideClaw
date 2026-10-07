@@ -422,16 +422,7 @@ fn backend_for_model(config: &Config, model: &str) -> Result<ApiBackend> {
     let is_non_anthropic =
         crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
     if !is_non_anthropic && config.api_key.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No Anthropic credential found.\n\
-                 OxideClaw checks, in order:\n\
-                   1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
-                   2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
-                   3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
-                   4. ant auth login         shared with Claude Code and the official SDKs\n\
-                 To use a local model instead: --model ollama:<name>\n\
-                 Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ..."
-        ));
+        return Err(config.missing_credential_error());
     }
     ApiBackend::new_with_auth(
         model,
@@ -548,6 +539,9 @@ async fn run_loop(
             .push(ChatEntry::system(crate::settings::load_errors_notice(
                 &config.settings_load_errors,
             )));
+    }
+    for why in &config.api_key_helper_rejected {
+        app.entries.push(ChatEntry::system(why.clone()));
     }
     if !config.untrusted_project_config.is_empty() {
         app.entries.push(ChatEntry::system(format!(

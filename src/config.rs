@@ -242,6 +242,12 @@ pub struct Config {
     /// Shell command that prints an Anthropic API key on stdout (apiKeyHelper).
     pub api_key_helper: Option<String>,
 
+    /// Why a configured apiKeyHelper was not used (its settings file is
+    /// writable by others). Shown at startup and in the missing-credential
+    /// error, which otherwise gave no reason.
+    #[serde(skip)]
+    pub api_key_helper_rejected: Vec<String>,
+
     /// Disable all hooks globally.
     pub disable_all_hooks: bool,
 
@@ -485,6 +491,7 @@ impl Default for Config {
             sandbox_enabled: false,
             untrusted_project_config: Vec::new(),
             settings_load_errors: Vec::new(),
+            api_key_helper_rejected: Vec::new(),
             sandbox_mode: "strict".to_string(),
             voice_enabled: false,
             voice_api_url: None,
@@ -523,6 +530,26 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The "No Anthropic credential found" error, with the reason an
+    /// apiKeyHelper was ignored when one was.
+    pub fn missing_credential_error(&self) -> anyhow::Error {
+        let mut msg = String::from(
+            "No Anthropic credential found.\n\
+             OxideClaw checks, in order:\n\
+             1. ANTHROPIC_API_KEY      export ANTHROPIC_API_KEY=sk-ant-...\n\
+             2. ANTHROPIC_AUTH_TOKEN   an OAuth access token\n\
+             3. apiKeyHelper / OXIDECLAW_API_KEY_FILE_DESCRIPTOR\n\
+             4. ant auth login         shared with Claude Code and the official SDKs\n\
+             To use a local model instead: --model ollama:<name>\n\
+             Or a cloud OpenAI-compatible model: --model groq:<name>, --model openrouter:<name>, ...",
+        );
+        for why in &self.api_key_helper_rejected {
+            msg.push('\n');
+            msg.push_str(why);
+        }
+        anyhow::anyhow!(msg)
+    }
+
     /// Take the API key from `api_key_helper`, if one is set and prints a
     /// key. The key is registered so a 401 on it re-runs the helper.
     pub fn apply_api_key_helper(&mut self) {
@@ -743,6 +770,7 @@ impl Config {
             auth_source: old.auth_source,
             auth_warnings: old.auth_warnings,
             api_key_helper: old.api_key_helper,
+            api_key_helper_rejected: old.api_key_helper_rejected,
             dangerously_skip_permissions: old.dangerously_skip_permissions,
             plan_mode: old.plan_mode,
             max_turns: old.max_turns,
@@ -834,6 +862,7 @@ impl Config {
         }
         self.env = settings.env;
         self.api_key_helper = settings.api_key_helper;
+        self.api_key_helper_rejected = settings.helper_rejected.clone();
         self.untrusted_project_config = settings.untrusted_project_config;
         self.settings_load_errors = settings.load_errors;
         self.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
@@ -2500,5 +2529,23 @@ mod flag_settings_retarget_tests {
         cfg.retarget_cwd(project.path().to_path_buf());
         assert!(cfg.disable_all_hooks);
         assert!(cfg.claudemd.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod missing_credential_tests {
+    use super::Config;
+
+    #[test]
+    fn the_error_says_why_the_helper_was_ignored() {
+        let mut c = Config::default();
+        assert!(!c.missing_credential_error().to_string().contains("ignored"));
+        c.api_key_helper_rejected = vec!["apiKeyHelper ignored: /x is world-writable".into()];
+        let msg = c.missing_credential_error().to_string();
+        assert!(msg.starts_with("No Anthropic credential found."), "{msg}");
+        assert!(
+            msg.ends_with("apiKeyHelper ignored: /x is world-writable"),
+            "{msg}"
+        );
     }
 }
