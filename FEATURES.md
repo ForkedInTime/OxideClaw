@@ -69,7 +69,7 @@ own environment variable (shell or `.env`):
 | OpenAI | `oai:` | `OPENAI_API_KEY` |
 | Generic | `openai-compat:` | `OPENAI_API_KEY`, plus `OPENAI_BASE_URL` (required) |
 
-Keys come from the environment, never from `settings.json`. Export the variable or put it in `~/.env` or `~/.config/oxideclaw/.env`, then pick the model:
+Keys come from the environment, never from `settings.json`. Export the variable or put it in `~/.env` or `~/.config/oxideclaw/.env`, then pick the model. `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not read from `.env` files; export them in your shell.
 
 ```bash
 echo 'GROQ_API_KEY=gsk_...' >> ~/.config/oxideclaw/.env
@@ -442,7 +442,7 @@ Auto-loaded from (in order):
 2. `~/.env`
 3. `~/.config/oxideclaw/.env`
 
-Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, ...) are read. `OLLAMA_HOST` and `ANTHROPIC_MODEL` decide where your prompts are sent, so `$CWD/.env` may set them only in a folder you have `/trust`ed; otherwise they are ignored with a note.
+Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, ...) are read; `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not, so export those in your shell. `OLLAMA_HOST` and `ANTHROPIC_MODEL` decide where your prompts are sent, so `$CWD/.env` may set them only in a folder you have `/trust`ed; otherwise they are ignored with a note.
 
 ### XDG Base Directories
 
@@ -479,8 +479,9 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 | `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
 | `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `MISTRAL_API_KEY`, `VENICE_API_KEY` | API key for the matching OpenAI-compatible provider |
 | `OPENAI_API_KEY` | API key for `oai:` and `openai-compat:` models |
-| `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix) |
-| `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`) |
+| `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix; shell only, not `.env`) |
+| `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |
+| `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |
 | `XDG_CONFIG_HOME` | Config directory base |
 | `XDG_DATA_HOME` | Data directory base |
 | `XDG_CACHE_HOME` | Cache directory base |

@@ -95,7 +95,11 @@ impl BrowserSession {
         let proxy =
             crate::net_policy::spawn_policy_proxy(crate::net_policy::NetPolicy::LOCAL_OK).await?;
 
-        let args = launch_args(port, user_data.path(), proxy.addr, headless, runs_as_root());
+        let no_sandbox = chrome_no_sandbox();
+        if no_sandbox {
+            tracing::warn!("Chrome sandbox disabled (running as root, {NO_SANDBOX_ENV}=1)");
+        }
+        let args = launch_args(port, user_data.path(), proxy.addr, headless, no_sandbox);
 
         let mut child = tokio::process::Command::new(&chrome)
             .args(&args)
@@ -124,10 +128,19 @@ impl BrowserSession {
                 let tail = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
                 let tail = String::from_utf8_lossy(&tail);
                 let tail = tail.trim();
+                let hint = if runs_as_root() && !no_sandbox {
+                    format!(
+                        "\nRunning as root, Chrome needs its sandbox off: set \
+                         {NO_SANDBOX_ENV}=1 to allow that (pages then run \
+                         unsandboxed as root), or run as a regular user."
+                    )
+                } else {
+                    String::new()
+                };
                 if tail.is_empty() {
-                    return Err(e);
+                    return Err(anyhow::anyhow!("{e}{hint}"));
                 }
-                return Err(anyhow::anyhow!("{e}\nChrome stderr:\n{tail}"));
+                return Err(anyhow::anyhow!("{e}\nChrome stderr:\n{tail}{hint}"));
             }
         };
         let client = match CdpClient::connect(&ws_url).await {
@@ -265,6 +278,22 @@ async fn keep_tail(mut pipe: tokio::process::ChildStderr, tail: Arc<std::sync::M
         let excess = t.len().saturating_sub(STDERR_TAIL);
         t.drain(..excess);
     }
+}
+
+/// Opt-in for running Chrome without its sandbox as root.
+pub(crate) const NO_SANDBOX_ENV: &str = "OXIDECLAW_BROWSER_NO_SANDBOX";
+
+/// Whether Chrome is launched with `--no-sandbox`: only as root (where it
+/// refuses to start otherwise) and only when the user set
+/// `OXIDECLAW_BROWSER_NO_SANDBOX=1`. The browser opens attacker-controlled
+/// pages, so a renderer exploit without the sandbox runs as root; that is
+/// never turned on silently.
+pub(crate) fn chrome_no_sandbox() -> bool {
+    no_sandbox_opted_in(runs_as_root(), std::env::var_os(NO_SANDBOX_ENV).as_deref())
+}
+
+fn no_sandbox_opted_in(root: bool, env: Option<&std::ffi::OsStr>) -> bool {
+    root && env.is_some_and(|v| v == "1")
 }
 
 /// Chrome on Linux refuses to start as root unless its sandbox is off
@@ -628,6 +657,16 @@ mod tests {
         let p = std::path::Path::new("/p");
         assert!(launch_args(9222, p, proxy, true, true).contains(&"--no-sandbox".to_string()));
         assert!(!launch_args(9222, p, proxy, true, false).contains(&"--no-sandbox".to_string()));
+    }
+
+    /// Root alone turned Chrome's sandbox off for attacker-chosen pages.
+    #[test]
+    fn no_sandbox_needs_root_and_the_opt_in() {
+        let one = std::ffi::OsStr::new("1");
+        assert!(no_sandbox_opted_in(true, Some(one)));
+        assert!(!no_sandbox_opted_in(true, None));
+        assert!(!no_sandbox_opted_in(true, Some(std::ffi::OsStr::new("0"))));
+        assert!(!no_sandbox_opted_in(false, Some(one)));
     }
 
     /// Chrome refusing to start (as root without --no-sandbox, a missing

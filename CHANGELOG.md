@@ -234,7 +234,9 @@ Follow-up QA pass (medium-severity findings, 2026-10-07).
   removes files the undone turns created, and recording continues after a
   resumed session's ref was pruned. `/watch` saves are no longer swallowed by
   editor swap files or `.git` writes.
-- **`/browse` and the browser.** Chrome launches as root and Brave, Edge and
+- **`/browse` and the browser.** As root, Chrome says how to start it
+  (`OXIDECLAW_BROWSER_NO_SANDBOX=1` turns its sandbox off; never by
+  default, and WebFetch uses the plain fetcher instead), and Brave, Edge and
   Windows browsers are found; `browser_press_key` sends real keys,
   `browser_fill` picks `<select>` options, hash-route navigation and
   full-page screenshots work. Loop-detector nudges reach the model, a

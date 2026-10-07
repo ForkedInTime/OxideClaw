@@ -99,9 +99,24 @@ async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option
     // Without the proxy Chromium would reach whatever a redirect names, so
     // no proxy means no Chromium; the guarded plain fetch takes over.
     // Both live until this returns, timeout included.
+    // As root Chromium only starts with its sandbox off, and these pages are
+    // model-chosen (often from prompt-injected content): never run them
+    // unsandboxed as root unless the user opted in. The plain fetch, which
+    // runs no page JavaScript, takes over.
+    let no_sandbox = crate::browser::chrome_no_sandbox();
+    if crate::browser::runs_as_root() && !no_sandbox {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::debug!(
+                "WebBrowser JS rendering disabled as root (set {}=1 to allow)",
+                crate::browser::NO_SANDBOX_ENV
+            )
+        });
+        return None;
+    }
     let proxy = crate::net_policy::spawn_policy_proxy(*policy).await.ok()?;
     let profile = tempfile::tempdir().ok()?;
-    let args = chromium_args(proxy.addr, profile.path(), url);
+    let args = chromium_args(proxy.addr, profile.path(), url, no_sandbox);
 
     // Try several common chromium executable names
     for exe in &[
@@ -147,7 +162,12 @@ fn is_chromium_error_page(dom: &str) -> bool {
     dom.contains("id=\"main-frame-error\"") && dom.contains("neterror")
 }
 
-fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &str) -> Vec<String> {
+fn chromium_args(
+    proxy: std::net::SocketAddr,
+    profile: &std::path::Path,
+    url: &str,
+    no_sandbox: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--headless".into(),
         "--disable-gpu".into(),
@@ -158,9 +178,8 @@ fn chromium_args(proxy: std::net::SocketAddr, profile: &std::path::Path, url: &s
         format!("--user-data-dir={}", profile.display()),
     ];
     args.extend(crate::net_policy::chromium_proxy_args(proxy));
-    // As root Chromium refuses to start with its sandbox on, and every
-    // fetch silently fell back to the plain one.
-    if crate::browser::runs_as_root() {
+    // Only as root with OXIDECLAW_BROWSER_NO_SANDBOX=1 (see try_chromium).
+    if no_sandbox {
         args.push("--no-sandbox".into());
     }
     args.extend(["--dump-dom".into(), url.into()]);
@@ -276,7 +295,13 @@ mod tests {
     #[test]
     fn chromium_is_pinned_to_the_policy_proxy() {
         let proxy: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
-        let args = chromium_args(proxy, std::path::Path::new("/p"), "https://e.example/");
+        let args = chromium_args(
+            proxy,
+            std::path::Path::new("/p"),
+            "https://e.example/",
+            false,
+        );
+        assert!(!args.contains(&"--no-sandbox".to_string()));
         assert!(args.contains(&"--proxy-server=http://127.0.0.1:4242".to_string()));
         assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
         assert!(args.contains(&"--user-data-dir=/p".to_string()));
