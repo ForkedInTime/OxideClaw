@@ -56,3 +56,17 @@ fn parses_ask_and_max_steps_combined() {
         _ => panic!(),
     }
 }
+
+/// A zero cap used to reach the engine as "no limit" and run 50 turns.
+#[test]
+fn a_zero_max_steps_falls_back_to_the_default() {
+    match parse_browse_command("--max-steps 0 quick check") {
+        CommandAction::Browse {
+            max_steps, goal, ..
+        } => {
+            assert_eq!(max_steps, None);
+            assert_eq!(goal, "quick check");
+        }
+        _ => panic!(),
+    }
+}

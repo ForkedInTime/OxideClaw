@@ -189,6 +189,42 @@ impl ToolMiddleware for UrlSyncMiddleware {
     }
 }
 
+/// Enforces the step cap per browser action. The engine's turn cap alone
+/// let one turn with several tool calls run past it. Placed first in the
+/// chain so a call over the cap never reaches the approval prompt.
+struct StepCapMiddleware {
+    counter: Arc<AtomicU32>,
+    max_steps: u32,
+    stopped: AtomicBool,
+}
+
+#[async_trait]
+impl ToolMiddleware for StepCapMiddleware {
+    async fn before_tool(&self, tool_name: &str, _input: &serde_json::Value) -> MiddlewareVerdict {
+        // The model must still be able to report after the last step.
+        if tool_name == "browse_done" || self.counter.load(Ordering::Relaxed) < self.max_steps {
+            return MiddlewareVerdict::Allow;
+        }
+        // It was told to finish and acted instead: end the run after this
+        // turn rather than spend more turns on denied calls.
+        self.stopped.store(true, Ordering::SeqCst);
+        MiddlewareVerdict::Deny {
+            reason: format!(
+                "step cap of {} reached; call browse_done now",
+                self.max_steps
+            ),
+        }
+    }
+
+    async fn after_tool(&self, _tool_name: &str, _output: &str) -> Option<String> {
+        None
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+}
+
 /// Middleware that emits `BrowseProgress::Step` for each allowed tool call.
 /// Placed last in the chain so denied calls (by gate or loop detector) are not
 /// reported as executed steps.
@@ -200,6 +236,10 @@ struct StepEmitterMiddleware {
 #[async_trait]
 impl ToolMiddleware for StepEmitterMiddleware {
     async fn before_tool(&self, tool_name: &str, input: &serde_json::Value) -> MiddlewareVerdict {
+        // Finishing is not a browser action, so it does not use up a step.
+        if tool_name == "browse_done" {
+            return MiddlewareVerdict::Allow;
+        }
         let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self
             .progress_tx
@@ -232,6 +272,12 @@ pub async fn run_browse(
         cancel,
         usage_sink,
     } = channels;
+    // A zero cap (settings.json, the SDK) used to fall through to the
+    // engine's default of 50 turns.
+    let req = BrowseRequest {
+        max_steps: req.max_steps.max(1),
+        ..req
+    };
     // 1. Emit Started event + speak the goal if voice is enabled.
     let _ = progress_tx
         .send(BrowseProgress::Started {
@@ -293,7 +339,13 @@ pub async fn run_browse(
     let (nudge_tx, mut nudge_rx) = mpsc::channel::<String>(16);
     let loop_mw = Arc::new(LoopDetectorMiddleware::new(nudge_tx));
 
-    // 5. Build the step-emitter middleware (runs last — only fires for allowed calls).
+    // 5. Build the step-cap middleware (runs first) and the step-emitter
+    // middleware (runs last — only fires for allowed calls).
+    let cap_mw = Arc::new(StepCapMiddleware {
+        counter: step_counter.clone(),
+        max_steps: req.max_steps,
+        stopped: AtomicBool::new(false),
+    });
     let step_emitter = Arc::new(StepEmitterMiddleware {
         progress_tx: progress_tx.clone(),
         counter: step_counter.clone(),
@@ -303,6 +355,7 @@ pub async fn run_browse(
     // Order matters: url_sync runs first so after_tool fires BEFORE any later
     // middleware reads the updated URL on the next iteration's before_tool.
     let mut middlewares: crate::browser::middleware::MiddlewareChain = Vec::new();
+    middlewares.push(cap_mw.clone() as Arc<dyn ToolMiddleware>);
     if let Some(session) = browser_session.as_ref() {
         middlewares.push(Arc::new(UrlSyncMiddleware {
             session: session.clone(),
@@ -319,9 +372,11 @@ pub async fn run_browse(
     // 7. Filter tools to browser_* + browse_done only.
     let browser_tools = filter_browser_tools(&tools);
 
-    // 8. Override config's max_turns to the browse step cap.
+    // 8. The step cap is enforced per action by StepCapMiddleware; every
+    // tool turn spends a step or ends the run, so the turn cap is only a
+    // backstop, with one turn to spare for browse_done after the last step.
     let mut browse_config = config.clone();
-    browse_config.max_turns = req.max_steps;
+    browse_config.max_turns = req.max_steps.saturating_add(1);
 
     // 9. Create the browse-mode query engine.
     // A setup failure (no credential, a /model whose client cannot be
@@ -401,7 +456,7 @@ pub async fn run_browse(
     };
 
     // 13. Determine the result.
-    let steps_used = engine.turns_used();
+    let steps_used = step_counter.load(Ordering::Relaxed).min(req.max_steps);
     let final_url = {
         let url = current_url.lock().await;
         if url.is_empty() {
@@ -421,6 +476,8 @@ pub async fn run_browse(
         Some(BrowseReason::Stagnation)
     } else if gate_mw.is_user_denied() {
         Some(BrowseReason::UserDenied)
+    } else if cap_mw.should_stop() {
+        Some(BrowseReason::StepCap)
     } else {
         None
     };
@@ -459,6 +516,9 @@ pub async fn run_browse(
                         BrowseReason::Cancelled => {
                             "Agent terminated: cancelled by user".to_string()
                         }
+                        BrowseReason::StepCap => {
+                            format!("Agent terminated: step cap of {} reached", req.max_steps)
+                        }
                         _ => "Agent terminated by middleware".to_string(),
                     },
                     reason,
@@ -467,7 +527,9 @@ pub async fn run_browse(
                 }
             } else if let Some(text) = engine.last_assistant_text() {
                 // No browse_done, no middleware stop — engine stopped for other reasons.
-                let reason = if steps_used >= req.max_steps {
+                let reason = if steps_used >= req.max_steps
+                    || engine.turns_used() > req.max_steps.saturating_add(1)
+                {
                     BrowseReason::StepCap
                 } else {
                     BrowseReason::Done
@@ -546,6 +608,47 @@ pub async fn run_browse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap was enforced per model turn, so a turn with several browser
+    /// calls ran past it; browse_done must still get through at the cap.
+    #[tokio::test]
+    async fn the_step_cap_counts_browser_actions_not_turns() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let cap = StepCapMiddleware {
+            counter: counter.clone(),
+            max_steps: 2,
+            stopped: AtomicBool::new(false),
+        };
+        let (progress_tx, _progress_rx) = mpsc::channel(16);
+        let emitter = StepEmitterMiddleware {
+            progress_tx,
+            counter: counter.clone(),
+        };
+        let click = serde_json::json!({"selector": "e1"});
+        // One model turn with three parallel clicks: only two may run.
+        let mut allowed = 0;
+        for _ in 0..3 {
+            if let MiddlewareVerdict::Allow = cap.before_tool("browser_click", &click).await {
+                emitter.before_tool("browser_click", &click).await;
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert!(cap.should_stop(), "acting past the cap ends the run");
+
+        let done = serde_json::json!({"summary": "x", "achieved": true});
+        assert!(matches!(
+            cap.before_tool("browse_done", &done).await,
+            MiddlewareVerdict::Allow
+        ));
+        emitter.before_tool("browse_done", &done).await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "browse_done is not a step"
+        );
+    }
 
     /// After Started, a setup failure sent nothing more: the TUI spinner ran
     /// until Esc and voice /browse stayed refused for the session.

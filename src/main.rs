@@ -334,7 +334,7 @@ enum Commands {
         #[arg(long)]
         ask: bool,
         /// Maximum number of steps (default: 50)
-        #[arg(long, default_value = "50")]
+        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u32).range(1..))]
         max_steps: u32,
     },
 }

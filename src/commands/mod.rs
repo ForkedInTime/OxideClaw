@@ -575,9 +575,8 @@ pub fn parse_browse_command(input: &str) -> CommandAction {
                 tokens.remove(i);
             }
             "--max-steps" if i + 1 < tokens.len() => {
-                if let Ok(n) = tokens[i + 1].parse() {
-                    max_steps = Some(n);
-                }
+                // Zero is no cap at all; treat it like any other bad value.
+                max_steps = tokens[i + 1].parse().ok().filter(|&n: &u32| n > 0);
                 tokens.drain(i..=i + 1);
             }
             _ => {
