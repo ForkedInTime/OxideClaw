@@ -235,6 +235,10 @@ Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; s
 
 XDG Base Directory compliant, and OxideClaw's own: settings live in `~/.config/oxideclaw/settings.json` (`$XDG_CONFIG_HOME/oxideclaw`; `$OXIDECLAW_CONFIG_DIR` overrides), sessions in `~/.local/share/oxideclaw/sessions` (`$XDG_DATA_HOME/oxideclaw`), the code index in `~/.cache/oxideclaw` (`$XDG_CACHE_HOME/oxideclaw`). Claude Code's `~/.claude` is never written (unless `$OXIDECLAW_CONFIG_DIR` names it): OxideClaw reads its `CLAUDE.md`, `AGENTS.md`, skills and agents as an import format, copies its own old state out of it once on first run, keeps the settings that only tighten (deny rules, `sandboxEnabled: true`, `autonomy: "suggest"`, a disabled auto-fix loop, ...), and imports hooks, allow rules or MCP servers only when you run `oxideclaw config import-claude`. Reads **both** `CLAUDE.md` and `AGENTS.md`, plus a `GEMINI.md` when there is one (same lookup, lowest priority). Hot-reload with `/reload` — no restart. Skills use the standard [Agent Skills](https://agentskills.io) `<name>/SKILL.md` layout from `.agents/skills/`, `.oxideclaw/skills/`, `.claude/skills/`, the config directory and `~/.claude/skills/`; only each skill's name and description load up front, and the body is read when it runs.
 
+### 🧳 &nbsp; Coming from Claude Code
+
+Your `CLAUDE.md`, skills and agents work as they are. `oxideclaw config import-claude` lists the Claude Code settings that run code or change permissions, and `--hooks`, `--permissions`, `--api-key-helper` or `--mcp` copy them. Run `oxideclaw config import-claude --sessions --list` in a project to see its Claude Code sessions, and `--sessions` (or `--sessions <id>`) to bring them over as OxideClaw sessions you can `--resume`, with their text, tool calls and results; a re-run skips the ones already imported, and `~/.claude` is only read.
+
 See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ slash commands, every config knob).
 
 ---

@@ -75,7 +75,8 @@ src/
 │   └── mod.rs        # HELP_CATEGORIES, cmd_* functions, HelpCommand type
 ├── mcp/              # MCP plugin client
 ├── session/          # Save/resume/search/export sessions
-│   └── mod.rs        # Session::list() with preview backfill
+│   ├── mod.rs        # Session::list() with preview backfill
+│   └── claude_code.rs  # Claude Code transcripts → sessions (`config import-claude --sessions`)
 ├── voice.rs          # Recording + Whisper STT + XTTS v2 TTS + find_all_voices()
 ├── sandbox.rs        # bwrap / firejail / strict
 ├── claude_import.rs  # One-time move off ~/.claude + `config import-claude`
