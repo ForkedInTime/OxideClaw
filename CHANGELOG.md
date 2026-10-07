@@ -7,15 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Keyless start on a local Ollama.** With no Anthropic credential and no
+  model chosen (`--model`, `ANTHROPIC_MODEL`, settings), the TUI and `-p`
+  look for a running Ollama, pick a pulled model that can call tools and
+  start on it with a one-line notice. Ollama with nothing pulled adds what
+  to pull to the missing-key error.
+- **Update notice.** Once a day the TUI checks GitHub in the background and
+  shows one dim line when a newer release exists. `"updateCheck": false` or
+  `OXIDECLAW_NO_UPDATE_CHECK=1` turns it off; `-p`, `--headless`, `acp` and
+  `browse` never check.
+- **Verifiable releases.** Every release carries a `SHA256SUMS` file and
+  Sigstore build-provenance attestations (`gh attestation verify`). Releases
+  stay drafts until the Linux binaries have started on Debian 10 and Rocky
+  Linux 8 (glibc 2.28), Ubuntu 22.04, Debian 12, Rocky Linux 9 and Alpine.
+
+### Changed
+
+- **Auto-fix runs only in trusted projects.** Lint and test commands run the
+  project's own code (`build.rs`, `conftest.py`, npm scripts), so a folder
+  you have not `/trust`ed now runs none of them and says so once. In a
+  trusted folder they run under the Bash tool's sandbox when one is enabled,
+  and `/trust` or `/reload` applies the project's `autoFixLoop` settings
+  from the next edit.
+- **Code index.** The walk follows `.gitignore`, `.git/info/exclude`, the
+  global excludes file and `.ignore`, so ignored files never reach a model.
+  The index lives in `$XDG_CACHE_HOME/oxideclaw/rag/` (default
+  `~/.cache/oxideclaw/rag/`), one per git work tree, instead of
+  `<project>/.claude/rag.db`; it builds on its own only inside a git
+  repository, never for `$HOME` or `/`, and reads never create one.
+  `/memory` notes move to `<project>/.claude/memory.db`, carried over from
+  the old file, which is then removed.
+- **Docs say what the code does.** README's comparison table covers Claude
+  Code, Codex CLI, Copilot CLI, OpenCode and Aider with partial marks; the
+  router is described as opt-in, the binary as "~19 MB" (only the musl build
+  is static; gnu needs glibc 2.28+), the voice add-on as needing Python with
+  non-commercial XTTS weights, and config paths as they really resolve.
+- **Rust 1.88 is the minimum** for `cargo install oxideclaw`, declared as
+  `rust-version` so older toolchains get a clear error.
+
 ### Fixed
 
 Full QA pass (2026-10-05). Each item below was reproduced or traced end to end.
 
-- **Dependency advisories cleared (2026-10).** `rustls` 0.23.37 → 0.23.45
-  (RUSTSEC-2026-0285). `lru` 0.12.5 → 0.18.5 (RUSTSEC-2026-0002, -0253),
-  which needed `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29. Building
-  from source (`cargo install oxideclaw`) now needs Rust 1.88 or newer;
-  `rust-version` is set in Cargo.toml, so older toolchains get a clear error.
 - **Cost and `/budget`.** The TUI billed only the last API call of a turn,
   so a turn with N tool round-trips cost about 1/N of what was shown.
   Every call is now recorded, prompt-cache reads/writes are priced, Opus
@@ -272,6 +307,92 @@ Follow-up QA pass (medium-severity findings, 2026-10-07).
   pnpm fallbacks start. bwrap runs projects under `/tmp` and finds `awk`,
   CA certificates and `~/.cargo` tools. The Docker image is rebuilt on every
   release. FEATURES.md documents the real OpenAI-compatible provider setup.
+
+### Fixed
+
+Low-severity QA pass (2026-10-07).
+
+- **Cost.** Opus 4.5 is billed at $5/$25 and every Opus 4.0/4.1 id at
+  $15/$75; `/cost` prices DeepSeek, Groq and Mistral instead of calling them
+  unrecognised, still reports spend after an aborted turn or `/clear`, and
+  `/context` counts prompt-cache tokens. With `promptCache` on, the
+  conversation history is cached too, not only the tools and system prompt.
+- **Requests and providers.** A huge `retry-after` header no longer aborts
+  the process; `xhigh` effort is accepted; thinking can be turned off on
+  Sonnet 5.5; redacted thinking blocks survive tool rounds instead of
+  causing a 400. OpenAI-compatible endpoints work without a key on the LAN
+  and with a trailing `/`, tool-call deltas without an index parse, and a
+  thinking-only turn replays. HTTPS trusts the OS certificate store
+  (`SSL_CERT_FILE`/`SSL_CERT_DIR` respected). `ANTHROPIC_MODEL` and
+  `--fallback-model` accept aliases such as `opus`.
+- **CLI and config.** `oxideclaw browse` honours `--model`, `--settings` and
+  the other global flags; `-p` sends every stream-json user message and
+  exits non-zero at the turn cap; flags that do nothing say so. `--bare`
+  skips AGENTS.md, phase routing and LSP. A symlinked global CLAUDE.md or
+  AGENTS.md (stow, home-manager) loads, global settings are not treated as
+  untrusted project config when run from `$HOME`, and `apiKeyHelper` runs
+  under `cmd.exe` on Windows without `sh`.
+- **Tools.** Read takes huge limits and reports reads past the end; `~/`
+  paths expand; Grep treats `head_limit` 0 as unlimited and kills `rg` on
+  cancel; MultiEdit writes nothing for a file whose edit has an empty
+  `old_string`; private (0600) files stay private mid-edit; NotebookEdit and
+  Agent sub-agent edits are restored by `/rewind`. ToolSearch lists MCP
+  tools, the Config tool reports live plan mode, LSP results show real paths
+  and 1-based positions, WebFetch decodes by charset and honours the policy
+  pin with the egress proxy, and the Skill tool expands arguments and finds
+  built-in and global skills. SendMessage cannot write outside its mailbox
+  directory or claim delivery nobody reads.
+- **Windows.** Auto-fix checks run through `cmd.exe`, a Bash timeout or
+  cancel kills the commands the shell started, npm-installed language
+  servers spawn, and the exe links the C runtime statically.
+- **`/undo`, sessions and memory.** A stale `rag.db` in an old snapshot can
+  no longer delete or overwrite the live database, git warnings stay off the
+  TUI, 1-9 quick picks work in `/undo` and `/redo`, and deleting a session
+  removes its `/rewind` snapshots. One-shot `-p`/SDK/ACP runs no longer
+  create database files in the project, `/checkpoint`, `/commit` and
+  `/spawn merge` no longer commit them, and `/memory` writes no longer
+  freeze while the index builds.
+- **Browser.** `browser_navigate` reports the page's real HTTP status, Enter
+  stays gated after a sensitive fill whose navigation failed, the step cap
+  holds per action, `/browse` with no goal shows usage, and a timed-out
+  approval is no longer reported as approved.
+- **Slash commands.** `/agents`, `/autonomy`, `/help` for `/branch` and
+  `/issue`, `/hooks`, `/release-notes`, `/powerup` and `/upgrade` describe
+  what really happens; bare `/autofix-pr` targets the current branch's PR;
+  `/branch` shows status columns correctly; `/commit` quotes the message;
+  `/rag delete|reset|force|reindex` are plain searches; `/copy`, `/share
+  clip`, `/edit-claude-md` and `/compact` hooks work; plugin slash commands
+  get their arguments; `/status` and `/env` survive a non-ASCII key;
+  `/spawn merge|discard` by id prefix clear the agent; `mcp
+  reset-project-choices` stops project servers; a failed marketplace update
+  keeps the working plugin, and `/plugin marketplace list` lists it.
+- **TUI.** `d` only deletes in the session picker; markdown tables align
+  with inline markup and wide characters; chat past 65,535 wrapped rows
+  stays on the live reply; thinking shows above its answer; ctx % resets
+  after `/clear` and compaction; live tool output shows the real line count;
+  no 2 s freeze when a background message resizes the viewport; vim `e`;
+  tab completion for more commands and plugin servers with underscores.
+- **SDK and MCP.** A budget stop no longer breaks later prompts,
+  `thinking/delta` is sent when thinking is shown, a non-UTF-8 line no longer
+  disconnects a stdio MCP server, and the SDK docs list only the error codes,
+  fields and notifications the server really uses.
+- **Install, CI and docs.** `install.sh --global` works as root; npm installs
+  the musl build on Alpine and old glibc and downloads through the
+  configured proxy with a timeout; the Docker image edits repos owned by any
+  uid; `/doctor` finds tools without `which`. Hyphenated tags publish as
+  pre-releases, a manual release dispatch builds the requested tag, build
+  jobs never hold a write token, and the weekly README drift scan can open
+  its issue. Docs give the real config, data and session paths, Ollama's
+  tool fallback, the opt-in router and the supported 0.4.x line.
+
+### Security
+
+- **Dependency advisories cleared.** `rustls` 0.23.37 → 0.23.45
+  (RUSTSEC-2026-0285). `lru` 0.12.5 → 0.18.5 (RUSTSEC-2026-0002, -0253),
+  which needed `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29.
+- **Untrusted repositories run no code through auto-fix**, and gitignored
+  files are never indexed, so secrets kept out of git never reach a model
+  (see Changed).
 
 ## [0.4.0] - 2026-09-11
 
