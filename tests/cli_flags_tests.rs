@@ -44,7 +44,7 @@ fn run(env: &Env, args: &[&str], extra_env: &[(&str, String)], stdin: &str) -> O
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &env.home)
-        .env("CLAUDE_CONFIG_DIR", &env.config_dir)
+        .env("OXIDECLAW_CONFIG_DIR", &env.config_dir)
         .env("XDG_CONFIG_HOME", env.home.join(".config"))
         .env("XDG_DATA_HOME", env.home.join(".local/share"))
         .env("XDG_CACHE_HOME", env.home.join(".cache"))

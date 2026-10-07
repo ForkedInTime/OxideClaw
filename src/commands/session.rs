@@ -213,8 +213,8 @@ pub(super) fn cmd_teleport(args: &str) -> CommandAction {
         "import" => CommandAction::TeleportImport,
         _ => CommandAction::Message(
             "Teleport — session context transfer\n\n\
-             /teleport export   — save session context to ~/.claude/teleport.json\n\
-             /teleport import   — load session context from ~/.claude/teleport.json\n\n\
+             /teleport export   — save session context to teleport.json in the config dir\n\
+             /teleport import   — load session context from teleport.json in the config dir\n\n\
              Use this to transfer a conversation to another terminal or instance."
                 .into(),
         ),

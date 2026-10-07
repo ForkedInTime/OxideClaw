@@ -85,6 +85,12 @@ impl MemoryStore {
     /// Open (or create) the memory store for a project, first carrying over
     /// the memories of a pre-cache-dir `.claude/rag.db`.
     pub fn open(cwd: &Path) -> Result<Self> {
+        if crate::config::Config::is_claude_code_project(cwd) {
+            anyhow::bail!(
+                "no project memory in the home directory: its .claude is Claude Code's; \
+                 run OxideClaw inside a project"
+            );
+        }
         crate::rag::retire_legacy_db(cwd);
         let store = Self::open_at(&memory_db_path(cwd))?;
         crate::rag::ensure_git_excluded_once(cwd);

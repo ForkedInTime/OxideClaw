@@ -1,6 +1,6 @@
 /// Session persistence — port of history.ts / session storage.
 ///
-/// Each session is stored as two files in ~/.claude/sessions/:
+/// Each session is stored as two files in <data dir>/sessions/:
 ///   <uuid>.jsonl  — one Message per line (full API history)
 ///   <uuid>.meta   — JSON with name, created_at, first_preview
 use crate::api::types::{ContentBlock, Message, Role, ToolResultContent};

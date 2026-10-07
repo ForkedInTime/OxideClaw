@@ -1,8 +1,8 @@
-/// Settings — load and merge ~/.claude/settings.json and ./.claude/settings.json.
+/// Settings — load and merge <config dir>/settings.json and ./.claude/settings.json.
 ///
 /// Priority (lowest → highest):
 ///   compiled defaults
-///   → ~/.claude/settings.json  (global)
+///   → <config dir>/settings.json  (global, `Config::config_dir`)
 ///   → <cwd>/.claude/settings.json  (project)
 ///   → environment variables
 ///   → CLI flags
@@ -761,27 +761,29 @@ impl Settings {
 
     /// The global settings file alone (no project overlay).
     pub fn load_global() -> Self {
-        Self::load_file(&crate::config::Config::claude_dir().join("settings.json"))
+        Self::load_file(&crate::config::Config::config_dir().join("settings.json"))
     }
 
     /// Load and merge global + project settings + .mcp.json + the user's
     /// private per-project MCP file.
     /// Priority: global → project → .mcp.json → private (MCP servers only).
     pub fn load(cwd: &Path) -> Self {
-        Self::load_in(&crate::config::Config::claude_dir(), cwd)
+        Self::load_in(&crate::config::Config::config_dir(), cwd)
     }
 
-    pub(crate) fn load_in(claude_dir: &Path, cwd: &Path) -> Self {
-        let global_path = claude_dir.join("settings.json");
+    pub(crate) fn load_in(config_dir: &Path, cwd: &Path) -> Self {
+        let global_path = config_dir.join("settings.json");
         let project_path = cwd.join(".claude").join("settings.json");
         let mcp_json_path = cwd.join(".mcp.json");
 
         let global = Self::from_file(&global_path);
-        // Run from $HOME with the legacy ~/.claude config dir, the "project"
-        // file is the global one: loading it again would flag the user's own
-        // hooks/env as untrusted project config (with a false "ignored"
-        // warning) and report any parse error twice.
-        let project = if same_file(&global_path, &project_path) {
+        // Run from $HOME, the "project" file is a user-level one: our own
+        // global file (when the config dir is ~/.claude via an override),
+        // whose hooks/env would be flagged as untrusted project config with a
+        // false "ignored" warning and any parse error reported twice; or
+        // Claude Code's ~/.claude/settings.json, which is not a project and
+        // is imported only through `oxideclaw config import-claude`.
+        let project = if is_user_settings_file(&global_path, &project_path) {
             Self::default()
         } else {
             Self::from_file(&project_path)
@@ -794,7 +796,7 @@ impl Settings {
         let merged = Self::merge_with_trust(global, project, mcp_extra, trusted);
         // Written by the user (`mcp add --scope local`) and outside the repo,
         // so the trust gate does not apply.
-        let local_path = Self::local_mcp_path(claude_dir, cwd);
+        let local_path = Self::local_mcp_path(config_dir, cwd);
         if local_path.exists() {
             merged.merge(Self::load_mcp_json(&local_path))
         } else {
@@ -805,9 +807,9 @@ impl Settings {
     /// `oxideclaw mcp add --scope local` (the default) target: servers private
     /// to this user and project. It lives under the config dir, not in the
     /// repo, so an `env` token is never committed with `.mcp.json`.
-    pub fn local_mcp_path(claude_dir: &Path, cwd: &Path) -> std::path::PathBuf {
+    pub fn local_mcp_path(config_dir: &Path, cwd: &Path) -> std::path::PathBuf {
         let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        claude_dir
+        config_dir
             .join("local-mcp")
             .join(format!("{}.json", crate::tools::snapshot_name(&cwd)))
     }
@@ -1064,21 +1066,35 @@ impl Settings {
 
     /// Return the path(s) that were actually loaded, for diagnostics.
     pub fn loaded_paths(cwd: &Path) -> Vec<String> {
-        let claude_dir = crate::config::Config::claude_dir();
+        let config_dir = crate::config::Config::config_dir();
+        let global = config_dir.join("settings.json");
+        let project = cwd.join(".claude").join("settings.json");
+        // From $HOME the project settings path is a user-level file.
+        let project = (!is_user_settings_file(&global, &project)).then_some(project);
         let mut loaded: Vec<std::path::PathBuf> = Vec::new();
         for p in [
-            claude_dir.join("settings.json"),
-            cwd.join(".claude").join("settings.json"),
-            cwd.join(".mcp.json"),
-            Self::local_mcp_path(&claude_dir, cwd),
-        ] {
-            // From $HOME the project settings path can be the global file.
-            if p.exists() && !loaded.iter().any(|l| same_file(l, &p)) {
+            Some(global),
+            project,
+            Some(cwd.join(".mcp.json")),
+            Some(Self::local_mcp_path(&config_dir, cwd)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if p.exists() {
                 loaded.push(p);
             }
         }
         loaded.iter().map(|p| p.display().to_string()).collect()
     }
+}
+
+/// Whether the project settings path is really a user-level file: our own
+/// global one, or Claude Code's `~/.claude/settings.json`.
+fn is_user_settings_file(global: &Path, project: &Path) -> bool {
+    same_file(global, project)
+        || crate::config::Config::claude_code_dir()
+            .is_some_and(|d| same_file(&d.join("settings.json"), project))
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -1651,7 +1667,7 @@ mod load_error_tests {
         assert!(read_config_file(Path::new("/dev/zero")).is_err());
     }
 
-    /// From $HOME with the legacy ~/.claude config dir, the project settings
+    /// From $HOME with ~/.claude as the config dir, the project settings
     /// path is the global file: its hooks/env were reported as untrusted
     /// project config that "was ignored" even though they applied.
     #[test]

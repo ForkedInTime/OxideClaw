@@ -112,7 +112,8 @@ impl Tool for WorkflowTool {
 }
 
 async fn load_workflow(cwd: &std::path::Path, name: &str) -> Result<Workflow> {
-    // Candidate paths: direct path, then local .claude/workflows/, then home .claude/workflows/
+    // Candidate paths: direct path, then .claude/workflows/ in the project,
+    // the config dir, and Claude Code's ~/.claude (read-only).
     let candidates: Vec<PathBuf> = {
         let mut c = Vec::new();
 
@@ -122,13 +123,11 @@ async fn load_workflow(cwd: &std::path::Path, name: &str) -> Result<Workflow> {
             c.push(direct);
         } else {
             // Try .json then .yaml/.yml in local and home directories
-            for dir in [
-                cwd.join(".claude").join("workflows"),
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".claude")
-                    .join("workflows"),
-            ] {
+            let dirs = [cwd.join(".claude"), crate::config::Config::config_dir()]
+                .into_iter()
+                .chain(crate::config::Config::claude_code_dir())
+                .map(|d| d.join("workflows"));
+            for dir in dirs {
                 for ext in &["json", "yaml", "yml"] {
                     c.push(dir.join(format!("{name}.{ext}")));
                 }
@@ -160,7 +159,8 @@ async fn load_workflow(cwd: &std::path::Path, name: &str) -> Result<Workflow> {
     }
 
     Err(anyhow!(
-        "Workflow '{}' not found. Searched in .claude/workflows/ and ~/.claude/workflows/.",
+        "Workflow '{}' not found. Searched in .claude/workflows/, the config dir's workflows/ \
+         and ~/.claude/workflows/.",
         name
     ))
 }

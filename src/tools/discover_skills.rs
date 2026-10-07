@@ -17,8 +17,8 @@ impl Tool for DiscoverSkillsTool {
 
     fn description(&self) -> &str {
         "List available skills (slash commands): the built-in skills plus those in the \
-        global skills dir (skills/ under the config dir, ~/.claude/skills/ by default) \
-        and .claude/skills/. Returns a list of skill names and their descriptions."
+        global skills dir (skills/ under the config dir, ~/.config/oxideclaw/skills/ by \
+        default), ~/.claude/skills/ and .claude/skills/. Returns a list of skill names and their descriptions."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -89,7 +89,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = crate::skills::load_skills_from(&global, &local).await;
+        let skills = crate::skills::load_skills_from(&[global, local]).await;
         let out = list_skills(&skills);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.contains(&"/both — project copy"), "{out}");

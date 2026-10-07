@@ -632,7 +632,7 @@ pub struct App {
     pub effort: Option<String>,
     /// Current working directory with ~ substitution — computed once (CWD doesn't change mid-session)
     pub cached_cwd: String,
-    /// Optional label shown in the banner (from bannerOrgDisplay in ~/.claude/config.json)
+    /// Optional label shown in the banner (from bannerOrgDisplay in <config dir>/config.json)
     pub banner_label: Option<String>,
     /// Current session name (displayed in title bar)
     pub session_name: String,

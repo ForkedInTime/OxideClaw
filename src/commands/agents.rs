@@ -4,16 +4,16 @@ use super::*;
 
 pub(super) fn cmd_skills(ctx: &CommandContext) -> CommandAction {
     if ctx.skills.is_empty() {
-        return CommandAction::Message(
+        return CommandAction::Message(format!(
             "No skills loaded.\n\
              \n\
-             Create skills by adding .md files to ~/.claude/skills/\n\
+             Create skills by adding .md files to {skills}/\n\
              Each file becomes a /skill-name command.\n\
              \n\
-             Example: ~/.claude/skills/review.md\n\
-             Then type /review [args] to expand it."
-                .into(),
-        );
+             Example: {skills}/review.md\n\
+             Then type /review [args] to expand it.",
+            skills = crate::config::Config::config_dir().join("skills").display()
+        ));
     }
 
     let mut lines = vec![format!("Loaded skills ({})\n", ctx.skills.len())];
@@ -84,10 +84,11 @@ pub(super) fn cmd_btw(args: &str) -> CommandAction {
 
 pub(super) fn cmd_agents(ctx: &CommandContext) -> CommandAction {
     // List agents defined in .claude/agents/ directories
-    let mut search_dirs = vec![ctx.config.cwd.join(".claude").join("agents")];
-    if let Some(home) = dirs::home_dir() {
-        search_dirs.push(home.join(".claude").join("agents"));
-    }
+    let mut search_dirs = vec![
+        ctx.config.cwd.join(".claude").join("agents"),
+        crate::config::Config::config_dir().join("agents"),
+    ];
+    search_dirs.extend(crate::config::Config::claude_code_dir().map(|d| d.join("agents")));
 
     let mut lines = vec!["Agents\n".to_string()];
     let mut total = 0usize;
@@ -163,7 +164,11 @@ pub(super) fn cmd_agents(ctx: &CommandContext) -> CommandAction {
     // Nothing reads these files yet: the Agent tool only knows its
     // built-in types, so do not invite users to write agents that never run.
     if total == 0 {
-        lines.push("No agent definitions found in .claude/agents/ or ~/.claude/agents/.".into());
+        lines.push(
+            "No agent definitions found in .claude/agents/, the config dir's agents/ or \
+             ~/.claude/agents/."
+                .into(),
+        );
     } else {
         lines.insert(1, format!("{total} agent definition(s) found\n"));
     }

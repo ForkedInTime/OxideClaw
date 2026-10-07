@@ -1,6 +1,6 @@
 /// Memory tools — read and write persistent memory across sessions.
 ///
-/// Memory is stored in ~/.claude/memory.md (global) and optionally in
+/// Memory is stored in <config dir>/memory.md (global) and optionally in
 /// ./.claude/memory.md (project-specific).  These files persist across
 /// all oxideclaw sessions so Claude can remember things long-term.
 use crate::api::types::ToolResultContent;
@@ -13,7 +13,7 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 fn global_memory_path() -> PathBuf {
-    crate::config::Config::claude_dir().join("memory.md")
+    crate::config::Config::config_dir().join("memory.md")
 }
 
 fn is_symlink(p: &Path) -> bool {
@@ -34,6 +34,12 @@ fn project_memory_path_checked(cwd: &Path, op: SensitiveOp) -> Result<PathBuf, T
             "Refusing project memory: {} is a symlink.",
             dir.display()
         )));
+    }
+    if op == SensitiveOp::Write && crate::config::Config::is_claude_code_project(cwd) {
+        return Err(ToolOutput::error(
+            "Refusing project memory in the home directory: ~/.claude is Claude Code's. \
+             Use scope \"global\" instead.",
+        ));
     }
     if op == SensitiveOp::Write {
         std::fs::create_dir_all(&dir)
@@ -132,7 +138,7 @@ impl Tool for MemoryReadTool {
 
     fn description(&self) -> &str {
         "Read persistent memory. Returns the contents of the global memory file \
-         (~/.claude/memory.md) and the project memory file (.claude/memory.md in cwd), \
+         (memory.md in the OxideClaw config dir) and the project memory file (.claude/memory.md in cwd), \
          if they exist. Use this to recall information saved in previous sessions."
     }
 
@@ -201,7 +207,7 @@ impl Tool for MemoryWriteTool {
     fn description(&self) -> &str {
         "Write or update persistent memory. Content is appended to the memory file \
          (or replaces it if replace=true). Use `scope` to write to global \
-         (~/.claude/memory.md) or project (.claude/memory.md) memory."
+         (memory.md in the OxideClaw config dir) or project (.claude/memory.md) memory."
     }
 
     fn input_schema(&self) -> serde_json::Value {

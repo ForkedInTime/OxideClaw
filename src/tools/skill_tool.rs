@@ -29,7 +29,8 @@ impl Tool for SkillTool {
     fn description(&self) -> &str {
         "Execute a skill by name. Skills are the built-in skills (commit, review, \
         explain, fix, test) plus markdown prompt templates in the global skills dir \
-        (skills/ under the config dir, ~/.claude/skills/ by default) or .claude/skills/. \
+        (skills/ under the config dir, ~/.config/oxideclaw/skills/ by default), \
+        ~/.claude/skills/ or .claude/skills/. \
         Use DiscoverSkills to list available skills."
     }
 
@@ -73,9 +74,10 @@ impl Tool for SkillTool {
 fn invoke(skills: &HashMap<String, Skill>, name: &str, args: Option<&str>) -> ToolOutput {
     let Some(skill) = skills.get(name) else {
         return ToolOutput::error(format!(
-            "Skill '{name}' not found in .claude/skills/, {} or the built-in skills.\n\
+            "Skill '{name}' not found in .claude/skills/, {}, ~/.claude/skills/ or the \
+            built-in skills.\n\
             Use DiscoverSkills to see available skills.",
-            crate::config::Config::claude_dir().join("skills").display()
+            crate::config::Config::config_dir().join("skills").display()
         ));
     };
     let args = args.unwrap_or("").trim();
@@ -144,7 +146,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(local.join("plain.md"), "Just do it").unwrap();
-        let skills = crate::skills::load_skills_from(&global, &local).await;
+        let skills = crate::skills::load_skills_from(&[global, local]).await;
 
         let out = invoke(&skills, "deploy", None);
         assert!(!out.is_error);
@@ -171,7 +173,7 @@ mod tests {
     async fn bundled_skills_are_found_and_unknown_names_are_errors() {
         let dir = tempfile::tempdir().unwrap();
         let skills =
-            crate::skills::load_skills_from(&dir.path().join("g"), &dir.path().join("l")).await;
+            crate::skills::load_skills_from(&[dir.path().join("g"), dir.path().join("l")]).await;
         let out = invoke(&skills, "commit", Some("--amend"));
         assert!(!out.is_error);
         assert!(text(&out).contains("git commit") && text(&out).contains("--amend"));
@@ -188,7 +190,7 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::os::unix::fs::symlink(&key, skills.join("setup.md")).unwrap();
         std::fs::write(skills.join("ok.md"), "do the thing").unwrap();
-        let skills = crate::skills::load_skills_from(&dir.path().join("global"), &skills).await;
+        let skills = crate::skills::load_skills_from(&[dir.path().join("global"), skills]).await;
 
         let out = invoke(&skills, "setup", None);
         assert!(out.is_error);

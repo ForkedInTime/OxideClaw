@@ -9,7 +9,7 @@
 /// `teams/<team>/inboxes/<name>.json`. Every result says so, so the model
 /// does not assume a teammate received anything.
 ///
-/// Mailbox layout: ~/.claude/mailboxes/<team>/<recipient>/messages/<uuid>.json
+/// Mailbox layout: <config dir>/mailboxes/<team>/<recipient>/messages/<uuid>.json
 use crate::tools::{Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ const NOT_DELIVERED: &str = "Written to the file mailbox only. Nothing in OxideC
      mailboxes, so no running OxideClaw agent receives this; an external process must read it.";
 
 /// A team or teammate name is used as a path component under
-/// `~/.claude/{teams,mailboxes}`. Anything but `[A-Za-z0-9_-]` (or the
+/// `<config dir>/{teams,mailboxes}`. Anything but `[A-Za-z0-9_-]` (or the
 /// broadcast `*`, where allowed) is refused so a model-supplied
 /// `../../.claude/settings` cannot reach outside the mailbox tree.
 pub fn valid_team_ident(s: &str) -> bool {
@@ -45,7 +45,7 @@ impl Tool for SendMessageTool {
 
     fn description(&self) -> &str {
         "Write a message to an agent teammate's file mailbox \
-         (~/.claude/mailboxes/<team>/<name>/messages/). \
+         (mailboxes/<team>/<name>/messages/ under the OxideClaw config dir). \
          Enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1. \
          Experimental: nothing in OxideClaw reads these mailboxes, so no running \
          OxideClaw agent receives the message; only an external process can. \
@@ -149,19 +149,16 @@ impl Tool for SendMessageTool {
                 ));
             }
             let content = message.as_str().unwrap_or("");
-            let team_file_path = dirs::home_dir().map(|h| {
-                h.join(".claude")
-                    .join("teams")
-                    .join(format!("{}.json", team_name))
-            });
+            let team_file_path = crate::config::Config::config_dir()
+                .join("teams")
+                .join(format!("{}.json", team_name));
 
-            let (members, skipped) =
-                if let Some(path) = team_file_path.as_ref().filter(|p| p.exists()) {
-                    let data = std::fs::read_to_string(path).unwrap_or_default();
-                    broadcast_recipients(&data, &sender_name)
-                } else {
-                    (vec![], vec![])
-                };
+            let (members, skipped) = if team_file_path.exists() {
+                let data = std::fs::read_to_string(&team_file_path).unwrap_or_default();
+                broadcast_recipients(&data, &sender_name)
+            } else {
+                (vec![], vec![])
+            };
 
             if members.is_empty() && skipped.is_empty() {
                 return Ok(ToolOutput::success(
@@ -396,9 +393,7 @@ fn write_mailbox_message(
     if !valid_team_ident(team) || !valid_team_ident(recipient) {
         anyhow::bail!("invalid mailbox path component: {team}/{recipient}");
     }
-    let mailbox_dir = dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".claude")
+    let mailbox_dir = crate::config::Config::config_dir()
         .join("mailboxes")
         .join(team)
         .join(recipient)
@@ -472,7 +467,7 @@ mod mailbox_tests {
     use super::*;
 
     /// Member names came from the team file unchecked, so `/abs/dir` or
-    /// `../..` put a mailbox outside ~/.claude/mailboxes.
+    /// `../..` put a mailbox outside the mailboxes dir.
     #[test]
     fn broadcast_skips_member_names_that_are_not_mailbox_idents() {
         let team = r#"{"members":[{"name":"alice"},{"name":"/tmp/evil"},

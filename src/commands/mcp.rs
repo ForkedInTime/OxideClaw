@@ -70,7 +70,7 @@ pub(super) fn cmd_mcp(args: &str, ctx: &CommandContext) -> CommandAction {
             if name.is_empty() {
                 return CommandAction::Message("Usage: /mcp get <name>".into());
             }
-            let settings_path = Config::claude_dir().join("settings.json");
+            let settings_path = Config::config_dir().join("settings.json");
             let raw = std::fs::read_to_string(&settings_path).unwrap_or_default();
             let val: serde_json::Value =
                 serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
@@ -99,7 +99,7 @@ pub(super) fn cmd_mcp(args: &str, ctx: &CommandContext) -> CommandAction {
     }
 }
 
-/// Write a new MCP server entry to ~/.claude/settings.json.
+/// Write a new MCP server entry to <config dir>/settings.json.
 /// Detects HTTP servers by URL prefix; everything else is stdio.
 pub(super) fn mcp_add_server(args: &str) -> CommandAction {
     let args = args.trim();
@@ -117,7 +117,7 @@ pub(super) fn mcp_add_server(args: &str) -> CommandAction {
         return CommandAction::Message(format!("Usage: /mcp add {name} <command|url> [args...]"));
     }
 
-    let settings_path = Config::claude_dir().join("settings.json");
+    let settings_path = Config::config_dir().join("settings.json");
     let mut val = match crate::config::read_json_object(&settings_path) {
         Ok(v) => v,
         Err(e) => return CommandAction::Message(e.to_string()),
@@ -182,14 +182,14 @@ pub(super) fn mcp_add_server(args: &str) -> CommandAction {
     }
 }
 
-/// Remove an MCP server from ~/.claude/settings.json.
+/// Remove an MCP server from <config dir>/settings.json.
 pub(super) fn mcp_remove_server(args: &str) -> CommandAction {
     let name = args.trim();
     if name.is_empty() {
         return CommandAction::Message("Usage: /mcp remove <name>".into());
     }
 
-    let settings_path = Config::claude_dir().join("settings.json");
+    let settings_path = Config::config_dir().join("settings.json");
     let mut val = match crate::config::read_json_object(&settings_path) {
         Ok(v) => v,
         Err(e) => return CommandAction::Message(e.to_string()),
@@ -227,7 +227,7 @@ pub(super) fn mcp_set_disabled(args: &str, disabled: bool) -> CommandAction {
         });
     }
 
-    let settings_path = Config::claude_dir().join("settings.json");
+    let settings_path = Config::config_dir().join("settings.json");
     let mut val = match crate::config::read_json_object(&settings_path) {
         Ok(v) => v,
         Err(e) => return CommandAction::Message(e.to_string()),

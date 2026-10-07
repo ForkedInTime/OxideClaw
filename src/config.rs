@@ -445,10 +445,10 @@ pub struct Config {
     #[serde(skip)]
     pub flag_settings: Option<crate::settings::Settings>,
     /// The config directory to read global settings, CLAUDE.md and AGENTS.md
-    /// from instead of [`Config::claude_dir`]; tests point it at a tempdir
+    /// from instead of [`Config::config_dir`]; tests point it at a tempdir
     /// so the developer's own files never leak in.
     #[serde(skip)]
-    pub(crate) claude_dir_override: Option<PathBuf>,
+    pub(crate) config_dir_override: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -548,7 +548,7 @@ impl Default for Config {
             auto_fix: crate::autofix::AutoFixConfig::default(),
             auto_commit: crate::settings::AutoCommitConfig::default(),
             flag_settings: None,
-            claude_dir_override: None,
+            config_dir_override: None,
         }
     }
 }
@@ -736,13 +736,13 @@ impl Config {
         }
         // --settings applies in every project, on top of its settings files.
         let flag_settings = self.flag_settings.clone();
-        let claude_dir_override = self.claude_dir_override.clone();
+        let config_dir_override = self.config_dir_override.clone();
         let project = |cwd: PathBuf, bare_mode: bool| {
             let mut c = Config {
                 cwd,
                 bare_mode,
                 flag_settings: flag_settings.clone(),
-                claude_dir_override: claude_dir_override.clone(),
+                config_dir_override: config_dir_override.clone(),
                 ..Config::default()
             };
             c.load_project();
@@ -858,7 +858,7 @@ impl Config {
             watch_rate_limit_ms: old.watch_rate_limit_ms,
             watch_markers: old.watch_markers,
             flag_settings: old.flag_settings,
-            claude_dir_override: old.claude_dir_override,
+            config_dir_override: old.config_dir_override,
         };
     }
 
@@ -886,7 +886,7 @@ impl Config {
     /// their phase-routing directives. Expects settings-derived fields still
     /// at their defaults.
     fn load_project(&mut self) {
-        // ── Settings files: global (~/.claude/settings.json) → project (./.claude/settings.json)
+        // ── Settings files: global (<config dir>/settings.json) → project (./.claude/settings.json)
         // → --settings. Env vars applied after (higher priority than settings).
         let settings = self.load_settings();
         self.apply_browser_settings(&settings);
@@ -1070,9 +1070,9 @@ impl Config {
 
         // ── CLAUDE.md + AGENTS.md files (global + project hierarchy) — skipped in bare mode
         if !self.bare_mode {
-            let dir = self.config_dir();
-            self.claudemd = Self::load_instruction_files(&dir, &self.cwd, "CLAUDE.md");
-            self.agentsmd = Self::load_instruction_files(&dir, &self.cwd, "AGENTS.md");
+            let dirs = self.global_instruction_dirs();
+            self.claudemd = Self::load_instruction_files(&dirs, &self.cwd, "CLAUDE.md");
+            self.agentsmd = Self::load_instruction_files(&dirs, &self.cwd, "AGENTS.md");
         }
 
         // ── CLAUDE.md phase-routing directive override
@@ -1082,11 +1082,27 @@ impl Config {
         Self::apply_phase_routing_from_claudemd(&self.claudemd, &mut self.phase_router);
     }
 
-    /// [`Config::claude_dir`], or the override tests set.
-    fn config_dir(&self) -> PathBuf {
-        self.claude_dir_override
+    /// [`Config::config_dir`], or the override tests set.
+    fn global_config_dir(&self) -> PathBuf {
+        self.config_dir_override
             .clone()
-            .unwrap_or_else(Self::claude_dir)
+            .unwrap_or_else(Self::config_dir)
+    }
+
+    /// Where the global `CLAUDE.md` / `AGENTS.md` may live, first match wins:
+    /// the config dir, then Claude Code's `~/.claude` (read-only import).
+    /// The override tests set stands alone, so they never read the real home.
+    fn global_instruction_dirs(&self) -> Vec<PathBuf> {
+        match &self.config_dir_override {
+            Some(dir) => vec![dir.clone()],
+            None => Self::default_instruction_dirs(),
+        }
+    }
+
+    fn default_instruction_dirs() -> Vec<PathBuf> {
+        std::iter::once(Self::config_dir())
+            .chain(Self::claude_code_dir())
+            .collect()
     }
 
     /// Rebuild `auto_fix` from the `autoFixLoop` settings block. Untrusted projects have their
@@ -1137,7 +1153,7 @@ impl Config {
 
     /// Settings files for `self.cwd`, with `--settings` on top.
     pub(crate) fn load_settings(&self) -> crate::settings::Settings {
-        let settings = crate::settings::Settings::load_in(&self.config_dir(), &self.cwd);
+        let settings = crate::settings::Settings::load_in(&self.global_config_dir(), &self.cwd);
         match &self.flag_settings {
             Some(flag) => settings.merge(flag.clone()),
             None => settings,
@@ -1227,24 +1243,25 @@ impl Config {
     }
 
     /// Load and merge all CLAUDE.md files in priority order:
-    ///   ~/.claude/CLAUDE.md (global)
+    ///   <config dir>/CLAUDE.md, else ~/.claude/CLAUDE.md (global)
     ///   → parent/CLAUDE.md … (ancestor dirs, outermost first)
     ///   → `<cwd>/CLAUDE.md`  (most specific, last = highest priority)
     ///
     /// Returns the concatenated text, with a source comment before each section.
     pub fn load_claude_md(cwd: &Path) -> String {
-        Self::load_instruction_files(&Self::claude_dir(), cwd, "CLAUDE.md")
+        Self::load_instruction_files(&Self::default_instruction_dirs(), cwd, "CLAUDE.md")
     }
 
     /// Load and merge all AGENTS.md files in priority order (same as CLAUDE.md).
     /// Industry-standard agent configuration — works across OxideClaw and other AGENTS.md-aware agents.
     pub fn load_agents_md(cwd: &Path) -> String {
-        Self::load_instruction_files(&Self::claude_dir(), cwd, "AGENTS.md")
+        Self::load_instruction_files(&Self::default_instruction_dirs(), cwd, "AGENTS.md")
     }
 
-    /// `global_dir/name`, then `name` in every directory from the filesystem
-    /// root (or home) down to `cwd`, outermost first.
-    fn load_instruction_files(global_dir: &Path, cwd: &Path, name: &str) -> String {
+    /// The first `global_dirs[i]/name` that exists, then `name` in every
+    /// directory from the filesystem root (or home) down to `cwd`, outermost
+    /// first.
+    fn load_instruction_files(global_dirs: &[PathBuf], cwd: &Path, name: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         // Track canonical paths so symlinks / relative traversal can't inject the same file twice
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1277,7 +1294,13 @@ impl Config {
             }
         };
 
-        include(&global_dir.join(name), true);
+        if let Some(global) = global_dirs
+            .iter()
+            .map(|d| d.join(name))
+            .find(|p| p.exists())
+        {
+            include(&global, true);
+        }
 
         // ── Walk from cwd up toward home/root, collect instruction files ─────
         // We collect outermost → innermost so that more-local files override.
@@ -1305,9 +1328,9 @@ impl Config {
         parts.join("\n\n")
     }
 
-    /// Read bannerOrgDisplay from ~/.claude/config.json
+    /// Read bannerOrgDisplay from <config dir>/config.json
     pub fn get_banner_label() -> Option<String> {
-        let path = Self::claude_dir().join("config.json");
+        let path = Self::config_dir().join("config.json");
         let text = std::fs::read_to_string(&path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&text).ok()?;
         let val = json.get("bannerOrgDisplay")?.as_str()?;
@@ -1318,50 +1341,86 @@ impl Config {
         }
     }
 
-    /// Write bannerOrgDisplay to ~/.claude/config.json (preserves other fields)
+    /// Write bannerOrgDisplay to <config dir>/config.json (preserves other fields)
     pub fn set_banner_label(value: &str) -> anyhow::Result<()> {
-        let path = Self::claude_dir().join("config.json");
+        let path = Self::config_dir().join("config.json");
         let mut json = read_json_object(&path)?;
         json["bannerOrgDisplay"] = serde_json::Value::String(value.to_string());
         write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
         Ok(())
     }
 
-    /// Path to the config directory (XDG-aware).
+    /// OxideClaw's own config directory: `settings.json`, the global
+    /// `CLAUDE.md` / `AGENTS.md`, plugins, memory, `local-mcp/`.
     ///
-    /// Priority: $CLAUDE_CONFIG_DIR > $XDG_CONFIG_HOME/oxideclaw > ~/.claude
-    /// Falls back to ~/.claude for backward compatibility.
-    pub fn claude_dir() -> PathBuf {
-        // Explicit override
-        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-            return PathBuf::from(dir);
-        }
-        // XDG: use $XDG_CONFIG_HOME/oxideclaw if XDG_CONFIG_HOME is set
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            let xdg_path = app_dir(Path::new(&xdg));
-            // Use XDG path if it already exists, or if ~/.claude does NOT exist
-            let legacy = dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claude");
-            if xdg_path.exists() || !legacy.exists() {
-                return xdg_path;
-            }
-        }
-        // Legacy fallback
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".claude")
+    /// Priority: `$OXIDECLAW_CONFIG_DIR` > `$CLAUDE_CONFIG_DIR` (deprecated,
+    /// and ignored when it names Claude Code's `~/.claude`) >
+    /// `$XDG_CONFIG_HOME/oxideclaw` > `~/.config/oxideclaw`. Never
+    /// `~/.claude`: that directory belongs to Claude Code, and OxideClaw only
+    /// reads from it (see [`Config::claude_code_dir`]).
+    pub fn config_dir() -> PathBuf {
+        Self::config_dir_choice().dir
     }
 
-    /// Path to the data directory (XDG-aware).
-    /// Used for sessions, RAG database, and other persistent data.
-    pub fn data_dir() -> PathBuf {
-        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-            let _ = app_dir(Path::new(&xdg)); // migrate a legacy directory first
+    /// [`Config::config_dir`] and how it was picked, from the real environment.
+    pub fn config_dir_choice() -> ConfigDirChoice {
+        resolve_config_dir(&|k| std::env::var(k).ok(), dirs::home_dir().as_deref())
+    }
+
+    /// Claude Code's user directory, `~/.claude`. OxideClaw reads `CLAUDE.md`,
+    /// `AGENTS.md`, skills, agents, output styles and workflows from it as an
+    /// import format, and copies its own old state out of it once
+    /// (`claude_import`). Nothing ever writes here.
+    pub fn claude_code_dir() -> Option<PathBuf> {
+        dirs::home_dir()
+            .filter(|h| h.is_absolute())
+            .map(|h| h.join(".claude"))
+    }
+
+    /// The app-specific `.env` files: the config dir's, then
+    /// `~/.config/oxideclaw/.env`, read before the config dir honoured
+    /// `$XDG_CONFIG_HOME`.
+    pub fn user_dotenv_paths() -> Vec<PathBuf> {
+        let mut paths = vec![Self::config_dir().join(".env")];
+        if let Some(home) = dirs::home_dir() {
+            let legacy = app_dir(&home.join(".config")).join(".env");
+            if !paths.contains(&legacy) {
+                paths.push(legacy);
+            }
         }
-        compute_data_dir(
-            std::env::var("XDG_DATA_HOME").ok().as_deref(),
-            Self::claude_dir(),
+        paths
+    }
+
+    /// Whether `project/.claude` is Claude Code's `~/.claude`, as when
+    /// OxideClaw runs in the home directory. Project-scoped writes (project
+    /// MCP servers, memory) are refused there instead of landing in it.
+    pub fn is_claude_code_project(project: &Path) -> bool {
+        Self::claude_code_dir().is_some_and(|c| same_dir(&project.join(".claude"), &c))
+    }
+
+    /// Path to the data directory (XDG-aware): sessions and other state that
+    /// is not configuration. `$XDG_DATA_HOME/oxideclaw`, else
+    /// `~/.local/share/oxideclaw`; an explicit config-dir override without
+    /// `$XDG_DATA_HOME` keeps its data alongside (see [`data_dir_in`]).
+    pub fn data_dir() -> PathBuf {
+        let xdg = std::env::var("XDG_DATA_HOME").ok();
+        let home = dirs::home_dir();
+        // Move a legacy rustyclaw directory first.
+        match xdg.as_deref().map(Path::new).filter(|x| x.is_absolute()) {
+            Some(x) => {
+                let _ = app_dir(x);
+            }
+            None => {
+                if let Some(h) = home.as_deref().filter(|h| h.is_absolute()) {
+                    let _ = app_dir(&h.join(".local").join("share"));
+                }
+            }
+        }
+        let choice = Self::config_dir_choice();
+        data_dir_in(
+            xdg.as_deref(),
+            home.as_deref(),
+            choice.source.is_explicit().then_some(choice.dir.as_path()),
             |p| p.exists(),
         )
     }
@@ -1382,39 +1441,31 @@ impl Config {
         Self::data_dir().join("sessions")
     }
 
-    /// Write a single key-value pair to `~/.claude/settings.json`.
+    /// Write a single key-value pair to `<config dir>/settings.json`.
     /// Preserves all other keys; creates the file if it doesn't exist.
     pub fn save_user_setting(key: &str, value: serde_json::Value) -> anyhow::Result<()> {
-        let path = Self::claude_dir().join("settings.json");
+        let path = Self::config_dir().join("settings.json");
         let mut json = read_json_object(&path)?;
         json[key] = value;
         write_json_atomic(&path, &serde_json::to_string_pretty(&json)?)?;
         Ok(())
     }
 
-    /// Load all available output styles: built-in + user (~/.claude/output-styles/*.md)
-    /// + project (./.claude/output-styles/*.md).
+    /// Load all available output styles: built-in + ~/.claude/output-styles
+    /// + <config dir>/output-styles + project ./.claude/output-styles (*.md).
     pub fn load_output_styles(cwd: &Path) -> Vec<OutputStyleDef> {
         let mut styles: Vec<OutputStyleDef> = builtin_output_styles();
 
-        // User styles (~/.claude/output-styles/*.md)
-        let user_dir = Self::claude_dir().join("output-styles");
-        if let Ok(entries) = std::fs::read_dir(&user_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("md")
-                    && let Some(def) = OutputStyleDef::from_markdown_file(&p)
-                {
-                    // project styles override user styles with the same name
-                    styles.retain(|s| !s.name.eq_ignore_ascii_case(&def.name));
-                    styles.push(def);
-                }
-            }
-        }
-
-        // Project styles (./.claude/output-styles/*.md) — highest priority
-        let project_dir = cwd.join(".claude").join("output-styles");
-        if let Ok(entries) = std::fs::read_dir(&project_dir) {
+        // Later directories override earlier ones by name: Claude Code's
+        // ~/.claude (read-only import), the config dir, then the project.
+        let dirs = Self::claude_code_dir()
+            .into_iter()
+            .chain([Self::config_dir(), cwd.join(".claude")])
+            .map(|d| d.join("output-styles"));
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("md")
@@ -1890,38 +1941,140 @@ mod rename_compat_tests {
     }
 }
 
+/// Where [`Config::config_dir`] came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigDirSource {
+    /// `$OXIDECLAW_CONFIG_DIR` (or the pre-rename `$RUSTYCLAW_CONFIG_DIR`).
+    Override,
+    /// `$CLAUDE_CONFIG_DIR`: honoured for one more release, with a warning.
+    ClaudeConfigDir,
+    /// `$CLAUDE_CONFIG_DIR` named Claude Code's own `~/.claude`, so it was
+    /// ignored and the XDG default used instead.
+    ClaudeConfigDirIgnored,
+    /// `$XDG_CONFIG_HOME/oxideclaw`, else `~/.config/oxideclaw`.
+    Xdg,
+}
+
+impl ConfigDirSource {
+    /// The user named this directory, so it is a self-contained profile:
+    /// without `$XDG_DATA_HOME` the sessions live in it too, as they did
+    /// under `$CLAUDE_CONFIG_DIR`, and nothing is migrated into it.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::Override | Self::ClaudeConfigDir)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDirChoice {
+    pub dir: PathBuf,
+    pub source: ConfigDirSource,
+}
+
+impl ConfigDirChoice {
+    /// The one-line warning owed for a `$CLAUDE_CONFIG_DIR` that picked (or
+    /// tried to pick) this directory.
+    pub fn notice(&self) -> Option<String> {
+        match self.source {
+            ConfigDirSource::ClaudeConfigDir => Some(format!(
+                "warning: CLAUDE_CONFIG_DIR is deprecated for OxideClaw and stops working in \
+                 the next release; set OXIDECLAW_CONFIG_DIR={} instead.",
+                self.dir.display()
+            )),
+            ConfigDirSource::ClaudeConfigDirIgnored => Some(format!(
+                "warning: CLAUDE_CONFIG_DIR points at Claude Code's ~/.claude, which OxideClaw \
+                 no longer writes to; ignoring it and using {}.",
+                self.dir.display()
+            )),
+            ConfigDirSource::Override | ConfigDirSource::Xdg => None,
+        }
+    }
+}
+
+/// `Config::config_dir_choice` for an injected environment (`var`) and home
+/// directory, so the precedence is testable without touching process env.
+pub(crate) fn resolve_config_dir(
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&Path>,
+) -> ConfigDirChoice {
+    let set = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(dir) = ENV_PREFIXES
+        .iter()
+        .find_map(|p| set(&format!("{p}CONFIG_DIR")))
+    {
+        return ConfigDirChoice {
+            dir,
+            source: ConfigDirSource::Override,
+        };
+    }
+    let mut source = ConfigDirSource::Xdg;
+    if let Some(dir) = set("CLAUDE_CONFIG_DIR") {
+        let claude_code = home.map(|h| h.join(".claude"));
+        if claude_code.is_some_and(|c| same_dir(&dir, &c)) {
+            source = ConfigDirSource::ClaudeConfigDirIgnored;
+        } else {
+            return ConfigDirChoice {
+                dir,
+                source: ConfigDirSource::ClaudeConfigDir,
+            };
+        }
+    }
+    let base = match var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|x| x.is_absolute())
+    {
+        Some(xdg) => xdg,
+        None => home.unwrap_or(Path::new(".")).join(".config"),
+    };
+    ConfigDirChoice {
+        dir: app_dir(&base),
+        source,
+    }
+}
+
+/// Same directory, by name or (when both exist) after resolving symlinks.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
 /// Pure helper for `Config::data_dir()` — all I/O is injected so the
 /// fallback logic is unit-testable without mutating process env vars.
 ///
-/// Rules (locked in by tests below):
-///   - If `XDG_DATA_HOME` is set AND the new XDG path already exists,
-///     use the XDG path. This respects explicit opt-in.
-///   - If `XDG_DATA_HOME` is set AND the legacy `<claude_dir>/sessions`
-///     directory does NOT exist, use the XDG path. Fresh installs get
-///     XDG semantics automatically.
-///   - Otherwise (XDG unset, OR legacy sessions exist and XDG path does
-///     not) fall back to the legacy claude_dir. This is the migration
-///     safety rail: a user with existing sessions at `~/.claude/sessions`
-///     who sets `XDG_DATA_HOME` for the first time will KEEP seeing their
-///     old sessions until they explicitly move them.
-fn compute_data_dir(
+///   - An absolute `$XDG_DATA_HOME` → `$XDG_DATA_HOME/oxideclaw`, except
+///     that an explicit config dir (`profile`) which already holds
+///     `sessions/` keeps them until `$XDG_DATA_HOME/oxideclaw` exists, so
+///     setting `XDG_DATA_HOME` never hides existing sessions.
+///   - No `$XDG_DATA_HOME` and an explicit config dir → that directory, as
+///     before the XDG split.
+///   - Otherwise `~/.local/share/oxideclaw`.
+fn data_dir_in(
     xdg_data_home: Option<&str>,
-    claude_dir: PathBuf,
+    home: Option<&Path>,
+    profile: Option<&Path>,
     exists: impl Fn(&Path) -> bool,
 ) -> PathBuf {
-    if let Some(xdg) = xdg_data_home {
-        let xdg_path = PathBuf::from(xdg).join(APP_DIR_NAME);
-        let legacy_sessions = claude_dir.join("sessions");
-        if exists(&xdg_path) || !exists(&legacy_sessions) {
-            return xdg_path;
+    let xdg = xdg_data_home.map(Path::new).filter(|x| x.is_absolute());
+    match (xdg, profile) {
+        (Some(xdg), Some(profile)) => {
+            let xdg_path = xdg.join(APP_DIR_NAME);
+            if exists(&xdg_path) || !exists(&profile.join("sessions")) {
+                xdg_path
+            } else {
+                profile.to_path_buf()
+            }
         }
+        (Some(xdg), None) => xdg.join(APP_DIR_NAME),
+        (None, Some(profile)) => profile.to_path_buf(),
+        (None, None) => home
+            .unwrap_or(Path::new("."))
+            .join(".local")
+            .join("share")
+            .join(APP_DIR_NAME),
     }
-    claude_dir
 }
 
 #[cfg(test)]
 mod data_dir_tests {
-    use super::{cache_dir_in, compute_data_dir};
+    use super::{ConfigDirSource, cache_dir_in, data_dir_in, resolve_config_dir};
     use std::path::{Path, PathBuf};
 
     /// A path that is absolute on every platform (`/x` has no drive on
@@ -1969,74 +2122,151 @@ mod data_dir_tests {
         }
     }
 
-    /// No XDG set → always return the legacy claude_dir, even when it
-    /// doesn't physically exist yet. This is the pre-XDG baseline and
-    /// must never regress.
-    #[test]
-    fn no_xdg_returns_legacy_claude_dir() {
-        let legacy = PathBuf::from("/home/u/.claude");
-        let got = compute_data_dir(None, legacy.clone(), |_| false);
-        assert_eq!(got, legacy);
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
-    /// XDG set, existing sessions under `~/.claude/sessions` → must
-    /// fall back to legacy so old sessions stay visible. This is the
-    /// SILENT-ORPHAN-SESSIONS regression the sprint item targets.
+    /// No overrides: `$XDG_CONFIG_HOME/oxideclaw`, else
+    /// `~/.config/oxideclaw` — never `~/.claude`, even when it exists.
     #[test]
-    fn xdg_set_but_legacy_sessions_exist_falls_back_to_legacy() {
-        let legacy = PathBuf::from("/home/u/.claude");
-        let legacy_sessions = legacy.join("sessions");
-
-        let got = compute_data_dir(
-            Some("/home/u/.local/share"),
-            legacy.clone(),
-            |p| p == legacy_sessions, // only the sessions dir exists
+    fn config_dir_defaults_to_xdg_never_dot_claude() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let xdg = home.join("xdg");
+        let got = resolve_config_dir(
+            &env(&[("XDG_CONFIG_HOME", xdg.to_str().unwrap())]),
+            Some(home),
         );
+        assert_eq!(got.dir, xdg.join("oxideclaw"));
+        assert_eq!(got.source, ConfigDirSource::Xdg);
+        assert_eq!(got.notice(), None);
+        for unset in [
+            &[][..],
+            &[("XDG_CONFIG_HOME", "")],
+            &[("XDG_CONFIG_HOME", "rel")],
+        ] {
+            let got = resolve_config_dir(&env(unset), Some(home));
+            assert_eq!(got.dir, home.join(".config/oxideclaw"), "{unset:?}");
+        }
+    }
+
+    /// `$OXIDECLAW_CONFIG_DIR` beats `$CLAUDE_CONFIG_DIR` and XDG, silently.
+    #[test]
+    fn oxideclaw_config_dir_has_the_highest_priority() {
+        let home = abs("home/u");
+        let vars = [
+            ("OXIDECLAW_CONFIG_DIR", "/ox"),
+            ("RUSTYCLAW_CONFIG_DIR", "/rusty"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("XDG_CONFIG_HOME", "/xdg"),
+        ];
+        let got = resolve_config_dir(&env(&vars), Some(&home));
+        assert_eq!(got.dir, PathBuf::from("/ox"));
+        assert_eq!(got.source, ConfigDirSource::Override);
+        assert_eq!(got.notice(), None);
+        let got = resolve_config_dir(&env(&vars[1..]), Some(&home));
+        assert_eq!(got.dir, PathBuf::from("/rusty"), "pre-rename name");
+        // Empty means unset.
+        let got = resolve_config_dir(&env(&[("OXIDECLAW_CONFIG_DIR", "")]), Some(&home));
+        assert_eq!(got.dir, home.join(".config/oxideclaw"));
+    }
+
+    /// `$CLAUDE_CONFIG_DIR` still works, with a deprecation warning, unless
+    /// it names Claude Code's own `~/.claude`: then it is ignored.
+    #[test]
+    fn claude_config_dir_is_deprecated_and_never_dot_claude() {
+        let home = abs("home/u");
+        let got = resolve_config_dir(&env(&[("CLAUDE_CONFIG_DIR", "/profile")]), Some(&home));
+        assert_eq!(got.dir, PathBuf::from("/profile"));
+        assert_eq!(got.source, ConfigDirSource::ClaudeConfigDir);
+        let warning = got.notice().unwrap();
+        assert!(warning.contains("deprecated"), "{warning}");
+        assert!(
+            warning.contains("OXIDECLAW_CONFIG_DIR=/profile"),
+            "{warning}"
+        );
+        assert!(!warning.contains('\n'), "one line: {warning}");
+
+        for dot_claude in [home.join(".claude"), home.join(".claude/")] {
+            let got = resolve_config_dir(
+                &env(&[("CLAUDE_CONFIG_DIR", dot_claude.to_str().unwrap())]),
+                Some(&home),
+            );
+            assert_eq!(got.dir, home.join(".config/oxideclaw"));
+            assert_eq!(got.source, ConfigDirSource::ClaudeConfigDirIgnored);
+            assert!(got.notice().unwrap().contains("ignoring"));
+        }
+    }
+
+    /// A symlink to `~/.claude` is still `~/.claude`.
+    #[cfg(unix)]
+    #[test]
+    fn claude_config_dir_through_a_symlink_to_dot_claude_is_ignored() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(home.join(".claude"), home.join("cc")).unwrap();
+        let got = resolve_config_dir(
+            &env(&[("CLAUDE_CONFIG_DIR", home.join("cc").to_str().unwrap())]),
+            Some(home),
+        );
+        assert_eq!(got.source, ConfigDirSource::ClaudeConfigDirIgnored);
+        assert_eq!(got.dir, home.join(".config/oxideclaw"));
+    }
+
+    /// Sessions: `$XDG_DATA_HOME/oxideclaw`, else `~/.local/share/oxideclaw`;
+    /// never the config dir and never `~/.claude` by default.
+    #[test]
+    fn data_dir_is_xdg_data_home_else_local_share() {
+        let home = abs("home/u");
+        let xdg = abs("xdg/data");
         assert_eq!(
-            got, legacy,
-            "legacy sessions dir must pin data_dir to legacy claude_dir"
+            data_dir_in(xdg.to_str(), Some(&home), None, |_| true),
+            xdg.join("oxideclaw")
+        );
+        for unset in [None, Some(""), Some("rel")] {
+            assert_eq!(
+                data_dir_in(unset, Some(&home), None, |_| true),
+                home.join(".local/share/oxideclaw"),
+                "{unset:?}"
+            );
+        }
+    }
+
+    /// An explicit config dir without `$XDG_DATA_HOME` keeps its sessions,
+    /// as under `$CLAUDE_CONFIG_DIR` before.
+    #[test]
+    fn explicit_profile_keeps_its_data_without_xdg_data_home() {
+        let home = abs("home/u");
+        let profile = abs("profile");
+        assert_eq!(
+            data_dir_in(None, Some(&home), Some(&profile), |_| false),
+            profile
         );
     }
 
-    /// XDG set, fresh machine (nothing exists) → use XDG path. Fresh
-    /// installs opt into XDG automatically.
+    /// `$XDG_DATA_HOME` set for the first time over a profile that already
+    /// has sessions: they stay visible until the XDG path exists.
     #[test]
-    fn xdg_set_fresh_install_uses_xdg() {
-        let legacy = PathBuf::from("/home/u/.claude");
-        let got = compute_data_dir(Some("/home/u/.local/share"), legacy, |_| false);
-        assert_eq!(got, PathBuf::from("/home/u/.local/share/oxideclaw"));
-    }
-
-    /// XDG set, the XDG path already exists (from a prior OxideClaw run
-    /// with XDG active) → use XDG even if legacy sessions also exist.
-    /// This matches the "explicit opt-in wins" rule.
-    #[test]
-    fn xdg_path_already_exists_wins_over_legacy() {
-        let legacy = PathBuf::from("/home/u/.claude");
-        let legacy_sessions = legacy.join("sessions");
-        let xdg_path = PathBuf::from("/home/u/.local/share/oxideclaw");
-
-        let got = compute_data_dir(Some("/home/u/.local/share"), legacy.clone(), |p: &Path| {
-            p == legacy_sessions || p == xdg_path
+    fn xdg_data_home_does_not_orphan_a_profiles_sessions() {
+        let home = abs("home/u");
+        let profile = abs("profile");
+        let xdg = abs("xdg/data");
+        let sessions = profile.join("sessions");
+        let xdg_path = xdg.join("oxideclaw");
+        let got = data_dir_in(xdg.to_str(), Some(&home), Some(&profile), |p| p == sessions);
+        assert_eq!(got, profile);
+        let got = data_dir_in(xdg.to_str(), Some(&home), Some(&profile), |p| {
+            p == sessions || p == xdg_path
         });
-        assert_eq!(
-            got, xdg_path,
-            "XDG path should win when it already exists (prior use)"
-        );
-    }
-
-    /// XDG set to an empty string → must still fall through to legacy,
-    /// not join to "/oxideclaw" with an empty prefix.
-    #[test]
-    fn empty_xdg_value_is_not_a_valid_path() {
-        let legacy = PathBuf::from("/home/u/.claude");
-        // With an empty XDG_DATA_HOME, joining produces "oxideclaw" which
-        // is a relative path. compute_data_dir still honours the "legacy
-        // sessions exist" guard, so as long as that guard is present the
-        // legacy wins. Confirm that behavior.
-        let legacy_sessions = legacy.join("sessions");
-        let got = compute_data_dir(Some(""), legacy.clone(), |p| p == legacy_sessions);
-        assert_eq!(got, legacy);
+        assert_eq!(got, xdg_path, "an existing XDG path wins");
+        let got = data_dir_in(xdg.to_str(), Some(&home), Some(&profile), |_| false);
+        assert_eq!(got, xdg_path, "fresh profile");
     }
 }
 
@@ -2285,10 +2515,36 @@ mod instruction_file_symlink_tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
 
-        let claude = Config::load_instruction_files(&global, &repo, "CLAUDE.md");
+        let claude =
+            Config::load_instruction_files(std::slice::from_ref(&global), &repo, "CLAUDE.md");
         assert!(claude.contains("global claude rules"), "{claude}");
-        let agents = Config::load_instruction_files(&global, &repo, "AGENTS.md");
+        let agents = Config::load_instruction_files(&[global], &repo, "AGENTS.md");
         assert!(agents.contains("global agents rules"), "{agents}");
+    }
+
+    /// The global AGENTS.md / CLAUDE.md come from OxideClaw's config dir
+    /// first and fall back to Claude Code's `~/.claude`, never both.
+    #[test]
+    fn global_instructions_prefer_the_config_dir_then_dot_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ours = tmp.path().join("config");
+        let claude = tmp.path().join("dot-claude");
+        let repo = tmp.path().join("repo");
+        for d in [&ours, &claude, &repo] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(claude.join("AGENTS.md"), "claude code agents").unwrap();
+        let dirs = [ours.clone(), claude.clone()];
+        let got = Config::load_instruction_files(&dirs, &repo, "AGENTS.md");
+        assert!(got.contains("claude code agents"), "fallback: {got}");
+
+        std::fs::write(ours.join("AGENTS.md"), "oxideclaw agents").unwrap();
+        let got = Config::load_instruction_files(&dirs, &repo, "AGENTS.md");
+        assert!(got.contains("oxideclaw agents"), "{got}");
+        assert!(
+            !got.contains("claude code agents"),
+            "first match only: {got}"
+        );
     }
 
     #[test]
@@ -2584,7 +2840,7 @@ mod retarget_cwd_tests {
         std::fs::create_dir_all(&home).unwrap();
         let mut c = Config {
             cwd: dir.to_path_buf(),
-            claude_dir_override: Some(home),
+            config_dir_override: Some(home),
             ..Config::default()
         };
         c.load_project();
@@ -2702,7 +2958,7 @@ mod flag_settings_retarget_tests {
         let mut cfg = Config {
             model: "cli-model".into(),
             cwd: start.path().into(),
-            claude_dir_override: Some(home.path().into()),
+            config_dir_override: Some(home.path().into()),
             flag_settings: Some(
                 serde_json::from_str(r#"{"permissions": {"deny": ["WebFetch"]}}"#).unwrap(),
             ),
@@ -2740,7 +2996,7 @@ mod flag_settings_retarget_tests {
         let project = tempfile::tempdir().unwrap();
         let cfg = Config {
             cwd: project.path().into(),
-            claude_dir_override: Some(home.path().into()),
+            config_dir_override: Some(home.path().into()),
             flag_settings: Some(
                 serde_json::from_str(r#"{"sandboxEnabled": true, "sandboxMode": "bwrap"}"#)
                     .unwrap(),
@@ -2771,7 +3027,7 @@ mod flag_settings_retarget_tests {
         let load = |bare_mode| {
             let mut c = Config {
                 cwd: project.path().into(),
-                claude_dir_override: Some(home.path().into()),
+                config_dir_override: Some(home.path().into()),
                 bare_mode,
                 ..Config::default()
             };
@@ -2800,7 +3056,7 @@ mod flag_settings_retarget_tests {
         std::fs::write(project.path().join(".claude/settings.json"), &own).unwrap();
         let cfg = Config {
             cwd: project.path().into(),
-            claude_dir_override: Some(home.path().into()),
+            config_dir_override: Some(home.path().into()),
             flag_settings: Some(serde_json::from_str(r#"{"verbose": true}"#).unwrap()),
             ..Config::default()
         };
@@ -2825,7 +3081,7 @@ mod flag_settings_retarget_tests {
         .unwrap();
         let mut cfg = Config {
             cwd: project.path().into(),
-            claude_dir_override: Some(home.path().into()),
+            config_dir_override: Some(home.path().into()),
             ..Config::default()
         };
         cfg.refresh_trust();
@@ -2858,7 +3114,7 @@ mod flag_settings_retarget_tests {
             bare_mode: true,
             disable_all_hooks: true,
             cwd: start.path().into(),
-            claude_dir_override: Some(home.path().into()),
+            config_dir_override: Some(home.path().into()),
             ..Config::default()
         };
         cfg.retarget_cwd(project.path().to_path_buf());

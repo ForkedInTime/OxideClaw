@@ -2,7 +2,7 @@
 ///
 /// Enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1 (same gate as SendMessageTool).
 ///
-/// Teams are stored in ~/.claude/teams/<name>.json
+/// Teams are stored in <config dir>/teams/<name>.json
 use crate::tools::{Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ impl Tool for TeamCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create a named agent team (~/.claude/teams/<name>.json). \
+        "Create a named agent team (teams/<name>.json under the OxideClaw config dir). \
          Experimental: this only records the team; it does not start any agents, \
          and SendMessage only writes file mailboxes that no OxideClaw agent reads. \
          Requires OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1."
@@ -74,10 +74,7 @@ impl Tool for TeamCreateTool {
             ));
         }
 
-        let teams_dir = dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".claude")
-            .join("teams");
+        let teams_dir = crate::config::Config::config_dir().join("teams");
         std::fs::create_dir_all(&teams_dir)?;
 
         let team_file = teams_dir.join(format!("{}.json", name));
@@ -171,9 +168,7 @@ impl Tool for TeamDeleteTool {
             ));
         }
 
-        let team_file = dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".claude")
+        let team_file = crate::config::Config::config_dir()
             .join("teams")
             .join(format!("{}.json", name));
 
@@ -184,9 +179,7 @@ impl Tool for TeamDeleteTool {
         std::fs::remove_file(&team_file)?;
 
         // Also clean up mailboxes for this team
-        let mailbox_dir = dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".claude")
+        let mailbox_dir = crate::config::Config::config_dir()
             .join("mailboxes")
             .join(name);
         if mailbox_dir.exists() {

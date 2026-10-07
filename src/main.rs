@@ -408,8 +408,8 @@ enum McpSubcommand {
 /// a narrow allowlist of our own API-key and model vars, and specifically NEVER
 /// load anything that could:
 ///   - Bypass permission prompts (`CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS`)
-///   - Redirect config / settings / hook resolution (`CLAUDE_CONFIG_DIR`,
-///     `XDG_CONFIG_HOME`, `HOME`)
+///   - Redirect config / settings / hook resolution (`OXIDECLAW_CONFIG_DIR`,
+///     `CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME`, `HOME`)
 ///   - Alter any process-spawn path (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
 ///     `DYLD_*`, `OXIDECLAW_*_COMMAND`, sandbox binaries, voice binaries,
 ///     MCP server argv)
@@ -467,6 +467,8 @@ const FORBIDDEN_ENV_KEYS: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "CLAUDE_CONFIG_DIR",
+    "OXIDECLAW_CONFIG_DIR",
+    "RUSTYCLAW_CONFIG_DIR",
     "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS",
     "OXIDECLAW_SANDBOX_COMMAND",
     "OXIDECLAW_VOICE_COMMAND",
@@ -566,8 +568,8 @@ fn load_dotenv_auto() {
     if let Ok(cwd) = std::env::current_dir() {
         let env_path = cwd.join(".env");
         if env_path.exists() {
-            // Safe this early: claude_dir() depends only on CLAUDE_CONFIG_DIR /
-            // XDG_CONFIG_HOME / HOME, none of which a .env may set.
+            // Safe this early: config_dir() depends only on OXIDECLAW_CONFIG_DIR /
+            // CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME / HOME, none of which a .env may set.
             let deny = project_dotenv_deny(&settings::Settings::load_global(), &cwd);
             let skipped = load_dotenv(&env_path, deny);
             // Warn if project .env exists — it won't leak into tool subprocesses
@@ -590,11 +592,18 @@ fn load_dotenv_auto() {
     // 2. ~/.env  — user-global keys
     if let Some(home) = dirs::home_dir() {
         load_dotenv(&home.join(".env"), &[]);
-        // 3. ~/.config/oxideclaw/.env  — app-specific config
-        load_dotenv(
-            &crate::config::app_dir(&home.join(".config")).join(".env"),
-            &[],
-        );
+    }
+    // 3. <config dir>/.env (~/.config/oxideclaw/.env by default) — app-specific
+    for path in Config::user_dotenv_paths() {
+        load_dotenv(&path, &[]);
+    }
+}
+
+/// Warns when a deprecated `$CLAUDE_CONFIG_DIR` picked (or tried to pick)
+/// the config dir.
+fn prepare_config_dirs() {
+    if let Some(notice) = Config::config_dir_choice().notice() {
+        eprintln!("{notice}");
     }
 }
 
@@ -661,6 +670,8 @@ async fn run() -> Result<()> {
     {
         colored::control::set_override(false);
     }
+
+    prepare_config_dirs();
 
     // Load .env files before anything else so API keys are available
     // to Config::load() and all downstream code.
@@ -786,8 +797,12 @@ async fn run() -> Result<()> {
                     println!("  \u{2717} ANTHROPIC_API_KEY not set");
                 }
                 // Config dir
-                let config_dir = config::Config::claude_dir();
+                let config_dir = config::Config::config_dir();
                 println!("  \u{2713} Config dir: {}", config_dir.display());
+                println!(
+                    "  \u{2713} Data dir: {}",
+                    config::Config::data_dir().display()
+                );
                 if config_dir.exists() {
                     println!("  \u{2713} Config dir exists");
                 } else {
@@ -1548,7 +1563,10 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             let settings = crate::settings::Settings::load(&config.cwd);
             if settings.mcp_servers.is_empty() {
                 println!("No MCP servers configured.");
-                println!("Add servers to ~/.claude/settings.json or .claude/settings.json:");
+                println!(
+                    "Add servers to {} or .claude/settings.json:",
+                    Config::config_dir().join("settings.json").display()
+                );
                 println!("  {{");
                 println!("    \"mcpServers\": {{");
                 println!(
@@ -1614,7 +1632,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             env,
         }) => {
             let cfg = mcp_add_config(transport, command, args, env)?;
-            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::claude_dir())?;
+            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::config_dir())?;
             println!(
                 "Added MCP server '{name}' (scope: {scope}) to {}",
                 path.display()
@@ -1623,7 +1641,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
         Some(McpSubcommand::AddJson { name, json, scope }) => {
             let cfg: crate::mcp::types::McpServerConfig =
                 serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
-            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::claude_dir())?;
+            let path = mcp_write_server(name, cfg, scope, &config.cwd, &Config::config_dir())?;
             println!(
                 "Added MCP server '{name}' (scope: {scope}) to {}",
                 path.display()
@@ -1665,7 +1683,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                                     cfg,
                                     scope,
                                     &config.cwd,
-                                    &Config::claude_dir(),
+                                    &Config::config_dir(),
                                 )?;
                                 println!("  Imported: {name}");
                                 imported += 1;
@@ -1681,7 +1699,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
         }
         Some(McpSubcommand::Remove { name, scope }) => {
             let removed =
-                mcp_remove_server(name, scope.as_deref(), &config.cwd, &Config::claude_dir())?;
+                mcp_remove_server(name, scope.as_deref(), &config.cwd, &Config::config_dir())?;
             if removed {
                 println!("Removed MCP server '{name}'.");
             } else {
@@ -1776,9 +1794,9 @@ fn mcp_write_server(
     cfg: crate::mcp::types::McpServerConfig,
     scope: &str,
     cwd: &std::path::Path,
-    claude_dir: &std::path::Path,
+    config_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
-    let path = mcp_scope_path(scope, cwd, claude_dir)?;
+    let path = mcp_scope_path(scope, cwd, config_dir)?;
     if scope == "project" {
         let has_secrets = match &cfg {
             crate::mcp::types::McpServerConfig::Stdio(s) => !s.env.is_empty(),
@@ -1808,18 +1826,18 @@ fn mcp_remove_server(
     name: &str,
     scope: Option<&str>,
     cwd: &std::path::Path,
-    claude_dir: &std::path::Path,
+    config_dir: &std::path::Path,
 ) -> Result<bool> {
     let paths: Vec<std::path::PathBuf> = if let Some(s) = scope {
-        vec![mcp_scope_path(s, cwd, claude_dir)?]
+        vec![mcp_scope_path(s, cwd, config_dir)?]
     } else {
-        vec![
-            mcp_scope_path("user", cwd, claude_dir)?,
-            mcp_scope_path("project", cwd, claude_dir)?,
-            mcp_scope_path("local", cwd, claude_dir)?,
+        // `project` is refused in the home directory (Claude Code's ~/.claude).
+        ["user", "project", "local"]
+            .into_iter()
+            .filter_map(|s| mcp_scope_path(s, cwd, config_dir).ok())
             // Where older versions wrote `--scope local`.
-            cwd.join(".mcp.json"),
-        ]
+            .chain([cwd.join(".mcp.json")])
+            .collect()
     };
     let mut removed = false;
     for path in &paths {
@@ -1841,15 +1859,20 @@ fn mcp_remove_server(
 fn mcp_scope_path(
     scope: &str,
     cwd: &std::path::Path,
-    claude_dir: &std::path::Path,
+    config_dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     match scope {
-        "user" => Ok(claude_dir.join("settings.json")),
+        "user" => Ok(config_dir.join("settings.json")),
+        "project" if Config::is_claude_code_project(cwd) => anyhow::bail!(
+            "{} is Claude Code's directory, not a project; use --scope user for OxideClaw's {}",
+            cwd.join(".claude").display(),
+            config_dir.join("settings.json").display()
+        ),
         "project" => Ok(cwd.join(".claude").join("settings.json")),
         // Private, outside the repo, and loaded without the trust gate: the
         // old `.mcp.json` target leaked `-e` tokens into a shared file and
         // was then ignored in untrusted projects.
-        "local" => Ok(crate::settings::Settings::local_mcp_path(claude_dir, cwd)),
+        "local" => Ok(crate::settings::Settings::local_mcp_path(config_dir, cwd)),
         other => anyhow::bail!("unknown scope '{other}' (expected local, project or user)"),
     }
 }

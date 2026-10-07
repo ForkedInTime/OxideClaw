@@ -827,7 +827,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.overlay = Some(Overlay::new("thinkback", text));
         }
         CommandAction::TeleportExport => {
-            let teleport_path = crate::config::Config::claude_dir().join("teleport.json");
+            let teleport_path = crate::config::Config::config_dir().join("teleport.json");
             let export_data = serde_json::json!({
                 "session_id": session.id,
                 "session_name": session.meta.name,
@@ -866,7 +866,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
         }
         CommandAction::TeleportImport => {
-            let teleport_path = crate::config::Config::claude_dir().join("teleport.json");
+            let teleport_path = crate::config::Config::config_dir().join("teleport.json");
             if !teleport_path.exists() {
                 app.overlay = Some(Overlay::new(
                     "teleport",
@@ -1003,13 +1003,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
         }
         CommandAction::EditClaudeMd => {
-            let claude_md = crate::config::Config::claude_dir().join("CLAUDE.md");
-            // Create the file if it doesn't exist
+            let claude_md = crate::config::Config::config_dir().join("CLAUDE.md");
+            // Create the file if it doesn't exist. It replaces Claude Code's
+            // ~/.claude/CLAUDE.md as the global file, so start from a copy.
             if !claude_md.exists() {
                 if let Some(parent) = claude_md.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::write(&claude_md, "# CLAUDE.md\n\n");
+                let seed = crate::config::Config::claude_code_dir()
+                    .and_then(|d| std::fs::read_to_string(d.join("CLAUDE.md")).ok())
+                    .unwrap_or_else(|| "# CLAUDE.md\n\n".to_string());
+                let _ = std::fs::write(&claude_md, seed);
             }
             let editor = editor_command(std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
             // Suspend raw mode, run editor, restore
@@ -1264,10 +1268,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
         }
         CommandAction::PluginList => {
-            let plugins_path = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("plugins.json");
+            let plugins_path = crate::config::Config::config_dir().join("plugins.json");
             let obj = std::fs::read_to_string(&plugins_path)
                 .ok()
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
@@ -1298,7 +1299,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::PluginRemove(name) => {
             // Where /plugin install registered it: the loader's config dir.
-            let settings_path = crate::config::Config::claude_dir().join("settings.json");
+            let settings_path = crate::config::Config::config_dir().join("settings.json");
             let mut removed = false;
             if let Ok(content) = std::fs::read_to_string(&settings_path)
                 && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content)
@@ -1315,10 +1316,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
             }
             // Remove from plugins.json
-            let plugins_path = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("plugins.json");
+            let plugins_path = crate::config::Config::config_dir().join("plugins.json");
             if let Ok(content) = std::fs::read_to_string(&plugins_path)
                 && let Ok(mut plugins) = serde_json::from_str::<serde_json::Value>(&content)
                 && let Some(obj) = plugins.as_object_mut()

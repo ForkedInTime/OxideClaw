@@ -90,14 +90,10 @@ pub(super) fn cmd_plugin(args: &str) -> CommandAction {
     }
 }
 
-/// plugins.json lives where `/plugin install` and `/plugin remove` keep it
-/// (~/.claude), not in the XDG-aware config dir; reading it from there made
-/// the listings come up empty under XDG_CONFIG_HOME or CLAUDE_CONFIG_DIR.
+/// The plugin registry `/plugin install` and `/plugin remove` keep in the
+/// config dir.
 fn plugins_json_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claude")
-        .join("plugins.json")
+    Config::config_dir().join("plugins.json")
 }
 
 pub(super) fn plugin_marketplace_list() -> CommandAction {
@@ -138,7 +134,7 @@ fn plugin_marketplace_list_in(plugins_path: &std::path::Path) -> CommandAction {
 
 pub(super) fn plugin_set_enabled(name: &str, enabled: bool) -> CommandAction {
     // Toggle disabled flag in settings.json mcpServers entry
-    let settings_path = Config::claude_dir().join("settings.json");
+    let settings_path = Config::config_dir().join("settings.json");
     let content = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
     let mut val: serde_json::Value =
         serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
@@ -251,7 +247,7 @@ pub(super) fn plugin_validate(path: &str) -> CommandAction {
 }
 
 pub(super) fn plugin_manage_list() -> CommandAction {
-    let settings_path = Config::claude_dir().join("settings.json");
+    let settings_path = Config::config_dir().join("settings.json");
     let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
     let val: serde_json::Value = serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
 
@@ -343,7 +339,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
         (
             "lesson 3 — skills",
             "Skills (prompt templates)",
-            "Skills are reusable prompt templates stored in ~/.claude/skills/\n\
+            "Skills are reusable prompt templates stored in ~/.config/oxideclaw/skills/\n\
              \n\
              **Built-in skills**\n\
              - /commit   — write a conventional git commit\n\
@@ -353,7 +349,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              - /test     — write tests\n\
              \n\
              **Create your own**\n\
-             Make a .md file in ~/.claude/skills/:\n\
+             Make a .md file in ~/.config/oxideclaw/skills/:\n\
              ```\n\
              # My Skill\n\
              What it does\n\
@@ -374,7 +370,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              - autoCompact  — set in settings.json to run automatically\n\
              \n\
              **Sessions are saved automatically**\n\
-             ~/.claude/sessions/<uuid>.jsonl\n\
+             ~/.local/share/oxideclaw/sessions/<uuid>.jsonl\n\
              \n\
              - /session list     — see all saved sessions\n\
              - /resume <id>      — continue an old session\n\
@@ -388,7 +384,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
             "MCP (Model Context Protocol) servers",
             "MCP servers extend oxideclaw with additional tools:\n\
              \n\
-             **Configure in ~/.claude/settings.json:**\n\
+             **Configure in ~/.config/oxideclaw/settings.json:**\n\
              ```json\n\
              {\n\
                \"mcpServers\": {\n\

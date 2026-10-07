@@ -253,7 +253,8 @@ pub fn parse_skill_invocation(input: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Load all skills from bundled set + ~/.claude/skills/ + ./.claude/skills/.
+/// Load all skills: bundled, ~/.claude/skills/ (Claude Code's, read-only),
+/// <config dir>/skills/, then ./.claude/skills/.
 pub async fn load_skills() -> HashMap<String, Skill> {
     load_skills_in(std::path::Path::new(".")).await
 }
@@ -262,20 +263,21 @@ pub async fn load_skills() -> HashMap<String, Skill> {
 /// tools go through this so the model sees exactly the skills `/name` runs,
 /// bundled ones included.
 pub async fn load_skills_in(cwd: &std::path::Path) -> HashMap<String, Skill> {
-    let global_dir = crate::config::Config::claude_dir().join("skills");
-    load_skills_from(&global_dir, &cwd.join(".claude").join("skills")).await
+    let dirs: Vec<std::path::PathBuf> = crate::config::Config::claude_code_dir()
+        .into_iter()
+        .chain([crate::config::Config::config_dir(), cwd.join(".claude")])
+        .map(|d| d.join("skills"))
+        .collect();
+    load_skills_from(&dirs).await
 }
 
-/// Later sources override earlier ones: bundled, then global, then project.
-pub(crate) async fn load_skills_from(
-    global_dir: &std::path::Path,
-    local_dir: &std::path::Path,
-) -> HashMap<String, Skill> {
+/// Later sources override earlier ones: bundled, then each of `dirs` in turn.
+pub(crate) async fn load_skills_from(dirs: &[std::path::PathBuf]) -> HashMap<String, Skill> {
     let mut skills = HashMap::new();
     for s in bundled_skills() {
         skills.insert(s.name.clone(), s);
     }
-    for dir in [global_dir, local_dir] {
+    for dir in dirs {
         if let Ok(mut entries) = fs::read_dir(&dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
@@ -409,8 +411,14 @@ mod tests {
         std::fs::write(global.join("both.md"), "global copy").unwrap();
         std::fs::write(local.join("both.md"), "project copy").unwrap();
         std::fs::write(local.join("commit.md"), "project commit").unwrap();
+        // Claude Code's ~/.claude/skills is read too, below ours.
+        let claude_code = dir.path().join("home/.claude/skills");
+        std::fs::create_dir_all(&claude_code).unwrap();
+        std::fs::write(claude_code.join("deploy.md"), "claude code deploy").unwrap();
+        std::fs::write(claude_code.join("lint.md"), "claude code lint").unwrap();
 
-        let skills = load_skills_from(&global, &local).await;
+        let skills = load_skills_from(&[claude_code, global, local]).await;
+        assert_eq!(skills["lint"].prompt_template, "claude code lint");
         assert_eq!(skills["deploy"].prompt_template, "global deploy");
         assert_eq!(skills["both"].prompt_template, "project copy");
         assert_eq!(skills["commit"].prompt_template, "project commit");

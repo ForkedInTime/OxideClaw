@@ -302,7 +302,8 @@ pub(super) fn cmd_hooks(ctx: &CommandContext) -> CommandAction {
             None => {
                 return CommandAction::Message(concat!(
                 "Hooks\n\nNo hooks configured.\n\n",
-                "Add hooks to ~/.claude/settings.json or .claude/settings.json:\n\n",
+                "Add hooks to settings.json in the config dir (/status shows it) or \
+                 .claude/settings.json:\n\n",
                 "{\n  \"hooks\": {\n",
                 "    \"preToolUse\": [\n",
                 "      {\"matcher\": \"Bash\", \"command\": \"echo Running: $TOOL_NAME\"}\n",

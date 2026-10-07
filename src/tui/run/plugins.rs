@@ -207,7 +207,7 @@ fn clone_entry_point(
 
 /// Give the plugins dir its own package.json. bun (and npm/pnpm without
 /// --prefix) install into the nearest ancestor that has one, which would be
-/// ~/.claude, ~ or wherever else a stray manifest lives.
+/// the config dir, ~ or wherever else a stray manifest lives.
 async fn ensure_plugins_manifest(plugins_dir: &std::path::Path) -> anyhow::Result<()> {
     let manifest = plugins_dir.join("package.json");
     if !manifest.exists() {
@@ -348,7 +348,7 @@ pub(super) async fn plugin_install_task(
         // Refuse a broken settings.json / plugins.json before cloning or
         // installing anything, rather than after the slow part.
         crate::config::read_json_object(&global_settings_path())?;
-        crate::config::read_json_object(&claude_home_file("plugins.json")?)?;
+        crate::config::read_json_object(&plugins_json_path())?;
 
         let (pm, pm_runner) = tokio::task::spawn_blocking(detect_package_manager)
             .await
@@ -356,9 +356,7 @@ pub(super) async fn plugin_install_task(
 
         if is_marketplace {
             // ── Marketplace install: git clone + install deps locally ─────────
-            let marketplace_dir = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-                .join(".claude")
+            let marketplace_dir = crate::config::Config::config_dir()
                 .join("plugins")
                 .join("marketplaces");
             std::fs::create_dir_all(&marketplace_dir)?;
@@ -403,17 +401,15 @@ pub(super) async fn plugin_install_task(
 
             Ok(format!(
                 "Plugin '{npm_name}' installed successfully (via {pm}).\n\
-                 Registered as MCP server '{npm_name}' in ~/.claude/settings.json.\n\
+                 Registered as MCP server '{npm_name}' in {}.\n\
                  \n\
                  Restart oxideclaw for the plugin to take effect.\n\
-                 After restart, verify with: /{npm_name}:ctx-doctor"
+                 After restart, verify with: /{npm_name}:ctx-doctor",
+                global_settings_path().display()
             ))
         } else {
             // ── npm/bun/pnpm registry install ────────────────────────────────
-            let plugins_dir = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-                .join(".claude")
-                .join("plugins");
+            let plugins_dir = crate::config::Config::config_dir().join("plugins");
             std::fs::create_dir_all(&plugins_dir)?;
 
             let npm_name = registry_package_name(&raw_spec)?;
@@ -441,9 +437,10 @@ pub(super) async fn plugin_install_task(
 
             Ok(format!(
                 "Plugin '{npm_name}' installed successfully (via {pm}).\n\
-                 Registered as MCP server '{npm_name}' in ~/.claude/settings.json.\n\
+                 Registered as MCP server '{npm_name}' in {}.\n\
                  \n\
-                 Restart oxideclaw for the plugin to take effect."
+                 Restart oxideclaw for the plugin to take effect.",
+                global_settings_path().display()
             ))
         }
     }.await;
@@ -455,16 +452,14 @@ pub(super) async fn plugin_install_task(
     let _ = tx.send(AppEvent::PluginInstallDone { success, message });
 }
 
-fn claude_home_file(name: &str) -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-        .join(".claude")
-        .join(name))
+/// The plugin registry, beside the settings.json the plugins register in.
+fn plugins_json_path() -> std::path::PathBuf {
+    crate::config::Config::config_dir().join("plugins.json")
 }
 
 /// The global settings.json, in the config dir the settings loader reads.
 fn global_settings_path() -> std::path::PathBuf {
-    crate::config::Config::claude_dir().join("settings.json")
+    crate::config::Config::config_dir().join("settings.json")
 }
 
 /// Register an MCP server entry in the global settings.json.
@@ -510,9 +505,9 @@ fn register_mcp_server_in(
     Ok(())
 }
 
-/// Track a plugin in ~/.claude/plugins.json.
+/// Track a plugin in <config dir>/plugins.json.
 pub(super) async fn track_plugin(name: &str, spec: &str, marketplace: bool) -> anyhow::Result<()> {
-    track_plugin_in(&claude_home_file("plugins.json")?, name, spec, marketplace)
+    track_plugin_in(&plugins_json_path(), name, spec, marketplace)
 }
 
 fn track_plugin_in(

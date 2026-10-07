@@ -134,9 +134,13 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     checks.push(String::new());
 
     // XDG / config directory
-    let config_dir = crate::config::Config::claude_dir();
+    let choice = crate::config::Config::config_dir_choice();
+    let config_dir = choice.dir.clone();
     let data_dir = crate::config::Config::data_dir();
     checks.push(format!("✓ Config dir: {}", config_dir.display()));
+    if let Some(notice) = choice.notice() {
+        checks.push(format!("! {notice}"));
+    }
     if data_dir != config_dir {
         checks.push(format!("✓ Data dir: {}", data_dir.display()));
     }
@@ -204,9 +208,10 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     let env_paths = [
         ctx.config.cwd.join(".env"),
         dirs::home_dir().unwrap_or_default().join(".env"),
-        crate::config::app_dir(&dirs::home_dir().unwrap_or_default().join(".config")).join(".env"),
-    ];
-    for p in env_paths.iter().filter(|p| p.exists()) {
+    ]
+    .into_iter()
+    .chain(crate::config::Config::user_dotenv_paths());
+    for p in env_paths.filter(|p| p.exists()) {
         checks.push(format!("✓ .env loaded: {}", p.display()));
     }
 

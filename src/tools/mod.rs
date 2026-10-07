@@ -75,7 +75,7 @@ pub struct ToolContext {
     pub env: std::collections::HashMap<String, String>,
 
     /// If set, Write/Edit tools snapshot the original file here before modifying it.
-    /// Set to `~/.claude/sessions/<sid>/snapshots/turn-<n>/` by the run loop.
+    /// Set to `<data dir>/sessions/<sid>/snapshots/turn-<n>/` by the run loop.
     pub snapshot_dir: Option<std::path::PathBuf>,
 
     /// Active sandbox mode for the Bash tool ("strict", "bwrap", "firejail").
