@@ -140,7 +140,7 @@ pub struct Settings {
     #[serde(default)]
     pub permissions: PermissionsConfig,
 
-    /// Effort level: low/medium/high/max (influences thinking budget and compactness).
+    /// Effort level: low/medium/high/xhigh/max (influences thinking budget and compactness).
     pub effort: Option<String>,
 
     /// Environment variables set on every Bash and PowerShell tool command.

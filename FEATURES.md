@@ -105,7 +105,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `/model` | Interactive model picker (Claude + Ollama) |
 | `/model <name>` | Switch to specific model |
 | `/model default` | Reset to default Claude model |
-| `/effort [low\|medium\|high\|max\|off]` | Set the API effort level (`output_config.effort`); prompt nudge on models without it |
+| `/effort [low\|medium\|high\|xhigh\|max\|off]` | Set the API effort level (`output_config.effort`); prompt nudge on models without it |
 
 ### Session Management
 
@@ -427,7 +427,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 | `maxTokens` | number | `32000` on Claude 4.5+, `8192` elsewhere | Output cap per turn, shared with thinking. `maxTokensByModel` sets it per model |
 | `showThinkingSummaries` | `true` / `false` | `false` | Show model reasoning. On Claude models that return empty thinking by default (Opus 4.7+, Claude 5, Fable), requests `display: "summarized"` |
 | `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables (ignored on Fable, Opus 5.5 and Sonnet 5.5, where the API does not allow thinking to be turned off, and on Opus 5 at `max` effort, where it only allows it at `high` or below). CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
-| `effort` | `low` / `medium` / `high` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5; older and non-Claude models get a prompt nudge. Set with `/effort` |
+| `effort` | `low` / `medium` / `high` / `xhigh` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5 (`xhigh` becomes `high` on Opus/Sonnet 4.6, which lack it); older and non-Claude models get a prompt nudge. Set with `/effort` |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |
 

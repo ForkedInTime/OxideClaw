@@ -209,7 +209,7 @@ pub struct Config {
     /// Plan mode: Claude cannot call destructive tools (Bash, Write, Edit, etc.)
     pub plan_mode: bool,
 
-    /// Effort level (low/medium/high/max) — influences thinking budget.
+    /// Effort level (low/medium/high/xhigh/max) — influences thinking budget.
     pub effort: Option<String>,
 
     /// Max agentic turns before stopping (0 = unlimited).

@@ -117,14 +117,16 @@ pub(super) fn cmd_effort(args: &str) -> CommandAction {
         "1" | "low" | "quick" => "low",
         "2" | "medium" | "normal" | "" => "medium",
         "3" | "high" | "thorough" => "high",
+        "xhigh" | "x-high" | "extra-high" => "xhigh",
         "4" | "max" | "maximum" => "max",
         "off" | "default" | "none" | "clear" => return CommandAction::SetEffort(None),
         _ => {
             return CommandAction::Message(format!(
-                "Usage: /effort [1|2|3|4] or [low|medium|high|max|off]\n\n\
+                "Usage: /effort [1|2|3|4] or [low|medium|high|xhigh|max|off]\n\n\
                  1 / low    — quick, brief responses\n\
                  2 / medium — balanced\n\
                  3 / high   — thorough, detailed responses\n\
+                   xhigh    — between high and max (Opus 4.7+ / Claude 5; high elsewhere)\n\
                  4 / max    — deepest reasoning the model offers\n\
                  off        — clear (API default)\n\n\
                  Sent as `output_config.effort` on Claude 4.6+ / Claude 5; \

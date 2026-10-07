@@ -184,7 +184,7 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     add_dir: Vec<String>,
 
-    /// Effort level: low, medium, high, max
+    /// Effort level: low, medium, high, xhigh, max
     #[arg(long)]
     effort: Option<String>,
 

@@ -143,7 +143,7 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/model", "interactive model picker"),
             (
                 "/effort",
-                "set effort (low, medium, high, max, off) — output_config.effort on Claude 4.6+/5",
+                "set effort (low, medium, high, xhigh, max, off) — output_config.effort on Claude 4.6+/5",
             ),
             ("/brief", "toggle concise responses"),
             ("/output-style", "set output style preference"),

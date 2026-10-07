@@ -330,7 +330,7 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
              - /doctor       — system health check\n\
              - /voice        — toggle voice input (whisper)\n\
              - /plan         — read-only mode (no destructive tools)\n\
-             - /effort       — set thinking depth (low/medium/high/max)\n\
+             - /effort       — set thinking depth (low/medium/high/xhigh/max)\n\
              \n\
              Type /powerup 3 for the next lesson.",
         ),

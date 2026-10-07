@@ -168,7 +168,7 @@ pub enum CommandAction {
     SetOutputStyle(String),
     /// Set the active UI theme ("dark", "light", "solarized")
     SetTheme(String),
-    /// Set the effort level sent as `output_config.effort` ("low" | "medium" | "high" | "max"); `None` clears it
+    /// Set the effort level sent as `output_config.effort` ("low" | "medium" | "high" | "xhigh" | "max"); `None` clears it
     SetEffort(Option<String>),
     /// Enable or disable voice input mode
     SetVoiceEnabled(bool),
@@ -659,6 +659,9 @@ mod model_catalogue_tests {
             ("", "medium"),
             ("high", "high"),
             ("3", "high"),
+            ("xhigh", "xhigh"),
+            ("X-High", "xhigh"),
+            ("extra-high", "xhigh"),
             ("MAX", "max"),
             ("4", "max"),
         ] {

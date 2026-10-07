@@ -66,8 +66,9 @@ pub struct OutputConfig {
     pub effort: String,
 }
 
-/// Effort levels the API accepts.
-pub const EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+/// Effort levels the API accepts. `xhigh` exists only on some models; see
+/// [`supports_xhigh_effort`].
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// How a requested effort level reaches the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +181,23 @@ pub fn supports_effort(model: &str) -> bool {
     supports_adaptive_thinking(model)
 }
 
+/// `xhigh` arrived with Opus 4.7: Opus/Sonnet 4.6 take every other level
+/// but return a 400 for it.
+fn supports_xhigh_effort(model: &str) -> bool {
+    let model = canonical(model);
+    let Some((_, family)) = family_of(&model) else {
+        return false;
+    };
+    if family == "fable" || family == "mythos" {
+        return true;
+    }
+    match model_version(&model) {
+        Some((major, _)) if major >= 5 => true,
+        Some((4, minor)) => (family == "opus" || family == "sonnet") && minor >= 7,
+        _ => false,
+    }
+}
+
 /// The `thinking` field for `model` given the user's budget setting.
 /// `None` budget = leave the API default. `Some(0)` = off. `effort` is the
 /// configured effort level, which decides whether "off" is legal on Opus 5.
@@ -252,7 +270,13 @@ pub fn effort_for(model: &str, effort: Option<&str>) -> Option<EffortWire> {
         return None;
     }
     if supports_effort(model) {
-        return Some(EffortWire::Param(OutputConfig { effort: level }));
+        // The closest level the model accepts beats a request that 400s.
+        let effort = if level == "xhigh" && !supports_xhigh_effort(model) {
+            "high".to_string()
+        } else {
+            level
+        };
+        return Some(EffortWire::Param(OutputConfig { effort }));
     }
     Some(EffortWire::Prompt(effort_prompt(&level).to_string()))
 }
@@ -660,6 +684,35 @@ mod tests {
             effort_for("llama3.2", Some("max")),
             Some(EffortWire::Prompt(_))
         ));
+    }
+
+    #[test]
+    fn xhigh_passes_through_where_supported_and_drops_to_high_elsewhere() {
+        let param = |e: &str| {
+            Some(EffortWire::Param(OutputConfig {
+                effort: e.to_string(),
+            }))
+        };
+        for m in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-fable-5-1",
+            "opus",
+        ] {
+            assert_eq!(effort_for(m, Some("xhigh")), param("xhigh"), "{m}");
+            assert_eq!(effort_for(m, Some(" XHIGH ")), param("xhigh"), "{m}");
+        }
+        for m in ["claude-sonnet-4-6", "claude-opus-4-6"] {
+            assert_eq!(effort_for(m, Some("xhigh")), param("high"), "{m}");
+            assert_eq!(effort_for(m, Some("max")), param("max"), "{m}");
+        }
+        // No effort parameter: the nudge is the "high" text.
+        assert_eq!(
+            effort_for("claude-haiku-4-5", Some("xhigh")),
+            Some(EffortWire::Prompt(effort_prompt("high").to_string()))
+        );
     }
 
     #[test]
