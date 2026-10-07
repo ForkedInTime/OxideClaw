@@ -801,7 +801,7 @@ pub struct OpenAiCompatClient {
     /// Gemini only: the thought signatures of recent tool calls, by call id,
     /// newest last; see [`gemini_extra_content`]. Shared by the clones each
     /// turn runs on, and capped at [`MAX_THOUGHT_SIGNATURES`].
-    thought_signatures: Option<Arc<Mutex<VecDeque<(String, String)>>>>,
+    thought_signatures: Option<Arc<Mutex<SignatureStore>>>,
     /// See `ClaudeClient::retry_notifier`. Rate limiting is far more common on
     /// these providers than on Anthropic — Groq and OpenRouter throttle hard.
     retry_notifier: Option<super::retry::RetryNotifier>,
@@ -812,8 +812,11 @@ pub struct OpenAiCompatClient {
 /// bound.
 const MAX_THOUGHT_SIGNATURES: usize = 256;
 
+/// Gemini thought signatures as (tool call id, signature), oldest first.
+type SignatureStore = VecDeque<(String, String)>;
+
 /// Adds `new` to `store`, dropping the oldest past [`MAX_THOUGHT_SIGNATURES`].
-fn remember_signatures(store: &mut VecDeque<(String, String)>, new: HashMap<String, String>) {
+fn remember_signatures(store: &mut SignatureStore, new: HashMap<String, String>) {
     store.extend(new);
     let excess = store.len().saturating_sub(MAX_THOUGHT_SIGNATURES);
     store.drain(..excess);
@@ -1846,7 +1849,7 @@ mod gemini_tests {
 
     #[test]
     fn signature_store_keeps_the_newest() {
-        let mut store: VecDeque<(String, String)> = (0..MAX_THOUGHT_SIGNATURES)
+        let mut store: SignatureStore = (0..MAX_THOUGHT_SIGNATURES)
             .map(|i| (format!("old{i}"), "s".into()))
             .collect();
         remember_signatures(
