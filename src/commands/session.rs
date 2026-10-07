@@ -82,7 +82,7 @@ pub(super) fn cmd_session(args: &str) -> CommandAction {
                 let dir = crate::config::Config::sessions_dir();
                 let dir = dir.display();
                 CommandAction::Message(format!(
-                    "To delete session, run:\n  rm '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta\n\nUse /session list to confirm the ID prefix."
+                    "To delete session, run:\n  rm -rf '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta '{dir}'/{sub_args}*/\n\nThe directory holds the session's /rewind file snapshots. Use /session list to confirm the ID prefix."
                 ))
             }
         }
@@ -279,6 +279,7 @@ mod session_command_tests {
                     m.contains(&format!("'{}'/abc123*.meta", dir.display())),
                     "{m}"
                 );
+                assert!(m.contains(&format!("'{}'/abc123*/", dir.display())), "{m}");
             }
             _ => panic!("/session delete must only print a hint"),
         }

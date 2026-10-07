@@ -391,7 +391,20 @@ impl Session {
             }
             let _ = fs::remove_file(dir.join(format!("{}.jsonl", meta.id))).await;
             let _ = fs::remove_file(dir.join(format!("{}.meta", meta.id))).await;
+            Self::remove_snapshots_in(dir, &meta.id).await;
         }
+    }
+
+    /// Remove `<dir>/<id>/`, which holds the per-turn copies of edited files
+    /// that /rewind restores. Without this a deleted session kept them
+    /// forever. The id comes from the .meta body, so anything but a single
+    /// plain path component ("", "..", "a/b") is refused rather than letting
+    /// a tampered meta point remove_dir_all at sessions_dir or its parent.
+    async fn remove_snapshots_in(dir: &std::path::Path, id: &str) {
+        if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
+            return;
+        }
+        let _ = fs::remove_dir_all(dir.join(id)).await;
     }
 
     /// The session `--continue` / `--resume` reopens: the most recently
@@ -412,16 +425,21 @@ impl Session {
         None
     }
 
-    /// Delete a session (both .jsonl and .meta).
+    /// Delete a session: its .jsonl, .meta and file-snapshot directory.
     pub async fn delete(id: &str) -> Result<()> {
-        let jsonl = Self::jsonl_path(id);
-        let meta = SessionMeta::path_for(id);
+        Self::delete_in(&crate::config::Config::sessions_dir(), id).await
+    }
+
+    async fn delete_in(dir: &std::path::Path, id: &str) -> Result<()> {
+        let jsonl = dir.join(format!("{id}.jsonl"));
+        let meta = dir.join(format!("{id}.meta"));
         if jsonl.exists() {
             fs::remove_file(&jsonl).await?;
         }
         if meta.exists() {
             fs::remove_file(&meta).await?;
         }
+        Self::remove_snapshots_in(dir, id).await;
         Ok(())
     }
 
@@ -1229,6 +1247,52 @@ mod continue_tests {
         assert_eq!(left, ["idle-resumed", "old-but-active"]);
         assert!(!d.join("idle.jsonl").exists());
         assert!(!d.join("idle.meta").exists());
+    }
+
+    /// Delete and cleanupPeriodDays removed only .jsonl/.meta, so every
+    /// deleted session kept its snapshots/turn-N copies of edited files.
+    #[tokio::test]
+    async fn delete_and_cleanup_remove_the_snapshot_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let snap = |id: &str| {
+            let turn = d.join(id).join("snapshots").join("turn-1");
+            std::fs::create_dir_all(&turn).unwrap();
+            std::fs::write(turn.join("main.rs"), "fn main() {}").unwrap();
+        };
+        for id in ["deleted", "idle", "kept"] {
+            meta(d, id, 1_000);
+            jsonl(d, id, if id == "kept" { 9_000 } else { 2_000 });
+            snap(id);
+        }
+
+        Session::delete_in(d, "deleted").await.unwrap();
+        assert!(!d.join("deleted.meta").exists());
+        assert!(!d.join("deleted").exists());
+
+        Session::prune_inactive_in(d, 5_000, None).await;
+        assert!(!d.join("idle").exists());
+        assert!(d.join("kept").join("snapshots").join("turn-1").exists());
+    }
+
+    /// The pruned id comes from the .meta body; ".." or "" must not turn
+    /// into remove_dir_all on sessions_dir or its parent.
+    #[tokio::test]
+    async fn cleanup_ignores_a_tampered_meta_id() {
+        let root = tempfile::tempdir().unwrap();
+        let d = root.path().join("sessions");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(root.path().join("precious"), "x").unwrap();
+        for (file, id) in [("dotdot", ".."), ("empty", "")] {
+            std::fs::write(
+                d.join(format!("{file}.meta")),
+                format!(r#"{{"id":"{id}","name":"n","created_at":1,"preview":""}}"#),
+            )
+            .unwrap();
+        }
+        Session::prune_inactive_in(&d, 5_000, None).await;
+        assert!(root.path().join("precious").exists());
+        assert!(d.exists());
     }
 
     #[tokio::test]
