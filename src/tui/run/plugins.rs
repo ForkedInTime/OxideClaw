@@ -3,30 +3,8 @@
 
 use super::*;
 
-/// Install a plugin from npm and register it as an MCP server.
-/// `spec` is either "marketplace:<user/repo>" or a direct npm package spec (e.g. "context-mode@context-mode").
-/// Check git log for the current commit hash, then fetch the latest release from GitHub.
+/// Fetch the latest release tag from GitHub and compare it with this build.
 pub(super) async fn upgrade_check_task(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    // Get current git commit hash (best-effort)
-    let git_hash = tokio::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(std::env::current_dir().unwrap_or_default())
-        .output()
-        .await
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        });
-
-    // Fetch latest OxideClaw release from GitHub API
     let latest = async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
@@ -38,32 +16,47 @@ pub(super) async fn upgrade_check_task(tx: tokio::sync::mpsc::UnboundedSender<Ap
             .await?
             .json()
             .await?;
-        anyhow::Ok(resp["tag_name"].as_str().unwrap_or("unknown").to_string())
+        anyhow::Ok(resp["tag_name"].as_str().map(str::to_string))
     }
-    .await;
+    .await
+    .ok()
+    .flatten();
+    let message = upgrade_message(env!("CARGO_PKG_VERSION"), latest.as_deref());
+    let _ = tx.send(AppEvent::UpgradeCheckDone { message });
+}
 
-    let hash_str = git_hash.map(|h| format!(" ({})", h)).unwrap_or_default();
-    let msg = match latest {
-        Ok(tag) => format!(
-            "Upgrade Check\n\n\
-             oxideclaw v{current_version}{hash_str}\n\
-             Latest release: {tag}\n\n\
-             To rebuild from source:\n\
-               cd ~/Projects/OxideClaw\n\
-               git pull\n\
-               cargo build --release"
-        ),
-        Err(_) => format!(
-            "Upgrade Check\n\n\
-             oxideclaw v{current_version}{hash_str}\n\
-             (Could not reach GitHub — check your connection)\n\n\
-             To rebuild from source:\n\
-               cd ~/Projects/OxideClaw\n\
-               git pull\n\
-               cargo build --release"
-        ),
+/// `v0.4.1` / `0.4.1` / `0.4.1-rc1` -> (0, 4, 1); None for anything else.
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let v = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(v)
+}
+
+/// The /upgrade report. No commit hash: the only one available at runtime
+/// was the user's own project HEAD, not this binary's. The update steps are
+/// the install.sh / release route most users installed through, not a
+/// developer's source checkout.
+fn upgrade_message(current: &str, latest: Option<&str>) -> String {
+    let status = match latest {
+        None => "Could not reach GitHub — check your connection.".to_string(),
+        Some(tag) => match (parse_version(current), parse_version(tag)) {
+            (Some(c), Some(l)) if l > c => format!("Update available: v{current} → {tag}"),
+            (Some(c), Some(l)) if l == c => "You are on the latest release.".to_string(),
+            (Some(_), Some(_)) => format!("This build is newer than the latest release ({tag})."),
+            _ => format!("Latest release: {tag}"),
+        },
     };
-    let _ = tx.send(AppEvent::UpgradeCheckDone { message: msg });
+    format!(
+        "Upgrade Check\n\n\
+         oxideclaw v{current}\n\
+         {status}\n\n\
+         To update:\n\
+           curl -fsSL https://raw.githubusercontent.com/ForkedInTime/OxideClaw/main/install.sh | bash\n\
+         or download a binary from https://github.com/ForkedInTime/OxideClaw/releases\n\
+         (from a source checkout: git pull && cargo build --release)"
+    )
 }
 
 /// A package manager's one-off runner: the command and the args that go
@@ -247,6 +240,8 @@ fn registry_install_cmd(
     cmd
 }
 
+/// Install a plugin from npm and register it as an MCP server.
+/// `spec` is either "marketplace:<user/repo>" or a direct npm package spec (e.g. "context-mode@context-mode").
 pub(super) async fn plugin_install_task(
     spec: String,
     tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
@@ -770,5 +765,37 @@ mod plugin_registration_tests {
             serde_json::from_str(&std::fs::read_to_string(&plugins).unwrap()).unwrap();
         assert_eq!(p["new"]["spec"], "new@1");
         assert_eq!(p["new"]["marketplace"], true);
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    /// /upgrade printed the cwd project's HEAD as oxideclaw's commit, never
+    /// said whether an update existed, and told everyone to rebuild in
+    /// ~/Projects/OxideClaw.
+    #[test]
+    fn upgrade_report_compares_versions_and_points_at_the_installer() {
+        let newer = upgrade_message("0.4.0", Some("v0.4.1"));
+        assert!(
+            newer.contains("Update available: v0.4.0 → v0.4.1"),
+            "{newer}"
+        );
+        assert!(newer.contains("install.sh"), "{newer}");
+        assert!(!newer.contains("~/Projects"), "{newer}");
+
+        let same = upgrade_message("0.4.0", Some("v0.4.0"));
+        assert!(same.contains("latest release"), "{same}");
+        assert!(!same.contains("Update available"), "{same}");
+
+        // Numeric, not lexical: 0.10.0 is newer than 0.9.0.
+        assert!(upgrade_message("0.9.0", Some("v0.10.0")).contains("Update available"));
+        assert!(upgrade_message("0.10.0", Some("v0.9.0")).contains("newer than"));
+
+        assert!(upgrade_message("0.4.0", None).contains("Could not reach GitHub"));
+        assert!(upgrade_message("0.4.0", Some("nightly")).contains("Latest release: nightly"));
+        assert_eq!(parse_version("v1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2"), None);
     }
 }
