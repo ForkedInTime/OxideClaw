@@ -185,7 +185,7 @@ Give it a goal, it drives. `/browse find the cheapest flight SF to Tokyo on July
 
 ### 🦀 &nbsp; Single 19 MB static binary
 
-No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw update` verifies them.
+No runtime. No dependencies. No post-install scripts. `scp` it to a server and run. Every release ships Linux (gnu, musl, aarch64), macOS (Intel, Apple Silicon), and Windows builds with SHA-256 digests, and `oxideclaw update` verifies them. Once a day the TUI asks GitHub in the background whether a newer release exists and, if so, says so in one dim line; `"updateCheck": false` in settings.json or `OXIDECLAW_NO_UPDATE_CHECK=1` turns that off.
 
 ### 🪝 &nbsp; Lifecycle hooks
 

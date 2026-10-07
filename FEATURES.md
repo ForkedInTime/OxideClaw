@@ -458,6 +458,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 | `routerMediumModel` | any model name | `claude-sonnet-5` | Model for medium-complexity turns |
 | `routerHighModel` | any model name | your `model` | Model for high-complexity turns |
 | `routerSuperHighModel` | any model name | `claude-opus-5` | Model for super-high-complexity turns |
+| `updateCheck` | `true` / `false` | `true` | Once every 24 h the TUI looks up the latest GitHub release (the one `oxideclaw update` installs) in the background, with a 3 s timeout, and shows one dim line when it is newer than yours. `false` in any settings file turns it off; `-p`, `--headless`, `acp` and `browse` never check. The last answer is cached in `$XDG_CACHE_HOME/oxideclaw/update-check.json` (default `~/.cache/oxideclaw/`). Uses `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |
 
 ### CLAUDE.md / AGENTS.md
@@ -475,12 +476,13 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 
 ### XDG Base Directories
 
-XDG paths are opt-in: they are used only when the matching variable is set. Otherwise everything lives in `~/.claude/`, shared with Claude Code.
+XDG config and data paths are opt-in: they are used only when the matching variable is set. Otherwise config and data live in `~/.claude/`, shared with Claude Code. The cache follows `$XDG_CACHE_HOME` and defaults to `~/.cache/oxideclaw/`.
 
 | Purpose | When the variable is set | Default (variable unset) |
 |---------|--------------------------|--------------------------|
 | Config (`settings.json`, MCP, output styles) | `$XDG_CONFIG_HOME/oxideclaw/`, if it exists or `~/.claude/` does not | `~/.claude/` |
 | Data (sessions, XTTS server files) | `$XDG_DATA_HOME/oxideclaw/`, if it exists or `<config dir>/sessions/` does not | the config directory |
+| Cache (update check) | `$XDG_CACHE_HOME/oxideclaw/` | `~/.cache/oxideclaw/` |
 
 `$CLAUDE_CONFIG_DIR` overrides the config directory outright. To move an existing `~/.claude/` setup to XDG paths, create `$XDG_CONFIG_HOME/oxideclaw/` (and `$XDG_DATA_HOME/oxideclaw/`) and copy your files in; `/status` shows which directories are in use.
 
@@ -513,10 +515,12 @@ XDG paths are opt-in: they are used only when the matching variable is set. Othe
 | `OPENAI_API_KEY` | API key for `oai:` models, and for `openai-compat:` endpoints that need one |
 | `OPENAI_BASE_URL` | Endpoint for `openai-compat:` models (required for that prefix; shell only, not `.env`) |
 | `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |
+| `OXIDECLAW_NO_UPDATE_CHECK` | `1` turns off the TUI's daily update check (same as `"updateCheck": false`). Shell only. |
 | `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |
 | `CLAUDE_CONFIG_DIR` | Config directory, overriding `~/.claude` and `XDG_CONFIG_HOME` |
 | `XDG_CONFIG_HOME` | Opt-in config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
 | `XDG_DATA_HOME` | Opt-in data directory base (`$XDG_DATA_HOME/oxideclaw`) |
+| `XDG_CACHE_HOME` | Cache directory base (`$XDG_CACHE_HOME/oxideclaw`, default `~/.cache/oxideclaw`); holds the update-check cache |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | CA certificates to trust in place of the OS certificate store (e.g. a TLS-inspecting corporate proxy's root). HTTPS trusts the bundled Mozilla roots plus the OS store by default |
 
 ---
