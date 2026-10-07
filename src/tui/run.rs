@@ -221,17 +221,32 @@ static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// kitty-protocol terminals send Ctrl+C as `ESC[99;5u`, so the child cannot
 /// be interrupted and an editor receives garbage.
 fn suspend_tty() {
-    if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-    }
+    release_input_modes(&mut io::stdout());
     let _ = disable_raw_mode();
 }
 
 fn resume_tty() {
     let _ = enable_raw_mode();
+    restore_input_modes(&mut io::stdout());
+}
+
+/// Mouse capture and bracketed paste must go too: left on, every mouse move
+/// and each paste wrap lands as escape bytes in sudo's password line or the
+/// editor's buffer.
+fn release_input_modes(w: &mut impl io::Write) {
+    // Separate command: on Windows the pop always errors, and execute!
+    // stops at the first error, which would skip the rest.
+    if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(w, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(w, DisableBracketedPaste, DisableMouseCapture);
+}
+
+fn restore_input_modes(w: &mut impl io::Write) {
+    let _ = execute!(w, EnableBracketedPaste, EnableMouseCapture);
     if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = execute!(
-            io::stdout(),
+            w,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
@@ -1680,6 +1695,28 @@ mod tui_asker_tests {
             None
         );
         ui.await.unwrap();
+    }
+}
+
+/// The sudo / $EDITOR handoff left mouse capture and bracketed paste on, so
+/// mouse motion leaked escape bytes into the password prompt.
+#[cfg(all(test, unix))]
+mod tty_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn handoff_toggles_mouse_capture_and_bracketed_paste() {
+        let mut out = Vec::new();
+        release_input_modes(&mut out);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\x1b[?2004l"), "{out:?}");
+        assert!(out.contains("\x1b[?1003l"), "{out:?}");
+
+        let mut back = Vec::new();
+        restore_input_modes(&mut back);
+        let back = String::from_utf8(back).unwrap();
+        assert!(back.contains("\x1b[?2004h"), "{back:?}");
+        assert!(back.contains("\x1b[?1003h"), "{back:?}");
     }
 }
 
