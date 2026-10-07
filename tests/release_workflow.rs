@@ -385,3 +385,64 @@ fn package_metadata_points_at_oxideclaw() {
         assert!(!desc.contains("cost-aware"), "{what} description: {desc}");
     }
 }
+
+/// npm/install.js opened a CONNECT tunnel and then set `agent: false`, which
+/// makes Node dial the host itself and ignore the tunnel: on a proxy-only
+/// network the postinstall still failed (`ENOTFOUND github.com`). A local
+/// proxy that closes every tunnel must see the TLS fail on the tunnel, never
+/// a direct DNS lookup of the (unresolvable) host.
+#[test]
+fn npm_installer_downloads_through_the_proxy_tunnel() {
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !node_ok {
+        return; // no node here; CI runners have it
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("proxy_check.js");
+    std::fs::write(
+        &script,
+        r#"
+const http = require("http");
+const seen = [];
+const proxy = http.createServer();
+proxy.on("connect", (req, sock) => {
+  seen.push(req.url);
+  sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+  sock.end();
+});
+proxy.listen(0, "127.0.0.1", async () => {
+  for (const k of Object.keys(process.env)) {
+    if (/^(https?_proxy|no_proxy|npm_config_(https_)?proxy|npm_config_noproxy)$/i.test(k)) delete process.env[k];
+  }
+  process.env.HTTPS_PROXY = `http://127.0.0.1:${proxy.address().port}`;
+  const { get } = require(process.argv[2]);
+  let err = "none";
+  try { await get("https://nonexistent-host.invalid/x"); } catch (e) { err = `${e.code} ${e.message}`; }
+  console.log(JSON.stringify({ seen, err }));
+  proxy.close();
+});
+"#,
+    )
+    .unwrap();
+    let install = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("npm/install.js");
+    let out = std::process::Command::new("node")
+        .arg(&script)
+        .arg(&install)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(r#""seen":["nonexistent-host.invalid:443"]"#),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("ENOTFOUND"), "direct DNS lookup: {stdout}");
+    assert!(!stdout.contains(r#""err":"none""#), "{stdout}");
+}

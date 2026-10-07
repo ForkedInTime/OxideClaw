@@ -119,7 +119,8 @@ async function get(url, redirects = 0) {
   const opts = { headers: { "User-Agent": `oxideclaw-npm/${VERSION}` } };
   if (proxy) {
     const socket = await tunnel(proxy, hostname, port || 443);
-    opts.agent = false;
+    // No `agent`: with `agent: false` Node builds a fresh Agent, which dials
+    // the host itself and never calls this, so the tunnel went unused.
     opts.createConnection = () => tls.connect({ socket, servername: hostname });
   }
   return new Promise((resolve, reject) => {
