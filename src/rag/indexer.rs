@@ -5,12 +5,13 @@
 /// and stores them as searchable chunks in the RAG database.
 ///
 /// Incremental: only re-indexes files whose mtime changed since last index.
+/// Gitignore-aware: anything git would not track never reaches the index,
+/// so a gitignored `config.local.js` full of keys is never sent to a model.
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 use tracing::{debug, warn};
-use walkdir::WalkDir;
 
 use super::RagDb;
 
@@ -413,28 +414,32 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
     let mut files_skipped = 0i64;
     let mut chunks_added = 0i64;
 
-    // Collect files to index
-    let walker = WalkDir::new(cwd)
+    // Collect files to index. `.gitignore` (in git repos and out of them),
+    // `.git/info/exclude`, the global excludes file and `.ignore` all apply.
+    // Hidden files are kept as before; hidden dirs and SKIP_DIRS are not.
+    let walker = ignore::WalkBuilder::new(cwd)
         .follow_links(false)
-        .into_iter()
+        .hidden(false)
+        .require_git(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             // Skip hidden dirs and known build/vendor dirs (but not the root cwd itself)
-            if e.file_type().is_dir() && e.depth() > 0 {
+            if e.file_type().is_some_and(|t| t.is_dir()) && e.depth() > 0 {
                 return !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref());
             }
             true
-        });
+        })
+        .build();
 
     // Every indexable file we saw this pass; anything in the index that is
     // not here was deleted or renamed and gets pruned below.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in walker.filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        // Defense in depth: WalkDir's `follow_links(false)` skips traversal
+        // Defense in depth: the walker's `follow_links(false)` skips traversal
         // into symlinked dirs but still surfaces symlinked files; `read_to_string`
         // would then follow them at I/O time. Reject symlinked entries so a
         // crafted repo can't trick the indexer into pulling in `~/.ssh/id_rsa`.
@@ -586,6 +591,10 @@ mod tests {
     use crate::rag::RagDb;
     use tempfile::TempDir;
 
+    fn test_db(project: &Path) -> RagDb {
+        RagDb::open(project).unwrap()
+    }
+
     fn setup_project(files: &[(&str, &str)]) -> TempDir {
         let tmp = TempDir::new().unwrap();
         for (path, content) in files {
@@ -637,13 +646,69 @@ mod tests {
         assert!(partial, "the whole index was committed in one transaction");
     }
 
+    fn indexed_files(db: &RagDb) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT DISTINCT file_path FROM code_chunks ORDER BY file_path")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Whatever git would not track never reaches the index (and so never
+    /// a model): `.gitignore` at any level, `.git/info/exclude` and
+    /// `.ignore`. A file that becomes ignored drops out on the next pass.
+    #[test]
+    fn gitignored_files_are_not_indexed() {
+        let tmp = setup_project(&[
+            ("src/app.js", "function startApp() { return 1; }\n"),
+            ("src/config.local.js", "const apiKey = 'sk-live-123';\n"),
+            ("secrets/keys.py", "def token():\n    return 'x'\n"),
+            ("pkg/gen.rs", "fn generated() {}\n"),
+            ("pkg/excluded.rs", "fn excluded() {}\n"),
+            ("scratch.rs", "fn scratch() {}\n"),
+            ("later.rs", "fn later() {}\n"),
+            (".gitignore", "*.local.js\n/secrets/\n"),
+            ("pkg/.gitignore", "gen.rs\n"),
+            (".ignore", "scratch.rs\n"),
+        ]);
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init failed");
+        std::fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "pkg/excluded.rs\n").unwrap();
+
+        let db = test_db(tmp.path());
+        index_project(&db, tmp.path(), false).unwrap();
+        assert_eq!(indexed_files(&db), ["later.rs", "src/app.js"]);
+        assert!(
+            super::super::search::search(&db, "apiKey", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::write(
+            tmp.path().join(".gitignore"),
+            "*.local.js\n/secrets/\nlater.rs\n",
+        )
+        .unwrap();
+        index_project(&db, tmp.path(), false).unwrap();
+        assert_eq!(indexed_files(&db), ["src/app.js"]);
+    }
+
     /// Chunks for a file that no longer exists must not survive an
     /// incremental re-index — otherwise search keeps returning code that is
     /// gone until the user thinks to `--force`.
     #[test]
     fn deleted_files_are_pruned_on_incremental_reindex() {
         let tmp = setup_project(&[("keep.rs", "fn keep() {}"), ("gone.rs", "fn gone() {}")]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(db.file_count().unwrap(), 2);
 
@@ -667,7 +732,7 @@ mod tests {
         let meta = |name: &str| std::fs::metadata(tmp.path().join(name)).unwrap();
         assert!(too_large_to_index(&meta("bundle.js")));
         assert!(!too_large_to_index(&meta("small.rs")));
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         for _ in 0..2 {
             let r = index_project(&db, tmp.path(), false).unwrap();
             assert_eq!(r.files_scanned, 2);
@@ -680,7 +745,7 @@ mod tests {
     #[test]
     fn an_edit_shortly_after_indexing_is_picked_up() {
         let tmp = setup_project(&[("lib.rs", "fn a() {}")]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         index_project(&db, tmp.path(), false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
         std::fs::write(tmp.path().join("lib.rs"), "fn b() {}").unwrap();
@@ -694,7 +759,7 @@ mod tests {
             "src/lib.rs",
             "pub fn hello() -> &'static str { \"hello\" }\n\nstruct Config { name: String }\n",
         )]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         let result = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(result.files_scanned, 1);
         assert_eq!(result.files_indexed, 1);
@@ -709,7 +774,7 @@ mod tests {
             ("app.py", "def run():\n    pass\n"),
             ("index.js", "function init() { return 1; }\n"),
         ]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         let result = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(result.files_scanned, 3);
         assert_eq!(result.files_indexed, 3);
@@ -719,7 +784,7 @@ mod tests {
     #[test]
     fn test_incremental_index_skips_unchanged() {
         let tmp = setup_project(&[("lib.rs", "fn foo() {}")]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
 
         let r1 = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(r1.files_indexed, 1);
@@ -733,7 +798,7 @@ mod tests {
     #[test]
     fn test_force_reindex() {
         let tmp = setup_project(&[("lib.rs", "fn foo() {}")]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
 
         index_project(&db, tmp.path(), false).unwrap();
         let r2 = index_project(&db, tmp.path(), true).unwrap();
@@ -746,7 +811,7 @@ mod tests {
             ("src/lib.rs", "fn good() {}"),
             ("target/debug/out.rs", "fn bad() {}"),
         ]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         let result = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(result.files_scanned, 1); // only src/lib.rs
         assert_eq!(db.file_count().unwrap(), 1);
@@ -759,7 +824,7 @@ mod tests {
             ("data.csv", "a,b,c"),
             ("lib.rs", "fn works() {}"),
         ]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         let result = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(result.files_scanned, 1); // only .rs
     }
@@ -769,7 +834,7 @@ mod tests {
         let tmp = setup_project(&[
             ("huge.rs", &"fn x() {}\n".repeat(6000)), // >5000 lines
         ]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         let result = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(result.files_skipped, 1);
         assert_eq!(result.files_indexed, 0);
@@ -796,7 +861,7 @@ impl MyStruct {
 }
 ",
         )]);
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = test_db(tmp.path());
         index_project(&db, tmp.path(), false).unwrap();
 
         // Should have extracted: public_func, MyStruct, Color, MyStruct (impl)

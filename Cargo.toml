@@ -67,6 +67,8 @@ colored = "2"
 
 # Recursive directory walking
 walkdir = "2"
+# Gitignore-aware walking for the code index
+ignore = "0.4"
 
 # HTML to plain text (for WebFetchTool)
 html2text = "0.12"
