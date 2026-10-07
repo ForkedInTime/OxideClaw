@@ -885,11 +885,33 @@ impl Config {
         self.add_cli_permission_rules();
     }
 
+    /// Apply `--tools` (empty when not given): `""` offers no tools,
+    /// `default` every tool, anything else only the tools named. Call it
+    /// before `apply_tool_flags`, which adds `--allowed-tools` rules' tools
+    /// to the list.
+    pub fn apply_tools_flag(&mut self, tools: &[String]) {
+        if tools.is_empty() {
+            return;
+        }
+        let raw = tools.join(",");
+        if raw.is_empty() {
+            self.allowed_tools = vec!["__none__".to_string()];
+        } else if raw.eq_ignore_ascii_case("default") {
+            self.allowed_tools.clear();
+        } else {
+            self.allowed_tools = tools.to_vec();
+        }
+    }
+
     /// Apply `--allowed-tools` / `--disallowed-tools` (each empty when the
-    /// flag was not given). A bare tool name filters the tool list; a rule
-    /// with a specifier (`Bash(git status:*)`) becomes a permission allow or
-    /// deny rule and leaves its tool available, so when `--allowed-tools`
-    /// also lists bare names, the rule's tool is kept beside them.
+    /// flag was not given), after `apply_tools_flag`. A bare tool name
+    /// filters the tool list; a rule with a specifier (`Bash(git status:*)`)
+    /// becomes a permission allow or deny rule and leaves its tool
+    /// available, so when `--allowed-tools` also lists bare names, or
+    /// `--tools` lists tools, the rule's tool is kept beside them. Bare
+    /// `--allowed-tools` names beside a `--tools` list, or any
+    /// `--allowed-tools` beside `--tools ""`, is an error: one of the two
+    /// would have to be ignored.
     pub fn apply_tool_flags(
         &mut self,
         allowed: &[String],
@@ -901,15 +923,38 @@ impl Config {
         let known = crate::tools::builtin_tool_names(self);
         if !allowed.is_empty() {
             let flag = crate::permissions::parse_tool_flag("--allowed-tools", allowed, &known)?;
-            if !flag.names.is_empty() {
-                let mut names = flag.names;
-                names.extend(
-                    flag.rules
-                        .iter()
-                        .filter_map(|r| r.split_once('('))
-                        .map(|(tool, _)| tool.to_string()),
+            let rule_tools = flag
+                .rules
+                .iter()
+                .filter_map(|r| r.split_once('('))
+                .map(|(tool, _)| tool.to_string());
+            if self.allowed_tools == ["__none__"] {
+                return Err(
+                    "--allowed-tools: --tools \"\" offers no tools, so there is \
+                     nothing to allow; drop one of the two flags."
+                        .to_string(),
                 );
+            }
+            if !flag.names.is_empty() {
+                if !self.allowed_tools.is_empty() {
+                    return Err("--allowed-tools: tool names and --tools both set the \
+                         tool list; name the tools in one of them (rules such as \
+                         Bash(git status:*) can go beside --tools)."
+                        .to_string());
+                }
+                let mut names = flag.names;
+                names.extend(rule_tools);
                 self.allowed_tools = names;
+            } else if !self.allowed_tools.is_empty() {
+                for tool in rule_tools {
+                    if !self
+                        .allowed_tools
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(&tool))
+                    {
+                        self.allowed_tools.push(tool);
+                    }
+                }
             }
             self.cli_permissions_allow = flag.rules;
         }
@@ -3809,6 +3854,44 @@ mod tool_flag_tests {
             GateOutcome::Denied(_)
         ));
         assert_eq!(bash(&gate, "git status").await, GateOutcome::Allowed);
+    }
+
+    /// `--tools` used to run after `--allowed-tools` and replace the list,
+    /// so an allow rule approved calls to a tool the model never saw.
+    #[test]
+    fn tools_flag_keeps_a_rule_tool_and_rejects_competing_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.apply_tools_flag(&v(&["Read"]));
+        c.apply_tool_flags(&v(&["Bash(git status:*)"]), &[])
+            .unwrap();
+        assert_eq!(c.allowed_tools, ["Read", "Bash"]);
+        assert_eq!(c.permissions_allow, ["Bash(git status:*)"]);
+        assert_eq!(tool_names(&c), ["Bash", "Read"]);
+
+        // `--tools default` lifts nothing that --allowed-tools set.
+        let mut c = cfg(dir.path());
+        c.apply_tools_flag(&v(&["default"]));
+        c.apply_tool_flags(&v(&["Read,Grep"]), &[]).unwrap();
+        assert_eq!(tool_names(&c), ["Grep", "Read"]);
+
+        for (tools, allowed, needle) in [
+            (vec!["Read"], vec!["Grep"], "tool names and --tools both"),
+            (vec![""], vec!["Bash(git status:*)"], "offers no tools"),
+            (vec![""], vec!["Read"], "offers no tools"),
+        ] {
+            let mut c = cfg(dir.path());
+            c.apply_tools_flag(&v(&tools));
+            let err = c.apply_tool_flags(&v(&allowed), &[]).unwrap_err();
+            assert!(err.contains(needle), "{err}");
+            assert!(c.permissions_allow.is_empty());
+        }
+
+        // --disallowed-tools still narrows a --tools list.
+        let mut c = cfg(dir.path());
+        c.apply_tools_flag(&v(&["Read", "Grep"]));
+        c.apply_tool_flags(&[], &v(&["Grep"])).unwrap();
+        assert_eq!(tool_names(&c), ["Read"]);
     }
 
     #[test]

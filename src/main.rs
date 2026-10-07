@@ -146,19 +146,26 @@ struct Cli {
     #[arg(long, default_value = "0")]
     max_turns: u32,
 
-    /// Tools to allow, comma- or space-separated or a repeated flag. A bare
-    /// name (Read) restricts the tool list to the names given; a rule
-    /// (Bash(git status:*)) runs matching calls without a prompt and keeps
-    /// its tool available.
+    /// Tools to allow, separated by commas or spaces, as separate arguments
+    /// or by repeating the flag. A bare name (Read) restricts the tool list
+    /// to the names given; a rule (Bash(git status:*)) runs matching calls
+    /// without a prompt and keeps its tool available. Every argument up to
+    /// the next flag is read as a tool: put the prompt first, end the list
+    /// with `--`, or write --allowed-tools=<list>.
     // No value_delimiter: clap would split `Bash(npm run a,b)` inside the
     // parentheses. permissions::parse_tool_flag splits outside them.
-    #[arg(long)]
+    // Variadic like Claude Code's `--allowedTools A B`: with one value per
+    // flag, `B` went into the prompt and the restriction silently shrank.
+    #[arg(long, num_args = 1..)]
     allowed_tools: Vec<String>,
 
-    /// Tools to block, comma- or space-separated or a repeated flag. A bare
-    /// name (Bash) removes the tool; a rule (Bash(git push:*)) refuses
-    /// matching calls and keeps the tool for the rest.
-    #[arg(long)]
+    /// Tools to block, separated by commas or spaces, as separate arguments
+    /// or by repeating the flag. A bare name (Bash) removes the tool; a rule
+    /// (Bash(git push:*)) refuses matching calls and keeps the tool for the
+    /// rest. Every argument up to the next flag is read as a tool: put the
+    /// prompt first, end the list with `--`, or write
+    /// --disallowed-tools=<list>.
+    #[arg(long, num_args = 1..)]
     disallowed_tools: Vec<String>,
 
     /// System prompt override (replaces built-in system prompt)
@@ -955,6 +962,8 @@ async fn run() -> Result<()> {
     if cli.max_turns > 0 {
         config.max_turns = cli.max_turns;
     }
+    // --tools first: --allowed-tools rules add their tool to its list.
+    config.apply_tools_flag(&cli.tools);
     if let Err(e) = config.apply_tool_flags(&cli.allowed_tools, &cli.disallowed_tools) {
         eprintln!("Error: {e}");
         std::process::exit(1);
@@ -1071,20 +1080,6 @@ async fn run() -> Result<()> {
             }
         }
     }
-    // --tools: override tool set ("" = none, "default" = all, or specific names)
-    if !cli.tools.is_empty() {
-        let raw = cli.tools.join(",");
-        if raw.is_empty() {
-            // "" = disable all tools
-            config.allowed_tools = vec!["__none__".to_string()];
-        } else if raw.eq_ignore_ascii_case("default") {
-            // "default" = use all tools (already the default, clear any restrictions)
-            config.allowed_tools.clear();
-        } else {
-            config.allowed_tools = cli.tools.clone();
-        }
-    }
-
     for arg in &cli.mcp_config {
         match parse_mcp_config_arg(arg) {
             Ok(servers) => config.extra_mcp_servers.extend(servers),
@@ -1177,7 +1172,8 @@ async fn run() -> Result<()> {
             );
             std::process::exit(1);
         }
-        let (tools, shared_state) = crate::tools::all_tools_with_state(&config);
+        let (mut tools, shared_state) = crate::tools::all_tools_with_state(&config);
+        crate::tools::apply_tool_filters(&mut tools, &config);
         let current_url = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let browser_session = shared_state.browser_session.clone();
 
@@ -2135,6 +2131,43 @@ mod cli_parse_tests {
         assert_eq!(cli.prompt, vec!["refactor auth"]);
         assert_eq!(cli.disallowed_tools, vec!["Bash"]);
         assert_eq!(cli.max_budget_usd, Some(1.0));
+    }
+
+    /// Claude Code's `--disallowedTools A B` form: with one value per flag,
+    /// `WebFetch` went into the prompt and stayed available.
+    #[test]
+    fn tool_flags_take_every_following_argument() {
+        let cli = Cli::try_parse_from([
+            "oxideclaw",
+            "-p",
+            "x",
+            "--disallowed-tools",
+            "Bash",
+            "WebFetch",
+            "--allowed-tools",
+            "Read",
+            "Bash(git status:*)",
+        ])
+        .unwrap();
+        assert_eq!(cli.prompt, vec!["x"]);
+        assert_eq!(cli.disallowed_tools, vec!["Bash", "WebFetch"]);
+        assert_eq!(cli.allowed_tools, vec!["Read", "Bash(git status:*)"]);
+
+        // `--` or `=` ends the list, so the prompt and subcommands still work.
+        let cli =
+            Cli::try_parse_from(["oxideclaw", "--disallowed-tools", "Bash", "--", "fix", "it"])
+                .unwrap();
+        assert_eq!(cli.disallowed_tools, vec!["Bash"]);
+        assert_eq!(cli.prompt, vec!["fix", "it"]);
+        let cli = Cli::try_parse_from([
+            "oxideclaw",
+            "--disallowed-tools=browser_fill",
+            "browse",
+            "find docs",
+        ])
+        .unwrap();
+        assert_eq!(cli.disallowed_tools, vec!["browser_fill"]);
+        assert!(matches!(cli.command, Some(super::Commands::Browse { .. })));
     }
 
     #[test]

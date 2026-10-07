@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`--allowed-tools` / `--disallowed-tools` take permission rules.** Each
+  value can be a tool name or a rule such as `Bash(git status:*)` or
+  `WebFetch(domain:example.com)`, separated by commas or spaces, as separate
+  arguments or by repeating the flag. A bare name filters the tool list as
+  before; a rule pre-approves (or refuses) only matching calls and keeps its
+  tool, so `--allowed-tools 'Bash(git status:*)'` now means every tool plus
+  that allow rule instead of no tools. `mcp__<server>` covers every tool of
+  that server. **Breaking:** unknown tool names (including Claude Code tools
+  OxideClaw lacks, such as `Task` or `LS`), malformed rules and empty values
+  now stop startup with exit 1 instead of being ignored; use `--tools ""`
+  for no tools where you passed `--allowed-tools ""`. Both flags now take
+  every argument up to the next flag, as Claude Code's do, so put the prompt
+  before them, end the list with `--` or write `--allowed-tools=<list>`.
+  Bare `--allowed-tools` names beside `--tools` are an error, and
+  `oxideclaw browse` now honours both flags.
 - **Auto-fix runs only in trusted projects.** Lint and test commands run the
   project's own code (`build.rs`, `conftest.py`, npm scripts), so a folder
   you have not `/trust`ed now runs none of them and says so once. In a

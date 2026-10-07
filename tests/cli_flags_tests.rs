@@ -314,9 +314,16 @@ fn offered_tools(body: &str) -> Vec<String> {
 fn touch_marker_with(flags: &[&str]) -> (bool, Vec<String>, String) {
     let e = env();
     let (port, bodies) = serve(bash_call_reply("touch marker"));
-    let mut args = vec!["-p", "--max-turns", "2", "--model", "openai-compat:test"];
+    // The prompt goes first: the tool flags take every argument after them.
+    let mut args = vec![
+        "-p",
+        "go",
+        "--max-turns",
+        "2",
+        "--model",
+        "openai-compat:test",
+    ];
     args.extend_from_slice(flags);
-    args.push("go");
     let out = run(&e, &args, &openai_env(port), "");
     let bodies = bodies.lock().unwrap();
     assert!(bodies.len() >= 2, "{}", stderr(&out));
@@ -375,6 +382,32 @@ fn disallowed_tools_rules_block_matching_commands() {
     assert!(!tools.iter().any(|n| n == "WebFetch"), "{tools:?}");
 }
 
+/// Claude Code's form passes each tool as its own argument. With one value
+/// per flag, `WebFetch` became prompt text and stayed available.
+#[test]
+fn tool_flags_take_separate_arguments() {
+    let (_, tools, _) = touch_marker_with(&["--disallowed-tools", "Edit", "WebFetch"]);
+    assert!(tools.iter().any(|n| n == "Bash"), "{tools:?}");
+    for t in ["Edit", "WebFetch"] {
+        assert!(
+            !tools.iter().any(|n| n == t),
+            "{t} still offered: {tools:?}"
+        );
+    }
+}
+
+/// A prompt after the flag is read as tool names and fails loudly, rather
+/// than dropping a restriction.
+#[test]
+fn a_prompt_after_a_tool_flag_is_a_startup_error() {
+    let e = env();
+    let out = run(&e, &["-p", "--disallowed-tools", "Bash", "fix it"], &[], "");
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("unknown tool `fix`"), "{err}");
+    assert!(err.contains("put the prompt first"), "{err}");
+}
+
 /// An entry that does not parse is a startup error, never dropped.
 #[test]
 fn malformed_tool_flags_exit_non_zero_with_the_reason() {
@@ -396,7 +429,7 @@ fn malformed_tool_flags_exit_non_zero_with_the_reason() {
             "`Agent(explore)` is not a permission rule",
         ),
     ] {
-        let out = run(&e, &["-p", flag, value, "go"], &[], "");
+        let out = run(&e, &["-p", "go", flag, value], &[], "");
         assert_eq!(out.status.code(), Some(1), "{flag} {value}");
         assert!(stderr(&out).contains(needle), "{}", stderr(&out));
     }

@@ -397,7 +397,10 @@ pub fn parse_tool_flag(
                     .ok_or_else(|| {
                         format!(
                             "{flag}: unknown tool `{entry}`. Known tools: {}; MCP tools \
-                             are named mcp__<server>__<tool>.",
+                             are named mcp__<server>__<tool>. {flag} reads every argument \
+                             up to the next flag as a tool; if `{entry}` is part of your \
+                             prompt, put the prompt first, end the list with `--`, or \
+                             write {flag}=<list>.",
                             known.join(", ")
                         )
                     })?
@@ -1826,5 +1829,18 @@ mod tool_flag_tests {
             assert!(err.starts_with("--allowed-tools: "), "{err}");
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    /// The flag takes every argument up to the next flag, so a prompt after
+    /// it fails here; the error says how to place it.
+    #[test]
+    fn a_prompt_read_as_tools_says_where_the_prompt_goes() {
+        let err = parse(&["Read", "fix the bug"]).unwrap_err();
+        assert!(err.contains("unknown tool `fix`"), "{err}");
+        assert!(
+            err.contains("put the prompt first, end the list with `--`"),
+            "{err}"
+        );
+        assert!(err.contains("--allowed-tools=<list>"), "{err}");
     }
 }
