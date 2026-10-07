@@ -85,6 +85,42 @@ impl LoopGuard {
 
 /// Publish the turn's history so far: `messages` plus the results of the
 /// tool round in progress.
+/// The files an edit tool call wrote, for the auto-fix check. MultiEdit
+/// has no top-level `file_path` (each edit names its own), so turns that
+/// edited only through it never ran lint or tests. It also commits per
+/// file: a reported error can still leave other files written, which its
+/// "✓" lines show.
+fn edited_paths(
+    name: &str,
+    input: &serde_json::Value,
+    output: &crate::tools::ToolOutput,
+) -> Vec<std::path::PathBuf> {
+    let as_path = |v: &serde_json::Value| {
+        v.get("file_path")
+            .and_then(|p| p.as_str())
+            .map(std::path::PathBuf::from)
+    };
+    match name {
+        "Write" | "Edit" if !output.is_error => as_path(input).into_iter().collect(),
+        "MultiEdit" => {
+            let applied = !output.is_error
+                || output.content.iter().any(|c| {
+                    let ToolResultContent::Text { text } = c;
+                    text.contains('✓')
+                });
+            if !applied {
+                return Vec::new();
+            }
+            input
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .map(|edits| edits.iter().filter_map(as_path).collect())
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn publish_history(history: &TurnHistory, messages: &[Message], results: &[ContentBlock]) {
     let mut h = messages.to_vec();
     if !results.is_empty() {
@@ -900,13 +936,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             return;
                         }
 
-                        // Track files touched by successful Write/Edit/MultiEdit
-                        // calls for the auto-fix post-loop check.
-                        if !output.is_error
-                            && matches!(name.as_str(), "Write" | "Edit" | "MultiEdit")
-                            && let Some(fp) = input.get("file_path").and_then(|v| v.as_str())
-                        {
-                            let path = std::path::PathBuf::from(fp);
+                        // Files this call wrote trigger the auto-fix check.
+                        for path in edited_paths(name, input, &output) {
                             if !auto_fix_touched.contains(&path) {
                                 auto_fix_touched.push(path);
                             }
@@ -1691,5 +1722,41 @@ mod loop_guard_tests {
         }
         assert_eq!(failed, None);
         assert!(done);
+    }
+
+    /// A turn that edited only through MultiEdit never ran lint or tests:
+    /// its file paths are inside `edits`, not at the top level.
+    #[test]
+    fn multiedit_paths_trigger_the_auto_fix_check() {
+        use crate::tools::ToolOutput;
+        let input = serde_json::json!({"edits": [
+            {"file_path": "/w/a.rs", "old_string": "x", "new_string": "y"},
+            {"file_path": "/w/b.rs", "old_string": "x", "new_string": "y"},
+        ]});
+        let ok = ToolOutput::success("[1/2] /w/a.rs ✓ Edit applied\n[2/2] /w/b.rs ✓ Edit applied");
+        assert_eq!(
+            edited_paths("MultiEdit", &input, &ok),
+            vec![
+                std::path::PathBuf::from("/w/a.rs"),
+                std::path::PathBuf::from("/w/b.rs")
+            ]
+        );
+        // One file failed, the other was still written.
+        let partial =
+            ToolOutput::error("[1/2] /w/a.rs ✓ Edit applied\n[2/2] /w/b.rs ✗ old_string not found");
+        assert_eq!(edited_paths("MultiEdit", &input, &partial).len(), 2);
+        // Nothing applied (denied, or every edit failed): no check.
+        let none =
+            ToolOutput::error("[1/2] /w/a.rs ✗ File not found\n[2/2] /w/b.rs ✗ File not found");
+        assert!(edited_paths("MultiEdit", &input, &none).is_empty());
+
+        let edit =
+            serde_json::json!({"file_path": "/w/c.rs", "old_string": "x", "new_string": "y"});
+        assert_eq!(
+            edited_paths("Edit", &edit, &ToolOutput::success("ok")),
+            vec![std::path::PathBuf::from("/w/c.rs")]
+        );
+        assert!(edited_paths("Edit", &edit, &ToolOutput::error("no")).is_empty());
+        assert!(edited_paths("Read", &edit, &ToolOutput::success("ok")).is_empty());
     }
 }
