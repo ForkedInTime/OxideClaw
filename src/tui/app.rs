@@ -1516,6 +1516,10 @@ impl App {
             // AppEvent::ToggleBriefMode removed — brief mode toggled directly
             // in run.rs via CommandAction::ToggleBriefMode without going through AppEvent.
             AppEvent::Compacted { summary_len, .. } => {
+                // The last request measured the history that was just
+                // summarised (or the summarize call itself), so its ctx % is
+                // stale; hide it until the next real call reports.
+                self.cost_tracker.last_input_tokens = 0;
                 self.entries.push(ChatEntry::system(format!(
                     "Context compacted — history replaced with {summary_len}-char summary."
                 )));
@@ -1567,6 +1571,8 @@ impl App {
         self.follow_bottom = true;
         self.show_welcome = true;
         self.turn_costs = Vec::new();
+        // Only the context gauge: cumulative cost and /budget survive /clear.
+        self.cost_tracker.last_input_tokens = 0;
         // An armed /voice clone would turn the next dictation after /clear
         // into the clone sample.
         self.pending_clone_tier = None;
@@ -1843,6 +1849,32 @@ mod trim_entries_tests {
 #[cfg(test)]
 mod background_event_tests {
     use super::*;
+
+    /// The status-bar ctx % kept the pre-/clear or pre-compaction size
+    /// (often red) until the next API call.
+    #[test]
+    fn clear_and_compaction_reset_the_context_gauge() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.cost_tracker
+            .record_with_cache("claude-sonnet-4-6", 180_000, 500, 0, 0);
+        let spent = app.cost_tracker.total_cost_usd;
+        app.apply(AppEvent::Compacted {
+            replacement: Vec::new(),
+            summary_len: 10,
+            base: None,
+        });
+        assert_eq!(app.cost_tracker.last_input_tokens, 0);
+        assert_eq!(app.cost_tracker.total_cost_usd, spent);
+
+        app.cost_tracker
+            .record_with_cache("claude-sonnet-4-6", 180_000, 500, 0, 0);
+        app.clear();
+        assert_eq!(app.cost_tracker.last_input_tokens, 0);
+        assert!(
+            app.cost_tracker.total_cost_usd > spent,
+            "cost survives /clear"
+        );
+    }
 
     /// ThinkingBlock flushed the streamed answer first, so with
     /// showThinkingSummaries on every turn read answer-then-reasoning.
