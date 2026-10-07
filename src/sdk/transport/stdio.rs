@@ -5,7 +5,7 @@
 //! Stderr is reserved for debug/log output.
 
 use crate::sdk::protocol::{SdkNotification, SdkRequest, SdkResponse};
-use crate::sdk::transport::Transport;
+use crate::sdk::transport::{BadRequest, Transport, parse_request};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
@@ -37,7 +37,7 @@ impl StdioTransport {
 
 #[async_trait]
 impl Transport for StdioTransport {
-    async fn read_request(&mut self) -> Result<Option<SdkRequest>> {
+    async fn read_request(&mut self) -> Result<Option<Result<SdkRequest, BadRequest>>> {
         let lines = self.lines.get_or_insert_with(|| {
             spawn_line_reader(BufReader::new(tokio::io::stdin()), MAX_LINE_SIZE)
         });
@@ -61,8 +61,10 @@ impl Transport for StdioTransport {
             if trimmed.is_empty() {
                 continue; // skip blank lines
             }
-            let req: SdkRequest = serde_json::from_str(trimmed)
-                .with_context(|| format!("Invalid JSON request: {}", preview(trimmed, 200)))?;
+            let req = parse_request(trimmed);
+            if req.is_err() {
+                eprintln!("[sdk] Invalid JSON request: {}", preview(trimmed, 200));
+            }
             return Ok(Some(req));
         }
     }

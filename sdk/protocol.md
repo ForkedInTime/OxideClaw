@@ -422,7 +422,9 @@ Request-level errors include the request `id`:
 }
 ```
 
-Error codes: `internal_error`, `not_implemented`, `session_not_found`.
+Error codes: `internal_error`, `not_implemented`, `session_not_found`, `invalid_request`, `parse_error`.
+
+A line that is not a valid request still gets an `error` reply: `parse_error` when it is not JSON, `invalid_request` when it is JSON but not a known request (unknown `type`, a missing required field, or a non-string `id`). The reply echoes the line's `id` when it has one (a numeric `id` comes back as a string) and is `""` otherwise.
 
 ---
 

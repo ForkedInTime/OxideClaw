@@ -78,7 +78,7 @@ impl SdkServer {
                 biased;
                 req = transport.read_request() => {
                     match req {
-                        Ok(Some(request)) => {
+                        Ok(Some(Ok(request))) => {
                             Self::handle_request(
                                 request,
                                 &config,
@@ -90,6 +90,15 @@ impl SdkServer {
                                 &active_sessions,
                                 start_time,
                             ).await?;
+                        }
+                        Ok(Some(Err(bad))) => {
+                            transport
+                                .send_response(SdkResponse::Error {
+                                    id: bad.id,
+                                    code: bad.code.into(),
+                                    message: bad.message,
+                                })
+                                .await?;
                         }
                         Ok(None) => break, // EOF — host closed stdin
                         Err(e) => {
@@ -666,7 +675,9 @@ mod browse_tests {
 
     #[async_trait]
     impl Transport for Recorder {
-        async fn read_request(&mut self) -> Result<Option<SdkRequest>> {
+        async fn read_request(
+            &mut self,
+        ) -> Result<Option<Result<SdkRequest, transport::BadRequest>>> {
             Ok(None)
         }
         async fn send_response(&self, response: SdkResponse) -> Result<()> {
@@ -794,6 +805,74 @@ mod browse_tests {
             }
             other => panic!("expected browse/completed, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod bad_request_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use transport::BadRequest;
+
+    /// Feeds fixed lines through the real parser, then EOF.
+    struct Scripted {
+        lines: std::collections::VecDeque<&'static str>,
+        sent: Arc<std::sync::Mutex<Vec<SdkResponse>>>,
+    }
+
+    #[async_trait]
+    impl Transport for Scripted {
+        async fn read_request(&mut self) -> Result<Option<Result<SdkRequest, BadRequest>>> {
+            Ok(self.lines.pop_front().map(transport::parse_request))
+        }
+        async fn send_response(&self, response: SdkResponse) -> Result<()> {
+            self.sent.lock().unwrap().push(response);
+            Ok(())
+        }
+        async fn send_notification(&self, _: SdkNotification) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A malformed request used to be logged to stderr only, so a host
+    /// waiting on its `id` hung forever.
+    #[tokio::test]
+    async fn every_unparseable_request_gets_an_error_reply() {
+        let sent = Arc::default();
+        let transport = Scripted {
+            lines: [
+                r#"{"id":"a","type":"health/chek"}"#,
+                r#"{"id":"b","type":"session/start"}"#,
+                r#"{"id":7,"type":"health/check"}"#,
+                r#"{"id":"c","type":"#,
+                r#"{"id":"d","type":"health/check"}"#,
+            ]
+            .into(),
+            sent: Arc::clone(&sent),
+        };
+        SdkServer::run(Config::default(), transport).await.unwrap();
+
+        let got: Vec<(String, String)> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| match r {
+                SdkResponse::Error { id, code, .. } => (id.clone(), code.clone()),
+                SdkResponse::HealthCheck { id, .. } => (id.clone(), "ok".into()),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let want = [
+            ("a", "invalid_request"),
+            ("b", "invalid_request"),
+            ("7", "invalid_request"),
+            ("", "parse_error"),
+            ("d", "ok"),
+        ];
+        assert_eq!(
+            got,
+            want.map(|(i, c)| (i.to_string(), c.to_string())).to_vec()
+        );
     }
 }
 
