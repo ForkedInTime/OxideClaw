@@ -399,6 +399,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
             output_config,
             betas,
             session_id: Some(session_id.to_string()),
+            explicit_max_tokens: config.explicit_max_tokens_for(&config.model).is_some(),
         };
 
         // Transient *pre-stream* failures (429, 5xx, Anthropic overloads,

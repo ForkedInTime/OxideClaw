@@ -1036,6 +1036,7 @@ mod credential_tests {
             output_config: None,
             betas: vec![],
             session_id: None,
+            explicit_max_tokens: false,
         }
     }
 

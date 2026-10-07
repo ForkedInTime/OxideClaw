@@ -271,6 +271,7 @@ impl QueryEngine {
             output_config,
             betas,
             session_id: self.session_id.clone(),
+            explicit_max_tokens: self.config.explicit_max_tokens_for(model).is_some(),
         }
     }
 

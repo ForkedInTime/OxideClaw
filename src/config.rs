@@ -1070,15 +1070,21 @@ impl Config {
     /// is tried first on the raw model string, then on its alias-resolved
     /// form.
     pub fn max_tokens_for(&self, model: &str) -> u32 {
+        self.explicit_max_tokens_for(model)
+            .unwrap_or_else(|| crate::api::default_max_tokens(model))
+    }
+
+    /// The user-configured output cap for `model` (`maxTokensByModel`, then
+    /// `maxTokens`), or None when only the model default would apply.
+    pub fn explicit_max_tokens_for(&self, model: &str) -> Option<u32> {
         if let Some(v) = self.max_tokens_by_model.get(model) {
-            return *v;
+            return Some(*v);
         }
         let canonical = crate::commands::resolve_model_alias(model);
         if let Some(v) = self.max_tokens_by_model.get(&canonical) {
-            return *v;
+            return Some(*v);
         }
         self.max_tokens
-            .unwrap_or_else(|| crate::api::default_max_tokens(model))
     }
 
     /// Parse `<!-- phase-routing: research=haiku, edit=opus -->` directives from

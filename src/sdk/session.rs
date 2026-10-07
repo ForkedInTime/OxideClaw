@@ -279,6 +279,10 @@ impl SdkSession {
                 output_config,
                 betas,
                 session_id: Some(self.session_id.clone()),
+                explicit_max_tokens: self
+                    .config
+                    .explicit_max_tokens_for(&self.config.model)
+                    .is_some(),
             };
 
             // Stream the response — callback sends MessageDelta notifications

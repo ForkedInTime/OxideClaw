@@ -150,8 +150,9 @@ impl OllamaClient {
             stream_options: Some(OaiStreamOptions {
                 include_usage: true,
             }),
-            // Ollama maps this to num_predict.
-            max_tokens: Some(request.max_tokens),
+            // Ollama maps this to num_predict, which is unlimited by
+            // default; a default cap would stop thinking models mid-thought.
+            max_tokens: request.explicit_max_tokens.then_some(request.max_tokens),
             max_completion_tokens: None,
         };
 

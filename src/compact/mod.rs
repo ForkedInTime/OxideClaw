@@ -318,6 +318,12 @@ fn summary_max_tokens(config: &Config, prompt: &str) -> u32 {
     if model.starts_with("claude-3-") && !model.starts_with("claude-3-7") {
         return configured;
     }
+    // The 32k floor is for Claude (Bedrock/Vertex ids wrap `claude-`).
+    // OpenAI-compatible providers cap output far lower (deepseek-chat 8k,
+    // gpt-4o 16k) and 400 on a larger max_tokens.
+    if !model.to_lowercase().contains("claude-") {
+        return configured;
+    }
     let window = crate::api::context_window_for_model(&config.model);
     // ~3.5 chars/token is conservative for code-heavy text; the constant
     // covers the system prompt and message framing.
@@ -364,6 +370,7 @@ pub async fn summarize_compact(
         }),
         betas: vec![],
         session_id: None,
+        explicit_max_tokens: config.explicit_max_tokens_for(&config.model).is_some(),
     };
 
     let mut summary_text = String::new();
@@ -577,6 +584,22 @@ mod tests {
         cfg.model = "claude-3-5-sonnet-20241022".into();
         assert_eq!(summary_max_tokens(&cfg, ""), 8_192);
         cfg.model = "claude-haiku-4-5".into();
+        assert_eq!(summary_max_tokens(&cfg, ""), 32_000);
+    }
+
+    /// The Claude 32k floor 400'd OpenAI-compatible providers whose output
+    /// limit is lower (deepseek-chat 8k, gpt-4o 16k).
+    #[test]
+    fn non_claude_summary_keeps_the_configured_cap() {
+        let mut cfg = config();
+        cfg.max_tokens = None;
+        cfg.max_tokens_by_model.clear();
+        for model in ["deepseek:deepseek-chat", "oai:gpt-4o"] {
+            cfg.model = model.into();
+            assert_eq!(summary_max_tokens(&cfg, ""), 8_192, "{model}");
+        }
+        // Bedrock ids keep the floor.
+        cfg.model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0".into();
         assert_eq!(summary_max_tokens(&cfg, ""), 32_000);
     }
 

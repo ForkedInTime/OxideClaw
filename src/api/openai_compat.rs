@@ -182,6 +182,10 @@ pub(crate) struct OaiFunctionDef {
     pub parameters: serde_json::Value,
 }
 
+/// deepseek-chat's own output limit. Its default (4096) cut long Write/Edit
+/// calls short, so this is sent even when `maxTokens` is unset.
+const DEEPSEEK_CHAT_MAX_TOKENS: u32 = 8_192;
+
 #[derive(Serialize)]
 pub(crate) struct OaiRequest {
     pub model: String,
@@ -190,9 +194,9 @@ pub(crate) struct OaiRequest {
     pub tools: Vec<OaiTool>,
     pub stream: bool,
     pub stream_options: Option<OaiStreamOptions>,
-    /// Output cap for most servers. Without it each provider applies its own
-    /// default (DeepSeek: 4096), cutting long Write/Edit calls short and
-    /// ignoring `maxTokens` / `maxTokensByModel`.
+    /// Output cap for most servers, sent only when the user set `maxTokens` /
+    /// `maxTokensByModel` (and for deepseek-chat); otherwise each provider
+    /// applies its own default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// OpenAI's own API rejects `max_tokens` on its reasoning models (o-series,
@@ -845,6 +849,17 @@ impl OpenAiCompatClient {
         };
 
         let official_openai = prefix == "oai";
+        // Only a user-configured cap is sent: the provider default is right
+        // for reasoning models (whose cap also counts reasoning tokens), and
+        // OpenAI-fronting endpoints reject `max_tokens` on them. DeepSeek's
+        // chat model defaults to 4k, below what it accepts, so raise it.
+        let cap = if request.explicit_max_tokens {
+            Some(request.max_tokens)
+        } else if prefix == "deepseek" && bare_model == "deepseek-chat" {
+            Some(DEEPSEEK_CHAT_MAX_TOKENS)
+        } else {
+            None
+        };
         let mut oai_request = OaiRequest {
             model: model.clone(),
             messages: oai_messages,
@@ -853,8 +868,8 @@ impl OpenAiCompatClient {
             stream_options: Some(OaiStreamOptions {
                 include_usage: true,
             }),
-            max_tokens: (!official_openai).then_some(request.max_tokens),
-            max_completion_tokens: official_openai.then_some(request.max_tokens),
+            max_tokens: if official_openai { None } else { cap },
+            max_completion_tokens: if official_openai { cap } else { None },
         };
 
         // Nothing has reached `on_text` yet, so retrying cannot duplicate
@@ -1094,6 +1109,7 @@ mod max_tokens_tests {
             output_config: None,
             betas: vec![],
             session_id: None,
+            explicit_max_tokens: true,
         }
     }
 
@@ -1132,6 +1148,38 @@ mod max_tokens_tests {
         let body = body.await.unwrap();
         assert_eq!(body["max_completion_tokens"], 12345, "{body}");
         assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    /// An unset `maxTokens` sent the 8k model default to every backend,
+    /// truncating reasoning models and 400ing endpoints that reject
+    /// `max_tokens`. Only deepseek-chat (default 4k) still gets a cap.
+    #[tokio::test]
+    async fn default_cap_is_not_sent() {
+        for model in ["groq:llama-3.3-70b", "oai:o4-mini", "deepseek:deepseek-reasoner"] {
+            let (url, body) = capture_one_body().await;
+            let mut req = request(model);
+            req.explicit_max_tokens = false;
+            let _ = client(url).messages_stream(req, |_| {}).await;
+            let body = body.await.unwrap();
+            assert!(body.get("max_tokens").is_none(), "{model}: {body}");
+            assert!(body.get("max_completion_tokens").is_none(), "{model}: {body}");
+        }
+        let (url, body) = capture_one_body().await;
+        let mut req = request("ollama:qwen3");
+        req.explicit_max_tokens = false;
+        let _ = crate::api::ollama::OllamaClient::new(url)
+            .unwrap()
+            .messages_stream(req, |_| {})
+            .await;
+        let body = body.await.unwrap();
+        assert!(body.get("max_tokens").is_none(), "{body}");
+
+        let (url, body) = capture_one_body().await;
+        let mut req = request("deepseek:deepseek-chat");
+        req.explicit_max_tokens = false;
+        let _ = client(url).messages_stream(req, |_| {}).await;
+        let body = body.await.unwrap();
+        assert_eq!(body["max_tokens"], DEEPSEEK_CHAT_MAX_TOKENS, "{body}");
     }
 
     #[tokio::test]

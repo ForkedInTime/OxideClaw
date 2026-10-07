@@ -188,7 +188,8 @@ Follow-up QA pass (medium-severity findings, 2026-10-07).
   Sonnet 5.5 and Opus 4.7/4.8, and switching to an unusable backend no
   longer saves it. Router tiers follow `/model` and no longer send Ollama or
   OpenAI-compatible models to Anthropic. OpenAI-compatible and Ollama models
-  get the output cap and `/image` attachments, Mistral accepts histories
+  get a `maxTokens` you set (deepseek-chat 8k by default, otherwise the
+  provider's default) and `/image` attachments, Mistral accepts histories
   from other models, and context overflows there auto-compact. Long SDK/ACP
   sessions and Opus 5.5/Fable 5.1 sessions auto-compact correctly.
 - **Credentials and settings.** `apiKeyHelper` works from a group-writable

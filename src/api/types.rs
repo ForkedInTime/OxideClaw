@@ -136,6 +136,14 @@ pub struct MessagesRequest {
     /// Enables proxies and backends to aggregate requests by session.
     #[serde(skip)]
     pub session_id: Option<String>,
+    /// Whether `max_tokens` came from the user (`maxTokens` /
+    /// `maxTokensByModel`) rather than the per-model default. Anthropic
+    /// always gets `max_tokens`; OpenAI-compatible and Ollama backends only
+    /// when the user set it, so their provider default applies otherwise
+    /// (a default 8k cap truncated reasoning models and 400'd endpoints
+    /// that reject `max_tokens`).
+    #[serde(skip)]
+    pub explicit_max_tokens: bool,
 }
 
 /// Tool definition sent to the API
