@@ -329,6 +329,15 @@ async fn collect_agent_diff(wt_path: &std::path::Path, base_sha: &str) -> (Strin
     (diff, stat)
 }
 
+/// The spawned agent's tools: the default set, narrowed by `--allowed-tools`
+/// / `--disallowed-tools` like every other tool list. It runs without
+/// prompts, so a tool the user removed must not come back here.
+fn spawned_agent_tools(config: &Config) -> Vec<crate::tools::DynTool> {
+    let mut tools = default_tools(crate::net_policy::NetPolicy::from_config(config));
+    crate::tools::apply_tool_filters(&mut tools, config);
+    tools
+}
+
 /// Run the actual agent loop. Returns the final summary text.
 async fn run_spawned_agent(
     config: Config,
@@ -336,7 +345,7 @@ async fn run_spawned_agent(
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     usage_sink: crate::tools::UsageSink,
 ) -> Result<String> {
-    let tools = default_tools(crate::net_policy::NetPolicy::from_config(&config));
+    let tools = spawned_agent_tools(&config);
     // The user asked for an autonomous background agent: no prompts. Settings
     // deny rules still hold (PermissionState checks them before bypass).
     let gate =
@@ -785,6 +794,34 @@ mod tests {
             error: None,
             cancel_tx: None,
         }
+    }
+
+    /// `--disallowed-tools Bash` left Bash with spawned agents, which run
+    /// every call without a prompt.
+    #[test]
+    fn spawned_agents_honour_the_tool_flags() {
+        let names = |allowed: &[&str], disallowed: &[&str]| {
+            let mut c = Config::default();
+            let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            c.apply_tool_flags(&v(allowed), &v(disallowed)).unwrap();
+            let mut n: Vec<String> = spawned_agent_tools(&c)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+            n.sort();
+            n
+        };
+        let all = names(&[], &[]);
+        assert!(all.iter().any(|n| n == "Bash"), "{all:?}");
+        let no_bash = names(&[], &["Bash"]);
+        assert!(!no_bash.iter().any(|n| n == "Bash"), "{no_bash:?}");
+        assert_eq!(no_bash.len(), all.len() - 1);
+        assert_eq!(names(&["Read,Grep"], &[]), ["Grep", "Read"]);
+        // A rule keeps its tool; the gate applies it.
+        assert_eq!(
+            names(&["Read", "Bash(git status:*)"], &[]),
+            ["Bash", "Read"]
+        );
     }
 
     fn registry_with(entries: Vec<SpawnedAgent>) -> SpawnRegistry {
