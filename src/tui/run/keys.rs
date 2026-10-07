@@ -209,12 +209,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete if is_interactive => {
-                // Delete the selected session
-                let selected_id = app
-                    .overlay
-                    .as_ref()
-                    .and_then(|o| o.selectable_ids.get(o.selected).cloned());
-                if let Some(id) = selected_id {
+                if let Some(id) = selected_session_to_delete(app) {
                     // Don't allow deleting the current session
                     if id == session.id {
                         app.entries.push(ChatEntry::system(
@@ -971,6 +966,16 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The session `d`/Delete would remove. Only the sessions picker holds
+/// session ids; in the model, help, voice and undo pickers the selected id is
+/// a model name, voice path or label that must not reach Session::delete.
+fn selected_session_to_delete(app: &App) -> Option<String> {
+    app.overlay
+        .as_ref()
+        .filter(|o| o.title == "sessions")
+        .and_then(|o| o.selectable_ids.get(o.selected).cloned())
+}
+
 /// Send the user's answer to the pending browse approval. The gate stops
 /// listening after its 60 s window (denying the action) or once voice answered,
 /// so a failed send means this key changed nothing and must not say otherwise.
@@ -1179,5 +1184,35 @@ mod browse_approval_key_tests {
         let last = last_entry(&app);
         assert!(!last.contains("✓ Approved"), "{last}");
         assert!(last.contains("expired"), "{last}");
+    }
+}
+
+#[cfg(test)]
+mod overlay_delete_tests {
+    use super::*;
+
+    fn app_with_picker(title: &str) -> App {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.overlay = Some(Overlay::with_items(
+            title,
+            "pick one",
+            vec!["claude-opus-4-6".into()],
+        ));
+        app
+    }
+
+    #[test]
+    fn delete_key_targets_only_the_sessions_picker() {
+        for title in ["models", "help", "help-commands", "voices", "undo", "redo"] {
+            assert_eq!(
+                selected_session_to_delete(&app_with_picker(title)),
+                None,
+                "{title}"
+            );
+        }
+        assert_eq!(
+            selected_session_to_delete(&app_with_picker("sessions")).as_deref(),
+            Some("claude-opus-4-6")
+        );
     }
 }
