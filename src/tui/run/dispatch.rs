@@ -89,6 +89,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 // reach the cleared turns.
                 session.meta.timeline.clear();
                 session.meta.redo.clear();
+                let _ = session.save_redo(false).await;
             }
             *saved_count = 0;
             app.clear();
@@ -823,6 +824,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         } else {
                             session.meta.timeline.clear();
                             session.meta.redo.clear();
+                            let _ = session.save_redo(false).await;
                         }
                         *saved_count = 0;
                         app.entries = display;

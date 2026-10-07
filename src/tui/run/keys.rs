@@ -446,6 +446,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     !config.no_session_persistence,
                 )
                 .await;
+                snapshot_after_turn(session, config, tools, app).await;
             }
             if let Some(cancel) = app.browse_cancel.take() {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);

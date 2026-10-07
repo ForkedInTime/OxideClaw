@@ -662,6 +662,8 @@ pub struct App {
     /// messages back, so a turn that is cancelled, stopped by /budget or
     /// fails is recovered from here instead of losing its tool calls.
     pub turn_history: Option<TurnHistory>,
+    /// Shown once: auto-commit skips turns that ran in a worktree.
+    pub worktree_undo_notice_shown: bool,
 
     /// Active UI theme ("dark", "light", "solarized")
     pub theme: String,
@@ -851,6 +853,7 @@ impl App {
             api_task: None,
             side_task: None,
             turn_history: None,
+            worktree_undo_notice_shown: false,
             theme: "dark".to_string(),
             voice_recording: false,
             voice_task: None,

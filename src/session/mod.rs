@@ -42,8 +42,11 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timeline: Vec<TurnMark>,
     /// Turns /undo took off the conversation, the next one to /redo last.
-    /// Any new turn clears it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Any new turn clears it. Never part of the `.meta`: it holds whole
+    /// messages (tool output, file contents), which `Session::list` would
+    /// read for every session and `--no-session-persistence` must keep off
+    /// disk. [`Session::save_redo`] keeps it in `<id>.redo`.
+    #[serde(skip)]
     pub redo: Vec<UndoneTurn>,
 }
 
@@ -92,8 +95,22 @@ impl SessionMeta {
     async fn load_in(dir: &Path, id: &str) -> Result<Self> {
         let path = Self::path_in(dir, id);
         let s = fs::read_to_string(&path).await?;
-        Ok(serde_json::from_str(&s)?)
+        let mut meta: Self = serde_json::from_str(&s)?;
+        match fs::read_to_string(redo_path(dir, id)).await {
+            Ok(body) => match serde_json::from_str(&body) {
+                Ok(redo) => meta.redo = redo,
+                Err(e) => tracing::warn!("session {id}: ignoring unreadable redo file: {e}"),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("session {id}: could not read redo file: {e}"),
+        }
+        Ok(meta)
     }
+}
+
+/// Where a session's /redo turns are kept between runs.
+fn redo_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.redo"))
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -350,6 +367,21 @@ impl Session {
         self.meta.save_in(&self.dir).await
     }
 
+    /// Save the /redo turns to `<id>.redo`, or remove that file when there
+    /// are none or the session is not persisted (`persist` false): the
+    /// undone turns' messages then stay in memory only.
+    pub async fn save_redo(&self, persist: bool) -> Result<()> {
+        let path = redo_path(&self.dir, &self.id);
+        if persist && !self.meta.redo.is_empty() {
+            let body = serde_json::to_string(&self.meta.redo)?;
+            return atomic_write(&path, body.as_bytes()).await;
+        }
+        match fs::remove_file(&path).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Persist the current `SessionMeta` to disk. Used by the auto-commit loop
     /// to checkpoint updated `auto_commits` / `undo_position` after each turn.
     pub async fn save_meta(&self) -> anyhow::Result<()> {
@@ -462,6 +494,7 @@ impl Session {
             }
             let _ = fs::remove_file(dir.join(format!("{}.jsonl", meta.id))).await;
             let _ = fs::remove_file(dir.join(format!("{}.meta", meta.id))).await;
+            let _ = fs::remove_file(redo_path(dir, &meta.id)).await;
             Self::remove_snapshots_in(dir, &meta.id).await;
         }
     }
@@ -496,7 +529,7 @@ impl Session {
         None
     }
 
-    /// Delete a session: its .jsonl, .meta and file-snapshot directory.
+    /// Delete a session: its .jsonl, .meta, .redo and file-snapshot directory.
     pub async fn delete(id: &str) -> Result<()> {
         Self::delete_in(&crate::config::Config::sessions_dir(), id).await
     }
@@ -513,6 +546,7 @@ impl Session {
         if meta.exists() {
             fs::remove_file(&meta).await?;
         }
+        let _ = fs::remove_file(redo_path(dir, id)).await;
         Self::remove_snapshots_in(dir, id).await;
         Ok(())
     }

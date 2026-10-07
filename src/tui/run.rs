@@ -154,10 +154,13 @@ async fn push_prompt_turn(
         role: Role::User,
         content,
     };
-    timeline::begin_turn(session, &prompt);
+    let dropped_redo = timeline::begin_turn(session, &prompt);
     messages.push(prompt);
     if let Err(e) = session.save_meta().await {
         tracing::warn!("undo timeline: failed to save meta: {e}");
+    }
+    if dropped_redo && let Err(e) = session.save_redo(false).await {
+        tracing::warn!("undo timeline: failed to remove the redo turns: {e}");
     }
 }
 
@@ -181,6 +184,109 @@ async fn begin_agent_turn(session: &mut Session, config: &Config) {
         session.meta.base_commit = base;
         if let Err(e) = session.save_meta().await {
             tracing::warn!("autoCommit: failed to save meta after base snapshot: {e}");
+        }
+    }
+}
+
+/// Snapshot the working tree at the end of a turn, however it ended: Done,
+/// Esc, a failed request, the /budget stop or a quit. A turn that edited
+/// files and ended any other way than Done was otherwise left off the
+/// timeline: /undo of it left its edits on disk, and the next turn's
+/// snapshot took them in, so /undo of that turn reverted both.
+///
+/// After EnterWorktree the turn's edits are in the worktree; snapshotting
+/// the main tree would record nothing of them, and mixing trees in one undo
+/// stack would make /undo restore the wrong one.
+async fn snapshot_after_turn(
+    session: &mut Session,
+    config: &Config,
+    tools: &[crate::tools::DynTool],
+    app: &mut App,
+) {
+    if !config.auto_commit.enabled {
+        return;
+    }
+    if crate::tools::session_cwd(tools, &config.cwd) != config.cwd {
+        if !app.worktree_undo_notice_shown {
+            app.worktree_undo_notice_shown = true;
+            app.entries.push(ChatEntry::system(
+                "Auto-commit paused: this session is in a worktree. /undo does not cover \
+                 worktree edits; commit them on the worktree branch.",
+            ));
+        }
+        return;
+    }
+    let turn_index = (session.meta.undo_position as u32) + 1;
+    let prompt = app
+        .entries
+        .iter()
+        .rev()
+        .find_map(|e| matches!(e.kind, crate::tui::app::EntryKind::User).then(|| e.text.clone()))
+        .unwrap_or_default();
+    // Off the runtime: staging runs git over the whole work tree. The chain
+    // goes in as a copy, so a panicking task cannot lose it.
+    let (cwd, prefix, id) = (
+        config.cwd.clone(),
+        config.auto_commit.message_prefix.clone(),
+        session.id.clone(),
+    );
+    let base = session.meta.base_commit.clone();
+    let mut commits = session.meta.auto_commits.clone();
+    let mut position = session.meta.undo_position;
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let out = oxideclaw::autocommit::snapshot_turn_raw(
+            &cwd,
+            &prefix,
+            &id,
+            &prompt,
+            turn_index,
+            &mut commits,
+            &mut position,
+            base.as_deref(),
+        );
+        (out, commits, position)
+    })
+    .await;
+    let outcome = match snapshot {
+        Ok((out, commits, position)) => {
+            session.meta.auto_commits = commits;
+            session.meta.undo_position = position;
+            out
+        }
+        Err(e) => Err(anyhow::anyhow!("snapshot task failed: {e}")),
+    };
+    match outcome {
+        Ok(oxideclaw::autocommit::SnapshotOutcome::Committed { sha, files }) => {
+            tracing::info!(
+                "autoCommit: turn {turn_index} committed ({files} files, sha={})",
+                &sha[..7.min(sha.len())]
+            );
+            if let Err(e) = session.save_meta().await {
+                tracing::warn!("autoCommit: failed to save meta after snapshot: {e}");
+            }
+        }
+        Ok(oxideclaw::autocommit::SnapshotOutcome::NoChanges) => {
+            tracing::debug!("autoCommit: turn {turn_index} had no file changes");
+        }
+        Ok(oxideclaw::autocommit::SnapshotOutcome::Disabled { reason }) => {
+            tracing::debug!("autoCommit: disabled ({reason})");
+        }
+        Ok(oxideclaw::autocommit::SnapshotOutcome::Conflict { reason }) => {
+            // Must be visible, not just logged: this turn is absent from the
+            // undo history, so /undo will silently skip it if the user is
+            // never told.
+            tracing::warn!("autoCommit: {reason}");
+            app.entries.push(ChatEntry::error(format!(
+                "⚠ Auto-commit conflict — this turn was not added to /undo history.\n{reason}"
+            )));
+        }
+        Err(e) => {
+            // Visible for the same reason as a conflict, and a refused
+            // (possibly tampered) repo filter must not go unnoticed.
+            tracing::warn!("autoCommit: snapshot failed: {e}");
+            app.entries.push(ChatEntry::error(format!(
+                "⚠ Auto-commit failed — this turn was not added to /undo history.\n{e}"
+            )));
         }
     }
 }
@@ -513,8 +619,6 @@ async fn run_loop(
     // drive the SAME Chrome instance as the `browser_*` tools. `None` if browser disabled.
     let browser_session_for_app = shared_state.browser_session.clone();
     let spawn_registry = crate::spawn::new_registry();
-    // Shown once: auto-commit skips turns that ran in a worktree.
-    let mut worktree_undo_notice_shown = false;
 
     crate::tools::apply_tool_filters(&mut tools, &config);
     let perm_state = PermissionState::new(
@@ -1186,6 +1290,7 @@ async fn run_loop(
                                             !config.no_session_persistence,
                                         )
                                         .await;
+                                        snapshot_after_turn(&mut session, &config, &tools, &mut app).await;
                                     }
                                     app.is_loading = false;
                                     app.turn_start = None;
@@ -1314,108 +1419,7 @@ async fn run_loop(
                             }
                             app.apply(AppEvent::Done { tokens_in, tokens_out, cache_read, cache_write, messages: new_messages, model_used });
 
-                            // Auto-commit: snapshot the working tree for this turn.
-                            // After EnterWorktree the turn's edits are in the
-                            // worktree; snapshotting the main tree would record
-                            // nothing of them, and mixing trees in one undo
-                            // stack would make /undo restore the wrong one.
-                            let in_worktree = config.auto_commit.enabled
-                                && crate::tools::session_cwd(&tools, &config.cwd) != config.cwd;
-                            if in_worktree {
-                                if !worktree_undo_notice_shown {
-                                    worktree_undo_notice_shown = true;
-                                    app.entries.push(crate::tui::app::ChatEntry::system(
-                                        "Auto-commit paused: this session is in a worktree. /undo does not cover \
-                                         worktree edits; commit them on the worktree branch.",
-                                    ));
-                                }
-                            } else if config.auto_commit.enabled {
-                                // snapshot_turn truncates the redo stack to undo_position before
-                                // appending, so after /undo + new work, auto_commits is about to
-                                // shrink. Use the post-truncation index so the tracing log line
-                                // reflects the real new turn number.
-                                let turn_index = (session.meta.undo_position as u32) + 1;
-                                let prompt = app
-                                    .entries
-                                    .iter()
-                                    .rev()
-                                    .find_map(|e| {
-                                        if matches!(e.kind, crate::tui::app::EntryKind::User) {
-                                            Some(e.text.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or_default();
-                                // Off the runtime: staging runs git over the whole
-                                // work tree. The chain goes in as a copy, so a
-                                // panicking task cannot lose it.
-                                let (cwd, prefix, id) = (
-                                    config.cwd.clone(),
-                                    config.auto_commit.message_prefix.clone(),
-                                    session.id.clone(),
-                                );
-                                let base = session.meta.base_commit.clone();
-                                let mut commits = session.meta.auto_commits.clone();
-                                let mut position = session.meta.undo_position;
-                                let snapshot = tokio::task::spawn_blocking(move || {
-                                    let out = oxideclaw::autocommit::snapshot_turn_raw(
-                                        &cwd,
-                                        &prefix,
-                                        &id,
-                                        &prompt,
-                                        turn_index,
-                                        &mut commits,
-                                        &mut position,
-                                        base.as_deref(),
-                                    );
-                                    (out, commits, position)
-                                })
-                                .await;
-                                let outcome = match snapshot {
-                                    Ok((out, commits, position)) => {
-                                        session.meta.auto_commits = commits;
-                                        session.meta.undo_position = position;
-                                        out
-                                    }
-                                    Err(e) => Err(anyhow::anyhow!("snapshot task failed: {e}")),
-                                };
-                                match outcome {
-                                    Ok(oxideclaw::autocommit::SnapshotOutcome::Committed { sha, files }) => {
-                                        tracing::info!(
-                                            "autoCommit: turn {turn_index} committed ({files} files, sha={})",
-                                            &sha[..7.min(sha.len())]
-                                        );
-                                        if let Err(e) = session.save_meta().await {
-                                            tracing::warn!("autoCommit: failed to save meta after snapshot: {e}");
-                                        }
-                                    }
-                                    Ok(oxideclaw::autocommit::SnapshotOutcome::NoChanges) => {
-                                        tracing::debug!("autoCommit: turn {turn_index} had no file changes");
-                                    }
-                                    Ok(oxideclaw::autocommit::SnapshotOutcome::Disabled { reason }) => {
-                                        tracing::debug!("autoCommit: disabled ({reason})");
-                                    }
-                                    Ok(oxideclaw::autocommit::SnapshotOutcome::Conflict { reason }) => {
-                                        // Must be visible, not just logged: this turn is absent
-                                        // from the undo history, so /undo will silently skip it
-                                        // if the user is never told.
-                                        tracing::warn!("autoCommit: {reason}");
-                                        app.entries.push(crate::tui::app::ChatEntry::error(
-                                            format!("⚠ Auto-commit conflict — this turn was not added to /undo history.\n{reason}"),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        // Visible for the same reason as a conflict, and a
-                                        // refused (possibly tampered) repo filter must not
-                                        // go unnoticed.
-                                        tracing::warn!("autoCommit: snapshot failed: {e}");
-                                        app.entries.push(crate::tui::app::ChatEntry::error(
-                                            format!("⚠ Auto-commit failed — this turn was not added to /undo history.\n{e}"),
-                                        ));
-                                    }
-                                }
-                            }
+                            snapshot_after_turn(&mut session, &config, &tools, &mut app).await;
                         }
                         AppEvent::Compacted { replacement, summary_len, base: Some(base) } => {
                             // Background result: applied once no turn is in
@@ -1436,6 +1440,7 @@ async fn run_loop(
                                 saved_count = to_save.len();
                                 let _ = session.overwrite(&to_save).await;
                             }
+                            timeline::prune_timeline_and_save(&mut session, &messages).await;
                             app.apply(AppEvent::Compacted {
                                 replacement: replacement.clone(),
                                 summary_len,
@@ -1524,7 +1529,14 @@ async fn run_loop(
                                     !config.no_session_persistence,
                                 )
                                 .await;
-                                dropped = drop_unsent_images(&mut messages);
+                                dropped = timeline::drop_failed_images(
+                                    &mut messages,
+                                    &mut session,
+                                    &mut saved_count,
+                                    !config.no_session_persistence,
+                                )
+                                .await;
+                                snapshot_after_turn(&mut session, &config, &tools, &mut app).await;
                             }
                             app.apply(ev);
                             if dropped {
@@ -1634,6 +1646,7 @@ async fn run_loop(
                         saved_count = messages.len();
                         let _ = session.overwrite(&messages).await;
                     }
+                    timeline::prune_timeline_and_save(&mut session, &messages).await;
                     // The last turn's token count measured the history
                     // that was just summarised.
                     last_tokens_in = 0;
@@ -1801,6 +1814,7 @@ async fn run_loop(
                     !config.no_session_persistence,
                 )
                 .await;
+                snapshot_after_turn(&mut session, &config, &tools, &mut app).await;
             }
 
             // Stop hooks — fire before exiting

@@ -8,12 +8,15 @@ use crate::session::{TurnMark, UndoneTurn, prompt_fingerprint};
 
 /// Put a new turn on the timeline. Any new turn ends what /redo could
 /// bring back.
-pub(super) fn begin_turn(session: &mut Session, prompt: &Message) {
+/// Returns whether that dropped any /redo turns.
+pub(super) fn begin_turn(session: &mut Session, prompt: &Message) -> bool {
+    let had_redo = !session.meta.redo.is_empty();
     session.meta.redo.clear();
     session.meta.timeline.push(TurnMark {
         prompt: prompt_fingerprint(prompt),
         before: session.meta.undo_position,
     });
+    had_redo
 }
 
 /// Indices into `messages` of each prompt, oldest first.
@@ -26,22 +29,28 @@ fn prompt_indices(messages: &[Message]) -> Vec<usize> {
         .collect()
 }
 
-/// The marks that pair with the newest prompts, oldest first: the last
-/// `n` returned belong to the last `n` prompts. Marks saved for prompts
-/// that never reached the transcript (a crash between the two writes) are
-/// skipped; pairing stops at the first prompt without its own mark (turns
-/// before a compaction, an import, or a session from before the timeline),
-/// so a mark never stands in for another turn.
-fn paired_marks(messages: &[Message], prompts: &[usize], timeline: &[TurnMark]) -> Vec<TurnMark> {
+/// The marks that pair with the newest prompts, oldest first, and the
+/// index in `timeline` of the first of them: the last `n` returned belong
+/// to the last `n` prompts. Marks saved for prompts that never reached the
+/// transcript (a crash between the two writes) are skipped; pairing stops
+/// at the first prompt without its own mark (turns before a compaction, an
+/// import, or a session from before the timeline), so a mark never stands
+/// in for another turn. Marks in front of the returned run belong to no
+/// live prompt.
+fn paired_marks<'t>(
+    messages: &[Message],
+    prompts: &[usize],
+    timeline: &'t [TurnMark],
+) -> (usize, &'t [TurnMark]) {
     let fingerprints: Vec<String> = prompts
         .iter()
         .map(|&i| prompt_fingerprint(&messages[i]))
         .collect();
     let Some(newest) = fingerprints.last() else {
-        return Vec::new();
+        return (0, &[]);
     };
     let Some(end) = timeline.iter().rposition(|m| m.prompt == *newest) else {
-        return Vec::new();
+        return (0, &[]);
     };
     let count = timeline[..=end]
         .iter()
@@ -49,7 +58,71 @@ fn paired_marks(messages: &[Message], prompts: &[usize], timeline: &[TurnMark]) 
         .zip(fingerprints.iter().rev())
         .take_while(|(m, fp)| m.prompt == **fp)
         .count();
-    timeline[end + 1 - count..=end].to_vec()
+    let start = end + 1 - count;
+    (start, &timeline[start..=end])
+}
+
+/// Keep only the marks that pair with a prompt of `messages`. After a
+/// compaction replaced the history, the marks of the summarised turns pair
+/// with nothing; left in front of the live ones, a later prompt with the
+/// same text ("continue", "yes") could pair with one of them and /undo
+/// would restore that old turn's files. Returns whether any mark went.
+pub(super) fn prune_timeline(session: &mut Session, messages: &[Message]) -> bool {
+    let prompts = prompt_indices(messages);
+    let (start, marks) = paired_marks(messages, &prompts, &session.meta.timeline);
+    let range = start..start + marks.len();
+    if range == (0..session.meta.timeline.len()) {
+        return false;
+    }
+    session.meta.timeline = session.meta.timeline[range].to_vec();
+    true
+}
+
+/// [`prune_timeline`], saved.
+pub(super) async fn prune_timeline_and_save(session: &mut Session, messages: &[Message]) {
+    if prune_timeline(session, messages)
+        && let Err(e) = session.save_meta().await
+    {
+        tracing::warn!("undo timeline: failed to save meta: {e}");
+    }
+}
+
+/// After a failed request, swap the unanswered prompt's images for a note
+/// ([`drop_unsent_images`]) and keep the turn on the timeline: its mark is
+/// moved to the changed prompt, which no longer matches the old
+/// fingerprint, and the saved transcript is rewritten to match (a resume
+/// otherwise re-sent the image and lost the pairing). Without this, /undo of
+/// every earlier turn moved the conversation only. Returns whether any image
+/// was removed.
+pub(super) async fn drop_failed_images(
+    messages: &mut [Message],
+    session: &mut Session,
+    saved_count: &mut usize,
+    persist: bool,
+) -> bool {
+    let old = messages.last().map(prompt_fingerprint);
+    if !drop_unsent_images(messages) {
+        return false;
+    }
+    if let (Some(old), Some(changed)) = (old, messages.last()) {
+        let new = prompt_fingerprint(changed);
+        if let Some(mark) = session
+            .meta
+            .timeline
+            .iter_mut()
+            .rev()
+            .find(|m| m.prompt == old)
+        {
+            mark.prompt = new;
+            if let Err(e) = session.save_meta().await {
+                tracing::warn!("undo timeline: failed to save meta: {e}");
+            }
+        }
+    }
+    if let Err(e) = rewrite_session_history(session, messages, persist, saved_count).await {
+        tracing::warn!("session: could not rewrite after dropping images: {e}");
+    }
+    true
 }
 
 /// What `/undo n` does: where the conversation is cut, the file position
@@ -59,7 +132,8 @@ struct UndoPlan {
     cut: usize,
     target: usize,
     undone: Vec<UndoneTurn>,
-    /// Marks left on the timeline.
+    /// Marks left on the timeline, counted from its start (stale marks in
+    /// front of the paired run included).
     keep: usize,
     /// Undone turns with no mark: only their conversation moves.
     unmarked: usize,
@@ -76,7 +150,7 @@ fn plan_undo(
     if n == 0 {
         return None;
     }
-    let marks = paired_marks(messages, &prompts, timeline);
+    let (start, marks) = paired_marks(messages, &prompts, timeline);
     let first_marked = prompts.len() - marks.len();
     let first = prompts.len() - n;
     // Newest to oldest: each turn ends where the next one started, the
@@ -106,7 +180,7 @@ fn plan_undo(
         cut: prompts[first],
         target: after,
         undone,
-        keep: marks.len() - (n - unmarked),
+        keep: start + marks.len() - (n - unmarked),
         unmarked,
     })
 }
@@ -119,45 +193,59 @@ fn files_tracked(config: &Config) -> bool {
 const UNTRACKED_NOTE: &str = "File changes are tracked only inside a git repository with \
                               auto-commit on, so only the conversation moved.";
 
+const FOREIGN_NOTE: &str = "This session's file snapshots are not in this repository \
+                            (resumed elsewhere, or pruned), so only the conversation moved.";
+
+/// What an undo or redo did to the files.
+enum FileMove {
+    /// File changes are not tracked here; only the conversation moves.
+    Untracked(&'static str),
+    /// Already where they should be.
+    Unchanged,
+    Restored(oxideclaw::autocommit::RestoreReport),
+}
+
 /// Move the files from the current position to `target`, refusing to
-/// overwrite anything changed since the current snapshot. `Ok(None)` when
-/// there is nothing to move.
-async fn move_files(
-    session: &Session,
-    config: &Config,
-    target: usize,
-) -> anyhow::Result<Option<oxideclaw::autocommit::RestoreReport>> {
-    if !files_tracked(config) || target == session.meta.undo_position {
-        return Ok(None);
+/// overwrite anything changed since the current snapshot.
+async fn move_files(session: &Session, config: &Config, target: usize) -> anyhow::Result<FileMove> {
+    if !files_tracked(config) {
+        return Ok(FileMove::Untracked(UNTRACKED_NOTE));
+    }
+    let from = session.meta.undo_position;
+    let (cwd, commits) = (config.cwd.clone(), session.meta.auto_commits.clone());
+    let resolves = tokio::task::spawn_blocking(move || {
+        oxideclaw::autocommit::chain_resolves(&cwd, &commits, &[from, target])
+    })
+    .await
+    .unwrap_or(false);
+    if !resolves {
+        return Ok(FileMove::Untracked(FOREIGN_NOTE));
+    }
+    if target == from {
+        return Ok(FileMove::Unchanged);
     }
     oxideclaw::autocommit::restore_from_blocking(
         config.cwd.clone(),
         session.id.clone(),
         session.meta.auto_commits.clone(),
-        session.meta.undo_position,
+        from,
         target,
     )
     .await
-    .map(Some)
+    .map(FileMove::Restored)
 }
 
 /// What happened to the files, for the /undo and /redo summary line.
-fn files_note(
-    config: &Config,
-    report: Option<&oxideclaw::autocommit::RestoreReport>,
-    unmarked: usize,
-) -> String {
-    if !files_tracked(config) {
-        return format!(" {UNTRACKED_NOTE}");
-    }
-    let mut note = match report {
-        Some(r) => format!(
+fn files_note(moved: &FileMove, unmarked: usize) -> String {
+    let mut note = match moved {
+        FileMove::Untracked(why) => return format!(" {why}"),
+        FileMove::Restored(r) => format!(
             " Files restored ({} in the tree{}).{}",
             r.files_restored,
             r.removed_note(),
             r.saved_edits_note()
         ),
-        None => " Files unchanged: no file changes were recorded.".to_string(),
+        FileMove::Unchanged => " Files unchanged: no file changes were recorded.".to_string(),
     };
     if unmarked > 0 {
         note.push_str(&format!(
@@ -200,8 +288,8 @@ pub(super) async fn undo(
         ));
         return;
     };
-    let report = match move_files(session, config, plan.target).await {
-        Ok(report) => report,
+    let moved = match move_files(session, config, plan.target).await {
+        Ok(moved) => moved,
         Err(e) => {
             app.entries.push(ChatEntry::error(format!("[undo] {e}")));
             return;
@@ -213,7 +301,7 @@ pub(super) async fn undo(
     session.meta.timeline.truncate(plan.keep);
     // The next one to redo goes last.
     session.meta.redo.extend(plan.undone.into_iter().rev());
-    if report.is_some() {
+    if matches!(moved, FileMove::Restored(_)) {
         session.meta.undo_position = plan.target;
     }
     // Transcript first: a crash before the meta is saved then leaves marks
@@ -234,6 +322,9 @@ pub(super) async fn undo(
     if let Err(e) = session.save_meta().await {
         tracing::warn!("[undo] failed to save meta: {e}");
     }
+    if let Err(e) = session.save_redo(!config.no_session_persistence).await {
+        tracing::warn!("[undo] failed to save the redo turns: {e}");
+    }
 
     // Display: drop everything from the n-th last prompt on.
     let user_entries: Vec<usize> = app
@@ -251,7 +342,7 @@ pub(super) async fn undo(
     app.entries.push(ChatEntry::system(format!(
         "[undo] Undid {}.{} /redo brings {} back.",
         turns(n),
-        files_note(config, report.as_ref(), plan.unmarked),
+        files_note(&moved, plan.unmarked),
         if n == 1 { "it" } else { "them" }
     )));
 }
@@ -282,8 +373,8 @@ pub(super) async fn redo(
     let target = redone
         .last()
         .map_or(session.meta.undo_position, |t| t.after);
-    let report = match move_files(session, config, target).await {
-        Ok(report) => report,
+    let moved = match move_files(session, config, target).await {
+        Ok(moved) => moved,
         Err(e) => {
             app.entries.push(ChatEntry::error(format!("[redo] {e}")));
             return;
@@ -291,7 +382,7 @@ pub(super) async fn redo(
     };
     let keep = session.meta.redo.len() - n;
     session.meta.redo.truncate(keep);
-    if report.is_some() {
+    if matches!(moved, FileMove::Restored(_)) {
         session.meta.undo_position = target;
     }
     let first_new = messages.len();
@@ -299,7 +390,12 @@ pub(super) async fn redo(
         session.meta.timeline.push(turn.mark);
         messages.extend(turn.messages);
     }
-    // Meta first: marks may run ahead of the transcript, never behind.
+    // Redo turns first, then the meta: a crash part way loses a redo
+    // rather than putting a turn back twice, and marks may run ahead of the
+    // transcript, never behind.
+    if let Err(e) = session.save_redo(!config.no_session_persistence).await {
+        tracing::warn!("[redo] failed to save the redo turns: {e}");
+    }
     if let Err(e) = session.save_meta().await {
         tracing::warn!("[redo] failed to save meta: {e}");
     }
@@ -321,7 +417,7 @@ pub(super) async fn redo(
     app.entries.push(ChatEntry::system(format!(
         "[redo] Redid {}.{}",
         turns(n),
-        files_note(config, report.as_ref(), 0)
+        files_note(&moved, 0)
     )));
 }
 
@@ -493,6 +589,82 @@ mod tests {
             meta.auto_commits = commits;
             meta.undo_position = pos;
             self.session.save_meta().await.unwrap();
+        }
+
+        /// A turn that edits files and is then cancelled with Esc: it ends
+        /// through the key handler, never through `Done`.
+        async fn cancelled_turn(&mut self, prompt: &str, edits: &[(&str, &str)]) {
+            begin_agent_turn(&mut self.session, &self.config).await;
+            self.app.entries.push(ChatEntry::user(prompt));
+            push_prompt_turn(
+                &mut self.messages,
+                vec![ContentBlock::Text {
+                    text: prompt.into(),
+                }],
+                &mut self.session,
+            )
+            .await;
+            for (rel, body) in edits {
+                self.write(rel, body);
+            }
+            let mut history = self.messages.clone();
+            history.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: format!("working on {prompt}"),
+                }],
+            });
+            let turn_history = TurnHistory::default();
+            *turn_history.lock().unwrap() = history;
+            self.app.turn_history = Some(turn_history);
+            self.app.is_loading = true;
+            self.key(KeyCode::Esc).await;
+            assert!(!self.app.is_loading);
+        }
+
+        async fn key(&mut self, code: KeyCode) {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut client =
+                ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
+            let mut system_prompt = String::new();
+            let todo_state = TodoState::default();
+            let spawn_registry = crate::spawn::new_registry();
+            handle_key(KeyCtx {
+                key: crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+                app: &mut self.app,
+                messages: &mut self.messages,
+                client: &mut client,
+                tools: &[],
+                config: &mut self.config,
+                perm_state: &PermissionState::new(false, &[], &[]),
+                skills: &std::collections::HashMap::new(),
+                system_prompt: &mut system_prompt,
+                tx: &tx,
+                todo_state: &todo_state,
+                session: &mut self.session,
+                saved_count: &mut self.saved,
+                mcp_statuses: &[],
+                spawn_registry: &spawn_registry,
+            })
+            .await
+            .unwrap();
+        }
+
+        /// A compaction as the run loop applies it: the history becomes the
+        /// summary, saved. `prune` false leaves the timeline as an earlier
+        /// build did, its summarised turns' marks in front.
+        async fn compact(&mut self, prune: bool) {
+            self.messages = vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "summary of the conversation so far".into(),
+                }],
+            }];
+            self.session.overwrite(&self.messages).await.unwrap();
+            self.saved = self.messages.len();
+            if prune {
+                prune_timeline_and_save(&mut self.session, &self.messages).await;
+            }
         }
 
         async fn undo(&mut self, n: usize) {
@@ -803,6 +975,230 @@ mod tests {
             "{}",
             h.last_note()
         );
+    }
+
+    /// Marks of turns a compaction summarised stay in front of the live
+    /// ones (as an earlier build left them). Each /undo must cut the
+    /// timeline after the live run, not at a count from its start, and a
+    /// live prompt with the same text as a summarised one ("continue")
+    /// pairs with its own mark: /undo never reverts the compacted turns.
+    #[tokio::test]
+    async fn undo_after_a_compaction_reverts_only_its_own_turns() {
+        let mut h = Harness::new(true).await;
+        h.turn("continue", &[("a.txt", "a1\n")]).await;
+        h.turn("two", &[("b.txt", "b2\n")]).await;
+        h.compact(false).await;
+        h.turn("continue", &[("a.txt", "a3\n")]).await;
+        h.turn("four", &[("c.txt", "c4\n")]).await;
+        assert_eq!(h.session.meta.timeline.len(), 4, "stale marks in front");
+
+        h.undo(1).await;
+        assert_eq!(h.read("c.txt"), None);
+        assert_eq!(h.read("a.txt").as_deref(), Some("a3\n"));
+        assert_eq!(h.session.meta.timeline.len(), 3, "only four's mark went");
+
+        h.undo(1).await;
+        let note = h.last_note();
+        assert!(note.contains("Files restored"), "{note}");
+        assert!(!note.contains("predate"), "{note}");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"), "only turn three");
+        assert_eq!(
+            h.read("b.txt").as_deref(),
+            Some("b2\n"),
+            "compacted turn kept"
+        );
+        assert_eq!(
+            h.prompts().await,
+            vec!["summary of the conversation so far"]
+        );
+
+        // The summary has no mark: undoing it moves the conversation only.
+        h.undo(1).await;
+        assert!(h.last_note().contains("predate"), "{}", h.last_note());
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+        assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"));
+    }
+
+    /// A compaction drops the marks of the turns it summarised and keeps
+    /// those of turns sent after it.
+    #[tokio::test]
+    async fn compaction_prunes_the_marks_of_summarised_turns() {
+        let mut h = Harness::new(true).await;
+        h.turn("continue", &[("a.txt", "a1\n")]).await;
+        h.turn("two", &[("b.txt", "b2\n")]).await;
+        h.compact(true).await;
+        assert!(h.session.meta.timeline.is_empty());
+        let (saved, _) = Session::resume_in(h.sessions.path(), "s1").await.unwrap();
+        assert!(saved.meta.timeline.is_empty(), "pruned timeline saved");
+
+        h.turn("continue", &[("a.txt", "a3\n")]).await;
+        // A background compaction merged in: summary + the turn sent since.
+        let kept = h.messages[1..].to_vec();
+        h.messages.truncate(1);
+        h.messages.extend(kept);
+        assert!(
+            !prune_timeline(&mut h.session, &h.messages),
+            "live mark kept"
+        );
+        assert_eq!(h.session.meta.timeline.len(), 1);
+
+        h.undo(2).await;
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"), "only turn three");
+        assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"));
+        assert!(h.prompts().await.is_empty());
+    }
+
+    /// A turn that edited files and ended without `Done` (Esc here; a
+    /// failed request, the /budget stop and quit share the same snapshot)
+    /// is on the timeline like any other: /undo of it reverts its edits,
+    /// and /undo of the next turn leaves them.
+    #[tokio::test]
+    async fn a_cancelled_turn_is_snapshotted_and_undone_on_its_own() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.cancelled_turn("two", &[("b.txt", "b2\n")]).await;
+        assert_eq!(
+            h.session.meta.undo_position, 2,
+            "cancelled turn snapshotted"
+        );
+        h.turn("three", &[("a.txt", "a3\n")]).await;
+
+        h.undo(1).await;
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+        assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"), "not turn three's");
+
+        h.undo(1).await;
+        let note = h.last_note();
+        assert!(note.contains("Files restored"), "{note}");
+        assert_eq!(h.read("b.txt"), None, "the cancelled turn's edit is undone");
+        assert_eq!(h.prompts().await, vec!["one"]);
+
+        h.cancelled_turn("again", &[("a.txt", "a4\n")]).await;
+        h.undo(1).await;
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+    }
+
+    /// A failed request with an image swaps the image for a note in the
+    /// prompt. Its mark follows, so earlier turns still undo their files,
+    /// and the saved transcript matches.
+    #[tokio::test]
+    async fn a_failed_image_prompt_keeps_the_timeline_paired() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        begin_agent_turn(&mut h.session, &h.config).await;
+        h.app.entries.push(ChatEntry::user("look"));
+        push_prompt_turn(
+            &mut h.messages,
+            vec![
+                ContentBlock::Text {
+                    text: "look".into(),
+                },
+                ContentBlock::Image {
+                    source: crate::api::types::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                },
+            ],
+            &mut h.session,
+        )
+        .await;
+        assert!(drop_failed_images(&mut h.messages, &mut h.session, &mut h.saved, true).await);
+        let (saved, transcript) = Session::resume_in(h.sessions.path(), "s1").await.unwrap();
+        assert_eq!(transcript, h.messages, "transcript rewritten to match");
+        assert_eq!(saved.meta.timeline, h.session.meta.timeline);
+
+        h.undo(2).await;
+        let note = h.last_note();
+        assert!(!note.contains("predate"), "{note}");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a0\n"), "turn one undone");
+        assert!(h.prompts().await.is_empty());
+    }
+
+    /// The undone turns' messages are never written to the `.meta`. With
+    /// --no-session-persistence they stay in memory only; otherwise they
+    /// go to `<id>.redo`, which a new turn removes.
+    #[tokio::test]
+    async fn undone_turns_stay_out_of_the_meta() {
+        let meta_text =
+            |h: &Harness| std::fs::read_to_string(h.sessions.path().join("s1.meta")).unwrap();
+        let redo_file = |h: &Harness| h.sessions.path().join("s1.redo");
+
+        let mut h = Harness::new(true).await;
+        h.config.no_session_persistence = true;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.turn("secret-prompt", &[("a.txt", "a2\n")]).await;
+        h.undo(1).await;
+        assert!(
+            !meta_text(&h).contains("secret-prompt"),
+            "{}",
+            meta_text(&h)
+        );
+        assert!(!redo_file(&h).exists());
+        h.redo(1).await;
+        assert_eq!(
+            h.read("a.txt").as_deref(),
+            Some("a2\n"),
+            "redo kept in memory"
+        );
+
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.turn("secret-prompt", &[("a.txt", "a2\n")]).await;
+        h.undo(1).await;
+        assert!(
+            !meta_text(&h).contains("secret-prompt"),
+            "{}",
+            meta_text(&h)
+        );
+        assert!(
+            std::fs::read_to_string(redo_file(&h))
+                .unwrap()
+                .contains("secret-prompt")
+        );
+        h.turn("three", &[]).await;
+        assert!(!redo_file(&h).exists(), "a new turn ends the redo");
+    }
+
+    /// A session resumed in another repository (or whose snapshots were
+    /// pruned): its chain does not resolve here, so /undo and /redo move the
+    /// conversation only, with a notice, and touch no file.
+    #[tokio::test]
+    async fn a_chain_from_another_repo_moves_the_conversation_only() {
+        let mut h = Harness::new(true).await;
+        h.three_turns().await;
+        let other = Harness::new(true).await;
+        h.config.cwd = other.repo.path().to_path_buf();
+
+        h.undo(1).await;
+        let note = h.last_note();
+        assert!(note.contains("not in this repository"), "{note}");
+        assert_eq!(note.lines().count(), 1, "one line: {note}");
+        assert_eq!(h.prompts().await, vec!["one", "two"]);
+        assert_eq!(other.read("a.txt").as_deref(), Some("a0\n"));
+        assert_eq!(h.read("a.txt").as_deref(), Some("a3\n"));
+        assert_eq!(h.session.meta.undo_position, 3);
+
+        h.redo(1).await;
+        assert!(h.last_note().contains("not in this repository"));
+        assert_eq!(h.prompts().await, vec!["one", "two", "three"]);
+    }
+
+    /// A hand edit to a file the undone turns did not touch neither blocks
+    /// the undo nor is overwritten.
+    #[tokio::test]
+    async fn a_hand_edit_elsewhere_does_not_block_the_undo() {
+        let mut h = Harness::new(true).await;
+        h.three_turns().await;
+        h.write("b.txt", "mine\n");
+
+        h.undo(1).await;
+
+        let note = h.last_note();
+        assert!(note.contains("Files restored"), "{note}");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+        assert_eq!(h.read("b.txt").as_deref(), Some("mine\n"));
+        assert_eq!(h.prompts().await, vec!["one", "two"]);
     }
 
     /// A mark saved for a prompt the transcript never got (a crash between

@@ -758,6 +758,27 @@ fn position_tree(cwd: &Path, auto_commits: &[String], position: usize) -> anyhow
     Ok(tree)
 }
 
+/// Whether every one of `positions` names a commit this repository has:
+/// false for a chain recorded in another repository (a session resumed
+/// elsewhere) or one whose objects were pruned, where restoring would fail
+/// or, for position 0, quietly fall back to HEAD.
+pub fn chain_resolves(cwd: &Path, auto_commits: &[String], positions: &[usize]) -> bool {
+    let has_commit = |sha: &str| {
+        git_cmd(cwd)
+            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    positions.iter().all(|&p| match p.checked_sub(1) {
+        Some(i) => auto_commits.get(i).is_some_and(|c| has_commit(c)),
+        // The session base is the first snapshot's parent (or HEAD when
+        // there is none), so the first snapshot must be here.
+        None => auto_commits.first().is_none_or(|c| has_commit(c)),
+    })
+}
+
 /// NUL-separated paths that differ between two trees, optionally filtered
 /// (`--diff-filter`). The memory and RAG databases never count: a tree that
 /// holds them (a pre-exclusion snapshot, or a HEAD that tracks them) must
@@ -804,7 +825,9 @@ pub fn restore_to(
 }
 
 /// [`restore_to`] for a step along the undo timeline from `from_position`,
-/// where the files are meant to be now. Refuses, before anything is
+/// where the files are meant to be now. Only the paths that differ between
+/// the two positions are written or removed; the rest of the tree, hand
+/// edits included, is left alone. Refuses, before anything is
 /// written, when a file that changed since the `from_position` snapshot (a
 /// hand edit, or a turn whose snapshot failed) would be overwritten or
 /// removed: /undo must never clobber work it did not record.
@@ -858,27 +881,48 @@ fn restore(
     }
 
     let live_tree = stage_live_tree(cwd, auto_commits)?;
+    // A step along the timeline touches only the paths the undone (or
+    // redone) turns changed: the rest of the tree, hand edits included, is
+    // left as it is. A plain restore brings the whole tree to the target.
+    let (from_tree, turn_paths) = match from_position {
+        Some(from) => {
+            let from_tree = position_tree(cwd, auto_commits, from)?;
+            let paths: std::collections::HashSet<String> =
+                nul_paths(&diff_trees(cwd, &from_tree, &tree_sha, None)?).collect();
+            (Some(from_tree), Some(paths))
+        }
+        None => (None, None),
+    };
+    let in_scope = |p: &str| turn_paths.as_ref().is_none_or(|t| t.contains(p));
     // Write only what differs from the live tree. `checkout-index -a` on a
     // fresh index rewrote every file (bumping every mtime, so builds redid
     // everything) and wrote out paths a sparse checkout had left out. Paths
     // absent from the target are skipped (`d`) here and removed below.
-    let changed = diff_trees(cwd, &live_tree, &tree_sha, Some("--diff-filter=d"))?;
+    // Raw bytes: the list goes back to git, and a lossy UTF-8 round trip
+    // would name a different file.
+    let changed_raw = diff_trees(cwd, &live_tree, &tree_sha, Some("--diff-filter=d"))?;
+    let changed: Vec<&[u8]> = changed_raw
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty() && in_scope(&String::from_utf8_lossy(p)))
+        .collect();
     // Safe to delete: save_unrecorded_worktree below makes sure the live
-    // tree is held by a snapshot or the recovery ref.
+    // tree is held by a snapshot or the recovery ref, and a timeline step
+    // only removes paths the from-snapshot holds unedited.
     let orphaned_files: Vec<String> = nul_paths(&diff_trees(
         cwd,
         &live_tree,
         &tree_sha,
         Some("--diff-filter=D"),
     )?)
-    .filter(|p| snapshotted.contains(p))
+    .filter(|p| snapshotted.contains(p) && in_scope(p))
     .collect();
 
-    if let Some(from) = from_position {
-        let from_tree = position_tree(cwd, auto_commits, from)?;
+    if let Some(from_tree) = &from_tree {
         let edited: std::collections::HashSet<String> =
-            nul_paths(&diff_trees(cwd, &from_tree, &live_tree, None)?).collect();
-        let mut clobbered: Vec<String> = nul_paths(&changed)
+            nul_paths(&diff_trees(cwd, from_tree, &live_tree, None)?).collect();
+        let mut clobbered: Vec<String> = changed
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
             .chain(orphaned_files.iter().cloned())
             .filter(|p| edited.contains(p))
             .collect();
@@ -899,7 +943,13 @@ fn restore(
     }
 
     let recovery = recovery_ref(session_id);
-    let saved_edits = save_unrecorded_worktree(cwd, &recovery, auto_commits, &live_tree)?;
+    // A timeline step overwrites only files the from-snapshot holds as they
+    // are (the guard above), so there is nothing unrecorded to save aside.
+    let saved_edits = if from_tree.is_some() {
+        None
+    } else {
+        save_unrecorded_worktree(cwd, &recovery, auto_commits, &live_tree)?
+    };
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
@@ -925,7 +975,12 @@ fn restore(
         // The path list goes in through a file: with stderr captured too, a
         // child blocked on a full stderr pipe would never drain stdin.
         let paths = td.path().join("restore.paths");
-        std::fs::write(&paths, &changed)?;
+        let mut list = Vec::new();
+        for p in &changed {
+            list.extend_from_slice(p);
+            list.push(0);
+        }
+        std::fs::write(&paths, &list)?;
         let out = git_cmd(&toplevel)
             .env("GIT_INDEX_FILE", &temp_index)
             .args(["checkout-index", "-f", "-z", "--stdin", "--prefix", &prefix])
@@ -2928,16 +2983,46 @@ mod restore_from_tests {
         );
     }
 
-    /// A hand edit to a file no undone turn touched is overwritten all the
-    /// same by a plain restore; the guard covers it too.
+    /// A hand edit to a file no undone turn touched neither blocks the undo
+    /// nor is overwritten: a timeline step rewrites only the turns' paths,
+    /// and saves nothing aside because it overwrites nothing unrecorded.
     #[test]
-    fn undo_refuses_a_hand_edit_to_a_file_the_turns_did_not_touch() {
+    fn undo_leaves_a_hand_edit_to_a_file_the_turns_did_not_touch() {
         let td = init_test_repo();
         write_file(td.path(), "keep.txt", "k\n");
         let commits = three_turns(td.path());
         write_file(td.path(), "keep.txt", "edited\n");
-        assert!(restore_from(td.path(), "s", &commits, 3, 2).is_err());
+
+        let report = restore_from(td.path(), "s", &commits, 3, 1).unwrap();
         assert_eq!(read(td.path(), "keep.txt"), "edited\n");
+        assert_eq!(read(td.path(), "a.txt"), "2\n");
+        assert!(!td.path().join("b.txt").exists());
+        assert_eq!(report.saved_edits, None);
+
+        restore_from(td.path(), "s", &commits, 1, 3).unwrap();
+        assert_eq!(read(td.path(), "keep.txt"), "edited\n");
+        assert_eq!(read(td.path(), "a.txt"), "3\n");
+        assert_eq!(read(td.path(), "b.txt"), "b\n");
+    }
+
+    /// The chain of another repository (a session resumed elsewhere, or a
+    /// pruned and collected ref) does not resolve; this repo's does.
+    #[test]
+    fn chain_resolves_only_in_its_own_repo() {
+        let td = init_test_repo();
+        let commits = three_turns(td.path());
+        assert!(chain_resolves(td.path(), &commits, &[3, 0]));
+        let other = init_test_repo();
+        write_file(other.path(), "x.txt", "x\n");
+        git_cmd(other.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(other.path())
+            .args(["commit", "-q", "-m", "x"])
+            .status()
+            .unwrap();
+        assert!(!chain_resolves(other.path(), &commits, &[3, 2]));
+        assert!(!chain_resolves(other.path(), &commits, &[0]));
+        assert!(!chain_resolves(td.path(), &commits, &[4]));
+        assert!(chain_resolves(other.path(), &[], &[0]));
     }
 
     /// Edits the restore does not overwrite (a new file no snapshot holds)
