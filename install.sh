@@ -79,6 +79,20 @@ fi
 
 ARTIFACT="oxideclaw-${platform}"
 
+# --global writes to a root-owned dir. Root (e.g. a container image, which
+# often has no sudo) or an already-writable dir needs no elevation; decide
+# before downloading so a missing sudo fails fast.
+SUDO=""
+if [ "$GLOBAL" = true ] && [ "$(id -u)" -ne 0 ] && ! { [ -d "$INSTALL_DIR" ] && [ -w "$INSTALL_DIR" ]; }; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "--global installs to ${INSTALL_DIR}, which needs root or sudo." >&2
+    echo "Re-run as root, or install per-user without --global." >&2
+    exit 1
+  fi
+fi
+
 # ── Resolve version ──────────────────────────────────────────────────────────
 
 if [ "$VERSION" = "latest" ]; then
@@ -126,12 +140,8 @@ echo "Checksum verified."
 
 # ── Install ──────────────────────────────────────────────────────────────────
 
-mkdir -p "$INSTALL_DIR"
-if [ "$GLOBAL" = true ]; then
-  sudo install -m 755 "${TMPDIR}/oxideclaw" "${INSTALL_DIR}/oxideclaw"
-else
-  install -m 755 "${TMPDIR}/oxideclaw" "${INSTALL_DIR}/oxideclaw"
-fi
+$SUDO mkdir -p "$INSTALL_DIR"
+$SUDO install -m 755 "${TMPDIR}/oxideclaw" "${INSTALL_DIR}/oxideclaw"
 
 # ── Ensure PATH includes install dir ─────────────────────────────────────────
 
