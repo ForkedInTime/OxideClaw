@@ -1836,7 +1836,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 Some(why) => format!("{why}\nAutonomy stays {}.", config.autonomy),
                 None => {
                     config.autonomy = mode;
-                    format!("Autonomy set to: {mode}")
+                    match crate::permissions::autonomy::home_notice(mode, &config.cwd) {
+                        Some(why) => format!("Autonomy set to: {mode}\n{why}"),
+                        None => format!("Autonomy set to: {mode}"),
+                    }
                 }
             };
             app.entries.push(ChatEntry::system(msg));

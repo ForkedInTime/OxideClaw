@@ -666,8 +666,11 @@ impl QueryEngine {
 
                 // ── Permission gate ───────────────────────────────────
                 // Same decision the TUI makes; headless engines fail closed.
+                // Judged where the tool will write: an entered worktree,
+                // not the launch project.
+                let work_cwd = crate::tools::session_cwd(&self.tools, &self.config.cwd);
                 if let crate::permissions::GateOutcome::Denied(reason) =
-                    gate.decide(name, input).await
+                    gate.decide_in(name, input, &work_cwd).await
                 {
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),

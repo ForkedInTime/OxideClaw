@@ -143,7 +143,22 @@ impl PermissionGate {
         )
     }
 
+    /// [`Self::decide_in`] the gate's own project directory.
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
+        self.decide_in(tool_name, input, &self.state.cwd()).await
+    }
+
+    /// Decide a call whose relative paths the tool resolves against
+    /// `work_cwd`: the session's cwd, which `EnterWorktree` moves out of the
+    /// launch project into a sibling worktree. The autonomy mode judges the
+    /// call there, so `auto-edit` pre-approves only edits inside the tree the
+    /// tool actually writes under, with symlinks checked in that tree.
+    pub async fn decide_in(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        work_cwd: &std::path::Path,
+    ) -> GateOutcome {
         if let Some((_, reason)) = self
             .blocked
             .iter()
@@ -164,10 +179,11 @@ impl PermissionGate {
         // The mode moves a call between Allow and Ask, never out of Deny: a
         // deny rule refuses outright in every mode instead of becoming one
         // more routine approval.
-        let check = match (
-            check,
-            self.autonomy.verdict(tool_name, input, &self.state.cwd()),
-        ) {
+        let verdict = self.autonomy.verdict(tool_name, input, work_cwd);
+        // `suggest` turned an allowed edit into a prompt: no rule or flag
+        // can let it through without one.
+        let forced_prompt = matches!((&check, verdict), (CheckResult::Allow, Verdict::Prompt));
+        let check = match (check, verdict) {
             (CheckResult::Allow, Verdict::Prompt) => CheckResult::Ask,
             (CheckResult::Ask, Verdict::PreApproved) => CheckResult::Allow,
             (CheckResult::Allow, _) if self.ask_every_tool => CheckResult::Ask,
@@ -180,6 +196,13 @@ impl PermissionGate {
             CheckResult::Ask => match &self.asker {
                 // Only name remedies that grant permission: --allowed-tools
                 // filters the tool list but never authorises a call.
+                None if forced_prompt => GateOutcome::Denied(format!(
+                    "Permission denied: {tool_name} needs a prompt, which no interactive \
+                     session is attached to show: autonomy is \"{}\", where every edit \
+                     prompts whatever the rules allow. Set \"autonomy\" to \"ask\" or \
+                     looser to let permissions.allow rules through.",
+                    self.autonomy
+                )),
                 None => GateOutcome::Denied(format!(
                     "Permission denied: {tool_name} requires approval and no interactive \
                      session is attached. Allow it with permissions.allow in settings.json \
@@ -641,6 +664,54 @@ mod tests {
         assert_eq!(asker.asked().len(), 1, "the edit must have prompted");
     }
 
+    /// After `EnterWorktree` the tools resolve relative paths in a sibling
+    /// worktree outside the launch project. The gate judged them against the
+    /// launch project, so a relative Write was "inside the project" (and its
+    /// symlinks checked there) while the file landed elsewhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_edit_judges_edits_where_the_session_writes() {
+        let launch = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // In the worktree only: a symlink out of it.
+        std::os::unix::fs::symlink(outside.path(), worktree.path().join("out")).unwrap();
+        let w = |p: &str| json!({"file_path": p, "content": "x"});
+        let launch_dir = launch.path().to_path_buf();
+        let asks = |work: &std::path::Path, input: serde_json::Value| {
+            let (work, launch_dir) = (work.to_path_buf(), launch_dir.clone());
+            async move {
+                let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+                let g = PermissionGate::new(
+                    PermissionState::new(false, &[], &[]).with_cwd(&launch_dir),
+                    Autonomy::AutoEdit,
+                    Some(asker.clone() as Arc<dyn PermissionAsker>),
+                );
+                assert_eq!(
+                    g.decide_in("Write", &input, &work).await,
+                    GateOutcome::Allowed
+                );
+                asker.asked().len()
+            }
+        };
+        let wt = worktree.path();
+        assert_eq!(asks(wt, w("src/a.rs")).await, 0, "inside the worktree");
+        let abs = wt.join("src/b.rs").to_string_lossy().into_owned();
+        assert_eq!(asks(wt, w(&abs)).await, 0, "absolute, inside the worktree");
+        assert_eq!(
+            asks(wt, w("out/x.rs")).await,
+            1,
+            "symlink out of the worktree"
+        );
+        assert_eq!(
+            asks(wt, w("Cargo.toml")).await,
+            1,
+            "protected in the worktree"
+        );
+        // Judged in the launch project, where `out` is a plain directory.
+        assert_eq!(asks(launch.path(), w("out/x.rs")).await, 0);
+    }
+
     /// `-p` has no one to ask: auto-edit runs in-project edits, commands are
     /// still refused, and full-auto without its sandbox is `ask`.
     #[tokio::test]
@@ -663,6 +734,29 @@ mod tests {
             g.decide("Bash", &bash).await,
             GateOutcome::Denied(_)
         ));
+
+        // `suggest` refuses every edit in -p, and must not point at rules
+        // or flags that cannot get past it.
+        cfg.autonomy = Autonomy::Suggest;
+        cfg.permissions_allow = vec!["Write".into()];
+        cfg.dangerously_skip_permissions = true;
+        let GateOutcome::Denied(why) = PermissionGate::headless(&cfg).decide("Write", &edit).await
+        else {
+            panic!("suggest let an edit through with no one to ask");
+        };
+        assert!(
+            why.contains("\"suggest\"") && why.contains("\"ask\""),
+            "{why}"
+        );
+        assert!(!why.contains("--dangerously-skip-permissions"), "{why}");
+        cfg.autonomy = Autonomy::Ask;
+        cfg.dangerously_skip_permissions = false;
+        let GateOutcome::Denied(why) = PermissionGate::headless(&cfg).decide("Bash", &bash).await
+        else {
+            panic!("an unallowed command ran with no one to ask");
+        };
+        assert!(why.contains("permissions.allow"), "{why}");
+        cfg.permissions_allow.clear();
 
         cfg.autonomy = Autonomy::FullAuto;
         cfg.sandbox_enabled = false;

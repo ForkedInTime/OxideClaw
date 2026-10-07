@@ -50,6 +50,17 @@ impl PolicyEngine {
 
     /// Evaluate a call to `tool_name` with `input` against the policy.
     pub fn evaluate(&self, tool_name: &str, input: &serde_json::Value) -> ApprovalDecision {
+        self.evaluate_in(tool_name, input, &self.project)
+    }
+
+    /// [`Self::evaluate`] for a call whose relative paths resolve against
+    /// `work_cwd` (an entered worktree), where the mode judges it.
+    pub fn evaluate_in(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        work_cwd: &std::path::Path,
+    ) -> ApprovalDecision {
         let listed = |list: &[String]| list.iter().any(|t| t == tool_name);
         // Deny takes highest priority, then the host's explicit ask.
         if listed(&self.policy.deny) {
@@ -63,7 +74,7 @@ impl PolicyEngine {
         if listed(&self.policy.ask) {
             return ApprovalDecision::Ask;
         }
-        let verdict = self.autonomy.verdict(tool_name, input, &self.project);
+        let verdict = self.autonomy.verdict(tool_name, input, work_cwd);
         if verdict == Verdict::Prompt {
             return ask;
         }

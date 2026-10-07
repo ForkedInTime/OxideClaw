@@ -808,7 +808,12 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         // and always-allow recording. Same code path as
                         // sub-agents and headless engines.
                         // The gate's text, so a blocked tool says why.
-                        if let GateOutcome::Denied(reason) = gate.decide(name, input).await {
+                        // Judged where the tool will write: an entered
+                        // worktree, not the launch project.
+                        let work_cwd = crate::tools::session_cwd(&tools, &config.cwd);
+                        if let GateOutcome::Denied(reason) =
+                            gate.decide_in(name, input, &work_cwd).await
+                        {
                             let _ = tx.send(AppEvent::ToolResult {
                                 is_error: true,
                                 text: reason.clone(),

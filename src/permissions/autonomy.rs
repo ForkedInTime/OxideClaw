@@ -19,7 +19,8 @@ pub enum Autonomy {
     /// Edits inside the project are pre-approved, except to the files in
     /// [`is_protected`]; commands still prompt.
     AutoEdit,
-    /// Everything is pre-approved. Only with a bwrap or firejail sandbox.
+    /// Everything is pre-approved. Only with the bwrap sandbox, and never
+    /// when started from `$HOME` or above it.
     FullAuto,
 }
 
@@ -39,7 +40,8 @@ pub const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// Directories whose contents a pre-approved edit must not touch: VCS and
 /// agent state, CI, git hook managers, and what auto-fix's runners execute
-/// or load (`.cargo/config.toml` runners, the `.venv` ruff/pytest).
+/// or load (`.cargo/config.toml` runners, the `.venv` ruff/pytest, the
+/// `node_modules` eslint and the packages `npm test` loads).
 const PROTECTED_DIRS: &[&str] = &[
     ".git",
     ".claude",
@@ -54,6 +56,7 @@ const PROTECTED_DIRS: &[&str] = &[
     ".githooks",
     ".cargo",
     ".venv",
+    "node_modules",
 ];
 
 /// File names (lowercase) that are hook, CI or build/test-runner config: an
@@ -136,8 +139,8 @@ impl Autonomy {
         self.rank() >= other.rank()
     }
 
-    /// The mode the gates apply: `full-auto` without a usable bwrap or
-    /// firejail sandbox (see [`full_auto_blocker`]) is `ask`.
+    /// The mode the gates apply: `full-auto` without a usable bwrap
+    /// sandbox (see [`full_auto_blocker`]) is `ask`.
     pub fn effective(self, sandbox_enabled: bool, sandbox_mode: &str) -> Self {
         if self == Self::FullAuto && full_auto_blocker(sandbox_enabled, sandbox_mode).is_some() {
             Self::Ask
@@ -167,7 +170,10 @@ impl Autonomy {
             // Leaving plan mode is the user's review of the plan, not a
             // permission: full-auto does not answer it for them.
             Self::FullAuto if tool == "ExitPlanMode" => Verdict::Rules,
-            Self::FullAuto if edit && project_holds_home(project, home) => Verdict::Rules,
+            // The sandbox binds the cwd read-write: from `$HOME` a
+            // pre-approved command could rewrite every dotfile, so full-auto
+            // pre-approves nothing there, edits or commands.
+            Self::FullAuto if project_holds_home(project, home) => Verdict::Rules,
             Self::FullAuto => Verdict::PreApproved,
             _ => Verdict::Rules,
         }
@@ -181,30 +187,42 @@ impl std::fmt::Display for Autonomy {
 }
 
 /// Why `full-auto` cannot be used with this sandbox setting, or `None` when
-/// it can: it needs bwrap or firejail, enabled and installed, on Linux.
+/// it can: it needs bwrap, enabled and installed, on Linux. firejail does
+/// not qualify: its default profile leaves all of `$HOME` writable, where
+/// bwrap binds only the project directory read-write.
 pub fn full_auto_blocker(sandbox_enabled: bool, sandbox_mode: &str) -> Option<String> {
     if !cfg!(target_os = "linux") {
         return Some(
             "full-auto is unavailable on this platform until a native sandbox ships: it \
-             requires bwrap or firejail, which exist only on Linux."
+             requires bwrap, which exists only on Linux."
                 .into(),
         );
     }
-    if !sandbox_enabled || !crate::sandbox::mode_enforces_isolation(sandbox_mode) {
+    if !sandbox_enabled || sandbox_mode != "bwrap" {
         return Some(
-            "full-auto requires the bwrap or firejail sandbox: run /sandbox enable bwrap \
-             (or firejail) first."
+            "full-auto requires the bwrap sandbox, which leaves only the project \
+             directory writable (firejail and strict do not): run /sandbox enable bwrap \
+             first."
                 .into(),
         );
     }
-    let installed = match sandbox_mode {
-        "bwrap" => crate::sandbox::bwrap_available(),
-        _ => crate::sandbox::firejail_available(),
-    };
-    (!installed).then(|| {
+    (!crate::sandbox::bwrap_available())
+        .then(|| "full-auto requires the bwrap sandbox, but bwrap is not installed.".into())
+}
+
+/// The line saying `mode` pre-approves nothing because the session started
+/// in `$HOME` (or above it), or `None` when that does not apply.
+pub fn home_notice(mode: Autonomy, project: &Path) -> Option<String> {
+    home_notice_with(mode, project, dirs::home_dir().as_deref())
+}
+
+fn home_notice_with(mode: Autonomy, project: &Path, home: Option<&Path>) -> Option<String> {
+    let mode_preapproves = matches!(mode, Autonomy::AutoEdit | Autonomy::FullAuto);
+    (mode_preapproves && project_holds_home(project, home)).then(|| {
         format!(
-            "full-auto requires the {sandbox_mode} sandbox, but {sandbox_mode} is not \
-             installed."
+            "Autonomy \"{mode}\" pre-approves nothing here: started in your home directory \
+             (or above it), every edit and command prompts as under \"ask\". Start \
+             oxideclaw in a project directory to use it."
         )
     })
 }
@@ -278,12 +296,15 @@ fn path_preapproved(file: &str, project: &Path, real_root: &Path) -> bool {
 
 /// Whether `rel` (relative to the project root) is a file `auto-edit` still
 /// prompts for. Compared case-insensitively, as macOS and Windows resolve
-/// `.GIT/hooks` to `.git/hooks`.
+/// `.GIT/hooks` to `.git/hooks`, and as Windows names them: Win32 drops
+/// trailing dots and spaces (`Makefile.` creates `Makefile`), and
+/// `name:stream` writes an alternate data stream of `name`. Applied on every
+/// platform; elsewhere it only makes a few odd names prompt.
 pub fn is_protected(rel: &Path) -> bool {
     let names: Vec<String> = rel
         .components()
         .filter_map(|c| match c {
-            Component::Normal(n) => Some(n.to_string_lossy().to_ascii_lowercase()),
+            Component::Normal(n) => Some(windows_name(&n.to_string_lossy())),
             _ => None,
         })
         .collect();
@@ -297,6 +318,13 @@ pub fn is_protected(rel: &Path) -> bool {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| PROTECTED_EXTENSIONS.contains(&e))
+}
+
+/// `name` as Windows resolves it, lowercased: any `:stream` suffix cut and
+/// trailing dots and spaces dropped.
+fn windows_name(name: &str) -> String {
+    let name = name.split(':').next().unwrap_or_default();
+    name.trim_end_matches(['.', ' ']).to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -355,8 +383,19 @@ mod tests {
             "Directory.Build.targets",
             ".cargo/config.toml",
             ".venv/bin/pytest",
+            "node_modules/.bin/eslint",
+            "web/node_modules/eslint/bin/eslint.js",
             "eslint.config.mjs",
             ".GIT/hooks/pre-push",
+            // Win32 drops trailing dots and spaces; `:` names a data stream.
+            "tests/conftest.py.",
+            "Makefile.",
+            "Makefile .",
+            ".mcp.json. ",
+            ".env.",
+            ".git./hooks/pre-commit",
+            "package.json:stream",
+            "Cargo.toml::$DATA",
         ] {
             assert!(is_protected(Path::new(p)), "{p}");
         }
@@ -367,6 +406,8 @@ mod tests {
             "src/environment.rs",
             "tests/test_app.py",
             "Cargo.lock",
+            "src/node_modules.rs",
+            "notes.txt.",
         ] {
             assert!(!is_protected(Path::new(p)), "{p}");
         }
@@ -446,6 +487,21 @@ mod tests {
                     root.display()
                 );
             }
+            // The sandbox binds the cwd read-write, so from $HOME a command
+            // reaches every dotfile: full-auto pre-approves none either.
+            for tool in ["Bash", "PowerShell", "mcp__fs__write_file"] {
+                assert_eq!(
+                    Autonomy::FullAuto.verdict_with_home(
+                        tool,
+                        &json!({"command": "echo x >> ~/.bashrc"}),
+                        root,
+                        Some(h)
+                    ),
+                    Verdict::Rules,
+                    "{tool} in {}",
+                    root.display()
+                );
+            }
         }
         // A project inside $HOME is fine.
         let proj = h.join("proj");
@@ -454,6 +510,24 @@ mod tests {
             Autonomy::AutoEdit.verdict_with_home("Write", &write("a.rs"), &proj, Some(h)),
             Verdict::PreApproved
         );
+        assert_eq!(
+            Autonomy::FullAuto.verdict_with_home("Bash", &json!({"command": "ls"}), &proj, Some(h)),
+            Verdict::PreApproved
+        );
+
+        // The user is told, for the two modes that would pre-approve.
+        for mode in Autonomy::ALL {
+            let line = home_notice_with(mode, h, Some(h));
+            let preapproves = matches!(mode, Autonomy::AutoEdit | Autonomy::FullAuto);
+            assert_eq!(line.is_some(), preapproves, "{mode}");
+            if let Some(line) = line {
+                assert!(
+                    line.contains(mode.as_str()) && line.contains("home"),
+                    "{line}"
+                );
+            }
+            assert_eq!(home_notice_with(mode, &proj, Some(h)), None, "{mode}");
+        }
     }
 
     #[test]
@@ -492,7 +566,14 @@ mod tests {
 
     #[test]
     fn full_auto_falls_back_to_ask_without_an_isolating_sandbox() {
-        for (enabled, mode) in [(false, "bwrap"), (true, "strict"), (true, "nonsense")] {
+        // firejail's default profile leaves $HOME writable: not isolation
+        // enough for unprompted commands.
+        for (enabled, mode) in [
+            (false, "bwrap"),
+            (true, "strict"),
+            (true, "firejail"),
+            (true, "nonsense"),
+        ] {
             assert!(
                 full_auto_blocker(enabled, mode).is_some(),
                 "{enabled} {mode}"

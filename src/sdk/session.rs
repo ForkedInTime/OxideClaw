@@ -729,7 +729,10 @@ impl SdkSession {
                 continue;
             }
 
-            let decision = self.policy_engine.evaluate(name, input);
+            // The mode judges the call where the tool will write: an
+            // entered worktree, not the launch project.
+            let work_cwd = crate::tools::session_cwd(&self.tools, &self.config.cwd);
+            let decision = self.policy_engine.evaluate_in(name, input, &work_cwd);
 
             match decision {
                 ApprovalDecision::Deny => {

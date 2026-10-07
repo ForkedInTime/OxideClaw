@@ -238,9 +238,10 @@ pub(super) fn cmd_autonomy(args: &str, current: crate::permissions::Autonomy) ->
              or [a]lways covers them\n  \
              auto-edit — edits inside the project run without a prompt, except to .git/,\n              \
              .claude/, .env*, .mcp.json, CI, hook and build/test config (package.json,\n              \
-             Cargo.toml, Makefile, conftest.py, ...); never when started in $HOME;\n              \
-             commands still prompt\n  \
-             full-auto — nothing prompts; needs /sandbox enable bwrap (or firejail), Linux only\n\n\
+             Cargo.toml, Makefile, conftest.py, node_modules/, ...); never when\n              \
+             started in $HOME; commands still prompt\n  \
+             full-auto — nothing prompts; needs /sandbox enable bwrap (not firejail),\n              \
+             Linux only; never when started in $HOME\n\n\
              permissions.deny rules hold in every mode. /autonomy lasts for this session;\n\
              set \"autonomy\" in settings.json to keep it.\n\n\
              Usage: /autonomy <mode>"

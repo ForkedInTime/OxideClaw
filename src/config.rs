@@ -1011,7 +1011,20 @@ impl Config {
                 )),
             }
         }
+        // A --settings file is not ours to rewrite, and may predate the
+        // modes meaning what they say: say what its value does now.
+        if let Some(a) = self
+            .flag_settings
+            .as_ref()
+            .and_then(|f| f.autonomy.as_deref())
+            && let Some(line) = legacy_autonomy_notice(a, "--settings")
+        {
+            self.settings_notices.push(line);
+        }
         if let Some(why) = self.fall_back_from_full_auto() {
+            self.settings_notices.push(why);
+        }
+        if let Some(why) = crate::permissions::autonomy::home_notice(self.autonomy, &self.cwd) {
             self.settings_notices.push(why);
         }
         self.memory_auto_capture = settings.memory_auto_capture.unwrap_or(false);
@@ -1170,14 +1183,13 @@ impl Config {
         self.apply_auto_fix_settings(settings.auto_fix.as_ref());
     }
 
-    /// Settings files for `self.cwd`, with `--settings` on top.
     /// The autonomy mode the permission gates apply.
     pub fn effective_autonomy(&self) -> crate::permissions::Autonomy {
         self.autonomy
             .effective(self.sandbox_enabled, &self.sandbox_mode)
     }
 
-    /// `full-auto` without a usable bwrap or firejail sandbox falls back to
+    /// `full-auto` without a usable bwrap sandbox falls back to
     /// `ask`; returns the line that says so, or `None` when nothing changed.
     pub fn fall_back_from_full_auto(&mut self) -> Option<String> {
         use crate::permissions::{Autonomy, autonomy::full_auto_blocker};
@@ -1189,6 +1201,7 @@ impl Config {
         Some(format!("Autonomy is \"ask\", not \"full-auto\": {why}"))
     }
 
+    /// Settings files for `self.cwd`, with `--settings` on top.
     pub(crate) fn load_settings(&self) -> crate::settings::Settings {
         let settings = crate::settings::Settings::load_in(&self.global_config_dir(), &self.cwd);
         match &self.flag_settings {
@@ -1808,69 +1821,146 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
     }
 }
 
-/// Read a JSON settings file for a read-modify-write. Missing or empty is
-/// `{}`; anything that does not parse as an object is an error, because
-/// writing back `{}` plus one key would silently delete the user's config.
 /// Left in the config dir once its `settings.json` `autonomy` has been
 /// carried over to the modes that pre-approve; its presence stops a second
 /// run from rewriting a value chosen since.
 pub const AUTONOMY_MIGRATION_MARKER: &str = ".autonomy-modes";
 
+/// Where the marker for Claude Code's `~/.claude` goes when that is the
+/// config dir: it is never written, so the data dir, or the cache dir when
+/// the data dir is inside it too.
+const CLAUDE_DIR_AUTONOMY_MARKER: &str = ".autonomy-modes-claude";
+
 /// Before the modes meant what they say, `auto-edit` (the old default) and
 /// `full-auto` both prompted for every edit. Once per config dir, a stored
 /// value of either becomes `ask`, so upgrading switches nobody to
 /// unprompted edits. Returns the line telling the user, if anything changed
-/// or could not be changed. Claude Code's `~/.claude` is never written.
+/// or could not be changed. Claude Code's `~/.claude` (named with
+/// `$OXIDECLAW_CONFIG_DIR`) is never written: a legacy value there is left
+/// as it is and reported once.
 pub fn migrate_legacy_autonomy(config_dir: &Path) -> Option<String> {
-    if Config::claude_code_dir().is_some_and(|c| same_dir(config_dir, &c)) {
-        return None;
-    }
-    let marker = config_dir.join(AUTONOMY_MIGRATION_MARKER);
-    if marker.exists() {
+    let Some(claude) = Config::claude_code_dir().filter(|c| same_dir(config_dir, c)) else {
+        let marker = config_dir.join(AUTONOMY_MIGRATION_MARKER);
+        return migrate_legacy_autonomy_in(config_dir, true, Some(&marker));
+    };
+    let outside = |d: &PathBuf| !d.starts_with(&claude) && !same_dir(d, &claude);
+    let marker = Some(Config::data_dir())
+        .filter(outside)
+        .or_else(|| Config::cache_dir().filter(outside))
+        .map(|d| d.join(CLAUDE_DIR_AUTONOMY_MARKER));
+    migrate_legacy_autonomy_in(config_dir, false, marker.as_deref())
+}
+
+/// [`migrate_legacy_autonomy`] with the choices made: whether `settings.json`
+/// may be rewritten, and the marker that says it is done (`None`: report
+/// on every run, for want of anywhere to record it).
+fn migrate_legacy_autonomy_in(
+    config_dir: &Path,
+    rewrite: bool,
+    marker: Option<&Path>,
+) -> Option<String> {
+    if marker.is_some_and(Path::exists) {
         return None;
     }
     let path = config_dir.join("settings.json");
-    // Unreadable: the load reports it, and this runs again once it is fixed.
-    let mut json = read_json_object(&path).ok()?;
+    let mut json = match read_json_object(&path) {
+        Ok(json) => json,
+        // Not marked, so this runs again once the file is fixed. The load
+        // reports the error; say here what an old mode in it would mean.
+        Err(e) => {
+            let raw = std::fs::read(&path)
+                .map(|b| String::from_utf8_lossy(&b).to_ascii_lowercase())
+                .unwrap_or_default();
+            return (raw.contains("auto-edit") || raw.contains("full-auto")).then(|| {
+                format!(
+                    "Warning: could not check the \"autonomy\" in {}: {e}. \"auto-edit\" \
+                     and \"full-auto\" used to prompt for every edit and now pre-approve \
+                     them; set \"autonomy\": \"ask\" to keep the prompts.",
+                    path.display()
+                )
+            });
+        }
+    };
     let legacy = json
         .get("autonomy")
         .and_then(|v| v.as_str())
         .map(|a| a.trim().to_string())
-        .filter(|a| a.eq_ignore_ascii_case("auto-edit") || a.eq_ignore_ascii_case("full-auto"));
+        .filter(|a| is_legacy_autonomy(a));
     let mut line = None;
     if let Some(old) = legacy {
-        json["autonomy"] = serde_json::Value::String("ask".into());
-        let written = serde_json::to_string_pretty(&json)
-            .map_err(std::io::Error::other)
-            .and_then(|text| write_json_atomic(&path, &text));
-        if let Err(e) = written {
-            return Some(format!(
-                "Warning: could not update \"autonomy\": \"{old}\" in {}: {e}. It now \
-                 pre-approves edits; set it to \"ask\" to keep being asked.",
+        if !rewrite {
+            line = legacy_autonomy_notice(&old, &path.display().to_string()).map(|l| {
+                format!("{l} (OxideClaw never changes files in Claude Code's ~/.claude.)")
+            });
+        } else {
+            json["autonomy"] = serde_json::Value::String("ask".into());
+            let written = serde_json::to_string_pretty(&json)
+                .map_err(std::io::Error::other)
+                .and_then(|text| write_json_atomic(&path, &text));
+            if let Err(e) = written {
+                return Some(format!(
+                    "Warning: could not update \"autonomy\": \"{old}\" in {}: {e}. It now \
+                     pre-approves edits; set it to \"ask\" to keep being asked.",
+                    path.display()
+                ));
+            }
+            line = Some(format!(
+                "Autonomy: \"{old}\" in {} used to prompt for every edit and now \
+                 pre-approves them, so it was changed to \"ask\", which keeps the prompts. \
+                 Run /autonomy for what each mode does.",
                 path.display()
             ));
         }
-        line = Some(format!(
-            "Autonomy: \"{old}\" in {} used to prompt for every edit and now \
-             pre-approves them, so it was changed to \"ask\", which keeps the prompts. \
-             Run /autonomy for what each mode does.",
-            path.display()
-        ));
     }
-    let _ = std::fs::create_dir_all(config_dir).and_then(|()| std::fs::write(&marker, ""));
+    if let Some(marker) = marker {
+        let _ = marker
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(marker, ""));
+    }
     line
 }
 
+/// `auto-edit` or `full-auto`: the modes that prompted for every edit
+/// before they meant what they say.
+fn is_legacy_autonomy(value: &str) -> bool {
+    let v = value.trim();
+    v.eq_ignore_ascii_case("auto-edit") || v.eq_ignore_ascii_case("full-auto")
+}
+
+/// The line saying what a legacy `value` from `source`, applied as written,
+/// does now, or `None` for any other value.
+fn legacy_autonomy_notice(value: &str, source: &str) -> Option<String> {
+    let old = value.trim();
+    let now = match crate::permissions::Autonomy::parse(old)? {
+        crate::permissions::Autonomy::AutoEdit => "runs edits inside the project without a prompt",
+        crate::permissions::Autonomy::FullAuto => {
+            "runs every edit and command without a prompt (under the bwrap sandbox)"
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "Autonomy: \"{old}\" in {source} used to prompt for every edit and now {now}. Set \
+         it to \"ask\" to keep the prompts; /autonomy lists the modes."
+    ))
+}
+
+/// Read a JSON settings file for a read-modify-write. Missing or empty is
+/// `{}`; anything that does not parse as an object is an error, because
+/// writing back `{}` plus one key would silently delete the user's config.
+/// A leading BOM (Notepad, PowerShell 5.1) is skipped, as the settings
+/// loader skips it; the file is written back without one.
 pub fn read_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     if text.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    match serde_json::from_str::<serde_json::Value>(&text) {
+    match serde_json::from_str::<serde_json::Value>(text) {
         Ok(v) if v.is_object() => Ok(v),
         Ok(_) => anyhow::bail!(
             "{} is not a JSON object; not overwriting it",
@@ -3386,7 +3476,118 @@ mod autonomy_migration_tests {
         assert!(!bad.path().join(AUTONOMY_MIGRATION_MARKER).exists());
     }
 
-    /// `full-auto` without bwrap/firejail starts as `ask` and says why;
+    /// Notepad and PowerShell 5.1 save settings.json with a BOM. The loader
+    /// skips it, so the migration must too: it returned early and left an
+    /// `auto-edit` that now pre-approved edits without a word.
+    #[test]
+    fn a_bom_prefixed_settings_file_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            "\u{feff}{\"autonomy\": \"auto-edit\", \"model\": \"m\"}",
+        )
+        .unwrap();
+        let line = migrate_legacy_autonomy(dir.path()).expect("the user is told");
+        assert!(
+            line.contains("auto-edit") && line.contains("\"ask\""),
+            "{line}"
+        );
+        assert_eq!(autonomy_in(dir.path()), "ask");
+        assert_eq!(read_json_object(&path).unwrap()["model"], "m");
+        assert!(dir.path().join(AUTONOMY_MIGRATION_MARKER).exists());
+
+        // A file this reader still cannot parse, naming a legacy mode: a
+        // warning, and no marker so it runs again once fixed.
+        let bad = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bad.path().join("settings.json"),
+            r#"{"autonomy": "auto-edit",}"#,
+        )
+        .unwrap();
+        let line = migrate_legacy_autonomy(bad.path()).expect("a warning");
+        assert!(
+            line.contains("could not check") && line.contains("ask"),
+            "{line}"
+        );
+        assert!(!bad.path().join(AUTONOMY_MIGRATION_MARKER).exists());
+    }
+
+    /// Claude Code's `~/.claude` (an `$OXIDECLAW_CONFIG_DIR` that names it)
+    /// is never written, but a legacy value there must still be reported,
+    /// once, with the marker kept outside it.
+    #[test]
+    fn a_legacy_value_in_a_dir_we_may_not_write_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let text = r#"{"autonomy": "full-auto"}"#;
+        std::fs::write(&path, text).unwrap();
+        let marker = data.path().join("state").join(CLAUDE_DIR_AUTONOMY_MARKER);
+        let line = migrate_legacy_autonomy_in(dir.path(), false, Some(&marker)).expect("reported");
+        assert!(
+            line.contains("full-auto") && line.contains("~/.claude") && line.contains("\"ask\""),
+            "{line}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "never written"
+        );
+        assert!(!dir.path().join(AUTONOMY_MIGRATION_MARKER).exists());
+        assert!(marker.exists());
+        assert_eq!(
+            migrate_legacy_autonomy_in(dir.path(), false, Some(&marker)),
+            None
+        );
+        // Nowhere to record it: reported every run.
+        for _ in 0..2 {
+            assert!(migrate_legacy_autonomy_in(dir.path(), false, None).is_some());
+        }
+    }
+
+    /// A `--settings` file is never rewritten; one carrying the old default
+    /// `auto-edit` (or `full-auto`) gets a notice saying what it does now.
+    #[test]
+    fn flag_settings_with_a_legacy_mode_are_explained() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let load = |flag: &str| {
+            let mut c = Config {
+                cwd: project.path().into(),
+                config_dir_override: Some(home.path().into()),
+                flag_settings: Some(serde_json::from_str(flag).unwrap()),
+                ..Config::default()
+            };
+            c.load_project();
+            c
+        };
+        let c = load(r#"{"autonomy": "auto-edit"}"#);
+        assert_eq!(c.autonomy, Autonomy::AutoEdit);
+        assert!(
+            c.settings_notices
+                .iter()
+                .any(|n| n.contains("--settings") && n.contains("without a prompt")),
+            "{:?}",
+            c.settings_notices
+        );
+        for quiet in [r#"{"autonomy": "ask"}"#, r#"{"model": "m"}"#] {
+            let c = load(quiet);
+            assert!(
+                c.settings_notices.is_empty(),
+                "{quiet}: {:?}",
+                c.settings_notices
+            );
+        }
+        assert!(
+            legacy_autonomy_notice(" Full-Auto ", "x")
+                .unwrap()
+                .contains("bwrap")
+        );
+        assert_eq!(legacy_autonomy_notice("suggest", "x"), None);
+    }
+
+    /// `full-auto` without bwrap starts as `ask` and says why;
     /// unknown names are reported instead of silently meaning something.
     #[test]
     fn loading_full_auto_without_its_sandbox_falls_back_to_ask() {
