@@ -205,7 +205,8 @@ fn registry_install_cmd(
             .arg(plugins_dir)
             .arg(spec);
     }
-    cmd.current_dir(plugins_dir);
+    // Esc aborts the install task; the package manager must die with it.
+    cmd.current_dir(plugins_dir).kill_on_drop(true);
     cmd
 }
 
@@ -285,6 +286,7 @@ pub(super) async fn plugin_install_task(
             let install_output = tokio::process::Command::new(pm)
                 .args(["install"])
                 .current_dir(&clone_dir)
+                .kill_on_drop(true)
                 .output()
                 .await
                 .map_err(|e| anyhow::anyhow!("{pm} install failed: {e}"))?;
@@ -303,6 +305,7 @@ pub(super) async fn plugin_install_task(
                 let _ = tokio::process::Command::new(pm)
                     .args(["run", "build"])
                     .current_dir(&clone_dir)
+                    .kill_on_drop(true)
                     .output()
                     .await;
             }

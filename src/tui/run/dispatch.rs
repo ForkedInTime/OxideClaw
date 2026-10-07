@@ -1087,7 +1087,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.start_loading();
             app.scroll_to_bottom();
             let tx2 = tx.clone();
-            tokio::spawn(plugin_install_task(spec, tx2));
+            app.side_task = Some(tokio::spawn(plugin_install_task(spec, tx2)).abort_handle());
         }
         CommandAction::ReloadSettings => {
             // Hot-reload settings.json without restarting
@@ -1200,7 +1200,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.start_loading();
             app.scroll_to_bottom();
             let tx2 = tx.clone();
-            tokio::spawn(upgrade_check_task(tx2));
+            app.side_task = Some(tokio::spawn(upgrade_check_task(tx2)).abort_handle());
         }
         CommandAction::RunInstall(cmd) => {
             // Signal run_loop to handle this — it needs terminal/cols/rows access.

@@ -518,6 +518,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             if let Some(handle) = app.api_task.take() {
                 handle.abort();
             }
+            if let Some(handle) = app.side_task.take() {
+                handle.abort();
+            }
             if let Some(history) = app.turn_history.take() {
                 adopt_turn_history(
                     &history,

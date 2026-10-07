@@ -634,6 +634,9 @@ pub struct App {
     pub tool_stream_buf: String,
     /// Handle to the current API task — used to abort it on Escape
     pub api_task: Option<tokio::task::AbortHandle>,
+    /// The running /plugin install or /upgrade check, which also shows the
+    /// spinner. Esc aborts it like a turn.
+    pub side_task: Option<tokio::task::AbortHandle>,
     /// The running API turn's history so far. Only `Done` hands the turn's
     /// messages back, so a turn that is cancelled, stopped by /budget or
     /// fails is recovered from here instead of losing its tool calls.
@@ -823,6 +826,7 @@ impl App {
             vim_pending: None,
             tool_stream_buf: String::new(),
             api_task: None,
+            side_task: None,
             turn_history: None,
             theme: "dark".to_string(),
             voice_recording: false,
@@ -904,6 +908,16 @@ impl App {
     pub fn finish_loading(&mut self) {
         self.is_loading = false;
         self.turn_start = None;
+    }
+
+    /// The spinner belongs to whatever is running now: a Done that arrives
+    /// after Esc and a new prompt must not end that turn.
+    fn finish_side_task(&mut self) {
+        self.side_task = None;
+        if self.api_task.is_none() && self.browse_progress_rx.is_none() {
+            self.finish_loading();
+        }
+        self.scroll_to_bottom();
     }
 
     // ── Input helpers ─────────────────────────────────────────────────────────
@@ -1487,15 +1501,11 @@ impl App {
                 } else {
                     self.entries.push(ChatEntry::error(message));
                 }
-                self.is_loading = false;
-                self.turn_start = None;
-                self.scroll_to_bottom();
+                self.finish_side_task();
             }
             AppEvent::UpgradeCheckDone { message } => {
                 self.entries.push(ChatEntry::system(message));
-                self.is_loading = false;
-                self.turn_start = None;
-                self.scroll_to_bottom();
+                self.finish_side_task();
             }
         }
     }
@@ -1757,6 +1767,33 @@ mod background_event_tests {
             "Esc could no longer cancel the turn"
         );
         turn.abort();
+    }
+
+    /// Esc during /plugin install, then a new prompt: the install's late
+    /// Done must not end that turn.
+    #[tokio::test]
+    async fn side_task_done_leaves_a_newer_turn_alone() {
+        let (mut app, turn) = app_in_turn();
+        app.apply(AppEvent::PluginInstallDone {
+            success: true,
+            message: "installed".into(),
+        });
+        app.apply(AppEvent::UpgradeCheckDone {
+            message: "v1".into(),
+        });
+        assert!(app.is_loading && app.turn_start.is_some());
+        assert!(app.api_task.is_some());
+        turn.abort();
+
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.start_loading();
+        let task = tokio::spawn(std::future::pending::<()>());
+        app.side_task = Some(task.abort_handle());
+        app.apply(AppEvent::UpgradeCheckDone {
+            message: "v1".into(),
+        });
+        assert!(!app.is_loading && app.side_task.is_none());
+        task.abort();
     }
 
     #[tokio::test]
