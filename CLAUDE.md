@@ -2,7 +2,7 @@
 
 ## Mission
 
-OxideClaw is a single-binary coding agent (Claude, Ollama, OpenAI-compatible backends). It is positioned as a **provider-neutral agent, not a "Rust port of Claude Code"** — that term is owned by leak clones since 2026-03-31. The goal is to win on the features nobody else ships (zero-setup code index, cost router, auto-fix loop, voice cloning, autonomous browser, /undo + /redo on invisible git refs) and match the field on the rest. OpenCode also has /undo + /redo (git-based); Codewhale has a cloud TTS tool; keep claims scoped. Full competitive analysis is in the private `.secret/` folder (not checked into the public repo).
+OxideClaw is a single-binary coding agent (Claude, Ollama, OpenAI-compatible backends). It is positioned as a **provider-neutral agent, not a "Rust port of Claude Code"** — that term is owned by leak clones since 2026-03-31. Features no other agent ships together: a built-in zero-setup code index, local cloned-voice replies (optional add-on), and a mid-session `/budget` hard stop, with any provider including Ollama. Match the field on the rest. The router, auto-fix loop, browser agent, worktree agents and `/undo` + `/redo` all exist elsewhere (Copilot CLI, Aider, Gemini CLI, OpenCode, Kilo, Cline), so keep every claim scoped to what the code does. Full competitive analysis is in the private `.secret/` folder (not checked into the public repo).
 
 ## Role
 
@@ -15,48 +15,46 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 - No "Great question!" or "Is there anything else?" — answer and stop.
 - One sentence if that's all it takes.
 
-## Competitive Strategy — REVISED 2026-04-07
+## Competitive Strategy — REVISED 2026-10-07
 
 ### SHIPPED (1-5 + Phase 1 robustness)
 1. **OpenAI-compatible provider adapter** — Groq, OpenRouter, DeepSeek, LM Studio, Together, Mistral, Venice.ai, OpenAI, generic openai-compat.
-2. **Local Codebase RAG Indexing** — tree-sitter AST parsing + SQLite FTS5 semantic search. Zero setup. 8 languages.
-3. **Smart Model Router + Cost Dashboard** — Auto-detect task complexity, route simple→Haiku/Ollama, complex→Opus. Real-time cost tracking. `/budget $5`.
-4. **Background Parallel Agents in Git Worktrees** — `oxideclaw spawn "refactor auth"` runs an agent in an isolated worktree while you keep working.
-5. **Self-voice model** — XTTS v2 voice cloning. No competitor has TTS at all.
+2. **Local Codebase RAG Indexing** — tree-sitter AST parsing + SQLite FTS5 (BM25) full-text search over symbol chunks. No embeddings. Zero setup. 8 languages.
+3. **Smart Model Router + Cost Dashboard** — Opt-in router (`/router on`, off by default): a keyword/length heuristic picks a tier, and the default tiers are Claude models. Real-time cost tracking. `/budget $5` hard stop, settable mid-session, counts sub-agents.
+4. **Background Parallel Agents in Git Worktrees** — `oxideclaw spawn "refactor auth"` runs an agent in an isolated worktree while you keep working. Table stakes (Claude Code, Codex, Copilot CLI have it).
+5. **Self-voice model** — XTTS v2 voice cloning. The only coding agent with a built-in record-your-voice flow that speaks every reply locally. Optional add-on: needs Python; the XTTS weights are non-commercial.
 
 ### PHASE 1 ROBUSTNESS (shipped 2026-04-08)
-- **AGENTS.md support** — Industry-standard agent config alongside CLAUDE.md (3,518 upvotes on claude-code)
-- **XDG Base Directory compliance** — $XDG_CONFIG_HOME/oxideclaw, $XDG_DATA_HOME, $XDG_CACHE_HOME with backward compat
+- **AGENTS.md + CLAUDE.md (table stakes)** — Both read and merged into the system prompt.
+- **XDG directories (partial)** — Code index in `$XDG_CACHE_HOME/oxideclaw`, sessions in `$XDG_DATA_HOME/oxideclaw` when set. Config still defaults to `~/.claude` (shared with Claude Code) until the config namespace change lands; do not call it XDG-compliant before then.
 - **Context usage % in status bar** — Real-time ctx % + color-coded warnings (yellow at 70%, red at 90%)
 - **Always-show-thinking** — Display model reasoning in TUI when enabled (`showThinkingSummaries: true`)
 - **Spinner style toggle** — `spinnerStyle: "themed" | "minimal" | "silent"` in settings.json
 - **/reload settings** — Hot-reload settings.json + CLAUDE.md + AGENTS.md without restart
 
 ### PHASE 2 (shipping now)
-- **Auto-fix loop (2026-04-10)** — Post-edit lint + tests + feedback-driven retries replace the old rollback revert. Anti-cheat protected. `autoFixLoop` in settings.json, `autoRollback` alias kept for backward compat.
-- **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn working-tree snapshots on private shadow refs (`refs/oxideclaw/sessions/<id>`). New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. Other tools with undo pollute history; OxideClaw's shadow refs are invisible to `git log`/`branch`/`status`. No competitor has `/redo`.
+- **Auto-fix loop (2026-04-10)** — Post-edit lint + tests + feedback-driven retries replace the old rollback revert. Anti-cheat protected. `autoFixLoop` in settings.json, `autoRollback` alias kept for backward compat. Aider has the same loop; ours detects lint and test runners with zero config.
+- **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn snapshots on private git refs in your own repo (`refs/oxideclaw/sessions/<id>`): no commits on your branches, hidden from default `log`/`branch`/`status`, HEAD and index never moved. They do show in `git log --all` and are pushed by `--mirror`. New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. `/redo` after `/undo`, like OpenCode and Kilo; Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI have no redo.
 8. **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `oxideclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
 
 ### NEXT UP
-6. **SDK/headless sidecar** — NDJSON stdio binary for editor embedding. Uncontested.
-7. **Phase 2 robustness** — Diff review, self-update, shell completions.
+1. **Trust gate + config namespace** — Repo code (lint/test runners) runs only in `/trust`ed projects; config moves to its own directory.
+2. **Agent Skills + index hygiene** — Load the standard `<name>/SKILL.md` layout; tighten what the code index walks and sends.
+3. **ACP `session/load`** — Resume sessions from the editor.
+4. **MCP 2026-07-28** — Move off the `2024-11-05` protocol revision.
+5. **Task-success benchmark** — Measure finished tasks, not just startup time.
 
 ### THE PITCH
-"A single 19 MB static Rust binary that indexes your codebase, routes tasks to the cheapest model, runs parallel agents in worktrees, speaks in your voice, shows you every token spent, and works offline via Ollama. Sub-50ms startup. Zero dependencies. Zero flickering. XDG-compliant. AGENTS.md + CLAUDE.md."
+"A ~19 MB static Rust binary that indexes your repo, caps your spend, and works offline with Ollama. No account, no gateway, no telemetry: your keys go straight to your provider."
 
-No tool in the world offers this combination. That's the salivation.
+## Our Advantages Over Other Rust Ports (updated 2026-10-07)
 
-## Our Advantages Over Other Rust Ports (updated 2026-04-07)
-
-- XTTS v2 voice cloning + voice model picker (others: NO TTS)
-- OpenAI-compat providers actually working (others: stubs for many)
-- Working Ollama tool execution (others: broken / partial)
+- XTTS v2 voice cloning + voice model picker
 - Pre-built binaries + install.sh + CI/CD
-- Zero-flicker inline TUI (Claude Code has 676-upvote flicker bug)
 - Interactive pickers (help, model, session, voice)
 - Custom spinner with 260+ themed verbs
 
-See `.secret/` for detailed competitor status and exploit vectors (private, not in public repo).
+See `.secret/` for detailed competitor status (private, not in public repo).
 
 ## Architecture
 
