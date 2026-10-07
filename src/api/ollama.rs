@@ -117,7 +117,12 @@ pub async fn probe_ollama(base_url: &str, budget: std::time::Duration) -> Ollama
     }
 
     let deadline = tokio::time::Instant::now() + budget;
-    let client = Client::new();
+    let Ok(client) = Client::builder()
+        .dns_resolver(Arc::new(DetachedResolver))
+        .build()
+    else {
+        return OllamaProbe::Unreachable;
+    };
     let tags = async {
         let resp = client
             .get(format!("{base_url}/api/tags"))
@@ -149,16 +154,61 @@ pub async fn probe_ollama(base_url: &str, budget: std::time::Duration) -> Ollama
             resp.json::<ShowResponse>().await.ok()?.capabilities
         }
     };
-    let lookups = futures_util::future::join_all(names.iter().map(|n| show(n)));
-    let caps = tokio::time::timeout_at(deadline, lookups)
-        .await
-        .unwrap_or_else(|_| vec![None; names.len()]);
+    // The deadline is per lookup: one model Ollama is slow to describe must
+    // not throw away what the others already reported.
+    let caps = futures_util::future::join_all(names.iter().map(|n| {
+        let lookup = show(n);
+        async move {
+            tokio::time::timeout_at(deadline, lookup)
+                .await
+                .ok()
+                .flatten()
+        }
+    }))
+    .await;
     let models: Vec<(String, Option<Vec<String>>)> = names.into_iter().zip(caps).collect();
     match pick_tool_model(&models) {
         Some(m) => OllamaProbe::Model(m.to_string()),
         // Only embedding models: nothing that can hold a conversation.
         None => OllamaProbe::NoModels,
     }
+}
+
+/// Resolves host names on a detached thread. reqwest's default resolver runs
+/// `getaddrinfo` under `spawn_blocking`, and dropping the runtime waits for
+/// that: an `OLLAMA_HOST` name with DNS down would hold the missing-credential
+/// error at exit until the resolver times out, long after the probe gave up.
+/// A detached thread is simply abandoned when the process exits.
+struct DetachedResolver;
+
+impl reqwest::dns::Resolve for DetachedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = resolve_detached(move || {
+                use std::net::ToSocketAddrs;
+                // Port 0: the connector fills in the URL's port.
+                (host.as_str(), 0).to_socket_addrs().map(Iterator::collect)
+            })
+            .await?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Run a blocking `lookup` on its own detached thread and await its result.
+async fn resolve_detached<F>(lookup: F) -> std::io::Result<Vec<std::net::SocketAddr>>
+where
+    F: FnOnce() -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ollama-probe-dns".into())
+        .spawn(move || {
+            let _ = tx.send(lookup());
+        })?;
+    rx.await
+        .unwrap_or_else(|_| Err(std::io::Error::other("DNS lookup thread died")))
 }
 
 /// The model to start with: one whose reported capabilities include
@@ -336,6 +386,9 @@ pub(crate) mod fake_server {
         Caps(HashMap<&'static str, Vec<&'static str>>),
         /// Never answers: the lookups must give up at the budget.
         Hang,
+        /// Answers like `Caps`, except for the one model whose lookup never
+        /// returns, as when Ollama is busy loading it.
+        HangOn(&'static str, HashMap<&'static str, Vec<&'static str>>),
     }
 
     /// Serve `models` until the test ends. Returns the base URL and the
@@ -360,12 +413,15 @@ pub(crate) mod fake_server {
                     let body = if line.starts_with("GET /api/tags") {
                         tags
                     } else if line.starts_with("POST /api/show") {
-                        let Show::Caps(caps) = show else {
-                            return std::future::pending::<()>().await;
-                        };
                         let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
                         let v: serde_json::Value = serde_json::from_str(body).unwrap();
-                        match caps.get(v["model"].as_str().unwrap_or("")) {
+                        let model = v["model"].as_str().unwrap_or("");
+                        let caps = match show {
+                            Show::Caps(caps) => caps,
+                            Show::HangOn(slow, caps) if slow != model => caps,
+                            _ => return std::future::pending::<()>().await,
+                        };
+                        match caps.get(model) {
                             Some(c) => serde_json::json!({ "capabilities": c }).to_string(),
                             None => "{}".to_string(),
                         }
@@ -550,6 +606,63 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(got, OllamaProbe::Model("llama3.1:8b".into()));
+    }
+
+    #[tokio::test]
+    async fn probe_keeps_the_capabilities_that_arrived_when_one_lookup_hangs() {
+        let caps = HashMap::from([
+            ("qwen3-coder:30b", vec!["completion"]),
+            ("granite3.3:8b", vec!["completion", "tools"]),
+        ]);
+        let (url, _) = fake_server::start(
+            &["qwen3-coder:30b", "llama3.1:8b", "granite3.3:8b"],
+            Show::HangOn("llama3.1:8b", caps),
+        )
+        .await;
+        let start = Instant::now();
+        let got = probe_ollama(&url, Duration::from_millis(400)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+        // Not the family list's `qwen3-coder` or `llama3.1`: Ollama said
+        // granite has tools before the deadline.
+        assert_eq!(got, OllamaProbe::Model("granite3.3:8b".into()));
+    }
+
+    #[test]
+    fn a_hung_dns_lookup_does_not_hold_up_runtime_shutdown() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let start = Instant::now();
+        let got = rt.block_on(async {
+            let lookup = resolve_detached(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(vec![])
+            });
+            tokio::time::timeout(Duration::from_millis(50), lookup).await
+        });
+        assert!(got.is_err(), "the lookup should still be running");
+        drop(rt);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "runtime drop waited for the lookup: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_detached_resolver_resolves_localhost() {
+        use reqwest::dns::Resolve;
+        let addrs: Vec<_> = DetachedResolver
+            .resolve("localhost".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert!(addrs.iter().any(|a| a.ip().is_loopback()), "{addrs:?}");
     }
 
     #[tokio::test]
