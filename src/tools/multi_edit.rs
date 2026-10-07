@@ -38,9 +38,11 @@ impl Tool for MultiEditTool {
     fn description(&self) -> &str {
         "Apply multiple file edits in a single call. Each edit is an exact \
         string replacement (old_string → new_string) in the specified file. \
-        All edits are applied sequentially; if any edit fails the tool reports \
-        the error but continues with remaining edits. Use this instead of \
-        multiple Edit calls when making related changes across one or more files."
+        Edits run in order, and later edits see the results of earlier ones. \
+        Writes are all-or-nothing per file: if any edit to a file fails, none \
+        of the edits to that file are written and all of them must be resent; \
+        edits to other files are still written. Use this instead of multiple \
+        Edit calls when making related changes across one or more files."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -99,12 +101,6 @@ impl Tool for MultiEditTool {
             std::collections::BTreeSet::new();
 
         for (i, edit) in input.edits.iter().enumerate() {
-            if edit.old_string.is_empty() {
-                let label = format!("[{}/{}] {}", i + 1, input.edits.len(), edit.file_path);
-                results.push(format!("{label} ✗ old_string must not be empty"));
-                had_error = true;
-                continue;
-            }
             let path = match resolve_path(&edit.file_path, &ctx.cwd) {
                 Ok(p) => p,
                 Err(e) => {
@@ -115,6 +111,15 @@ impl Tool for MultiEditTool {
                 }
             };
             let label = format!("[{}/{}] {}", i + 1, input.edits.len(), path.display());
+
+            // Checked once the path is known so the file is marked failed:
+            // skipping it bare let sibling edits to the same file commit.
+            if edit.old_string.is_empty() {
+                results.push(format!("{label} ✗ old_string must not be empty"));
+                had_error = true;
+                failed_files.insert(path.clone());
+                continue;
+            }
 
             if let Some(err) = super::check_protected_path(&path)
                 .or_else(|| super::check_write_escape(&path, &ctx.cwd))

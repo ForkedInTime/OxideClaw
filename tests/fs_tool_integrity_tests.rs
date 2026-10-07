@@ -49,6 +49,33 @@ async fn multi_edit_writes_nothing_to_a_file_when_any_edit_to_it_fails() {
     );
 }
 
+/// An empty old_string was rejected before the path was resolved, so the file
+/// was never marked failed and its other edits were still written.
+#[tokio::test]
+async fn multi_edit_empty_old_string_blocks_the_other_edits_to_that_file() {
+    let td = TempDir::new().unwrap();
+    let ctx = ToolContext::new(PathBuf::from(td.path()));
+    std::fs::write(td.path().join("a.txt"), "foo\n").unwrap();
+
+    let out = MultiEditTool
+        .execute(
+            json!({"edits": [
+                {"file_path": "a.txt", "old_string": "foo", "new_string": "bar"},
+                {"file_path": "a.txt", "old_string": "",    "new_string": "x"}
+            ]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.is_error, "got: {}", text(&out));
+    assert!(text(&out).contains("no changes written"), "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("a.txt")).unwrap(),
+        "foo\n"
+    );
+}
+
 /// A failure in one file must not discard good edits to another — the
 /// granularity is per file, not per batch.
 #[tokio::test]
