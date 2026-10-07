@@ -97,12 +97,16 @@ impl MemoryStore {
     /// never adds `.claude/memory.db` to a project that has none. Writes
     /// (`/memory add`, auto-capture) go through `open`.
     pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
-        let legacy = cwd.join(".claude").join("rag.db");
-        if memory_db_path(cwd).is_file() || legacy.is_file() {
-            Self::open(cwd).map(Some)
-        } else {
-            Ok(None)
+        // Free when there is no rag.db. Another tool's rag.db, or an old
+        // index with no memories, leaves no memory.db behind.
+        crate::rag::retire_legacy_db(cwd);
+        let path = memory_db_path(cwd);
+        if !path.is_file() {
+            return Ok(None);
         }
+        let store = Self::open_at(&path)?;
+        crate::rag::ensure_git_excluded_once(cwd);
+        Ok(Some(store))
     }
 
     /// Open (or create) the memory database at `path`.

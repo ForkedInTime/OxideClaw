@@ -477,12 +477,10 @@ pub fn index_project(db: &RagDb, project: &Path, force: bool) -> Result<IndexRes
 
         files_scanned += 1;
 
-        // Get relative path for storage
-        let rel_path = path
-            .strip_prefix(&project)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        // Relative path for storage, `/`-separated on every OS so the keys
+        // (and search results) are the same everywhere. Old `\` keys from a
+        // Windows index are not `seen`, so the prune below drops them.
+        let rel_path = slash_path(path.strip_prefix(&project).unwrap_or(path));
         seen.insert(rel_path.clone());
 
         let meta = match path.metadata() {
@@ -599,6 +597,14 @@ pub fn index_project(db: &RagDb, project: &Path, force: bool) -> Result<IndexRes
         chunks_added,
         elapsed_ms: start.elapsed().as_millis(),
     })
+}
+
+/// `p` with its components joined by `/`, whatever the OS separator.
+pub(crate) fn slash_path(p: &Path) -> String {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]

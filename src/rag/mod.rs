@@ -10,7 +10,8 @@
 /// neither is known. A project is the enclosing git work tree (see
 /// `project_root`), walked from its root so `.gitignore`,
 /// `.git/info/exclude`, the global excludes file and `.ignore` all apply,
-/// and only a work tree below `$HOME` is indexed on its own.
+/// and the filesystem root, `$HOME` and its ancestors are never indexed (a
+/// work tree at `$HOME`, such as a dotfiles repo, is never the project).
 ///
 /// Paid tools charge for this; we do it locally, for free, in a single binary
 /// with zero external dependencies.
@@ -252,7 +253,7 @@ impl IndexTarget {
     pub fn display_path(&self, stored: &str) -> String {
         let abs = self.root.join(stored);
         match abs.strip_prefix(&self.cwd) {
-            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Ok(rel) => indexer::slash_path(rel),
             Err(_) => abs.to_string_lossy().into_owned(),
         }
     }
@@ -362,7 +363,15 @@ pub(crate) fn retire_legacy_db(project: &Path) {
     if !legacy.is_file() {
         return;
     }
-    match retire_legacy_db_at(&legacy, &crate::memory::memory_db_path(project)) {
+    let memory_db = crate::memory::memory_db_path(project);
+    let res = retire_legacy_db_at(&legacy, &memory_db);
+    // Retirement can leave the project its first memory.db (TUI startup
+    // reaches here through IndexTarget::open, not MemoryStore::open), and a
+    // `git add -A` must not commit it.
+    if memory_db.is_file() {
+        ensure_git_excluded_once(project);
+    }
+    match res {
         Ok(true) => info!("removed the old code index {}", legacy.display()),
         Ok(false) => debug!("left {} alone: not an OxideClaw index", legacy.display()),
         Err(e) => warn!("could not retire {}: {e}", legacy.display()),
@@ -391,7 +400,12 @@ fn retire_legacy_db_at(legacy: &Path, memory_db: &Path) -> Result<bool> {
             return Ok(false);
         }
         // Memories are the user's own words, not regenerable like chunks.
-        if has("memory") {
+        // An empty table (every old index had one) creates no memory.db.
+        if has("memory")
+            && conn.query_row("SELECT EXISTS(SELECT 1 FROM memory)", [], |r| {
+                r.get::<_, bool>(0)
+            })?
+        {
             crate::memory::MemoryStore::open_at(memory_db)?.import_from(&conn)?;
         }
     }
@@ -1217,6 +1231,70 @@ mod tests {
         assert!(!legacy.exists());
         assert_eq!(mem.count().unwrap(), 1);
         assert!(crate::memory::memory_db_path(proj.path()).is_file());
+    }
+
+    /// Retiring the old index from TUI startup (IndexTarget::open, not
+    /// MemoryStore::open) wrote `.claude/memory.db` without the git exclude,
+    /// so the next `git add -A` committed it.
+    #[test]
+    fn retiring_the_legacy_index_excludes_the_memory_db_it_leaves() {
+        let proj = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(proj.path())
+                .output()
+                .unwrap()
+        };
+        if !git(&["init", "-q"]).status.success() {
+            return; // no git here
+        }
+        let legacy = write_legacy_db(proj.path());
+        retire_legacy_db(proj.path());
+        assert!(!legacy.exists());
+        assert!(crate::memory::memory_db_path(proj.path()).is_file());
+        let exclude =
+            std::fs::read_to_string(proj.path().join(".git").join("info").join("exclude"))
+                .unwrap_or_default();
+        assert!(
+            exclude.lines().any(|l| l.trim() == GIT_EXCLUDE_PATTERN),
+            "{exclude}"
+        );
+        let status = String::from_utf8(git(&["status", "--porcelain"]).stdout).unwrap();
+        assert!(!status.contains(".claude"), "{status}");
+    }
+
+    /// An old index with no memories is just deleted: no memory.db appears.
+    #[test]
+    fn legacy_index_without_memories_leaves_no_memory_db() {
+        let proj = TempDir::new().unwrap();
+        let legacy = proj.path().join(".claude").join("rag.db");
+        RagDb::open_at(&legacy).unwrap();
+        crate::memory::MemoryStore::open_at(&legacy).unwrap();
+        assert!(
+            crate::memory::MemoryStore::open_existing(proj.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!legacy.exists());
+        assert!(!crate::memory::memory_db_path(proj.path()).exists());
+    }
+
+    /// Reading memories next to someone else's `.claude/rag.db` must not
+    /// create `.claude/memory.db` (or touch git's exclude file).
+    #[test]
+    fn open_existing_creates_nothing_beside_a_foreign_rag_db() {
+        let proj = TempDir::new().unwrap();
+        let path = proj.path().join(".claude").join("rag.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "my notes, not a database\n").unwrap();
+        assert!(
+            crate::memory::MemoryStore::open_existing(proj.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.is_file());
+        assert!(!crate::memory::memory_db_path(proj.path()).exists());
     }
 
     /// A `.claude/rag.db` that is not OxideClaw's (another tool's SQLite
