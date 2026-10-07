@@ -384,16 +384,17 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 
 | ACP method / update | OxideClaw behaviour |
 |---------------------|---------------------|
-| `initialize` | Protocol version 1. Advertises `embeddedContext`; no image/audio prompts, no `loadSession`, no HTTP/SSE MCP. |
+| `initialize` | Protocol version 1. Advertises `embeddedContext`, `loadSession` and `mcpCapabilities.http`; no image/audio prompts, no `sse` MCP (the transport MCP deprecated). With `oxideclaw --no-session-persistence acp`, `loadSession` is `false`. |
 | `authenticate` | No-op. Credentials come from the normal chain (`ANTHROPIC_API_KEY`, `ant` profile, settings). |
-| `session/new` | Requires an existing `cwd`; the session reads that directory's CLAUDE.md, AGENTS.md, GEMINI.md and project settings. Stdio `mcpServers` entries are recorded on the session config. |
+| `session/new` | Requires an existing `cwd`; the session reads that directory's CLAUDE.md, AGENTS.md, GEMINI.md and project settings. `mcpServers` entries of the stdio and `http` (Streamable HTTP, with the client's `headers`) kinds are started for the session; their tools ask for permission like any other. The conversation is saved after every turn, in the same sessions directory as the TUI's. |
+| `session/load` | Loads a saved session by id (one made over ACP, or a TUI or `-p` session), replays it as `session/update`s in order (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call` then its `tool_call_update` with the result), answers `{}`, and then takes prompts with the full history. Takes `cwd` and `mcpServers` like `session/new`. An unknown id is `-32002` (resource not found). |
 | `session/prompt` | Text, `resource_link`, and embedded text resources are flattened into one prompt. Answers with `stopReason`: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` (budget exceeded), or `cancelled`. |
 | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call` (kind + title + raw input), `tool_call_update` (status + output summary). |
 | `session/request_permission` | Sent for every tool the SDK policy marks *ask* (the default for tools not on an allow list). Options: allow once / reject once. A `cancelled` outcome denies the tool. |
 | `session/cancel` | Stops the in-flight model stream and skips queued tools; the prompt is answered with `cancelled`. |
-| `session/load`, `session/set_mode` | Not supported (`-32601`). |
+| `session/set_mode` | Not supported (`-32601`). |
 
-Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, unknown session, media prompt), `-32000` when a prompt is already running, `-32601` unsupported method.
+Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, prompt for an unknown session, media prompt), `-32002` when `session/load` names no saved session, `-32000` when a prompt is already running (including a `session/load` of a session mid-prompt), `-32601` unsupported method.
 
 ---
 

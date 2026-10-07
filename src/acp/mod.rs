@@ -6,10 +6,12 @@
 //! module only translates between ACP messages and SDK notifications.
 //!
 //! Supported: `initialize`, `authenticate` (no-op, no auth needed),
-//! `session/new` (with stdio MCP servers), `session/prompt`, `session/cancel`,
-//! `session/update` streaming, and `session/request_permission` for tools
-//! the policy marks as ask. Not supported (advertised as such):
-//! `session/load`, image/audio prompts, HTTP/SSE MCP transports.
+//! `session/new` and `session/load` (with stdio and `http` MCP servers),
+//! `session/prompt`, `session/cancel`, `session/update` streaming, and
+//! `session/request_permission` for tools the policy marks as ask. Sessions
+//! are saved after each turn in the sessions directory the TUI uses, so
+//! `session/load` also opens TUI sessions. Not supported (advertised as
+//! such): image/audio prompts and the deprecated `sse` MCP transport.
 
 pub mod rpc;
 pub mod server;

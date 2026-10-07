@@ -9,6 +9,8 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 /// ACP-reserved range starts at -32000; we use it for "turn already running".
 pub const BUSY: i64 = -32000;
+/// ACP `ResourceNotFound`: `session/load` names no saved session.
+pub const RESOURCE_NOT_FOUND: i64 = -32002;
 
 /// A decoded inbound message.
 #[derive(Debug, Clone, PartialEq)]

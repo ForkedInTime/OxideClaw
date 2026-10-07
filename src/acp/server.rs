@@ -2,14 +2,18 @@
 //! per ACP session. See the module docs in `acp/mod.rs` for scope.
 
 use super::rpc::{self, Incoming, RpcError};
+use crate::api::types::{ContentBlock, Message, Role, ToolResultContent};
 use crate::config::Config;
+use crate::mcp::types::{HttpServerConfig, McpServerConfig, StdioServerConfig};
 use crate::sdk::protocol::{Capabilities, Policy, SdkNotification};
 use crate::sdk::session::{CancelSignal, SdkSession, TurnEnd};
 use crate::sdk::transport::stdio::{LineRead, spawn_line_reader};
 use crate::sdk::validate_session_cwd;
+use crate::session::Session;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -43,6 +47,8 @@ pub struct AcpServer;
 
 struct State {
     config: Config,
+    /// Where sessions are saved after each turn and `session/load` reads them.
+    sessions_dir: PathBuf,
     initialized: bool,
     sessions: HashMap<String, SessionHandle>,
     pending: HashMap<String, PendingPermission>,
@@ -52,8 +58,23 @@ struct State {
 }
 
 impl AcpServer {
-    /// Serve ACP over `reader`/`writer` until the reader hits EOF.
-    pub async fn run<R, W>(config: Config, reader: R, mut writer: W) -> Result<()>
+    /// Serve ACP over `reader`/`writer` until the reader hits EOF. Sessions
+    /// live in the normal sessions directory, shared with the TUI's /resume.
+    pub async fn run<R, W>(config: Config, reader: R, writer: W) -> Result<()>
+    where
+        R: AsyncBufRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin,
+    {
+        Self::serve(config, Config::sessions_dir(), reader, writer).await
+    }
+
+    /// `run`, saving and loading sessions in `sessions_dir`.
+    pub async fn serve<R, W>(
+        config: Config,
+        sessions_dir: PathBuf,
+        reader: R,
+        mut writer: W,
+    ) -> Result<()>
     where
         R: AsyncBufRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin,
@@ -62,6 +83,7 @@ impl AcpServer {
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TurnDone>();
         let mut st = State {
             config,
+            sessions_dir,
             initialized: false,
             sessions: HashMap::new(),
             pending: HashMap::new(),
@@ -152,18 +174,23 @@ impl State {
         match method {
             "initialize" => {
                 self.initialized = true;
-                Ok(vec![rpc::response(id, initialize_result())])
+                let load = !self.config.no_session_persistence;
+                Ok(vec![rpc::response(id, initialize_result(load))])
             }
             "authenticate" => Ok(vec![rpc::response(id, json!({}))]),
             "session/new" => {
-                if !self.initialized {
-                    return Err(RpcError::new(
-                        rpc::INVALID_REQUEST,
-                        "call initialize before session/new",
-                    ));
-                }
-                let sid = self.new_session(params).await?;
+                self.require_initialized(method)?;
+                let sid = self.start_session(params, None).await?;
                 Ok(vec![rpc::response(id, json!({"sessionId": sid}))])
+            }
+            // Advertised as unsupported: nothing is saved to load.
+            "session/load" if self.config.no_session_persistence => Err(RpcError::new(
+                rpc::METHOD_NOT_FOUND,
+                "session/load is off: sessions are not saved (--no-session-persistence)",
+            )),
+            "session/load" => {
+                self.require_initialized(method)?;
+                self.load_session(id, params).await
             }
             "session/prompt" => {
                 self.start_prompt(id, params)?;
@@ -176,7 +203,60 @@ impl State {
         }
     }
 
-    async fn new_session(&mut self, params: &Value) -> Result<String, RpcError> {
+    fn require_initialized(&self, method: &str) -> Result<(), RpcError> {
+        if self.initialized {
+            return Ok(());
+        }
+        Err(RpcError::new(
+            rpc::INVALID_REQUEST,
+            format!("call initialize before {method}"),
+        ))
+    }
+
+    /// `session/load`: replay the saved conversation as `session/update`s,
+    /// then answer, then take prompts on it like any other session.
+    async fn load_session(&mut self, id: &Value, params: &Value) -> Result<Vec<Value>, RpcError> {
+        let sid = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "sessionId is required"))?;
+        // Loading replaces a live copy; a turn still running would keep
+        // writing the transcript underneath the new one.
+        if self
+            .sessions
+            .get(sid)
+            .is_some_and(|h| h.prompt_id.is_some())
+        {
+            return Err(RpcError::new(
+                rpc::BUSY,
+                "a prompt is in progress for this session",
+            ));
+        }
+        if !Session::exists_in(&self.sessions_dir, sid) {
+            return Err(RpcError::new(
+                rpc::RESOURCE_NOT_FOUND,
+                format!("no saved session {sid}"),
+            ));
+        }
+        let (saved, history) = Session::resume_in(&self.sessions_dir, sid)
+            .await
+            .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
+        let mut frames: Vec<Value> = replay_updates(sid, &history)
+            .into_iter()
+            .map(|p| rpc::notification("session/update", p))
+            .collect();
+        self.start_session(params, Some((saved, history))).await?;
+        frames.push(rpc::response(id, json!({})));
+        Ok(frames)
+    }
+
+    /// Start a session for `session/new`, or for `session/load` with the
+    /// saved transcript and its history. Returns the session id.
+    async fn start_session(
+        &mut self,
+        params: &Value,
+        saved: Option<(Session, Vec<Message>)>,
+    ) -> Result<String, RpcError> {
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -186,56 +266,13 @@ impl State {
             .expect("Some(cwd) validates to Some(dir)");
         let mut cfg = self.config.clone();
         cfg.retarget_cwd(dir);
-        if let Some(servers) = params.get("mcpServers").and_then(Value::as_array) {
-            for s in servers {
-                let name = s.get("name").and_then(Value::as_str).unwrap_or("mcp");
-                match s.get("command").and_then(Value::as_str) {
-                    Some(command) => {
-                        let args = s
-                            .get("args")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_string)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let env = s
-                            .get("env")
-                            .and_then(Value::as_array)
-                            .map(|e| {
-                                e.iter()
-                                    .filter_map(|kv| {
-                                        Some((
-                                            kv.get("name")?.as_str()?.to_string(),
-                                            kv.get("value")?.as_str()?.to_string(),
-                                        ))
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        cfg.extra_mcp_servers.insert(
-                            name.to_string(),
-                            crate::mcp::types::McpServerConfig::Stdio(
-                                crate::mcp::types::StdioServerConfig {
-                                    command: command.to_string(),
-                                    args,
-                                    env,
-                                    disabled: false,
-                                },
-                            ),
-                        );
-                    }
-                    None => tracing::warn!("acp: ignoring non-stdio MCP server {name}"),
-                }
-            }
-        }
+        cfg.extra_mcp_servers.extend(mcp_servers(params));
         // Starting servers here stalls other sessions' updates for up to the
         // per-server startup timeout; acceptable for a once-per-session cost.
         let tools = crate::mcp::tools_for_config(&cfg).await;
+        let persist = !cfg.no_session_persistence;
         let (approval_in_tx, approval_in_rx) = mpsc::unbounded_channel();
-        let session = SdkSession::new(
+        let mut session = SdkSession::new(
             cfg,
             tools,
             Policy::default(),
@@ -245,6 +282,17 @@ impl State {
             approval_in_rx,
         )
         .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
+        let mut transcript = Transcript {
+            dir: self.sessions_dir.clone(),
+            file: None,
+            saved: 0,
+            rewrite: false,
+        };
+        if let Some((file, history)) = saved {
+            transcript.saved = history.len();
+            session.resume_history(file.id.clone(), history);
+            transcript.file = Some(file);
+        }
         let session_id = session.session_id.clone();
         let cancel = session.cancel_signal();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<String>();
@@ -257,11 +305,17 @@ impl State {
                     .execute_turn(prompt)
                     .await
                     .map_err(|e| format!("{e:#}"));
+                // Before the answer: a session/load sent right after it
+                // must find the whole turn on disk.
+                if persist {
+                    transcript.save(&mut session).await;
+                }
                 if done_tx.send((sid.clone(), r)).is_err() {
                     break;
                 }
             }
         });
+        // On a load this drops any live copy, whose task then ends.
         self.sessions.insert(
             session_id.clone(),
             SessionHandle {
@@ -461,16 +515,65 @@ fn update(session_id: &str, update: Value) -> Value {
     )
 }
 
+/// An ACP session's conversation on disk, in the sessions directory the TUI
+/// also uses, so `session/load` (or /resume) can continue it later.
+struct Transcript {
+    dir: PathBuf,
+    /// Created by the first save: a session never prompted leaves no file.
+    file: Option<Session>,
+    /// How many history messages are on disk.
+    saved: usize,
+    /// Compaction replaced saved messages: the next save rewrites the file.
+    rewrite: bool,
+}
+
+impl Transcript {
+    /// Save what the last turn added. A failure is logged and retried with
+    /// the next turn, as in the TUI.
+    async fn save(&mut self, session: &mut SdkSession) {
+        self.rewrite |= session.take_history_rewritten();
+        let history = session.history();
+        if !self.rewrite && history.len() <= self.saved {
+            return;
+        }
+        let file = match &mut self.file {
+            Some(f) => f,
+            None => match Session::create_in(&self.dir, session.session_id.clone()).await {
+                Ok(f) => self.file.insert(f),
+                Err(e) => {
+                    tracing::warn!("acp: could not save session {}: {e:#}", session.session_id);
+                    return;
+                }
+            },
+        };
+        let written = if self.rewrite {
+            file.overwrite(history).await
+        } else {
+            file.append(&history[self.saved..]).await
+        };
+        match written {
+            Ok(()) => {
+                self.saved = history.len();
+                self.rewrite = false;
+            }
+            Err(e) => tracing::warn!("acp: could not save session {}: {e:#}", session.session_id),
+        }
+    }
+}
+
 // ── pure translation helpers (unit-tested) ──────────────────────────────────
 
-/// The `initialize` result: what we can and cannot do.
-pub(crate) fn initialize_result() -> Value {
+/// The `initialize` result: what we can and cannot do. `load_session` is
+/// false when sessions are not saved (`--no-session-persistence`).
+pub(crate) fn initialize_result(load_session: bool) -> Value {
     json!({
         "protocolVersion": super::PROTOCOL_VERSION,
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": load_session,
             "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
-            "mcpCapabilities": {"http": false, "sse": false},
+            // `sse` is MCP's deprecated HTTP+SSE transport, which the MCP
+            // client does not speak; `http` is Streamable HTTP.
+            "mcpCapabilities": {"http": true, "sse": false},
         },
         "agentInfo": {"name": "oxideclaw", "title": "OxideClaw", "version": VERSION},
         "authMethods": [],
@@ -568,6 +671,143 @@ pub(crate) fn prompt_text(blocks: &Value) -> Result<String, RpcError> {
         return Err(RpcError::new(rpc::INVALID_PARAMS, "prompt is empty"));
     }
     Ok(text)
+}
+
+/// The `mcpServers` entries of `session/new` / `session/load` that we can
+/// start: stdio, and `http` (Streamable HTTP). Others, `sse` included, are
+/// skipped with a warning, as `mcpCapabilities` tells the client.
+pub(crate) fn mcp_servers(params: &Value) -> Vec<(String, McpServerConfig)> {
+    // `env` and `headers` are both arrays of {name, value}.
+    let pairs = |v: Option<&Value>| -> HashMap<String, String> {
+        v.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|kv| {
+                Some((
+                    kv.get("name")?.as_str()?.to_string(),
+                    kv.get("value")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    let entries = params.get("mcpServers").and_then(Value::as_array);
+    for s in entries.into_iter().flatten() {
+        let name = s.get("name").and_then(Value::as_str).unwrap_or("mcp");
+        let kind = s.get("type").and_then(Value::as_str);
+        let server = match (kind, s.get("command").and_then(Value::as_str)) {
+            (Some("http"), _) => match s.get("url").and_then(Value::as_str) {
+                Some(url) => McpServerConfig::Http(HttpServerConfig {
+                    url: url.to_string(),
+                    headers: pairs(s.get("headers")),
+                    disabled: false,
+                }),
+                None => {
+                    tracing::warn!("acp: ignoring HTTP MCP server {name} without a url");
+                    continue;
+                }
+            },
+            (None | Some("stdio"), Some(command)) => McpServerConfig::Stdio(StdioServerConfig {
+                command: command.to_string(),
+                args: s
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                env: pairs(s.get("env")),
+                disabled: false,
+            }),
+            (kind, _) => {
+                tracing::warn!(
+                    "acp: ignoring MCP server {name}: transport {} is not supported",
+                    kind.unwrap_or("stdio without a command")
+                );
+                continue;
+            }
+        };
+        out.push((name.to_string(), server));
+    }
+    out
+}
+
+/// `session/update` params that replay a saved conversation, in order:
+/// user text, the agent's text and thoughts, and each tool call followed
+/// by its result, shaped as a live turn reports them.
+pub(crate) fn replay_updates(session_id: &str, history: &[Message]) -> Vec<Value> {
+    let params = |u: Value| json!({"sessionId": session_id, "update": u});
+    let chunk = |kind: &str, text: &str| {
+        params(json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}}))
+    };
+    let mut out = Vec::new();
+    for msg in history {
+        for block in &msg.content {
+            match (&msg.role, block) {
+                // Retrieved code context rides in the user turn; the user
+                // never typed it.
+                (Role::User, ContentBlock::Text { text })
+                    if !text.trim().is_empty() && !text.starts_with("<codebase_context>") =>
+                {
+                    out.push(chunk("user_message_chunk", text));
+                }
+                (Role::Assistant, ContentBlock::Text { text }) if !text.trim().is_empty() => {
+                    out.push(chunk("agent_message_chunk", text));
+                }
+                (Role::Assistant, ContentBlock::Thinking { thinking, .. })
+                    if !thinking.trim().is_empty() =>
+                {
+                    out.push(chunk("agent_thought_chunk", thinking));
+                }
+                (Role::Assistant, ContentBlock::ToolUse { id, name, input }) => {
+                    out.push(params(json!({
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": id,
+                        "title": tool_title(name, input),
+                        "kind": tool_kind(name),
+                        "status": "in_progress",
+                        "rawInput": input,
+                    })));
+                }
+                (
+                    _,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    },
+                ) => {
+                    let text = content
+                        .iter()
+                        .map(|ToolResultContent::Text { text }| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push(params(json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_use_id,
+                        "status": if is_error.unwrap_or(false) { "failed" } else { "completed" },
+                        "content": [{"type": "content", "content": {"type": "text", "text": clip(&text, 500)}}],
+                    })));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// At most `max` bytes of `s`, cut on a char boundary and marked, the way
+/// a live tool result's summary is.
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 /// `None` = approved; `Some(reason)` = denied.
@@ -668,9 +908,9 @@ mod tests {
 
     #[test]
     fn initialize_advertises_exactly_what_we_support() {
-        let r = initialize_result();
+        let r = initialize_result(true);
         assert_eq!(r["protocolVersion"], json!(1));
-        assert_eq!(r["agentCapabilities"]["loadSession"], json!(false));
+        assert_eq!(r["agentCapabilities"]["loadSession"], json!(true));
         assert_eq!(
             r["agentCapabilities"]["promptCapabilities"]["image"],
             json!(false)
@@ -684,8 +924,8 @@ mod tests {
             json!(true)
         );
         assert_eq!(
-            r["agentCapabilities"]["mcpCapabilities"]["http"],
-            json!(false)
+            r["agentCapabilities"]["mcpCapabilities"],
+            json!({"http": true, "sse": false})
         );
         assert_eq!(r["agentInfo"]["name"], json!("oxideclaw"));
         assert_eq!(r["agentInfo"]["version"], json!(VERSION));
@@ -851,6 +1091,11 @@ mod tests {
 
     // ── server handshake over an in-memory pipe ──────────────────────────
 
+    /// Sessions go under the test's temp dir, never the user's.
+    fn sessions_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("sessions")
+    }
+
     fn test_config() -> (Config, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
@@ -874,11 +1119,21 @@ mod tests {
     }
 
     async fn drive_raw(cfg: Config, input: &[u8]) -> Vec<Value> {
+        let sessions = tempfile::tempdir().unwrap();
+        drive_in(cfg, sessions.path().to_path_buf(), input).await
+    }
+
+    async fn drive_in(cfg: Config, sessions: PathBuf, input: &[u8]) -> Vec<Value> {
         use tokio::io::AsyncReadExt;
         let (client, server) = tokio::io::duplex(1 << 20);
         let (srv_r, srv_w) = tokio::io::split(server);
         let (mut cli_r, mut cli_w) = tokio::io::split(client);
-        let task = tokio::spawn(AcpServer::run(cfg, tokio::io::BufReader::new(srv_r), srv_w));
+        let task = tokio::spawn(AcpServer::serve(
+            cfg,
+            sessions,
+            tokio::io::BufReader::new(srv_r),
+            srv_w,
+        ));
         cli_w.write_all(input).await.unwrap();
         // A dropped WriteHalf does not close a duplex; shutdown does.
         cli_w.shutdown().await.unwrap();
@@ -943,9 +1198,9 @@ mod tests {
     #[tokio::test]
     async fn unsupported_methods_are_method_not_found() {
         let (cfg, _dir) = test_config();
-        let load = json!({"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"x","cwd":"/"}}).to_string();
+        let mode = json!({"jsonrpc":"2.0","id":1,"method":"session/set_mode","params":{"sessionId":"x","modeId":"m"}}).to_string();
         let weird = json!({"jsonrpc":"2.0","id":2,"method":"does/not/exist"}).to_string();
-        let out = drive(cfg, &[init_line(), load, weird]).await;
+        let out = drive(cfg, &[init_line(), mode, weird]).await;
         assert_eq!(out[1]["error"]["code"], json!(rpc::METHOD_NOT_FOUND));
         assert_eq!(out[2]["error"]["code"], json!(rpc::METHOD_NOT_FOUND));
     }
@@ -1002,47 +1257,113 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// Ollama stand-in whose every reply is cut off at the token limit, so
-    /// each turn ends with an Error notification right before it returns.
-    async fn max_tokens_model() -> String {
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A loopback HTTP/1.1 server, one request per connection. `reply` gets
+    /// each raw request (head and body) and returns the response's content
+    /// type and body, or `None` for an empty 202. Every request is recorded.
+    async fn http_stub<F>(reply: F) -> (String, Seen)
+    where
+        F: Fn(&str) -> Option<(&'static str, String)> + Send + Sync + 'static,
+    {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let seen = Seen::default();
+        let log = seen.clone();
+        let reply = Arc::new(reply);
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = sock.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&buf);
-                    if let Some(end) = text.find("\r\n\r\n") {
-                        let len = text[..end]
-                            .lines()
-                            .find_map(|l| {
-                                let (k, v) = l.split_once(':')?;
-                                k.eq_ignore_ascii_case("content-length")
-                                    .then(|| v.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        if buf.len() >= end + 4 + len {
+                let (reply, log) = (reply.clone(), log.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
                             break;
                         }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
                     }
-                }
-                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                    let req = String::from_utf8_lossy(&buf).into_owned();
+                    let resp = match reply(&req) {
+                        Some((ctype, body)) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        None => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    log.lock().unwrap().push(req);
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), seen)
+    }
+
+    fn request_body(req: &str) -> &str {
+        req.split_once("\r\n\r\n").map_or("", |(_, b)| b)
+    }
+
+    /// The chat requests a model stub has seen, oldest first.
+    fn chat_requests(seen: &Seen) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /v1/chat/completions"))
+            .cloned()
+            .collect()
+    }
+
+    /// An OpenAI-style SSE stream of `chunks`.
+    fn sse(chunks: &[Value]) -> String {
+        let mut body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// Ollama stand-in that answers every chat request with `text`.
+    async fn text_model(text: &'static str) -> (String, Seen) {
+        http_stub(move |_| {
+            Some((
+                "text/event-stream",
+                sse(&[
+                    json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}]}),
+                ]),
+            ))
+        })
+        .await
+    }
+
+    /// Ollama stand-in whose every reply is cut off at the token limit, so
+    /// each turn ends with an Error notification right before it returns.
+    async fn max_tokens_model() -> String {
+        http_stub(|_| {
+            Some((
+                "text/event-stream",
+                sse(&[
+                    json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"length"}]}),
+                ]),
+            ))
+        })
+        .await
+        .0
     }
 
     /// The session task queues a turn's last updates and then its TurnDone
@@ -1058,7 +1379,12 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (srv_r, srv_w) = tokio::io::split(server);
         let (cli_r, mut cli_w) = tokio::io::split(client);
-        let task = tokio::spawn(AcpServer::run(cfg, tokio::io::BufReader::new(srv_r), srv_w));
+        let task = tokio::spawn(AcpServer::serve(
+            cfg,
+            sessions_in(&dir),
+            tokio::io::BufReader::new(srv_r),
+            srv_w,
+        ));
         let mut lines = tokio::io::BufReader::new(cli_r).lines();
         let mut next = async || -> Value {
             let l = tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
@@ -1113,6 +1439,7 @@ mod tests {
         let (done_tx, _d) = mpsc::unbounded_channel();
         let mut st = State {
             config: cfg,
+            sessions_dir: PathBuf::from("/nonexistent"),
             initialized: true,
             sessions: HashMap::new(),
             pending: HashMap::new(),
@@ -1173,7 +1500,12 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (srv_r, srv_w) = tokio::io::split(server);
         let (cli_r, mut cli_w) = tokio::io::split(client);
-        let task = tokio::spawn(AcpServer::run(cfg, tokio::io::BufReader::new(srv_r), srv_w));
+        let task = tokio::spawn(AcpServer::serve(
+            cfg,
+            sessions_in(&dir),
+            tokio::io::BufReader::new(srv_r),
+            srv_w,
+        ));
         let mut lines = tokio::io::BufReader::new(cli_r).lines();
         cli_w
             .write_all((init_line() + "\n").as_bytes())
@@ -1247,7 +1579,12 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (srv_r, srv_w) = tokio::io::split(server);
         let (cli_r, mut cli_w) = tokio::io::split(client);
-        let task = tokio::spawn(AcpServer::run(cfg, tokio::io::BufReader::new(srv_r), srv_w));
+        let task = tokio::spawn(AcpServer::serve(
+            cfg,
+            sessions_in(&dir),
+            tokio::io::BufReader::new(srv_r),
+            srv_w,
+        ));
         let mut lines = tokio::io::BufReader::new(cli_r).lines();
         cli_w
             .write_all((init_line() + "\n").as_bytes())
@@ -1285,5 +1622,523 @@ mod tests {
         cli_w.shutdown().await.unwrap();
         drop(cli_w);
         task.await.unwrap().unwrap();
+    }
+
+    // ── session/load and host-provided MCP servers ───────────────────────
+
+    /// One ACP client talking to a server over an in-memory pipe.
+    struct Client {
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        w: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl Client {
+        fn start(cfg: Config, sessions: PathBuf) -> Self {
+            use tokio::io::AsyncBufReadExt;
+            let (client, server) = tokio::io::duplex(1 << 20);
+            let (srv_r, srv_w) = tokio::io::split(server);
+            let (cli_r, w) = tokio::io::split(client);
+            let task = tokio::spawn(AcpServer::serve(
+                cfg,
+                sessions,
+                tokio::io::BufReader::new(srv_r),
+                srv_w,
+            ));
+            Self {
+                lines: tokio::io::BufReader::new(cli_r).lines(),
+                w,
+                task,
+            }
+        }
+
+        async fn send(&mut self, frame: Value) {
+            self.w
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn recv(&mut self) -> Value {
+            let l =
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.lines.next_line())
+                    .await
+                    .expect("no timeout")
+                    .unwrap()
+                    .expect("server closed");
+            serde_json::from_str(&l).unwrap()
+        }
+
+        /// Send request `id` and collect every frame up to its answer.
+        async fn call(&mut self, id: u64, method: &str, params: Value) -> (Vec<Value>, Value) {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+                .await;
+            let mut before = Vec::new();
+            loop {
+                let v = self.recv().await;
+                if v["id"] == json!(id) && v.get("method").is_none() {
+                    return (before, v);
+                }
+                before.push(v);
+            }
+        }
+
+        async fn init(&mut self) {
+            let (_, r) = self
+                .call(
+                    0,
+                    "initialize",
+                    json!({"protocolVersion":1,"clientCapabilities":{}}),
+                )
+                .await;
+            assert!(r.get("result").is_some(), "{r}");
+        }
+
+        async fn close(mut self) {
+            self.w.shutdown().await.unwrap();
+            drop(self.w);
+            self.task.await.unwrap().unwrap();
+        }
+    }
+
+    fn prompt(sid: &str, text: &str) -> Value {
+        json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]})
+    }
+
+    /// (sessionUpdate kind, text or toolCallId) of each replayed update.
+    fn update_summary(frames: &[Value]) -> Vec<(String, String)> {
+        frames
+            .iter()
+            .filter(|f| f["method"] == json!("session/update"))
+            .map(|f| {
+                let u = &f["params"]["update"];
+                let what = u["content"]["text"]
+                    .as_str()
+                    .or_else(|| u["toolCallId"].as_str())
+                    .unwrap_or_default();
+                (
+                    u["sessionUpdate"].as_str().unwrap().to_string(),
+                    what.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn text(role: Role, t: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    #[test]
+    fn host_mcp_servers_cover_stdio_and_http_but_not_sse() {
+        let params = json!({"mcpServers": [
+            {"name": "fs", "command": "/bin/fs-mcp", "args": ["--stdio"], "env": [{"name": "K", "value": "v"}]},
+            {"type": "http", "name": "api", "url": "https://mcp.example.com/mcp",
+             "headers": [{"name": "Authorization", "value": "Bearer t"}]},
+            {"type": "sse", "name": "old", "url": "https://mcp.example.com/sse", "headers": []},
+            {"type": "http", "name": "nourl", "headers": []},
+        ]});
+        let servers = mcp_servers(&params);
+        assert_eq!(servers.len(), 2, "{servers:?}");
+        match &servers[0] {
+            (name, McpServerConfig::Stdio(s)) => {
+                assert_eq!(name, "fs");
+                assert_eq!(s.command, "/bin/fs-mcp");
+                assert_eq!(s.args, vec!["--stdio".to_string()]);
+                assert_eq!(s.env.get("K").map(String::as_str), Some("v"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &servers[1] {
+            (name, McpServerConfig::Http(h)) => {
+                assert_eq!(name, "api");
+                assert_eq!(h.url, "https://mcp.example.com/mcp");
+                assert_eq!(
+                    h.headers.get("Authorization").map(String::as_str),
+                    Some("Bearer t")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(mcp_servers(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn replay_skips_injected_code_context_and_clips_tool_output() {
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "fix it".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "<codebase_context>\nfn a() {}\n</codebase_context>".into(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: json!({"command": "make"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: vec![ToolResultContent::text("é".repeat(400))],
+                    is_error: Some(true),
+                }],
+            },
+        ];
+        let u = replay_updates("s1", &history);
+        assert_eq!(u.len(), 3, "{u:?}");
+        assert_eq!(u[0]["update"]["content"]["text"], json!("fix it"));
+        assert_eq!(u[1]["update"]["title"], json!("Bash: make"));
+        assert_eq!(u[1]["update"]["kind"], json!("execute"));
+        assert_eq!(u[2]["update"]["status"], json!("failed"));
+        let out = u[2]["update"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(out.len() <= 503 && out.ends_with("..."), "{}", out.len());
+        assert!(u.iter().all(|p| p["sessionId"] == json!("s1")));
+    }
+
+    #[tokio::test]
+    async fn session_load_of_an_unknown_session_is_resource_not_found() {
+        let (cfg, dir) = test_config();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let load = |id: u64, sid: &str| {
+            json!({"jsonrpc":"2.0","id":id,"method":"session/load","params":{"sessionId":sid,"cwd":cwd,"mcpServers":[]}})
+                .to_string()
+        };
+        // A saved session elsewhere must not be reachable by a relative id.
+        let other = tempfile::tempdir().unwrap();
+        Session::create_in(other.path(), "elsewhere".into())
+            .await
+            .unwrap();
+        let escape = format!(
+            "../{}/elsewhere",
+            other.path().file_name().unwrap().to_string_lossy()
+        );
+        let no_id = json!({"jsonrpc":"2.0","id":4,"method":"session/load","params":{"cwd":cwd,"mcpServers":[]}}).to_string();
+        let out = drive_in(
+            cfg,
+            sessions_in(&dir),
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                load(9, "early"),
+                init_line(),
+                load(2, "no-such-session"),
+                load(3, &escape),
+                no_id
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(out[0]["error"]["code"], json!(rpc::INVALID_REQUEST));
+        assert_eq!(out[2]["error"]["code"], json!(rpc::RESOURCE_NOT_FOUND));
+        assert_eq!(out[3]["error"]["code"], json!(rpc::RESOURCE_NOT_FOUND));
+        assert_eq!(out[4]["error"]["code"], json!(rpc::INVALID_PARAMS));
+    }
+
+    #[tokio::test]
+    async fn without_session_persistence_load_is_neither_offered_nor_served() {
+        let (mut cfg, dir) = test_config();
+        cfg.no_session_persistence = true;
+        let load = json!({"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"x","cwd":dir.path(),"mcpServers":[]}}).to_string();
+        let out = drive(cfg, &[init_line(), load]).await;
+        assert_eq!(
+            out[0]["result"]["agentCapabilities"]["loadSession"],
+            json!(false)
+        );
+        assert_eq!(out[1]["error"]["code"], json!(rpc::METHOD_NOT_FOUND));
+    }
+
+    /// A saved conversation is replayed in order (code context left out),
+    /// answered with `{}`, and then continues: the model sees the old
+    /// history, the new turn is saved, and loading again replays it too.
+    #[tokio::test]
+    async fn session_load_replays_the_history_in_order_then_takes_prompts() {
+        let (mut cfg, dir) = test_config();
+        let (model, model_seen) = text_model("Still hello.").await;
+        cfg.model = "ollama:test-model".into();
+        cfg.ollama_host = model;
+        let sessions = sessions_in(&dir);
+        let sid = "5f0c6d1e-0000-4000-8000-00000000abcd";
+        let mut saved = Session::create_in(&sessions, sid.into()).await.unwrap();
+        saved
+            .append(&[
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "What is in a.txt?".into(),
+                        },
+                        ContentBlock::Text {
+                            text: "<codebase_context>\nfn x() {}\n</codebase_context>".into(),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "Read the file.".into(),
+                            signature: String::new(),
+                        },
+                        ContentBlock::Text {
+                            text: "Let me look.".into(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "toolu_1".into(),
+                            name: "Read".into(),
+                            input: json!({"file_path": "/p/a.txt"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "toolu_1".into(),
+                        content: vec![ToolResultContent::text("hello")],
+                        is_error: None,
+                    }],
+                },
+                text(Role::Assistant, "It says hello."),
+            ])
+            .await
+            .unwrap();
+
+        let cwd = dir.path().to_string_lossy().to_string();
+        let load = json!({"sessionId": sid, "cwd": cwd, "mcpServers": []});
+        let mut c = Client::start(cfg, sessions.clone());
+        c.init().await;
+        let (replay, answer) = c.call(1, "session/load", load.clone()).await;
+        assert_eq!(answer["result"], json!({}), "{answer}");
+        assert!(
+            replay
+                .iter()
+                .all(|f| f["params"]["sessionId"] == json!(sid)),
+            "{replay:?}"
+        );
+        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let expected = vec![
+            s("user_message_chunk", "What is in a.txt?"),
+            s("agent_thought_chunk", "Read the file."),
+            s("agent_message_chunk", "Let me look."),
+            s("tool_call", "toolu_1"),
+            s("tool_call_update", "toolu_1"),
+            s("agent_message_chunk", "It says hello."),
+        ];
+        assert_eq!(update_summary(&replay), expected);
+        assert_eq!(
+            replay[3]["params"]["update"]["title"],
+            json!("Read: /p/a.txt")
+        );
+        assert_eq!(replay[4]["params"]["update"]["status"], json!("completed"));
+        assert_eq!(
+            replay[4]["params"]["update"]["content"][0]["content"]["text"],
+            json!("hello")
+        );
+
+        let (updates, answer) = c.call(2, "session/prompt", prompt(sid, "And now?")).await;
+        assert_eq!(
+            answer["result"]["stopReason"],
+            json!("end_turn"),
+            "{answer}"
+        );
+        assert!(
+            update_summary(&updates).contains(&s("agent_message_chunk", "Still hello.")),
+            "{updates:?}"
+        );
+        // The model got the loaded history, not a blank conversation.
+        let req = chat_requests(&model_seen).pop().unwrap();
+        let body = request_body(&req);
+        assert!(body.contains("What is in a.txt?"), "{body}");
+        assert!(body.contains("It says hello."), "{body}");
+        assert!(body.contains("And now?"), "{body}");
+
+        // The turn was saved before the answer, so loading the (live)
+        // session again replays it as well, and it still takes prompts.
+        let (replay, answer) = c.call(3, "session/load", load).await;
+        assert_eq!(answer["result"], json!({}));
+        let got = update_summary(&replay);
+        assert_eq!(got.len(), expected.len() + 2, "{got:?}");
+        assert_eq!(got[6], s("user_message_chunk", "And now?"));
+        assert_eq!(got[7], s("agent_message_chunk", "Still hello."));
+        let (_, answer) = c.call(4, "session/prompt", prompt(sid, "Once more")).await;
+        assert_eq!(answer["result"]["stopReason"], json!("end_turn"));
+        c.close().await;
+
+        let (_, history) = Session::resume_in(&sessions, sid).await.unwrap();
+        assert_eq!(history.len(), 8, "{history:?}");
+    }
+
+    /// A session started over ACP is saved as it goes, so another agent
+    /// process (a restarted editor) can load it.
+    #[tokio::test]
+    async fn a_new_session_is_saved_and_loads_in_a_later_process() {
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        cfg.ollama_host = text_model("Noted: kiwi.").await.0;
+        let sessions = sessions_in(&dir);
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let mut c = Client::start(cfg.clone(), sessions.clone());
+        c.init().await;
+        let (_, created) = c
+            .call(1, "session/new", json!({"cwd": cwd, "mcpServers": []}))
+            .await;
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        let (_, answer) = c
+            .call(2, "session/prompt", prompt(&sid, "Remember kiwi"))
+            .await;
+        assert_eq!(answer["result"]["stopReason"], json!("end_turn"));
+        c.close().await;
+
+        let mut c = Client::start(cfg, sessions);
+        c.init().await;
+        let (replay, answer) = c
+            .call(
+                1,
+                "session/load",
+                json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+        assert_eq!(answer["result"], json!({}), "{answer}");
+        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            update_summary(&replay),
+            vec![
+                s("user_message_chunk", "Remember kiwi"),
+                s("agent_message_chunk", "Noted: kiwi."),
+            ]
+        );
+        c.close().await;
+    }
+
+    /// An `http` MCP server passed by the host is started over Streamable
+    /// HTTP with the host's headers; its tool reaches the model, asks the
+    /// editor for permission like any other tool, and runs.
+    #[tokio::test]
+    async fn a_host_provided_http_mcp_server_is_started_and_its_tools_run() {
+        let (mcp_url, mcp_seen) = http_stub(|req| {
+            let msg: Value = serde_json::from_str(request_body(req)).ok()?;
+            let id = msg.get("id")?.clone(); // notifications get a 202
+            let result = match msg["method"].as_str()? {
+                "initialize" => json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fake", "version": "1"},
+                }),
+                "tools/list" => json!({"tools": [{
+                    "name": "echo",
+                    "description": "Echo text back",
+                    "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                }]}),
+                "tools/call" => json!({"content": [{
+                    "type": "text",
+                    "text": format!("echoed {}", msg["params"]["arguments"]["text"].as_str().unwrap_or("")),
+                }]}),
+                _ => {
+                    return Some((
+                        "application/json",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"no"}})
+                            .to_string(),
+                    ));
+                }
+            };
+            Some((
+                "application/json",
+                json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            ))
+        })
+        .await;
+        // Calls the MCP tool first, then answers once it has the result.
+        let (model, model_seen) = http_stub(|req| {
+            let chunk = if request_body(req).contains(r#""role":"tool""#) {
+                json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]})
+            } else {
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",
+                    "function":{"name":"mcp__fake__echo","arguments":"{\"text\":\"hi\"}"}}]},
+                    "finish_reason":"tool_calls"}]})
+            };
+            Some(("text/event-stream", sse(&[chunk])))
+        })
+        .await;
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        cfg.ollama_host = model;
+        let mut c = Client::start(cfg, sessions_in(&dir));
+        c.init().await;
+        let (_, created) = c
+            .call(
+                1,
+                "session/new",
+                json!({"cwd": dir.path(), "mcpServers": [{
+                    "type": "http", "name": "fake", "url": mcp_url,
+                    "headers": [{"name": "Authorization", "value": "Bearer t0k"}],
+                }]}),
+            )
+            .await;
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+
+        c.send(json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":prompt(&sid, "echo hi")}))
+            .await;
+        let mut asked = false;
+        let mut updates = Vec::new();
+        let answer = loop {
+            let v = c.recv().await;
+            if v["method"] == json!("session/request_permission") {
+                assert_eq!(
+                    v["params"]["toolCall"]["title"],
+                    json!("mcp__fake__echo"),
+                    "{v}"
+                );
+                asked = true;
+                c.send(json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":ALLOW_ONCE}}}))
+                    .await;
+                continue;
+            }
+            if v["id"] == json!(2) {
+                break v;
+            }
+            updates.push(v);
+        };
+        assert_eq!(
+            answer["result"]["stopReason"],
+            json!("end_turn"),
+            "{answer}"
+        );
+        assert!(asked, "the MCP tool ran without asking the editor");
+        let done = updates.iter().find(|u| {
+            u["params"]["update"]["sessionUpdate"] == json!("tool_call_update")
+                && u["params"]["update"]["status"] == json!("completed")
+        });
+        assert_eq!(
+            done.expect("a completed tool call")["params"]["update"]["content"][0]["content"]["text"],
+            json!("echoed hi")
+        );
+        // The model was offered the server's tool.
+        let first = chat_requests(&model_seen).remove(0);
+        assert!(request_body(&first).contains("mcp__fake__echo"), "{first}");
+        // Every request to the server carried the host's header.
+        let seen = mcp_seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|r| r.contains("\"tools/call\"")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|r| r.to_ascii_lowercase().contains("authorization: bearer t0k")),
+            "{seen:?}"
+        );
+        c.close().await;
     }
 }
