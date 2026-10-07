@@ -673,10 +673,20 @@ impl SdkSession {
             let tool = self.tools.iter().find(|t| t.name() == name.as_str());
             ctx.cwd = crate::tools::session_cwd(&self.tools, &self.config.cwd);
 
+            // Raced against session/cancel so the tool's future is dropped:
+            // that kills a Bash process group and stops an Agent child,
+            // which otherwise ran to their timeout or to completion.
+            let cancel = Arc::clone(&self.cancel);
             let output = match tool {
-                Some(t) => match t.execute(input.clone(), &ctx).await {
-                    Ok(out) => out,
-                    Err(e) => ToolOutput::error(format!("Tool error: {e}")),
+                Some(t) => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        ToolOutput::error("Cancelled by the client while the tool was running.")
+                    }
+                    r = t.execute(input.clone(), &ctx) => match r {
+                        Ok(out) => out,
+                        Err(e) => ToolOutput::error(format!("Tool error: {e}")),
+                    },
                 },
                 None => ToolOutput::error(format!("Unknown tool: {name}")),
             };
@@ -1212,6 +1222,9 @@ mod guard_tests {
             if input["command"] == "huge" {
                 return Ok(ToolOutput::success("x".repeat(3_000_000)));
             }
+            if input["command"] == "hang" {
+                std::future::pending::<()>().await;
+            }
             Ok(ToolOutput::success("ran"))
         }
     }
@@ -1503,6 +1516,29 @@ mod guard_tests {
         assert_eq!(tool_use_id, "t1");
         assert!(!success);
         assert!(summary.contains("timed out"), "{summary}");
+    }
+
+    /// session/cancel was checked only before each tool, so a running Bash
+    /// command went on to its timeout and an Agent child to completion.
+    #[tokio::test]
+    async fn cancel_interrupts_a_running_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, bash) = session(cfg(dir.path()));
+        let cancel = s.cancel_signal();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            s.execute_tools_with_approval(&call("hang")),
+        )
+        .await
+        .expect("the tool kept running after cancel")
+        .unwrap();
+        assert_eq!(bash.0.load(Ordering::SeqCst), 1, "the tool had started");
+        assert!(is_error(&r), "{r:?}");
+        assert!(result_text(&r).contains("Cancelled"), "{r:?}");
     }
 
     /// Sub-agent spend never reached the SDK's tracker, so CostUpdated,
