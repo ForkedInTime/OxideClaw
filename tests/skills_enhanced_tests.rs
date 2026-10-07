@@ -79,6 +79,7 @@ fn filter_skills_by_category() {
             prompt_template: String::new(),
             category: Some("browser".into()),
             params: vec![],
+            skill_file: None,
         },
         Skill {
             name: "b".into(),
@@ -86,6 +87,7 @@ fn filter_skills_by_category() {
             prompt_template: String::new(),
             category: Some("code".into()),
             params: vec![],
+            skill_file: None,
         },
         Skill {
             name: "c".into(),
@@ -93,6 +95,7 @@ fn filter_skills_by_category() {
             prompt_template: String::new(),
             category: None,
             params: vec![],
+            skill_file: None,
         },
     ];
     let _ = SkillParam {

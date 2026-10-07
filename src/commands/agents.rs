@@ -7,11 +7,13 @@ pub(super) fn cmd_skills(ctx: &CommandContext) -> CommandAction {
         return CommandAction::Message(format!(
             "No skills loaded.\n\
              \n\
-             Create skills by adding .md files to {skills}/\n\
-             Each file becomes a /skill-name command.\n\
+             Create a skill as .agents/skills/<name>/SKILL.md in your project\n\
+             (or {skills}/<name>/SKILL.md for every project), with YAML\n\
+             frontmatter giving its `name` and `description`.\n\
+             Each skill becomes a /<name> command.\n\
              \n\
-             Example: {skills}/review.md\n\
-             Then type /review [args] to expand it.",
+             Example: .agents/skills/review/SKILL.md\n\
+             Then type /review [args] to run it.",
             skills = crate::config::Config::config_dir().join("skills").display()
         ));
     }

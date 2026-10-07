@@ -1,7 +1,7 @@
 /// SkillTool — port of skill.ts
 /// Looks up a skill by name from the skills registry and executes it.
-/// Skills are the built-in set plus .md files in the global config dir's skills/
-/// or .claude/skills/ — the same set `/name` runs.
+/// Skills are the built-in set plus the `<name>/SKILL.md` and flat `.md`
+/// skills `crate::skills::load_skills_in` finds — the same set `/name` runs.
 use super::{Tool, ToolContext, ToolOutput, async_trait};
 use crate::skills::Skill;
 use anyhow::Result;
@@ -13,7 +13,7 @@ pub struct SkillTool;
 
 #[derive(Deserialize)]
 struct Input {
-    /// Skill name (filename without extension)
+    /// Skill name, as DiscoverSkills lists it
     skill: String,
     /// Optional arguments to append to the skill prompt
     #[serde(default)]
@@ -28,10 +28,10 @@ impl Tool for SkillTool {
 
     fn description(&self) -> &str {
         "Execute a skill by name. Skills are the built-in skills (commit, review, \
-        explain, fix, test) plus markdown prompt templates in the global skills dir \
-        (skills/ under the config dir, ~/.config/oxideclaw/skills/ by default), \
-        ~/.claude/skills/ or .claude/skills/. \
-        Use DiscoverSkills to list available skills."
+        explain, fix, test) plus Agent Skills (<name>/SKILL.md) and markdown prompt \
+        templates in the project's .agents/skills/, .oxideclaw/skills/ or .claude/skills/, \
+        the config dir's skills/ or ~/.claude/skills/. Returns the skill's instructions; \
+        follow them. Use DiscoverSkills to list available skills."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -54,43 +54,36 @@ impl Tool for SkillTool {
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: Input = serde_json::from_value(input)?;
 
-        // The name becomes `<skills dir>/<name>.md`; keep it a bare file stem.
         if input.skill.is_empty() || input.skill.contains(['/', '\\']) || input.skill.contains("..")
         {
             return Ok(ToolOutput::error(
-                "skill must be a bare name (the file stem under .claude/skills), not a path",
+                "skill must be a bare name, as DiscoverSkills lists it, not a path",
             ));
         }
 
-        let skills = crate::skills::load_skills_in(&ctx.cwd).await;
+        let skills = crate::skills::load_skills_in(&ctx.cwd).await.skills;
         Ok(invoke(&skills, &input.skill, input.args.as_deref()))
     }
 }
 
 /// Expands the skill exactly as `/name` would, so `{{ARGS}}` and declared
 /// params are filled in rather than reaching the model as literal
-/// placeholders. The loader already refuses skill files that link to key
-/// material.
+/// placeholders, and a `SKILL.md` body is read only now. The loader already
+/// refuses skill files that link to key material.
 fn invoke(skills: &HashMap<String, Skill>, name: &str, args: Option<&str>) -> ToolOutput {
     let Some(skill) = skills.get(name) else {
         return ToolOutput::error(format!(
-            "Skill '{name}' not found in .claude/skills/, {}, ~/.claude/skills/ or the \
-            built-in skills.\n\
+            "Skill '{name}' not found in the built-in skills, .agents/skills/, \
+            .oxideclaw/skills/, .claude/skills/, {} or ~/.claude/skills/.\n\
             Use DiscoverSkills to see available skills.",
             crate::config::Config::config_dir().join("skills").display()
         ));
     };
-    let args = args.unwrap_or("").trim();
-    let mut prompt = skill.expand_named(args);
-    // A template with nowhere to put free-form args would silently drop the
-    // caller's context.
-    let has_slot =
-        skill.prompt_template.contains("{{ARGS}}") || skill.prompt_template.contains("{{args}}");
-    if !args.is_empty() && !has_slot && skill.params.is_empty() {
-        prompt = format!("{prompt}\n\n{args}");
+    match skill.invoke(args.unwrap_or("")) {
+        // The caller (run_api_task) sends this on as a user message.
+        Ok(prompt) => ToolOutput::success(format!("[SKILL_PROMPT]\n{prompt}")),
+        Err(why) => ToolOutput::error(format!("Skill '{name}' could not be loaded: {why}")),
     }
-    // The caller (run_api_task) sends this on as a user message.
-    ToolOutput::success(format!("[SKILL_PROMPT]\n{prompt}"))
 }
 
 #[cfg(test)]
@@ -146,7 +139,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(local.join("plain.md"), "Just do it").unwrap();
-        let skills = crate::skills::load_skills_from(&[global, local]).await;
+        let skills = crate::skills::load_skills_at(&dir.path().join("proj"), &global, None)
+            .await
+            .skills;
 
         let out = invoke(&skills, "deploy", None);
         assert!(!out.is_error);
@@ -172,8 +167,9 @@ mod tests {
     #[tokio::test]
     async fn bundled_skills_are_found_and_unknown_names_are_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let skills =
-            crate::skills::load_skills_from(&[dir.path().join("g"), dir.path().join("l")]).await;
+        let skills = crate::skills::load_skills_at(dir.path(), &dir.path().join("g"), None)
+            .await
+            .skills;
         let out = invoke(&skills, "commit", Some("--amend"));
         assert!(!out.is_error);
         assert!(text(&out).contains("git commit") && text(&out).contains("--amend"));
@@ -190,7 +186,14 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::os::unix::fs::symlink(&key, skills.join("setup.md")).unwrap();
         std::fs::write(skills.join("ok.md"), "do the thing").unwrap();
-        let skills = crate::skills::load_skills_from(&[dir.path().join("global"), skills]).await;
+        let loaded = crate::skills::load_skills_at(
+            &dir.path().join("proj"),
+            &dir.path().join("global"),
+            None,
+        )
+        .await;
+        assert_eq!(loaded.invalid.len(), 1, "the refused skill is reported");
+        let skills = loaded.skills;
 
         let out = invoke(&skills, "setup", None);
         assert!(out.is_error);

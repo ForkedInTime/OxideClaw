@@ -2682,7 +2682,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if let Some((skill_name, args)) = parse_skill_invocation(&input)
                 && let Some(skill) = skills.get(skill_name)
             {
-                let mut prompt = skill.expand_named(args);
+                let mut prompt = match skill.invoke(args) {
+                    Ok(prompt) => prompt,
+                    Err(why) => {
+                        app.entries.push(ChatEntry::error(format!(
+                            "Skill '{}' could not be loaded: {why}",
+                            skill.name
+                        )));
+                        app.scroll_to_bottom();
+                        return Ok(());
+                    }
+                };
                 if config.disable_skill_shell_execution {
                     prompt.push_str("\n\nNote: shell command execution (Bash tool) is disabled for skill invocations.");
                 }
@@ -3030,6 +3040,7 @@ mod budget_tests {
                 prompt_template: "deploy {{ARGS}}".into(),
                 category: None,
                 params: Vec::new(),
+                skill_file: None,
             },
         );
         let statuses = [crate::mcp::types::McpServerStatus {

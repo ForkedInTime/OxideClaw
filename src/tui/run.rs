@@ -243,7 +243,7 @@ impl PermissionAsker for TuiAsker {
     }
 }
 use crate::session::{Session, entries_from_messages};
-use crate::skills::{load_skills, parse_skill_invocation};
+use crate::skills::parse_skill_invocation;
 use crate::tools::todo::TodoState;
 use crate::tools::{DynTool, ToolContext, ToolOutput, all_tools_with_state_and_mcp};
 use crate::tui::app::{App, ChatEntry, Overlay, TurnHistory};
@@ -554,7 +554,9 @@ async fn run_loop(
         &config.permissions_deny,
     )
     .with_cwd(&config.cwd);
-    let skills = load_skills().await;
+    let loaded_skills = crate::skills::load_skills_in(&config.cwd).await;
+    let skills_warning = loaded_skills.warning();
+    let skills = loaded_skills.skills;
 
     let mut app = App::new(&config.model, &config.cwd);
     app.browser_session = browser_session_for_app;
@@ -579,6 +581,9 @@ async fn run_loop(
             "Leftover spawn worktrees from a previous session:\n{}\nMerge with `git merge <branch>` or remove with `git worktree remove <path>`.",
             list.join("\n")
         )));
+    }
+    if let Some(warning) = skills_warning {
+        app.entries.push(ChatEntry::system(warning));
     }
     if !config.settings_load_errors.is_empty() {
         app.entries
