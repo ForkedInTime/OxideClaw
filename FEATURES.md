@@ -511,6 +511,7 @@ Earlier versions accepted `auto-edit` (then the default) and `full-auto` but pro
 | `routerMediumModel` | any model name | `claude-sonnet-5` | Model for medium-complexity turns |
 | `routerHighModel` | any model name | your `model` | Model for high-complexity turns |
 | `routerSuperHighModel` | any model name | `claude-opus-5` | Model for super-high-complexity turns |
+| `allowPrivateNetworkFetch` | `true` / `false` | `false` | Let WebFetch and WebBrowser reach loopback, RFC 1918, CGNAT and ULA addresses (e.g. a dev server on `localhost:3000`). Link-local and cloud metadata endpoints stay refused either way. Behind an `HTTP(S)_PROXY` the same check runs on the locally resolved address before the proxy is used; see [SECURITY.md](SECURITY.md#network-access-from-webfetch-and-webbrowser) |
 | `updateCheck` | `true` / `false` | `true` | Once every 24 h the TUI looks up the latest GitHub release (the one `oxideclaw update` installs) in the background, with a 3 s timeout, and shows one dim line when it is newer than yours. `false` in any settings file turns it off; `-p`, `--headless`, `acp` and `browse` never check. The last answer is cached in `$XDG_CACHE_HOME/oxideclaw/update-check.json` (default `~/.cache/oxideclaw/`). Uses `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |
 
@@ -576,6 +577,7 @@ OxideClaw is XDG Base Directory compliant and never writes to Claude Code's `~/.
 | `XDG_CONFIG_HOME` | Config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
 | `XDG_DATA_HOME` | Sessions directory base (`$XDG_DATA_HOME/oxideclaw`), under the rule in [Where files live](#where-files-live) |
 | `XDG_CACHE_HOME` | Cache directory base (code index, update-check answer) |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (either case) | Egress proxy for WebFetch and WebBrowser (per scheme for WebFetch; WebBrowser chains `http://` proxies only). Hosts are resolved and checked locally before the request goes to the proxy, private and `NO_PROXY` hosts connect directly; see [SECURITY.md](SECURITY.md#network-access-from-webfetch-and-webbrowser) |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | CA certificates to trust in place of the OS certificate store (e.g. a TLS-inspecting corporate proxy's root). HTTPS trusts the bundled Mozilla roots plus the OS store by default |
 
 ---

@@ -38,6 +38,18 @@ OxideClaw executes shell commands and modifies files as part of its core functio
 - **HTTP MCP servers use static headers.** The bearer token in `mcpServers.<name>.headers` is sent as-is; OxideClaw has no OAuth refresh flow. When a token expires the server returns 401, the failure is reported, and you replace the token and restart.
 - **SDK / Headless mode** — the NDJSON server accepts commands on stdin. Secure the transport layer in production deployments.
 
+## Network access from WebFetch and WebBrowser
+
+WebFetch and WebBrowser run without an approval prompt, so a prompt-injected turn could aim them at the cloud metadata service or a service on your network. Every destination, including each redirect hop, is checked against the addresses its hostname resolves to before anything is sent:
+
+- **Always refused:** link-local (`169.254.0.0/16`, `fe80::/10`, where `169.254.169.254` lives), unspecified, multicast, broadcast and IPv4 documentation ranges, and the metadata endpoints outside link-local (`100.100.100.200`, `fd00:ec2::254`).
+- **Refused unless `allowPrivateNetworkFetch: true`:** loopback, RFC 1918, CGNAT (`100.64.0.0/10`) and ULA (`fc00::/7`).
+- A direct connection is pinned to the checked addresses, so a second DNS answer cannot redirect it.
+
+**Behind a proxy** (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, honouring `NO_PROXY`) the hostname is still resolved and checked locally first; the proxy never sees a request the policy refuses. Public destinations are then sent to the proxy by name, private ones (when allowed) and `NO_PROXY` hosts connect directly with the same pinning. The proxy resolves the name again itself, so the address pin cannot extend through it.
+
+A name that does not resolve locally (split-horizon DNS where only the proxy can resolve it) can only be judged by its shape. It goes to the proxy only if it looks public: cloud metadata names (`metadata.google.internal`, `metadata`, `instance-data`, ...) are always refused, and local-network names (single-label names, `localhost`, `.local`, `.internal`, `.lan`, `.corp`, `.home.arpa`, ...) only pass with `allowPrivateNetworkFetch: true`. For such names, and for what a public name resolves to at the proxy, **the proxy is treated as trusted egress**: if it can reach your internal network or a metadata service, restrict it there.
+
 ## Sandboxing
 
 OxideClaw supports multiple sandbox backends to limit tool execution:
