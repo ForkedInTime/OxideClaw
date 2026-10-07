@@ -327,7 +327,7 @@ enum Commands {
     Browse {
         /// Goal for the browser agent
         goal: Vec<String>,
-        /// Skip all approval prompts (requires prior acknowledgment)
+        /// Skip all approval prompts (warns once, on first use)
         #[arg(long)]
         yolo: bool,
         /// Prompt for approval on every destructive action
@@ -1051,7 +1051,8 @@ async fn run() -> Result<()> {
                 eprintln!(
                     "Warning: --yolo disables all approval prompts. \
                      The browser agent will execute destructive actions without confirmation.\n\
-                     To proceed, this acknowledgment is recorded in your XDG state directory."
+                     This warning is shown once; the acknowledgment is recorded in your XDG \
+                     state directory."
                 );
                 if let Err(e) = crate::browser::yolo_ack::acknowledge() {
                     eprintln!("Warning: could not write yolo-ack file: {e}");
