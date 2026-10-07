@@ -18,14 +18,14 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 ## Competitive Strategy — REVISED 2026-10-07
 
 ### SHIPPED (1-5 + Phase 1 robustness)
-1. **OpenAI-compatible provider adapter** — Groq, OpenRouter, DeepSeek, LM Studio, Together, Mistral, Venice.ai, OpenAI, generic openai-compat.
+1. **OpenAI-compatible provider adapter** — Groq, OpenRouter, DeepSeek, Gemini, LM Studio, Together, Mistral, Venice.ai, OpenAI, plus a generic openai-compat escape hatch for any endpoint.
 2. **Local Codebase RAG Indexing** — tree-sitter AST parsing + SQLite FTS5 (BM25) full-text search over symbol chunks. No embeddings. Zero setup. 8 languages.
 3. **Smart Model Router + Cost Dashboard** — Opt-in router (`/router on`, off by default): a keyword/length heuristic picks a tier, and the default tiers are Claude models. Real-time cost tracking. `/budget $5` hard stop, settable mid-session, counts sub-agents.
 4. **Background Parallel Agents in Git Worktrees** — `oxideclaw spawn "refactor auth"` runs an agent in an isolated worktree while you keep working. Table stakes (Claude Code, Codex, Copilot CLI have it).
 5. **Self-voice model** — XTTS v2 voice cloning. The only coding agent with a built-in record-your-voice flow that speaks every reply locally. Optional add-on: needs Python; the XTTS weights are non-commercial.
 
 ### PHASE 1 ROBUSTNESS (shipped 2026-04-08)
-- **AGENTS.md + CLAUDE.md (table stakes)** — Both read and merged into the system prompt.
+- **AGENTS.md + CLAUDE.md + GEMINI.md (table stakes)** — All read and merged into the system prompt; GEMINI.md last, only when present.
 - **XDG Base Directory compliance** — Config in `$XDG_CONFIG_HOME/oxideclaw` (`~/.config/oxideclaw`, `$OXIDECLAW_CONFIG_DIR` overrides; `$CLAUDE_CONFIG_DIR` deprecated), sessions in `$XDG_DATA_HOME/oxideclaw` (`~/.local/share/oxideclaw`), code index in `$XDG_CACHE_HOME/oxideclaw`. Never writes to Claude Code's `~/.claude`: reads CLAUDE.md/AGENTS.md/skills/agents from it as an import format, migrates OxideClaw's old state out once (`src/claude_import.rs`), and `oxideclaw config import-claude` copies hooks/allow rules/apiKeyHelper/MCP only on request (deny rules and tighten-only settings come along on first run). `Config::config_dir()` is OxideClaw's dir; `Config::claude_code_dir()` is the read-only `~/.claude`.
 - **Context usage % in status bar** — Real-time ctx % + color-coded warnings (yellow at 70%, red at 90%)
 - **Always-show-thinking** — Display model reasoning in TUI when enabled (`showThinkingSummaries: true`)
@@ -37,12 +37,13 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 - **Auto git commits + /undo + /redo (2026-04-10)** — Per-turn snapshots on private git refs in your own repo (`refs/oxideclaw/sessions/<id>`): no commits on your branches, hidden from default `log`/`branch`/`status`, HEAD and index never moved. They do show in `git log --all` and are pushed by `--mirror`. New `/undo`, `/redo`, `/autocommit` slash commands. Keeps 10 newest session refs with startup prune. `/redo` after `/undo`, like OpenCode and Kilo; Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI have no redo.
 - **Autonomous browser agent (2026-04-15)** — `/browse <goal>`, `oxideclaw browse`, `/voice` prefix routing. Goal-driven loop reuses the query_engine tool-use pipeline. 50-step cap, approval gate on destructive actions, loop_detector stagnation guard, milestone TTS for voice. SDK exposes `browse/start` + progress + approval + completed notifications.
 - **ACP `session/load` + editor HTTP MCP (2026-10-07)** — ACP sessions are saved after each turn in the shared sessions dir; `session/load` replays one (or a TUI session) as `session/update`s and continues it. `http` (Streamable HTTP) and `sse` (legacy HTTP+SSE) MCP servers from the editor start with its headers, used literally.
+- **Agent Skills (2026-10-07)** — Standard `<name>/SKILL.md` layout from `.agents/skills/`, `.oxideclaw/skills/`, `.claude/skills/`, the config dir and `~/.claude/skills/`, first match winning; name + description load up front, the body on use. Flat `.md` skills still load outside `.agents/skills/`.
+
+Also shipped: the auto-fix trust gate (lint/test runners run only in `/trust`ed projects), index hygiene (the walk honours gitignore rules, auto-indexing needs a git work tree, the index lives in the cache dir) and the config namespace (see XDG above).
 
 ### NEXT UP
-1. **Config namespace** — Config moves to its own directory. (The auto-fix trust gate shipped: lint/test runners run only in `/trust`ed projects.)
-2. **Agent Skills** — Load the standard `<name>/SKILL.md` layout. (Index hygiene shipped: the walk honours gitignore rules, auto-indexing needs a git work tree, and the index lives in the cache dir.)
-3. **MCP 2026-07-28** — Move off the `2024-11-05` protocol revision.
-4. **Task-success benchmark** — Measure finished tasks, not just startup time.
+1. **MCP 2026-07-28** — Move off the `2024-11-05` protocol revision.
+2. **Task-success benchmark** — Measure finished tasks, not just startup time.
 
 ### THE PITCH
 "A ~19 MB Rust binary that indexes your repo, caps your spend, and works offline with Ollama. No account, no gateway, no telemetry: your keys go straight to your provider."

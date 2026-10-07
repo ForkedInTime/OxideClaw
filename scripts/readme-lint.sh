@@ -5,9 +5,10 @@
 #   1. sdk/README.md health-check example `"version":"X.Y.Z"` matches Cargo.toml
 #   2. README.md "N CDP tools" / "Nine CDP-driven tools" claim matches the
 #      count of browser tool impls
-#   3. README.md "N providers" claim matches count of named entries in the
+#   3. README.md "N providers" claim matches count of named providers in the
 #      OpenAI-compat provider registry (the PROVIDERS table only, not the
-#      tool names in that file's tests)
+#      tool names in that file's tests, and not the generic `openai-compat:`
+#      escape hatch, which has no base URL and is "any endpoint")
 #   4. README.md keeps the 'Autonomous browser agent' row
 #   5. README.md "Rust X.Y+" matches Cargo.toml rust-version
 #
@@ -54,9 +55,11 @@ fi
 
 # ── 3. OpenAI-compat provider count ──────────────────────────────────────────
 # Only the registry: the same file's tests build tool definitions with
-# `name: "Read"` and the like, which are not providers.
+# `name: "Read"` and the like, which are not providers. Count entries with a
+# base URL: the generic escape hatch (`base_url: ""`) is any endpoint the
+# user points it at, not a provider.
 provider_count=$(awk '/^pub static PROVIDERS/ {on=1} on && /^\];/ {on=0} on' src/api/openai_compat.rs \
-  | grep -cE '^\s*name: "')
+  | grep -cE '^\s*base_url: "[^"]+"')
 provider_claim=$(grep -oE '[0-9]+ providers' README.md | head -1 | grep -oE '^[0-9]+')
 
 if [ "$provider_count" = "$provider_claim" ]; then

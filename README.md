@@ -12,7 +12,7 @@
 <h3 align="center">OxideClaw is a provider-neutral coding agent that indexes your repo, caps your spend, and works offline with Ollama.</h3>
 
 <p align="center">
-  Claude, Ollama, and 10 OpenAI-compatible providers (Gemini among them). One ~19 MB binary; the Linux musl build is fully static.<br>
+  Claude, Ollama, 9 OpenAI-compatible providers (Gemini among them) and any other OpenAI-compatible endpoint. One ~19 MB binary; the Linux musl build is fully static.<br>
   No account, no gateway, no telemetry: your keys go straight to your provider.<br>
   Optional local voice-cloning add-on (Python; XTTS weights are non-commercial).<br>
   <sub>Rust is iron oxide. The claw stays.</sub>
@@ -120,7 +120,7 @@ oxideclaw
 
 ## Why OxideClaw?
 
-OxideClaw is a coding agent, not a port. It talks to Claude, Ollama, and 10 OpenAI-compatible providers (Gemini, DeepSeek, Groq, OpenRouter and more), and `/model` switches between them mid-session. Three things no other agent ships together: a code index that builds itself (tree-sitter + SQLite FTS5, no embeddings, no account), a `/budget` hard stop you can set mid-session that counts sub-agents, and replies spoken locally in a voice you record (an optional add-on). The rest (worktree agents, an auto-fix loop, `/undo` + `/redo`, a browser agent, MCP, ACP) is what good agents ship, and OxideClaw has it too.
+OxideClaw is a coding agent, not a port. It talks to Claude, Ollama, 9 OpenAI-compatible providers (Gemini, DeepSeek, Groq, OpenRouter and more) and any other OpenAI-compatible endpoint, and `/model` switches between them mid-session. Three things no other agent ships together: a code index that builds itself (tree-sitter + SQLite FTS5, no embeddings, no account), a `/budget` hard stop you can set mid-session that counts sub-agents, and replies spoken locally in a voice you record (an optional add-on). The rest (worktree agents, an auto-fix loop, `/undo` + `/redo`, a browser agent, MCP, ACP) is what good agents ship, and OxideClaw has it too.
 
 How it compares with the agents people actually run. Competitor cells were checked against each project's docs, README or source on 2026-10-06.
 ✅ yes · ◐ partial · ❌ no · — not checked.
@@ -140,7 +140,7 @@ How it compares with the agents people actually run. Competitor cells were check
 | Autonomous browser agent (`/browse <goal>`) | ✅ Chrome extension, claude.ai plan required | — | — | ◐ v2 desktop app only | ❌ | **✅ any provider, 50-step cap, approval gate** |
 | Voice input | ✅ | ◐ realtime, cloud | ✅ local | — | ✅ `/voice` | **✅ Whisper** |
 | Ollama with native tool calling | ◐ via Ollama's Anthropic-compatible API | — | ✅ BYOK or offline | ✅ | ◐ edit formats, no tool calls | **✅ no shim, no login** |
-| OpenAI-compatible providers | ❌ | ◐ Responses API only | ✅ BYOK | ✅ 75+ providers | ✅ | **✅ 10 providers** |
+| OpenAI-compatible providers | ❌ | ◐ Responses API only | ✅ BYOK | ✅ 75+ providers | ✅ | **✅ 9 providers + any endpoint** |
 | MCP servers | ✅ | ✅ | ✅ | ✅ | ❌ | **✅ `2024-11-05` spec** |
 | Editor integration (Agent Client Protocol) | via adapter | — | ✅ | ✅ | — | **✅ `oxideclaw acp`** |
 | Sandboxed shell | ✅ Seatbelt / bwrap | ✅ every OS | — | — | — | **◐ Linux only (bwrap / firejail)** |
@@ -253,7 +253,7 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 
 # Inside the TUI
 /help                   # interactive command menu
-/model                  # pick a model (Claude + Ollama + 10 OpenAI-compat providers)
+/model                  # pick a model (Claude + Ollama + 9 OpenAI-compat providers + any endpoint)
 /rag search <query>     # full-text codebase search
 /budget $5              # cap the bill
 /voice                  # voice I/O + TTS picker
