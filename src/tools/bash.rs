@@ -20,12 +20,22 @@ use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 /// [`new_session`]) and sending SIGKILL to the negated pgid on drop, we
 /// guarantee the whole subtree dies when the tool future is dropped (Esc
 /// cancellation, tokio::time::timeout, task::abort, etc.).
+///
+/// Windows has no process groups, and TerminateProcess on the shell leaves
+/// everything it started running, so there the shell goes into a job object
+/// (which its descendants inherit) and Drop terminates the job. Processes the
+/// shell starts in the few instructions before the assignment escape it.
 pub(crate) struct ProcessGroupGuard {
     child: Child,
     /// Process group ID = child pid (we always spawn with [`new_session`]).
     /// `None` means the child was already reaped cleanly via `wait().await`,
     /// so Drop becomes a no-op.
     pgid: Option<i32>,
+    /// The job's HANDLE, kept as an integer so the guard stays `Send`.
+    /// Without KILL_ON_JOB_CLOSE, so closing it on a disarmed guard leaves
+    /// deliberate background jobs alone, as on Unix.
+    #[cfg(windows)]
+    job: Option<usize>,
 }
 
 impl ProcessGroupGuard {
@@ -33,7 +43,14 @@ impl ProcessGroupGuard {
         // child.id() is None only if the child has already been polled to
         // completion. Since we just spawned it, this is always Some.
         let pgid = child.id().map(|id| id as i32);
-        Self { child, pgid }
+        #[cfg(windows)]
+        let job = assign_job(&child);
+        Self {
+            child,
+            pgid,
+            #[cfg(windows)]
+            job,
+        }
     }
 
     pub(crate) fn child_mut(&mut self) -> &mut Child {
@@ -61,6 +78,41 @@ impl Drop for ProcessGroupGuard {
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            // SAFETY: `job` is the live handle `assign_job` created and only
+            // this Drop closes it.
+            unsafe {
+                if self.pgid.take().is_some() {
+                    TerminateJobObject(job as HANDLE, 1);
+                }
+                CloseHandle(job as HANDLE);
+            }
+        }
+    }
+}
+
+/// Put `child` in a fresh job object; `None` (the old shell-only kill) if
+/// Windows refuses.
+#[cfg(windows)]
+fn assign_job(child: &Child) -> Option<usize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    let process = child.raw_handle()? as HANDLE;
+    // SAFETY: plain FFI with null (default) attributes and name; the process
+    // handle is valid while `child` is alive, and a failed job is closed.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        if AssignProcessToJobObject(job, process) == 0 {
+            CloseHandle(job);
+            return None;
+        }
+        Some(job as usize)
     }
 }
 
