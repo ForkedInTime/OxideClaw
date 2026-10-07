@@ -10,8 +10,8 @@
 //! have needed one.
 
 use super::{
-    Autonomy, CheckResult, PermissionDecision, PermissionState, Verdict, blocked_entry_matches,
-    check_compound_command, describe_tool_call, is_command_tool,
+    Autonomy, CheckResult, PermissionDecision, PermissionState, ShellGrammar, Verdict,
+    blocked_entry_matches, check_compound_command_as, describe_tool_call, is_command_tool,
 };
 use std::sync::Arc;
 
@@ -60,6 +60,8 @@ pub struct PermissionGate {
     /// the sensitive ones: an SDK/ACP host policy covers Read and WebFetch
     /// too, and an `Agent` child must not get around it.
     ask_every_tool: bool,
+    /// How the shell that runs Bash commands reads them (`defaultShell`).
+    bash_shell: ShellGrammar,
 }
 
 impl PermissionGate {
@@ -74,7 +76,16 @@ impl PermissionGate {
             asker,
             blocked: Vec::new(),
             ask_every_tool: false,
+            bash_shell: ShellGrammar::Posix,
         }
+    }
+
+    /// Check Bash commands with the grammar of `shell`, the program that
+    /// will parse them (see `tools::bash::command_shell`): rules read with
+    /// bash quoting let a pwsh or fish `defaultShell` hide a second command.
+    pub fn with_bash_shell(mut self, shell: &str) -> Self {
+        self.bash_shell = ShellGrammar::of_shell(shell);
+        self
     }
 
     /// See [`PermissionState::read_deny`].
@@ -193,7 +204,9 @@ impl PermissionGate {
             // Compound commands are split so a prefix rule cannot authorise
             // whatever is chained after the first statement.
             match input.get("command").and_then(|c| c.as_str()) {
-                Some(cmd) => check_compound_command(&self.state, tool_name, cmd),
+                Some(cmd) => {
+                    check_compound_command_as(&self.state, tool_name, cmd, self.bash_shell)
+                }
                 None => self.state.check_with_input(tool_name, Some(input)),
             }
         } else {
@@ -727,6 +740,29 @@ mod tests {
             let out = g.decide(tool, &input).await;
             assert!(matches!(out, GateOutcome::Denied(_)), "{tool}: {out:?}");
         }
+    }
+
+    /// Bash commands that pwsh parses are checked with its quoting: `\"`
+    /// does not hide the `rm` from a `git:*` rule.
+    #[tokio::test]
+    async fn bash_rules_use_the_grammar_of_the_shell_that_runs_them() {
+        let cmd = json!({"command": r#"git log "a\"; rm -rf ~; "b""#});
+        let gate = |shell: &str| {
+            PermissionGate::new(
+                PermissionState::new(false, &["Bash(git:*)".into()], &[]),
+                Autonomy::Ask,
+                None,
+            )
+            .with_bash_shell(shell)
+        };
+        assert_eq!(
+            gate("bash").decide("Bash", &cmd).await,
+            GateOutcome::Allowed
+        );
+        assert!(matches!(
+            gate("pwsh").decide("Bash", &cmd).await,
+            GateOutcome::Denied(_)
+        ));
     }
 
     #[tokio::test]

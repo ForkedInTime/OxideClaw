@@ -830,93 +830,90 @@ pub enum CheckResult {
     Deny,
 }
 
-/// Split a compound bash command into individual sub-commands.
-/// Handles `&&`, `||`, `;`, and `|` as separators.
-/// Does NOT descend into subshells `$(...)` or backticks — just top-level splits.
-pub fn split_compound_command(cmd: &str) -> Vec<&str> {
+/// How the shell that runs a command string reads quotes and escapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellGrammar {
+    /// sh, bash, zsh, dash, ash, ksh: `\` escapes, `'` and `"` quote.
+    #[default]
+    Posix,
+    /// pwsh / powershell: backtick escapes, `\` is literal, typographic
+    /// quotes close strings, and `(…)` / `{…}` run commands inside arguments.
+    PowerShell,
+    /// fish, nu, tcsh, cmd...: rules are checked as if POSIX, but no prefix
+    /// rule vouches for a command (fish runs `(cmd)` as a substitution).
+    Other,
+}
+
+impl ShellGrammar {
+    /// The grammar of the shell `shell` (a path or name, `.exe` allowed).
+    pub fn of_shell(shell: &str) -> Self {
+        match crate::tools::bash::shell_file_name(shell)
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "mksh" | "yash" => Self::Posix,
+            "pwsh" | "powershell" => Self::PowerShell,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether `c` opens or closes a single- (`'`) or double-quoted (`"`)
+    /// string. PowerShell also takes the typographic quotes, so
+    /// `"a” ; Remove-Item ~` ends the string before the `;`.
+    fn quote(self, c: char) -> Option<char> {
+        match c {
+            '\'' | '"' => Some(c),
+            '\u{2018}'..='\u{201B}' if self == Self::PowerShell => Some('\''),
+            '\u{201C}'..='\u{201E}' if self == Self::PowerShell => Some('"'),
+            _ => None,
+        }
+    }
+
+    fn escape(self) -> char {
+        if self == Self::PowerShell { '`' } else { '\\' }
+    }
+}
+
+/// Split a compound command into individual sub-commands, reading quotes and
+/// escapes the way `grammar` does. `&&`, `||`, `;`, `&`, `|` and newlines
+/// separate. Does NOT descend into subshells `$(...)` or backticks — just
+/// top-level splits.
+pub fn split_compound_command(cmd: &str, grammar: ShellGrammar) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
-    let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
-
-    while i < len {
-        let c = bytes[i];
-        match c {
-            b'\'' if !in_double => {
+    let mut chars = cmd.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match grammar.quote(c) {
+            Some('\'') if !in_double => {
                 in_single = !in_single;
-                i += 1;
+                continue;
             }
-            b'"' if !in_single => {
+            Some('"') if !in_single => {
                 in_double = !in_double;
-                i += 1;
+                continue;
             }
-            b'\\' if !in_single => {
-                i += 2;
-            } // skip escaped char
-            _ if in_single || in_double => {
-                i += 1;
+            _ => {}
+        }
+        if c == grammar.escape() && !in_single {
+            chars.next();
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+        // `&&` and `||` split like two single separators, since empty parts
+        // are dropped. A bare `&` backgrounds the left-hand command and runs
+        // the right, exactly like `;`. Newlines separate statements in both
+        // sh and PowerShell: missing them let a `git ` prefix rule match
+        // "git status\nrm -rf /" as one sub-command.
+        if matches!(c, '&' | '|' | ';' | '\n' | '\r') {
+            let part = cmd[start..i].trim();
+            if !part.is_empty() {
+                parts.push(part);
             }
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => {
-                let part = cmd[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                i += 2;
-                start = i;
-            }
-            b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
-                let part = cmd[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                i += 2;
-                start = i;
-            }
-            // A bare `&` backgrounds the left-hand command and runs the right —
-            // it separates two commands exactly like `;`. The `&&` arm above
-            // runs first, so this only sees a single `&`.
-            b'&' => {
-                let part = cmd[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                i += 1;
-                start = i;
-            }
-            // Newlines separate statements in both sh and PowerShell. Missing
-            // this made prefix allow-rules trivially bypassable: a rule for
-            // `git ` matched "git status\nrm -rf /" as one sub-command, because
-            // the whole string still starts with the allowed prefix.
-            b'\n' | b'\r' => {
-                let part = cmd[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                i += 1;
-                start = i;
-            }
-            b';' => {
-                let part = cmd[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                i += 1;
-                start = i;
-            }
-            b'|' => {
-                let part = cmd[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                i += 1;
-                start = i;
-            }
-            _ => {
-                i += 1;
-            }
+            start = i + c.len_utf8();
         }
     }
     let tail = cmd[start..].trim();
@@ -952,7 +949,23 @@ pub fn check_compound_command(
     tool_name: &str,
     full_command: &str,
 ) -> CheckResult {
-    let subs = split_compound_command(full_command);
+    check_compound_command_as(state, tool_name, full_command, ShellGrammar::Posix)
+}
+
+/// [`check_compound_command`] for a Bash tool whose commands `bash_shell`
+/// parses (the `defaultShell`). PowerShell commands always use its grammar.
+pub fn check_compound_command_as(
+    state: &PermissionState,
+    tool_name: &str,
+    full_command: &str,
+    bash_shell: ShellGrammar,
+) -> CheckResult {
+    let grammar = if tool_name == "PowerShell" {
+        ShellGrammar::PowerShell
+    } else {
+        bash_shell
+    };
+    let subs = split_compound_command(full_command, grammar);
     if subs.is_empty() {
         return CheckResult::Ask;
     }
@@ -973,7 +986,8 @@ pub fn check_compound_command(
     // Every part matched an allow rule. A prefix rule (`Bash(git:*)`) vouches
     // for the command it names, not for what substitution runs or where a
     // redirect writes, so those still ask, unless the tool is allowed outright.
-    if defeats_prefix_rules(full_command)
+    // Under a shell whose grammar is not modelled, it vouches for nothing.
+    if (grammar == ShellGrammar::Other || defeats_prefix_rules(full_command, grammar))
         && !matches!(state.check_with_input(tool_name, None), CheckResult::Allow)
     {
         return CheckResult::Ask;
@@ -984,14 +998,21 @@ pub fn check_compound_command(
 /// Shell constructs a prefix rule cannot vouch for: `$(…)`, backticks and
 /// process substitution run other commands; `>` writes files; newlines and
 /// ANSI-C quotes (`$'…'`) are where the splitter's quote tracking can be
-/// fooled (`echo # it's⏎rm -rf ~`). Discarding output is fine.
-fn defeats_prefix_rules(cmd: &str) -> bool {
+/// fooled (`echo # it's⏎rm -rf ~`). Discarding output is fine. PowerShell
+/// also runs commands inside `(…)`, `@(…)` and script blocks `{…}`.
+fn defeats_prefix_rules(cmd: &str, grammar: ShellGrammar) -> bool {
     let cmd = cmd
         .replace("2>&1", "")
         .replace(">/dev/null", "")
         .replace("> /dev/null", "");
+    let ps: &[&str] = if grammar == ShellGrammar::PowerShell {
+        &["(", "{"]
+    } else {
+        &[]
+    };
     ["$(", "`", "<(", ">(", ">", "\n", "\r", "$'"]
         .iter()
+        .chain(ps)
         .any(|t| cmd.contains(t))
 }
 
@@ -1176,7 +1197,7 @@ mod tests {
             ("git status\r\nrm -rf /", "CRLF"),
             ("git status & rm -rf /", "background &"),
         ] {
-            let parts = split_compound_command(cmd);
+            let parts = split_compound_command(cmd, ShellGrammar::Posix);
             assert!(
                 parts.len() >= 2,
                 "{why} must separate commands, got {parts:?}"
@@ -1235,6 +1256,75 @@ mod tests {
         ));
     }
 
+    /// PowerShell commands were split with bash quoting (`\"` as an escaped
+    /// quote) and `(…)` was not flagged, so a `Get-ChildItem:*` rule
+    /// auto-approved a chained or nested `Remove-Item`.
+    #[test]
+    fn powershell_rules_use_powershell_quoting() {
+        let st = PermissionState::new(false, &["PowerShell(Get-ChildItem:*)".to_string()], &[]);
+        let check = |c: &str| check_compound_command(&st, "PowerShell", c);
+        for cmd in [
+            r#"Get-ChildItem "a\"; Remove-Item -Recurse -Force ~; "b""#,
+            "Get-ChildItem (Remove-Item -Recurse -Force ~)",
+            "Get-ChildItem \"a\u{201d}; Remove-Item -Recurse -Force ~; \"b\"",
+            "Get-ChildItem { Remove-Item ~ }",
+            "Get-ChildItem @(Remove-Item ~)",
+        ] {
+            assert!(
+                matches!(check(cmd), CheckResult::Ask),
+                "must prompt: {cmd:?}"
+            );
+        }
+        for cmd in ["Get-ChildItem .", "Get-ChildItem 'a''b; c'"] {
+            assert!(matches!(check(cmd), CheckResult::Allow), "{cmd:?}");
+        }
+        assert_eq!(
+            split_compound_command(r#"a "x\"; b"#, ShellGrammar::PowerShell),
+            [r#"a "x\""#, "b"]
+        );
+        assert_eq!(
+            split_compound_command(r#"a "x`"; y""#, ShellGrammar::PowerShell).len(),
+            1
+        );
+    }
+
+    /// A Bash tool run by a `defaultShell` of pwsh or fish was checked with
+    /// bash rules, so `\"` hid a chained command and fish's `(cmd)`
+    /// substitution passed a prefix rule.
+    #[test]
+    fn bash_tool_rules_follow_the_shell_that_runs_it() {
+        let st = PermissionState::new(false, &["Bash(git:*)".to_string()], &[]);
+        let check = |c: &str, g| check_compound_command_as(&st, "Bash", c, g);
+        assert!(matches!(
+            check(r#"git log "a\"; rm -rf ~; "b""#, ShellGrammar::PowerShell),
+            CheckResult::Ask
+        ));
+        assert!(matches!(
+            check("git log (rm -rf ~)", ShellGrammar::Other),
+            CheckResult::Ask
+        ));
+        assert!(matches!(
+            check("git status", ShellGrammar::Posix),
+            CheckResult::Allow
+        ));
+        // Allowed outright, the tool needs no prefix rule to vouch.
+        let all = PermissionState::new(false, &["Bash".to_string()], &[]);
+        assert!(matches!(
+            check_compound_command_as(&all, "Bash", "git log (x)", ShellGrammar::Other),
+            CheckResult::Allow
+        ));
+        for (shell, g) in [
+            ("/usr/bin/fish", ShellGrammar::Other),
+            ("pwsh", ShellGrammar::PowerShell),
+            (r"C:\Windows\powershell.EXE", ShellGrammar::PowerShell),
+            ("/bin/bash", ShellGrammar::Posix),
+            ("/bin/sh", ShellGrammar::Posix),
+            ("zsh", ShellGrammar::Posix),
+        ] {
+            assert_eq!(ShellGrammar::of_shell(shell), g, "{shell}");
+        }
+    }
+
     /// A command-executing tool that is gated but not compound-checked has
     /// prefix rules that chaining can bypass. Adding one to SENSITIVE_TOOLS
     /// without adding it here is precisely the mistake this catches.
@@ -1267,7 +1357,7 @@ mod tests {
     /// produce nonsense sub-commands and spurious prompts.
     #[test]
     fn separators_inside_quotes_do_not_split() {
-        let parts = split_compound_command("echo 'a; b && c' \"d | e\"");
+        let parts = split_compound_command("echo 'a; b && c' \"d | e\"", ShellGrammar::Posix);
         assert_eq!(
             parts.len(),
             1,

@@ -820,7 +820,8 @@ impl SdkSession {
         let mut gate = crate::permissions::PermissionGate::bypass_with_deny(
             &self.config.permissions_deny,
             &self.config.cwd,
-        );
+        )
+        .with_bash_shell(&ctx.command_shell());
         // `Agent` children go through the same deny rules and host policy,
         // asking the host when the policy says Ask. Not the bypass gate
         // above: that would let a child run anything the host never saw.
@@ -839,6 +840,7 @@ impl SdkSession {
                 crate::permissions::Autonomy::Ask,
                 Some(Arc::new(child_asker)),
             )
+            .with_bash_shell(&ctx.command_shell())
             .with_asker_for_all_tools(),
         );
         if self.skill_shell_blocked {

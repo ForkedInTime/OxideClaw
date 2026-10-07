@@ -157,6 +157,16 @@ impl ToolContext {
             middlewares: Vec::new(),
         }
     }
+
+    /// The program that parses the Bash tool's command string here (see
+    /// [`bash::command_shell`]).
+    pub fn command_shell(&self) -> String {
+        bash::command_shell(
+            self.sandbox_mode.as_deref(),
+            self.default_shell.as_deref(),
+            std::env::var("SHELL").ok().as_deref(),
+        )
+    }
 }
 
 /// Reversible flat file name for `path`: separators → `_`, with literal

@@ -857,12 +857,14 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 // via /autonomy), rebuilt when plan mode flips mid-response.
                 // Published on the context so `Agent` children prompt
                 // through the same user and inherit the plan-mode blocks.
+                let bash_shell = ctx.command_shell();
                 let build_gate = |plan: bool, skill_shell: bool| {
                     let gate = PermissionGate::new(
                         perm_state.clone(),
                         config.effective_autonomy(),
                         Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
                     )
+                    .with_bash_shell(&bash_shell)
                     .with_blocked_tools(if plan {
                         PLAN_MODE_BLOCKED_TOOLS
                     } else {

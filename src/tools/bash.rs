@@ -497,11 +497,7 @@ impl Tool for BashTool {
         let stream_tx = ctx.stream_tx.clone();
         let cwd = ctx.cwd.clone();
         let extra_env = ctx.env.clone();
-        let shell = command_shell(
-            ctx.sandbox_mode.as_deref(),
-            ctx.default_shell.as_deref(),
-            std::env::var("SHELL").ok().as_deref(),
-        );
+        let shell = ctx.command_shell();
 
         let fut = async move {
             let mut cmd = Command::new(&shell);
