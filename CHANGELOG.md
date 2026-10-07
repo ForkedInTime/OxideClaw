@@ -412,6 +412,13 @@ Low-severity QA pass (2026-10-07).
   its issue. Docs give the real config, data and session paths, Ollama's
   tool fallback, the opt-in router and the supported 0.4.x line.
 
+### Removed
+
+- **`/statusline` and the `statusline-setup` agent.** The agent wrote a
+  `statusLine` setting that OxideClaw never reads, so the command changed
+  nothing anyone could see. A `statusLine` key left in settings.json still
+  loads without a notice.
+
 ### Security
 
 - **Dependency advisories cleared.** `rustls` 0.23.37 → 0.23.45
