@@ -83,7 +83,9 @@ impl Tool for LSPTool {
         "Query a language server for code intelligence. Operations: \
         goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, \
         goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls. \
-        Automatically selects the appropriate language server based on file extension."
+        Automatically selects the appropriate language server based on file extension; \
+        workspaceSymbol without file_path picks it from the project's build files \
+        (Cargo.toml, package.json, pyproject.toml, go.mod, ...)."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -138,8 +140,22 @@ impl Tool for LSPTool {
             None => ctx.cwd.clone(),
         };
 
-        // Determine language server command from file extension
-        let server_cmd = match file_path.extension().and_then(|e| e.to_str()) {
+        // Determine language server command from file extension. A workspace
+        // query has no file to go by, so the project's build files pick it.
+        let ext = match file_path.extension().and_then(|e| e.to_str()) {
+            None if input.operation == "workspaceSymbol" => match project_ext(&file_path) {
+                Some(ext) => Some(ext),
+                None => {
+                    return Ok(ToolOutput::error(
+                        "workspaceSymbol: no project build file (Cargo.toml, package.json, \
+                             pyproject.toml, go.mod, ...) found here. Pass file_path of any \
+                             source file in the project to select a language server.",
+                    ));
+                }
+            },
+            ext => ext,
+        };
+        let server_cmd = match ext {
             Some("rs") => vec!["rust-analyzer".to_string()],
             Some("py") | Some("pyi") => {
                 vec!["pyright-langserver".to_string(), "--stdio".to_string()]
@@ -557,6 +573,30 @@ fn path_to_uri(path: &Path) -> String {
         .unwrap_or_else(|_| format!("file://{}", abs.display()))
 }
 
+/// The source extension a project directory's build files point to, for
+/// choosing a server when there is no file to go by.
+fn project_ext(dir: &Path) -> Option<&'static str> {
+    const MARKERS: &[(&str, &str)] = &[
+        ("Cargo.toml", "rs"),
+        ("go.mod", "go"),
+        ("tsconfig.json", "ts"),
+        ("package.json", "ts"),
+        ("pyproject.toml", "py"),
+        ("setup.py", "py"),
+        ("requirements.txt", "py"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+        ("build.gradle.kts", "java"),
+        ("Gemfile", "rb"),
+        ("compile_commands.json", "cpp"),
+        ("CMakeLists.txt", "cpp"),
+    ];
+    MARKERS
+        .iter()
+        .find(|(marker, _)| dir.join(marker).is_file())
+        .map(|(_, ext)| *ext)
+}
+
 fn lang_id_for_ext(ext: Option<&str>) -> &'static str {
     match ext {
         Some("rs") => "rust",
@@ -609,7 +649,23 @@ fn format_lsp_result(operation: &str, result: &Value) -> String {
                         let name = sym.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                         let kind = sym.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
                         let kind_str = symbol_kind(kind);
-                        format!("{kind_str} {name}")
+                        // SymbolInformation carries a location; DocumentSymbol
+                        // only a range in the file that was asked about.
+                        if sym.get("location").is_some() {
+                            return format!("{kind_str} {name} — {}", format_location(sym));
+                        }
+                        let start = sym
+                            .get("selectionRange")
+                            .or_else(|| sym.get("range"))
+                            .and_then(|r| r.get("start"));
+                        match start {
+                            Some(start) => format!(
+                                "{kind_str} {name} — {}:{}",
+                                start.get("line").and_then(|v| v.as_u64()).unwrap_or(0),
+                                start.get("character").and_then(|v| v.as_u64()).unwrap_or(0)
+                            ),
+                            None => format!("{kind_str} {name}"),
+                        }
                     })
                     .collect();
                 lines.join("\n")
@@ -765,6 +821,73 @@ mod lifecycle_tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}; the pending request was left waiting for the full timeout",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::*;
+
+    /// A bare `{operation: workspaceSymbol, query}` used to resolve the cwd's
+    /// (missing) extension and always fail with "No language server
+    /// configured for extension: None".
+    #[test]
+    fn workspace_symbol_picks_the_server_from_project_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(project_ext(dir.path()), None);
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(project_ext(dir.path()), Some("rs"));
+        let py = tempfile::tempdir().unwrap();
+        std::fs::write(py.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(project_ext(py.path()), Some("py"));
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_without_a_project_explains_what_to_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = LSPTool::default()
+            .execute(
+                json!({"operation": "workspaceSymbol", "query": "main"}),
+                &ToolContext::new(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        let text: String = out
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::api::types::ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect();
+        assert!(text.contains("Pass file_path"), "{text}");
+        assert!(!text.contains("extension: None"), "{text}");
+    }
+
+    #[test]
+    fn symbol_results_say_where_each_symbol_is() {
+        let workspace = json!([{
+            "name": "parse",
+            "kind": 12,
+            "location": {
+                "uri": "file:///p/src/lib.rs",
+                "range": {"start": {"line": 41, "character": 7}, "end": {"line": 41, "character": 12}}
+            }
+        }]);
+        assert_eq!(
+            format_lsp_result("workspaceSymbol", &workspace),
+            "Function parse — /p/src/lib.rs:41:7"
+        );
+        let document = json!([{
+            "name": "Config",
+            "kind": 23,
+            "range": {"start": {"line": 3, "character": 0}, "end": {"line": 9, "character": 1}},
+            "selectionRange": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 17}}
+        }]);
+        assert_eq!(
+            format_lsp_result("documentSymbol", &document),
+            "Struct Config — 4:11"
         );
     }
 }
