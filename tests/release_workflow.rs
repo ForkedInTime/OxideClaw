@@ -173,6 +173,85 @@ fn smoke_matrix_runs_release_assets_on_the_glibc_floor_and_alpine() {
     assert!(run.contains("exit 1"), "{run}");
 }
 
+/// Runs for one tag never overlap, so one run's draft cleanup cannot delete
+/// the release another run's smoke or publish job still holds.
+#[test]
+fn release_runs_for_one_tag_are_serialized() {
+    let wf = workflow();
+    let group = wf["concurrency"]["group"]
+        .as_str()
+        .expect("concurrency group");
+    assert!(group.contains("github.event.inputs.tag"), "{group}");
+    assert!(group.contains("github.ref_name"), "{group}");
+    assert_eq!(
+        wf["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(false),
+        "a queued run must not cancel one that is mid-publish"
+    );
+}
+
+/// The cleanup deletes only drafts this workflow made, the run picks out its
+/// own draft by run id, and a dispatched tag lands on the commit that was
+/// built and attested rather than on whatever HEAD is at publish time.
+#[test]
+fn draft_cleanup_spares_hand_made_drafts_and_pins_the_built_commit() {
+    let wf = workflow();
+    let (_, create) = step(job(&wf, "release"), "Create draft release");
+    // The tag must exist, and the build jobs check that tag out, so the
+    // release can only point at the built commit.
+    assert!(create.contains("--verify-tag"), "{create}");
+    assert!(!create.contains("--target"), "{create}");
+    let checkout_ref = steps(job(&wf, "build"))
+        .iter()
+        .find(|s| s["name"].as_str() == Some("Checkout"))
+        .and_then(|s| s["with"]["ref"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        checkout_ref.contains("github.event.inputs.tag"),
+        "{checkout_ref}"
+    );
+
+    let marker = "marker='<!-- oxideclaw-release-workflow -->'";
+    assert!(create.contains(marker), "{create}");
+    assert!(
+        create.contains("$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"),
+        "{create}"
+    );
+    // The marker goes into the body the drafts() filter reads back.
+    assert!(
+        create.contains(r#"--notes "$marker$run_marker""#),
+        "{create}"
+    );
+    assert!(create.contains("contains("), "{create}");
+    assert!(
+        create.contains(r#"for id in $(drafts "$marker")"#),
+        "{create}"
+    );
+    assert!(create.contains(r#"id=$(drafts "$run_marker")"#), "{create}");
+    // No unfiltered sweep over every draft for the tag remains.
+    assert!(!create.contains("$(drafts)"), "{create}");
+}
+
+/// This file reads .github/, contrib/ and scripts/, which the crates.io
+/// package leaves out, so the file itself must be left out too or
+/// `cargo test` on the published source fails to compile.
+#[test]
+fn this_test_is_left_out_of_the_crates_io_package() {
+    let manifest = include_str!("../Cargo.toml");
+    let exclude = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("exclude"))
+        .expect("Cargo.toml exclude list");
+    for dir in [".github/*", "contrib/*", "scripts/*"] {
+        assert!(exclude.contains(&format!("\"{dir}\"")), "{exclude}");
+    }
+    assert!(
+        exclude.contains("\"tests/release_workflow.rs\""),
+        "{exclude}"
+    );
+}
+
 #[test]
 fn release_stays_a_draft_until_every_smoke_run_passes() {
     let wf = workflow();

@@ -16,6 +16,13 @@ on:
 permissions:
   contents: read
 
+# One run per tag at a time: a tag push and a manual dispatch (or a re-run
+# started mid-smoke) would otherwise share a draft, and one run's cleanup
+# would delete the release_id the other's smoke and publish jobs still use.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 # Flow: build -> release (draft, SHA256SUMS, provenance attestations) ->
 # smoke (run the draft's Linux x64 assets on old and new distros) -> publish.
 # Users and docker.yml only ever see a release whose binaries started.
@@ -267,8 +274,13 @@ jobs:
           fi
 
       # A draft is invisible to users, install.sh and self-update until the
-      # publish job flips it. A full re-run first deletes the draft an earlier
-      # attempt left, so the smoke jobs can only fetch this run's assets.
+      # publish job flips it. The body carries an invisible marker naming
+      # this workflow and run attempt. A full re-run first deletes drafts an
+      # earlier attempt left (marker present), so the smoke jobs can only
+      # fetch this run's assets; a hand-written draft for the tag (no marker)
+      # is left alone. The tag must already exist (--verify-tag): the build
+      # jobs checked out that tag, so the release lands on the commit that
+      # was built and attested, never on the default branch's HEAD.
       - name: Create draft release
         id: draft
         env:
@@ -279,24 +291,27 @@ jobs:
           # which install.sh and /upgrade resolve for every stable user.
           EXTRA=()
           if [[ "$TAG" == *-* ]]; then EXTRA=(--prerelease --latest=false); fi
+          marker='<!-- oxideclaw-release-workflow -->'
+          run_marker="<!-- oxideclaw-release-run: $GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT -->"
           drafts() {
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-              --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id"
+              --jq ".[] | select(.draft and .tag_name == \"$TAG\" and ((.body // \"\") | contains(\"$1\"))) | .id"
           }
-          for id in $(drafts); do
+          for id in $(drafts "$marker"); do
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
           done
           # --verify-tag: never create a missing tag at the default branch tip.
           gh release create "$TAG" \
             --draft \
             --title "OxideClaw $TAG" \
+            --notes "$marker$run_marker" \
             --generate-notes \
             --verify-tag \
             "${EXTRA[@]}" \
             release/*
-          id=$(drafts)
+          id=$(drafts "$run_marker")
           if [ "$(echo "$id" | wc -w)" != 1 ]; then
-            echo "::error::expected one draft release for $TAG, found: $id"
+            echo "::error::expected one draft release for $TAG from this run, found: $id"
             exit 1
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
