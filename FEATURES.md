@@ -114,7 +114,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `/session` | Browse and resume sessions |
 | `/session list` | List saved sessions |
 | `/export` | Export current session to markdown (sessions save automatically) |
-| `/session delete` | Delete a session |
+| `/session delete <id-prefix>` | Print the `rm` command that deletes a session's files |
 
 ### Voice & TTS
 
@@ -155,7 +155,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | Command | Description |
 |---------|-------------|
 | `/mcp` | List MCP plugins |
-| `/mcp add <uri>` | Add MCP plugin |
+| `/mcp add <name> <command\|url> [args...]` | Add MCP plugin (stdio command or HTTP URL) |
 | `/mcp tools` | List tools per MCP server |
 
 ---
@@ -233,7 +233,7 @@ Local codebase search powered by tree-sitter AST parsing and SQLite FTS5.
 
 ### Supported Languages
 
-Rust, Python, JavaScript, TypeScript, Go, Java, C, C++
+Rust, Python, JavaScript, TypeScript, Go, Java, C, Bash
 
 ### How It Works
 

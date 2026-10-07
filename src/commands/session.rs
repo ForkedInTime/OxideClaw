@@ -75,8 +75,12 @@ pub(super) fn cmd_session(args: &str) -> CommandAction {
             if sub_args.is_empty() {
                 CommandAction::Message("Usage: /session delete <id-prefix>".into())
             } else {
+                // Sessions live under the XDG data dir when XDG_DATA_HOME is
+                // set, so a hard-coded ~/.claude path would point at nothing.
+                let dir = crate::config::Config::sessions_dir();
+                let dir = dir.display();
                 CommandAction::Message(format!(
-                    "To delete session, run:\n  rm ~/.claude/sessions/{sub_args}*.jsonl ~/.claude/sessions/{sub_args}*.meta\n\nUse /session list to confirm the ID prefix."
+                    "To delete session, run:\n  rm '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta\n\nUse /session list to confirm the ID prefix."
                 ))
             }
         }
@@ -237,6 +241,26 @@ mod session_command_tests {
                 matches!(cmd_session(args), CommandAction::ClearAllSessions),
                 "{args:?}"
             );
+        }
+    }
+
+    /// The delete hint hard-coded ~/.claude/sessions, which is wrong once
+    /// XDG_DATA_HOME moves the sessions dir.
+    #[test]
+    fn delete_hint_points_at_the_real_sessions_dir() {
+        let dir = crate::config::Config::sessions_dir();
+        match cmd_session("delete abc123") {
+            CommandAction::Message(m) => {
+                assert!(
+                    m.contains(&format!("'{}'/abc123*.jsonl", dir.display())),
+                    "{m}"
+                );
+                assert!(
+                    m.contains(&format!("'{}'/abc123*.meta", dir.display())),
+                    "{m}"
+                );
+            }
+            _ => panic!("/session delete must only print a hint"),
         }
     }
 }
