@@ -61,6 +61,9 @@ pub struct QueryEngine {
     /// Where the code index is looked up: None is the user's cache dir;
     /// tests point it at a temp dir.
     rag_index_dir: Option<std::path::PathBuf>,
+    /// The model router for `query` (`-p`): each prompt goes to a tier and
+    /// may move up one on failure. None: every prompt uses `config.model`.
+    router: Option<crate::router::RouterConfig>,
 }
 
 impl QueryEngine {
@@ -91,12 +94,7 @@ impl QueryEngine {
         }));
         // With a distinct --fallback-model, `stream_turn` switches models on the
         // first overload; a backoff before that would only delay it.
-        client.set_retry_overloaded(
-            config
-                .fallback_model
-                .as_ref()
-                .is_none_or(|fb| *fb == config.model),
-        );
+        client.set_retry_overloaded(retry_overloads(&config, &config.model));
         let system_prompt = config.build_system_prompt();
         let gate = crate::permissions::PermissionGate::headless(&config);
         let (child_usage_tx, child_usage_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -125,7 +123,107 @@ impl QueryEngine {
             child_usage_tx,
             child_usage_rx,
             rag_index_dir: None,
+            router: None,
         })
+    }
+
+    /// Route each `query` prompt with `router` (when it is enabled).
+    pub fn set_router(&mut self, router: crate::router::RouterConfig) {
+        self.router = router.enabled.then_some(router);
+    }
+
+    /// Serve `model` with `client` from the next request on, with this
+    /// engine's retry notices.
+    fn use_client(&mut self, mut client: ApiBackend, model: String) {
+        if self.quiet {
+            client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
+                tracing::warn!("{}", n.message());
+            }));
+        } else {
+            client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
+                eprintln!("{}", n.message().yellow());
+            }));
+        }
+        client.set_retry_overloaded(retry_overloads(&self.config, &model));
+        self.client = client;
+        self.config.model = model;
+    }
+
+    /// Pick this prompt's tier and switch to it. `--verbose` names it on
+    /// stderr; a tier skipped for the first time is always named.
+    async fn route_prompt(&mut self, prompt: &str) -> Option<crate::router::TurnRoute> {
+        let router = self.router.clone()?;
+        let context_tokens =
+            crate::router::estimate_context_tokens(&self.system_prompt, &self.messages)
+                + prompt.len() as u64 / 4;
+        let outcome = router
+            .route(&self.config, &self.client, prompt, context_tokens)
+            .await;
+        for n in &outcome.notices {
+            self.notice(n.as_str().dimmed());
+        }
+        if let Some((model, usage)) = &outcome.classifier_usage {
+            self.cumulative_cost_usd += estimate_cost_usd(model, usage);
+            if let Some(sink) = &self.usage_sink {
+                let _ = sink.send((model.clone(), usage.clone()));
+            }
+        }
+        let Some(route) = outcome.route else {
+            if self.config.verbose {
+                self.notice(
+                    format!("[router] no tier is usable; using {}", self.config.model).dimmed(),
+                );
+            }
+            return None;
+        };
+        if self.config.verbose {
+            self.notice(format!("[router] {}", route.line()).dimmed());
+        }
+        self.use_client(route.client, route.model);
+        Some(crate::router::TurnRoute::new(router, route.tier))
+    }
+
+    /// Move the rest of this prompt one tier up after `trigger`, once.
+    async fn escalate(
+        &mut self,
+        routing: &mut Option<crate::router::TurnRoute>,
+        trigger: crate::router::Trigger,
+    ) -> bool {
+        let Some(route) = routing.as_mut() else {
+            return false;
+        };
+        let context_tokens =
+            crate::router::estimate_context_tokens(&self.system_prompt, &self.messages);
+        let left = self
+            .config
+            .max_budget_usd
+            .map(|b| (b - self.cumulative_cost_usd).max(0.0));
+        let mut notices = Vec::new();
+        let next = route
+            .escalate(
+                &self.config,
+                &self.client,
+                context_tokens,
+                left,
+                trigger,
+                &mut notices,
+            )
+            .await;
+        for n in &notices {
+            self.notice(n.as_str().dimmed());
+        }
+        match next {
+            crate::router::Escalation::To(r) => {
+                self.notice(r.line().dimmed());
+                self.use_client(r.client, r.model);
+                true
+            }
+            crate::router::Escalation::OverBudget(line) => {
+                self.notice(line.yellow());
+                false
+            }
+            crate::router::Escalation::None => false,
+        }
     }
 
     /// Report this engine's spend to the executor that launched it.
@@ -320,8 +418,19 @@ impl QueryEngine {
 
     /// Add a user message and run the agentic loop until stop_reason == EndTurn.
     /// Mirrors the main query() function in query.ts.
+    ///
+    /// A routed prompt runs on its tier's model and client; the next prompt
+    /// is routed afresh from the session model.
     pub async fn query(&mut self, user_input: impl Into<String>) -> Result<()> {
-        let user_input = user_input.into();
+        let base = (self.client.clone(), self.config.model.clone());
+        let result = self.query_routed(user_input.into()).await;
+        if self.router.is_some() {
+            (self.client, self.config.model) = base;
+        }
+        result
+    }
+
+    async fn query_routed(&mut self, user_input: String) -> Result<()> {
         self.turns = 0;
         self.skill_shell_blocked = false;
         // /browse starts with what is left of the session budget; with
@@ -350,6 +459,7 @@ impl QueryEngine {
                 .await
                 .unwrap_or_default()
         };
+        let mut routing = self.route_prompt(&user_input).await;
         let mut content = vec![ContentBlock::Text { text: user_input }];
         if !rag_context.is_empty() {
             content.push(ContentBlock::Text { text: rag_context });
@@ -394,8 +504,10 @@ impl QueryEngine {
             }
             let include_partial = self.include_partial_messages && self.stream_json_output;
             let stream_json = self.stream_json_output;
-            let (response, served_model) = self
+            let mut streamed = false;
+            let turn_result = self
                 .stream_turn(request, |chunk| {
+                    streamed = true;
                     if stream_json {
                         if include_partial {
                             let event = serde_json::json!({"type":"partial_text","text": chunk});
@@ -408,7 +520,30 @@ impl QueryEngine {
                         full_text.push_str(chunk);
                     }
                 })
-                .await?;
+                .await;
+            let (response, served_model) = match turn_result {
+                Ok(r) => r,
+                // A routed prompt the cheap tier failed moves one tier up,
+                // unless part of the answer is already out.
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    let trigger = if crate::api::is_context_overflow(&err) {
+                        crate::router::Trigger::ContextOverflow
+                    } else {
+                        crate::router::Trigger::ApiError
+                    };
+                    if !streamed
+                        && crate::router::escalates_on(&err)
+                        && self.escalate(&mut routing, trigger).await
+                    {
+                        if human {
+                            println!();
+                        }
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
             if human {
                 println!(); // newline after streamed text
             }
@@ -455,7 +590,7 @@ impl QueryEngine {
             }
 
             // Context compaction check
-            let window = compaction_window(&self.config, None, None);
+            let window = compaction_window(&self.config, routing.as_ref().map(|r| &r.router), None);
             let mut summarise_after_tools = false;
             let context_tokens = response.usage.context_tokens();
             match compact_needed(context_tokens, window) {
@@ -510,6 +645,16 @@ impl QueryEngine {
                     break;
                 }
                 Some(StopReason::ToolUse) => {
+                    // Malformed calls twice in a row: they still get their
+                    // (error) results; the next request goes a tier up.
+                    if let Some(route) = routing.as_mut() {
+                        let defs: Vec<ToolDefinition> =
+                            self.tools.iter().map(|t| t.definition()).collect();
+                        if route.malformed_twice(&response.content, &defs) {
+                            self.escalate(&mut routing, crate::router::Trigger::MalformedToolCalls)
+                                .await;
+                        }
+                    }
                     // Execute all tool calls in this response
                     let tool_results = self.execute_tools(&response.content).await?;
                     let stop = self
@@ -1040,6 +1185,12 @@ fn result_json(text: &str, usage: &Usage) -> serde_json::Value {
 }
 
 /// Per-call cost in USD, from the same price table as `/cost`.
+/// Whether the client backs off on an overload itself: not when a distinct
+/// `--fallback-model` takes over at the first one.
+fn retry_overloads(config: &Config, model: &str) -> bool {
+    config.fallback_model.as_ref().is_none_or(|fb| fb == model)
+}
+
 fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
     crate::cost::model_price(model).cost(
         usage.input_tokens,
@@ -2389,5 +2540,90 @@ mod tests {
             .messages
             .push(result("c", "missing required field: achieved", true));
         assert_eq!(engine.last_successful_call("browse_done"), Some(&ok));
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::router::fake_chat::{self, Reply};
+
+    /// `-p` with a router whose tiers all live on one fake Ollama host:
+    /// "yes" is a low-tier prompt.
+    fn engine(host: &str, dir: &std::path::Path, budget: Option<f64>) -> QueryEngine {
+        let config = Config {
+            model: "ollama:big".into(),
+            ollama_host: host.to_string(),
+            cwd: dir.to_path_buf(),
+            max_budget_usd: budget,
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&config.model);
+        router.enabled = true;
+        router.low_model = "ollama:small".into();
+        router.medium_model = "ollama:mid".into();
+        router.super_high_model = "ollama:big".into();
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.set_router(router);
+        e.quiet = true;
+        e
+    }
+
+    /// The low tier fails the request; the prompt is answered one tier up,
+    /// and the next prompt starts from the low tier again.
+    #[tokio::test]
+    async fn a_failed_low_tier_request_is_retried_one_tier_up() {
+        let (host, seen) = fake_chat::start(|model, _| match model {
+            "small" => Reply::Status(500, r#"{"error":"model runner crashed"}"#),
+            _ => Reply::Text("answer from mid"),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine(&host, dir.path(), None);
+
+        e.query("yes").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["small", "mid"]);
+        assert_eq!(e.last_assistant_text().as_deref(), Some("answer from mid"));
+        // The engine is back on the session model for the next prompt.
+        assert_eq!(e.config.model, "ollama:big");
+
+        e.query("ok").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["small", "mid", "small", "mid"]);
+    }
+
+    /// A model that cannot drive the tools: the second malformed response
+    /// in a row moves the rest of the prompt one tier up.
+    #[tokio::test]
+    async fn malformed_tool_calls_twice_escalate() {
+        let (host, seen) = fake_chat::start(|model, _| match model {
+            "small" => Reply::Tool("Nope", "{}"),
+            _ => Reply::Text("done"),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine(&host, dir.path(), None);
+
+        e.query("yes").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["small", "small", "mid"]);
+        assert_eq!(e.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    /// With the next tier priced past what is left of the budget, the
+    /// failure stands and nothing more is sent.
+    #[tokio::test]
+    async fn the_budget_stops_escalation() {
+        let (host, seen) =
+            fake_chat::start(|_, _| Reply::Status(500, r#"{"error":"model runner crashed"}"#))
+                .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine(&host, dir.path(), Some(0.000_001));
+        e.config.api_key = "sk-ant-test".into();
+        if let Some(r) = e.router.as_mut() {
+            r.medium_model = "claude-opus-5".into();
+        }
+
+        let err = e.query("yes").await.unwrap_err().to_string();
+        assert!(err.contains("500"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), vec!["small"]);
     }
 }

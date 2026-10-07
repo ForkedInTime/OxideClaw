@@ -1029,6 +1029,8 @@ async fn run() -> Result<()> {
 
     let mut config = Config::load_with(None, flag_settings(), cli.bare)?;
     let chosen = model_chosen(cli.model.is_some(), &config);
+    // `-p --model X` pins the run to X: a script that names a model gets it.
+    let model_flag = cli.model.is_some();
 
     // Apply CLI overrides (highest priority)
     if cli.verbose {
@@ -1406,6 +1408,9 @@ async fn run() -> Result<()> {
         }
 
         let mut engine = QueryEngine::new(config.clone(), tools)?;
+        if !model_flag {
+            engine.set_router(crate::router::RouterConfig::from_config(&config));
+        }
         // -p used to ignore the resume flags and run a fresh conversation.
         let mut resumed = None;
         if let Some(id) = &resume_id {

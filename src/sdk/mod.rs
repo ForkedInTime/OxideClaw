@@ -174,6 +174,7 @@ impl SdkServer {
                         return Ok(());
                     }
                 }
+                let model_given = model.is_some();
                 if let Some(m) = model {
                     cfg.model = m;
                 }
@@ -195,6 +196,9 @@ impl SdkServer {
                 // Clone notif_tx for error reporting in the spawned task
                 let spawn_notif_tx = notif_tx.clone();
 
+                // A host that names a model gets it; otherwise the user's
+                // router settings apply.
+                let router = (!model_given).then(|| crate::router::RouterConfig::from_config(&cfg));
                 let session = match SdkSession::new(
                     cfg,
                     tools,
@@ -217,6 +221,10 @@ impl SdkServer {
                     }
                 };
 
+                let mut session = session;
+                if let Some(router) = router {
+                    session.set_router(router);
+                }
                 let session_id = session.session_id.clone();
                 let model_name = session.config_model().to_string();
 

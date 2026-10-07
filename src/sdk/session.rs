@@ -100,6 +100,9 @@ pub struct SdkSession {
     /// `take_history_rewritten`, so a saved transcript must be rewritten,
     /// not appended to.
     history_rewritten: bool,
+    /// The model router, when this session routes: each turn goes to a
+    /// tier (`model/routed` says which) and may move up one on failure.
+    router: Option<crate::router::RouterConfig>,
 }
 
 impl SdkSession {
@@ -161,6 +164,7 @@ impl SdkSession {
             child_cache_tokens: (0, 0),
             summarise_pending: false,
             history_rewritten: false,
+            router: None,
         })
     }
 
@@ -191,8 +195,116 @@ impl SdkSession {
         Arc::clone(&self.cancel)
     }
 
+    /// Route each turn with `router` (when it is enabled).
+    pub fn set_router(&mut self, router: crate::router::RouterConfig) {
+        self.router = router.enabled.then_some(router);
+    }
+
     /// Execute a full agentic turn: prompt → stream → tool loop → complete.
+    /// A routed turn runs on its tier; the next one is routed afresh.
     pub async fn execute_turn(&mut self, prompt: String) -> Result<TurnEnd> {
+        let base = (self.client.clone(), self.config.model.clone());
+        let end = self.execute_routed_turn(prompt).await;
+        if self.router.is_some() {
+            (self.client, self.config.model) = base;
+        }
+        end
+    }
+
+    /// Pick the turn's tier, switch to it and say so with `model/routed`.
+    async fn route_turn(
+        &mut self,
+        prompt: &str,
+        turn_cost_start: f64,
+    ) -> Option<crate::router::TurnRoute> {
+        let router = self.router.clone()?;
+        let context_tokens =
+            crate::router::estimate_context_tokens(&self.system_prompt, &self.messages)
+                + prompt.len() as u64 / 4;
+        let outcome = router
+            .route(&self.config, &self.client, prompt, context_tokens)
+            .await;
+        for n in &outcome.notices {
+            tracing::warn!("{n}");
+        }
+        if let Some((model, u)) = &outcome.classifier_usage {
+            self.cost_tracker.record_with_cache(
+                model,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+            );
+            self.send_notif(SdkNotification::CostUpdated {
+                session_id: self.session_id.clone(),
+                turn_cost_usd: self.cost_tracker.total_cost_usd - turn_cost_start,
+                session_total_usd: self.cost_tracker.total_cost_usd,
+                budget_remaining_usd: self.cost_tracker.remaining(),
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_read_tokens: u.cache_read_input_tokens,
+                cache_write_tokens: u.cache_creation_input_tokens,
+                model: model.clone(),
+            });
+        }
+        let route = outcome.route?;
+        self.send_notif(SdkNotification::ModelRouted {
+            session_id: self.session_id.clone(),
+            model: route.model.clone(),
+            complexity: route.tier.to_string(),
+            reason: route.reason,
+        });
+        self.client = route.client;
+        self.config.model = route.model;
+        Some(crate::router::TurnRoute::new(router, route.tier))
+    }
+
+    /// Move the rest of the turn one tier up after `trigger`, once.
+    async fn escalate(
+        &mut self,
+        routing: &mut Option<crate::router::TurnRoute>,
+        trigger: crate::router::Trigger,
+    ) -> bool {
+        let Some(route) = routing.as_mut() else {
+            return false;
+        };
+        let context_tokens =
+            crate::router::estimate_context_tokens(&self.system_prompt, &self.messages);
+        let mut notices = Vec::new();
+        let next = route
+            .escalate(
+                &self.config,
+                &self.client,
+                context_tokens,
+                self.cost_tracker.remaining(),
+                trigger,
+                &mut notices,
+            )
+            .await;
+        for n in &notices {
+            tracing::warn!("{n}");
+        }
+        match next {
+            crate::router::Escalation::To(r) => {
+                self.send_notif(SdkNotification::ModelRouted {
+                    session_id: self.session_id.clone(),
+                    model: r.model.clone(),
+                    complexity: r.tier.to_string(),
+                    reason: r.reason,
+                });
+                self.client = r.client;
+                self.config.model = r.model;
+                true
+            }
+            crate::router::Escalation::OverBudget(line) => {
+                tracing::warn!("{line}");
+                false
+            }
+            crate::router::Escalation::None => false,
+        }
+    }
+
+    async fn execute_routed_turn(&mut self, prompt: String) -> Result<TurnEnd> {
         let turn_start = Instant::now();
         let mut turn_input_tokens: u64 = 0;
         let mut turn_output_tokens: u64 = 0;
@@ -267,6 +379,8 @@ impl SdkSession {
             turn_input_tokens += i;
             turn_output_tokens += o;
         }
+
+        let mut routing = self.route_turn(&prompt, turn_cost_start).await;
 
         // 3. Push user message
         let mut base = self.messages.len();
@@ -365,6 +479,20 @@ impl SdkSession {
             let response = match response {
                 Ok(r) => r,
                 Err(e) => {
+                    // A routed turn the cheap tier failed moves one tier
+                    // up, unless part of the answer already reached the host.
+                    let err = format!("{e:#}");
+                    let trigger = if crate::api::is_context_overflow(&err) {
+                        crate::router::Trigger::ContextOverflow
+                    } else {
+                        crate::router::Trigger::ApiError
+                    };
+                    if turn_text.is_empty()
+                        && crate::router::escalates_on(&err)
+                        && self.escalate(&mut routing, trigger).await
+                    {
+                        continue;
+                    }
                     // ACP runs every prompt on this session. Keeping a turn
                     // whose request was rejected (say, too large) would resend
                     // it, and fail the same way, on every later prompt.
@@ -431,7 +559,11 @@ impl SdkSession {
             // tools), prompt-cache hits included, is the real measure of
             // how full the context window is.
             let context_tok = response.usage.context_tokens();
-            let window = crate::compact::compaction_window(&self.config, None, None);
+            let window = crate::compact::compaction_window(
+                &self.config,
+                routing.as_ref().map(|r| &r.router),
+                None,
+            );
             let used_pct = ((context_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
             self.send_notif(SdkNotification::ContextHealth {
                 session_id: self.session_id.clone(),
@@ -495,6 +627,16 @@ impl SdkSession {
             // Check stop reason
             match &response.stop_reason {
                 Some(StopReason::ToolUse) => {
+                    // Malformed calls twice in a row: they still get their
+                    // (error) results; the next request goes a tier up.
+                    if let Some(route) = routing.as_mut() {
+                        let defs: Vec<ToolDefinition> =
+                            self.tools.iter().map(|t| t.definition()).collect();
+                        if route.malformed_twice(&response.content, &defs) {
+                            self.escalate(&mut routing, crate::router::Trigger::MalformedToolCalls)
+                                .await;
+                        }
+                    }
                     let tool_results = self.execute_tools_with_approval(&response.content).await?;
 
                     // Push tool results as user message
@@ -2062,5 +2204,75 @@ mod subagent_gate_tests {
         let got = outcomes.lock().unwrap();
         assert_eq!(got[0], GateOutcome::Allowed);
         assert!(matches!(got[1], GateOutcome::Denied(_)), "{got:?}");
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::router::fake_chat::{self, Reply};
+
+    /// The host sees where the turn went (`model/routed`), where it moved
+    /// after the cheap tier failed, and which model finished it.
+    #[tokio::test]
+    async fn routed_turns_report_their_model_and_escalation() {
+        let (host, seen) = fake_chat::start(|model, _| match model {
+            "small" => Reply::Status(500, r#"{"error":"model runner crashed"}"#),
+            _ => Reply::Text("done"),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            model: "ollama:big".into(),
+            ollama_host: host,
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&cfg.model);
+        router.enabled = true;
+        router.low_model = "ollama:small".into();
+        router.medium_model = "ollama:mid".into();
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let mut s = SdkSession::new(
+            cfg,
+            Vec::new(),
+            Policy::default(),
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        s.set_router(router);
+
+        assert!(matches!(
+            s.execute_turn("yes".into()).await.unwrap(),
+            TurnEnd::EndTurn
+        ));
+        assert_eq!(*seen.lock().unwrap(), vec!["small", "mid"]);
+        let (mut routed, mut completed) = (Vec::new(), None);
+        while let Ok(n) = nrx.try_recv() {
+            match n {
+                SdkNotification::ModelRouted {
+                    model,
+                    complexity,
+                    reason,
+                    ..
+                } => routed.push((model, complexity, reason)),
+                SdkNotification::TurnCompleted { model, .. } => completed = Some(model),
+                _ => {}
+            }
+        }
+        assert_eq!(routed.len(), 2, "{routed:?}");
+        assert_eq!(routed[0].0, "ollama:small");
+        assert_eq!(routed[0].1, "low");
+        assert_eq!(routed[1].0, "ollama:mid");
+        assert_eq!(routed[1].1, "medium");
+        assert!(routed[1].2.contains("API error"), "{}", routed[1].2);
+        assert_eq!(completed.as_deref(), Some("ollama:mid"));
+        // Back on the session model for the next turn.
+        assert_eq!(s.config_model(), "ollama:big");
     }
 }
