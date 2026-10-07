@@ -178,8 +178,18 @@ pub fn detect_lint_command(cwd: &Path, override_cmd: &Option<String>) -> Option<
 /// default `"test": "echo \"Error: no test specified\" && exit 1"` would
 /// otherwise fail every check and send the model chasing an error it cannot
 /// fix. `path` is the PATH to search (a parameter so tests do not depend on
-/// the machine's).
-fn runnable_detected(cwd: &Path, cmd: String, path: Option<&std::ffi::OsStr>) -> Option<String> {
+/// the machine's). The clippy probe runs a binary the project picks (rustup
+/// honours `rust-toolchain.toml`, whose `path` can point into the repo), so
+/// it goes through `containment` like the checks themselves; a probe the
+/// sandbox refuses means "not runnable".
+fn runnable_detected(
+    cwd: &Path,
+    cmd: String,
+    path: Option<&std::ffi::OsStr>,
+    containment: &Containment,
+    timeout_secs: u64,
+    cancel: &AtomicBool,
+) -> Option<String> {
     let program = cmd.split_whitespace().next()?.to_string();
     // A project virtualenv is where Python tools usually live, and it is
     // often not activated in the shell oxideclaw was started from.
@@ -191,15 +201,16 @@ fn runnable_detected(cwd: &Path, cmd: String, path: Option<&std::ffi::OsStr>) ->
     let resolved = find_on_path(&program, path)?;
     if cmd.starts_with("cargo clippy") {
         // `cargo clippy` without the clippy component exits 101.
-        let ok = Command::new(&resolved)
-            .args(["clippy", "--version"])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
+        let resolved = resolved.display().to_string();
+        // run_command goes through `sh -c` on unix only.
+        #[cfg(unix)]
+        let resolved = crate::sandbox::shell_quote(&resolved);
+        let probe = format!("{resolved} clippy --version");
+        let wrapped = containment.wrap(&probe, cwd).ok()?;
+        if !matches!(
+            run_command(cwd, &wrapped, timeout_secs, cancel),
+            CommandResult::Pass
+        ) {
             return None;
         }
     }
@@ -642,6 +653,58 @@ pub fn format_feedback_message(
     )
 }
 
+/// Output that says the check could not run in a namespace sandbox (no
+/// network, a tool or path outside it), as opposed to code that is wrong.
+/// Lower-case substrings matched against lower-cased output.
+const SANDBOX_ENVIRONMENT_ERRORS: [&str; 15] = [
+    // cargo with an empty or unreachable registry
+    "failed to download",
+    "failed to get `",
+    "failed to load source for dependency",
+    "failed to update registry",
+    // name resolution and sockets (curl, git, go, npm, pip)
+    "could not resolve host",
+    "couldn't resolve host",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "dial tcp",
+    "eai_again",
+    "enotfound",
+    "failed to establish a new connection",
+    // a program or path the sandbox does not expose
+    "command not found",
+    ": not found",
+    "read-only file system",
+];
+
+/// The status to show instead of a retry when a check failed inside a
+/// namespace sandbox (bwrap, firejail) because of the sandbox itself. The
+/// model would otherwise be told its edit broke the build and spend every
+/// retry chasing an error no edit can fix.
+fn sandbox_environment_failure(
+    containment: &Containment,
+    outputs: &[&Option<String>],
+) -> Option<String> {
+    let mode = containment
+        .sandbox_mode
+        .as_deref()
+        .filter(|m| crate::sandbox::mode_enforces_isolation(m))?;
+    let line = outputs
+        .iter()
+        .filter_map(|o| o.as_deref())
+        .flat_map(str::lines)
+        .find(|line| {
+            let line = line.to_ascii_lowercase();
+            SANDBOX_ENVIRONMENT_ERRORS.iter().any(|e| line.contains(e))
+        })?;
+    let line: String = line.trim().chars().take(200).collect();
+    Some(format!(
+        "[auto-fix] skipped: the check could not run inside the {mode} sandbox \
+         (`{line}`), so it says nothing about the edit. Allow network with \
+         sandboxAllowNetwork, or set autoFixLoop.lintCommand / testCommand."
+    ))
+}
+
 fn trim_section(s: &str) -> String {
     if s.len() <= MAX_FEEDBACK_SECTION_BYTES {
         return s.to_string();
@@ -715,15 +778,23 @@ pub fn run_auto_fix_check(
     // auto-detected runner that is not installed here is skipped instead:
     // `sh: ruff: not found` is not something the model can fix by editing.
     let path = std::env::var_os("PATH");
+    let runnable = |cmd| {
+        runnable_detected(
+            cwd,
+            cmd,
+            path.as_deref(),
+            containment,
+            config.timeout_secs,
+            cancel,
+        )
+    };
     let lint_cmd = match &config.lint_command {
         Some(cmd) => Some(cmd.clone()),
-        None => detect_lint_command(cwd, &None)
-            .and_then(|cmd| runnable_detected(cwd, cmd, path.as_deref())),
+        None => detect_lint_command(cwd, &None).and_then(runnable),
     };
     let test_cmd = match &config.test_command {
         Some(cmd) => Some(cmd.clone()),
-        None => detect_test_command(cwd, &None)
-            .and_then(|cmd| runnable_detected(cwd, cmd, path.as_deref())),
+        None => detect_test_command(cwd, &None).and_then(runnable),
     };
 
     if lint_cmd.is_none() && test_cmd.is_none() {
@@ -761,6 +832,13 @@ pub fn run_auto_fix_check(
             lint_stderr,
             test_stderr,
         } => {
+            if let Some(status) =
+                sandbox_environment_failure(containment, &[&lint_stderr, &test_stderr])
+            {
+                return AutoFixAction::Continue {
+                    status: Some(status),
+                };
+            }
             if retries_used >= config.max_retries {
                 let lint_tail = lint_stderr
                     .as_deref()
@@ -812,6 +890,15 @@ mod tests {
     }
 
     // ── Auto-detected runners must be runnable ───────────────────────────────
+
+    /// `runnable_detected` in a trusted project with no sandbox.
+    fn runnable(
+        cwd: &std::path::Path,
+        cmd: String,
+        path: Option<&std::ffi::OsStr>,
+    ) -> Option<String> {
+        super::runnable_detected(cwd, cmd, path, &trusted(), 10, &NOT_CANCELLED)
+    }
 
     #[cfg(unix)]
     fn fake_bin(dir: &std::path::Path, name: &str, exit: i32) {
@@ -884,10 +971,7 @@ mod tests {
         std::fs::write(proj.path().join("pyproject.toml"), "[project]\n").unwrap();
         let path = empty_path.path().as_os_str();
         for cmd in ["ruff check .", "pytest"] {
-            assert_eq!(
-                super::runnable_detected(proj.path(), cmd.into(), Some(path)),
-                None
-            );
+            assert_eq!(runnable(proj.path(), cmd.into(), Some(path)), None);
         }
     }
 
@@ -899,7 +983,7 @@ mod tests {
         std::fs::create_dir_all(proj.path().join(".venv/bin")).unwrap();
         fake_bin(&proj.path().join(".venv/bin"), "ruff", 0);
         assert_eq!(
-            super::runnable_detected(
+            runnable(
                 proj.path(),
                 "ruff check .".into(),
                 Some(empty_path.path().as_os_str())
@@ -916,14 +1000,49 @@ mod tests {
         fake_bin(bin.path(), "cargo", 101); // `cargo clippy --version` fails
         let path = Some(bin.path().as_os_str());
         let lint = "cargo clippy --all-targets -- -D warnings";
+        assert_eq!(runnable(proj.path(), lint.into(), path), None);
         assert_eq!(
-            super::runnable_detected(proj.path(), lint.into(), path),
-            None
-        );
-        assert_eq!(
-            super::runnable_detected(proj.path(), "cargo test".into(), path),
+            runnable(proj.path(), "cargo test".into(), path),
             Some("cargo test".to_string())
         );
+    }
+
+    /// The probe runs a binary the project can choose (`rust-toolchain.toml`
+    /// `path`), so it is contained like the checks: a sandbox that refuses
+    /// it means no clippy, never a bare run.
+    #[cfg(unix)]
+    #[test]
+    fn the_clippy_probe_goes_through_the_sandbox() {
+        use std::os::unix::fs::PermissionsExt;
+        let proj = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let marker = proj.path().join("probed");
+        let cargo = bin.path().join("cargo");
+        std::fs::write(
+            &cargo,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = Some(bin.path().as_os_str());
+        let lint = "cargo clippy --all-targets -- -D warnings";
+
+        let refused = super::Containment {
+            trusted: true,
+            sandbox_mode: Some("bogus".to_string()),
+            sandbox_allow_network: false,
+        };
+        assert_eq!(
+            super::runnable_detected(proj.path(), lint.into(), path, &refused, 10, &NOT_CANCELLED),
+            None
+        );
+        assert!(!marker.exists(), "the probe ran outside the sandbox");
+
+        assert_eq!(
+            runnable(proj.path(), lint.into(), path),
+            Some(lint.to_string())
+        );
+        assert!(marker.exists());
     }
 
     #[cfg(unix)]
@@ -939,15 +1058,9 @@ mod tests {
             r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            super::runnable_detected(proj.path(), "npm test".into(), path),
-            None
-        );
+        assert_eq!(runnable(proj.path(), "npm test".into(), path), None);
         let eslint = "npx --no-install eslint .";
-        assert_eq!(
-            super::runnable_detected(proj.path(), eslint.into(), path),
-            None
-        );
+        assert_eq!(runnable(proj.path(), eslint.into(), path), None);
 
         std::fs::write(
             proj.path().join("package.json"),
@@ -958,11 +1071,11 @@ mod tests {
         std::fs::create_dir_all(proj.path().join("node_modules/.bin")).unwrap();
         fake_bin(&proj.path().join("node_modules/.bin"), "eslint", 0);
         assert_eq!(
-            super::runnable_detected(proj.path(), "npm test".into(), path),
+            runnable(proj.path(), "npm test".into(), path),
             Some("npm test".to_string())
         );
         assert_eq!(
-            super::runnable_detected(proj.path(), eslint.into(), path),
+            runnable(proj.path(), eslint.into(), path),
             Some(eslint.to_string())
         );
     }
@@ -1649,6 +1762,49 @@ mod tests {
         }
         assert!(!dir.path().join("lint.marker").exists());
         assert!(!dir.path().join("test.marker").exists());
+    }
+
+    /// Under bwrap, `cargo test` with no crate cache or network used to be
+    /// reported to the model as "your last edits failed", retry after retry.
+    #[test]
+    fn sandbox_environment_errors_are_not_sent_as_edit_failures() {
+        let bwrap = Containment {
+            trusted: true,
+            sandbox_mode: Some("bwrap".to_string()),
+            sandbox_allow_network: false,
+        };
+        let cargo = Some(
+            "    Updating crates.io index\n\
+             error: failed to get `serde` as a dependency of package `x v0.1.0`\n"
+                .to_string(),
+        );
+        let sh = Some("bash: line 1: ruff: command not found\n".to_string());
+        let go = Some("dial tcp: lookup proxy.golang.org: Temporary failure\n".to_string());
+        for out in [&cargo, &sh, &go] {
+            let status = super::sandbox_environment_failure(&bwrap, &[&None, out])
+                .expect("an environment failure");
+            assert!(status.contains("bwrap sandbox"), "{status}");
+        }
+
+        // A real build error is still the model's to fix.
+        let rustc = Some(
+            "error[E0583]: file not found for module `foo`\n\
+             error[E0425]: cannot find value `x` in this scope\n"
+                .to_string(),
+        );
+        assert_eq!(
+            super::sandbox_environment_failure(&bwrap, &[&rustc, &None]),
+            None
+        );
+        // Without a namespace sandbox the environment is the user's own, and
+        // a failure is reported as before.
+        for mode in [None, Some("strict".to_string())] {
+            let c = Containment {
+                sandbox_mode: mode,
+                ..bwrap.clone()
+            };
+            assert_eq!(super::sandbox_environment_failure(&c, &[&cargo, &sh]), None);
+        }
     }
 
     /// The namespace modes wrap the command exactly as for Bash; without

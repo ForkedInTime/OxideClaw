@@ -172,9 +172,12 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 ///     /etc/ssl + /etc/pki (Fedora/RHEL keep the CA bundle under pki), the
 ///     dynamic-linker cache, and the name-service/timezone files
 ///   - Mounts per-user toolchains (~/.cargo/bin, ~/.rustup, ~/.local/bin,
-///     ~/.nvm) read-only so PATH entries pointing at them still resolve. The
-///     rest of $HOME stays hidden; ~/.cargo itself is not bound because it
-///     holds registry credentials.
+///     ~/.nvm) read-only so PATH entries pointing at them still resolve, and
+///     the package caches their builds read (~/.cargo/registry, ~/.cargo/git,
+///     ~/go/pkg/mod, ~/.local/lib), since with the network off nothing can be
+///     downloaded again. $CARGO_HOME, $RUSTUP_HOME, $GOMODCACHE and $GOPATH
+///     are honoured. The rest of $HOME stays hidden; ~/.cargo itself is not
+///     bound because it holds registry credentials.
 ///   - Mounts a fresh tmpfs on /tmp, then binds the current working directory
 ///     read-write on top. bwrap applies mounts in argument order, so the cwd
 ///     bind must come last or a project under /tmp would be buried by the tmpfs
@@ -188,7 +191,56 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 ///     control, so bwrap's own guard is the right place to rely on.
 ///   - Uses --die-with-parent so cleanup is automatic
 pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
-    bwrap_wrap_with_home(command, cwd, allow_network, dirs::home_dir().as_deref())
+    bwrap_wrap_with_home(
+        command,
+        cwd,
+        allow_network,
+        dirs::home_dir().as_deref(),
+        &|name| std::env::var_os(name),
+    )
+}
+
+/// The per-user toolchain and package-cache directories bound read-only.
+/// `var` reads an environment variable (a parameter so tests do not depend
+/// on the machine's); relative values are ignored.
+fn toolchain_dirs(
+    home: Option<&std::path::Path>,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let abs = |name: &str| var(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(h) = home {
+        for d in [
+            ".cargo/bin",
+            ".cargo/registry",
+            ".cargo/git",
+            ".rustup",
+            ".local/bin",
+            ".local/lib",
+            ".nvm",
+            "go/pkg/mod",
+        ] {
+            dirs.push(h.join(d));
+        }
+    }
+    if let Some(cargo_home) = abs("CARGO_HOME") {
+        for d in ["bin", "registry", "git"] {
+            dirs.push(cargo_home.join(d));
+        }
+    }
+    dirs.extend(abs("RUSTUP_HOME"));
+    dirs.extend(abs("GOMODCACHE"));
+    if let Some(gopath) = var("GOPATH") {
+        dirs.extend(
+            std::env::split_paths(&gopath)
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join("pkg/mod")),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs
 }
 
 fn bwrap_wrap_with_home(
@@ -196,20 +248,17 @@ fn bwrap_wrap_with_home(
     cwd: &std::path::Path,
     allow_network: bool,
     home: Option<&std::path::Path>,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> String {
     let cwd_quoted = shell_quote(&cwd.display().to_string());
     let net_flag = if allow_network { "" } else { "--unshare-net " };
-    let home_binds: String = home
-        .map(|h| {
-            [".cargo/bin", ".rustup", ".local/bin", ".nvm"]
-                .iter()
-                .map(|d| {
-                    let p = shell_quote(&h.join(d).display().to_string());
-                    format!("--ro-bind-try {p} {p} ")
-                })
-                .collect()
+    let home_binds: String = toolchain_dirs(home, var)
+        .iter()
+        .map(|d| {
+            let p = shell_quote(&d.display().to_string());
+            format!("--ro-bind-try {p} {p} ")
         })
-        .unwrap_or_default();
+        .collect();
 
     format!(
         "bwrap \
@@ -427,7 +476,7 @@ pub fn sandbox_status(enabled: bool, mode: &str) -> String {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -518,6 +567,7 @@ mod tests {
             Path::new("/tmp/proj"),
             true,
             Some(Path::new("/tmp/home")),
+            &no_env,
         );
         let tmpfs = cmd.find("--tmpfs /tmp ").expect("tmpfs on /tmp");
         let bind = cmd
@@ -542,6 +592,7 @@ mod tests {
             Path::new("/work"),
             true,
             Some(Path::new("/home/o'neil")),
+            &no_env,
         );
         for needed in [
             "--ro-bind-try /etc/alternatives /etc/alternatives",
@@ -556,8 +607,56 @@ mod tests {
             !cmd.contains("neil/.cargo' "),
             "~/.cargo holds registry credentials and must stay hidden: {cmd}"
         );
-        let no_home = bwrap_wrap_with_home("true", Path::new("/work"), true, None);
+        let no_home = bwrap_wrap_with_home("true", Path::new("/work"), true, None, &no_env);
         assert!(!no_home.contains(".rustup"));
+    }
+
+    fn no_env(_: &str) -> Option<std::ffi::OsString> {
+        None
+    }
+
+    /// With the network off nothing can be downloaded, so a Rust, Go or
+    /// user-site Python build needs its package cache; auto-fix's `cargo
+    /// test` failed on every edit of any project with dependencies.
+    #[test]
+    fn bwrap_exposes_package_caches_read_only() {
+        let home = Path::new("/home/dev");
+        let cmd =
+            bwrap_wrap_with_home("cargo test", Path::new("/work"), false, Some(home), &no_env);
+        for dir in [".cargo/registry", ".cargo/git", "go/pkg/mod", ".local/lib"] {
+            let p = format!("'/home/dev/{dir}'");
+            assert!(
+                cmd.contains(&format!("--ro-bind-try {p} {p} ")),
+                "missing {dir} in: {cmd}"
+            );
+        }
+        assert!(!cmd.contains("--bind '/home/dev/.cargo"), "{cmd}");
+
+        let env = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "CARGO_HOME" => Some("/opt/cargo".into()),
+                "RUSTUP_HOME" => Some("/opt/rustup".into()),
+                "GOMODCACHE" => Some("/opt/gomod".into()),
+                "GOPATH" => Some("/opt/go:relative/go".into()),
+                _ => None,
+            }
+        };
+        let cmd = bwrap_wrap_with_home("go test", Path::new("/work"), false, None, &env);
+        for dir in [
+            "/opt/cargo/bin",
+            "/opt/cargo/registry",
+            "/opt/cargo/git",
+            "/opt/rustup",
+            "/opt/gomod",
+            "/opt/go/pkg/mod",
+        ] {
+            assert!(
+                cmd.contains(&format!("--ro-bind-try '{dir}' '{dir}' ")),
+                "missing {dir} in: {cmd}"
+            );
+        }
+        assert!(!cmd.contains("relative"), "{cmd}");
+        assert!(!cmd.contains("'/opt/cargo' "), "{cmd}");
     }
 
     // ── Honesty about what `strict` actually does ────────────────────────────
