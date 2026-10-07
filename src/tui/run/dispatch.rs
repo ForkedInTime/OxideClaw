@@ -1070,7 +1070,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::ReloadSettings => {
             // Hot-reload settings.json without restarting
-            let settings = crate::settings::Settings::load(&config.cwd);
+            let settings = config.load_settings();
             let mut reloaded = Vec::new();
 
             if let Some(model) = reloaded_model(
@@ -1160,9 +1160,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::ReloadPlugins => {
             // Re-read settings.json mcpServers section
-            let count = crate::settings::Settings::load(&config.cwd)
-                .mcp_servers
-                .len();
+            let count = config.load_settings().mcp_servers.len();
             app.entries.push(ChatEntry::system(format!(
                 "Plugin/MCP config reloaded — {} server(s) defined in settings.json.\n\
                  \n\

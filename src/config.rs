@@ -429,6 +429,11 @@ pub struct Config {
     /// session moved to another project (`retarget_cwd`) applies them there.
     #[serde(skip)]
     pub flag_settings: Option<crate::settings::Settings>,
+    /// The config directory to read global settings, CLAUDE.md and AGENTS.md
+    /// from instead of [`Config::claude_dir`]; tests point it at a tempdir
+    /// so the developer's own files never leak in.
+    #[serde(skip)]
+    pub(crate) claude_dir_override: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -525,6 +530,7 @@ impl Default for Config {
             auto_fix: crate::autofix::AutoFixConfig::default(),
             auto_commit: crate::settings::AutoCommitConfig::default(),
             flag_settings: None,
+            claude_dir_override: None,
         }
     }
 }
@@ -682,11 +688,13 @@ impl Config {
         }
         // --settings applies in every project, on top of its settings files.
         let flag_settings = self.flag_settings.clone();
+        let claude_dir_override = self.claude_dir_override.clone();
         let project = |cwd: PathBuf, bare_mode: bool| {
             let mut c = Config {
                 cwd,
                 bare_mode,
                 flag_settings: flag_settings.clone(),
+                claude_dir_override: claude_dir_override.clone(),
                 ..Config::default()
             };
             c.load_project();
@@ -799,6 +807,7 @@ impl Config {
             watch_rate_limit_ms: old.watch_rate_limit_ms,
             watch_markers: old.watch_markers,
             flag_settings: old.flag_settings,
+            claude_dir_override: old.claude_dir_override,
         };
     }
 
@@ -1021,8 +1030,9 @@ impl Config {
 
         // ── CLAUDE.md + AGENTS.md files (global + project hierarchy) — skipped in bare mode
         if !self.bare_mode {
-            self.claudemd = Self::load_claude_md(&self.cwd);
-            self.agentsmd = Self::load_agents_md(&self.cwd);
+            let dir = self.config_dir();
+            self.claudemd = Self::load_claude_md_in(&dir, &self.cwd);
+            self.agentsmd = Self::load_agents_md_in(&dir, &self.cwd);
         }
 
         // ── CLAUDE.md phase-routing directive override
@@ -1032,9 +1042,16 @@ impl Config {
         Self::apply_phase_routing_from_claudemd(&self.claudemd, &mut self.phase_router);
     }
 
+    /// [`Config::claude_dir`], or the override tests set.
+    fn config_dir(&self) -> PathBuf {
+        self.claude_dir_override
+            .clone()
+            .unwrap_or_else(Self::claude_dir)
+    }
+
     /// Settings files for `self.cwd`, with `--settings` on top.
-    fn load_settings(&self) -> crate::settings::Settings {
-        let settings = crate::settings::Settings::load(&self.cwd);
+    pub(crate) fn load_settings(&self) -> crate::settings::Settings {
+        let settings = crate::settings::Settings::load_in(&self.config_dir(), &self.cwd);
         match &self.flag_settings {
             Some(flag) => settings.merge(flag.clone()),
             None => settings,
@@ -1130,6 +1147,10 @@ impl Config {
     ///
     /// Returns the concatenated text, with a source comment before each section.
     pub fn load_claude_md(cwd: &Path) -> String {
+        Self::load_claude_md_in(&Self::claude_dir(), cwd)
+    }
+
+    fn load_claude_md_in(claude_dir: &Path, cwd: &Path) -> String {
         let mut parts: Vec<String> = Vec::new();
         // Track canonical paths so symlinks / relative traversal can't inject the same file twice
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1160,7 +1181,7 @@ impl Config {
         };
 
         // ── Global: ~/.claude/CLAUDE.md ──────────────────────────────────────
-        let global = Self::claude_dir().join("CLAUDE.md");
+        let global = claude_dir.join("CLAUDE.md");
         include(&global);
 
         // ── Walk from cwd up toward home/root, collect CLAUDE.md files ───────
@@ -1192,6 +1213,10 @@ impl Config {
     /// Load and merge all AGENTS.md files in priority order (same as CLAUDE.md).
     /// Industry-standard agent configuration — works across OxideClaw, [redacted], [redacted], etc.
     pub fn load_agents_md(cwd: &Path) -> String {
+        Self::load_agents_md_in(&Self::claude_dir(), cwd)
+    }
+
+    fn load_agents_md_in(claude_dir: &Path, cwd: &Path) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -1220,7 +1245,7 @@ impl Config {
         };
 
         // Global: ~/.claude/AGENTS.md
-        let global = Self::claude_dir().join("AGENTS.md");
+        let global = claude_dir.join("AGENTS.md");
         include(&global);
 
         // Walk from cwd up toward home/root
@@ -2393,10 +2418,14 @@ mod retarget_cwd_tests {
         std::fs::write(dir.join(".claude/settings.json"), settings).unwrap();
     }
 
-    /// What Config::load builds when launched in `dir`, minus credentials.
+    /// What Config::load builds when launched in `dir`, minus credentials,
+    /// with an empty config dir next to it so ~/.claude never leaks in.
     fn launched_in(dir: &Path) -> Config {
+        let home = dir.join(".test-config-dir");
+        std::fs::create_dir_all(&home).unwrap();
         let mut c = Config {
             cwd: dir.to_path_buf(),
+            claude_dir_override: Some(home),
             ..Config::default()
         };
         c.load_project();
@@ -2509,8 +2538,12 @@ mod flag_settings_retarget_tests {
         )
         .unwrap();
 
+        let home = tempfile::tempdir().unwrap();
+        let start = tempfile::tempdir().unwrap();
         let mut cfg = Config {
             model: "cli-model".into(),
+            cwd: start.path().into(),
+            claude_dir_override: Some(home.path().into()),
             flag_settings: Some(
                 serde_json::from_str(r#"{"permissions": {"deny": ["WebFetch"]}}"#).unwrap(),
             ),
@@ -2534,13 +2567,44 @@ mod flag_settings_retarget_tests {
         assert_eq!(cfg.model, "cli-model", "overrides are kept");
     }
 
+    /// /reload re-read only the settings files and wrote them over the
+    /// config, so `--settings '{"sandboxEnabled":true}'` was turned off by a
+    /// settings.json with `"sandboxEnabled": false`.
+    #[test]
+    fn load_settings_keeps_the_flag_settings_on_top() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"sandboxEnabled": false, "model": "file-model"}"#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cwd: project.path().into(),
+            claude_dir_override: Some(home.path().into()),
+            flag_settings: Some(
+                serde_json::from_str(r#"{"sandboxEnabled": true, "sandboxMode": "bwrap"}"#)
+                    .unwrap(),
+            ),
+            ..Config::default()
+        };
+        let s = cfg.load_settings();
+        assert_eq!(s.sandbox_enabled, Some(true));
+        assert_eq!(s.sandbox_mode.as_deref(), Some("bwrap"));
+        assert_eq!(s.model.as_deref(), Some("file-model"));
+    }
+
     #[test]
     fn retarget_keeps_bare_mode_bare() {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(project.path().join("CLAUDE.md"), "project rules").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let start = tempfile::tempdir().unwrap();
         let mut cfg = Config {
             bare_mode: true,
             disable_all_hooks: true,
+            cwd: start.path().into(),
+            claude_dir_override: Some(home.path().into()),
             ..Config::default()
         };
         cfg.retarget_cwd(project.path().to_path_buf());
