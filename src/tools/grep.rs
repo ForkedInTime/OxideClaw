@@ -182,9 +182,9 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
         Some(OutputMode::Count) => args.push("-c".into()),
     }
 
-    // Content mode — explicit (no -l)
-    if input.output_mode == Some(OutputMode::Content) {
-        args.retain(|a| a != "-l");
+    // rg numbers lines only when stdout is a TTY; here it is a pipe.
+    if input.output_mode == Some(OutputMode::Content) && input.line_numbers {
+        args.push("-n".into());
     }
 
     if input.case_insensitive {
@@ -306,6 +306,10 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
         .await?;
 
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    // Exit 1 is "no matches"; 2 is an error (bad regex, missing path,
+    // unreadable file), which must not read as a definitive "No matches".
+    let failed = !output.status.success() && output.status.code() != Some(1);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
 
     if let Some(limit) = input.head_limit {
         let lines: Vec<&str> = text.lines().take(limit).collect();
@@ -313,7 +317,15 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
     }
 
     if text.trim().is_empty() {
+        if failed {
+            return Ok(ToolOutput::error(format!("rg failed: {stderr}")));
+        }
         return Ok(ToolOutput::success("No matches found."));
+    }
+    if failed && !stderr.is_empty() {
+        // Partial failure: the matches are real, but some files were skipped.
+        let note: Vec<&str> = stderr.lines().take(5).collect();
+        text = format!("{}\n[rg errors]\n{}", text.trim_end(), note.join("\n"));
     }
 
     Ok(ToolOutput::success(text))
@@ -671,6 +683,37 @@ mod search_scope_tests {
         for t in both(&ctx, json!({"pattern": "useState", "path": "build"})).await {
             assert!(t.contains("out.js"), "{t}");
         }
+    }
+
+    /// rg's exit 2 (bad regex, missing path) came back as "No matches
+    /// found.", and content mode never had line numbers because stdout is a
+    /// pipe.
+    #[tokio::test]
+    async fn rg_errors_surface_and_content_mode_numbers_lines() {
+        if !has_rg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "x\nfoo(1)\n");
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let rg = |v: serde_json::Value| {
+            let input: GrepInput = serde_json::from_value(v).unwrap();
+            let ctx = &ctx;
+            async move { run_with_rg(&input, ctx).await.unwrap() }
+        };
+
+        let out = rg(json!({"pattern": "foo("})).await;
+        assert!(out.is_error, "{}", text(&out));
+        assert!(text(&out).contains("regex"), "{}", text(&out));
+
+        let out = rg(json!({"pattern": "foo", "path": "missing"})).await;
+        assert!(out.is_error, "{}", text(&out));
+
+        let out = rg(json!({"pattern": "nothing-here"})).await;
+        assert!(!out.is_error && text(&out) == "No matches found.");
+
+        let out = rg(json!({"pattern": "foo", "output_mode": "content", "-n": true})).await;
+        assert!(text(&out).contains(":2:foo(1)"), "{}", text(&out));
     }
 
     /// The walker (the only backend in the Docker image) ignored
