@@ -45,41 +45,48 @@ pub fn thresholds(window: u64) -> (u64, u64, u64) {
     (window / 100 * 80, window / 100 * 85, window / 100 * 90)
 }
 
-/// The window to compact against: the smallest among the configured model and
-/// every model a router may send the next turn to. A history that is fine on a
-/// 1M model is a prompt-too-long 400 once a simple prompt routes to Haiku.
+/// The window to compact against.
 ///
-/// The phase router is passed in rather than read from `config`: only the TUI
-/// phase-routes, and headless/SDK sessions always send `config.model`.
+/// With the model router on it is the largest tier's: each turn goes to a
+/// tier whose window holds the history (or escalates to one on overflow),
+/// so compacting for the smallest tier would throw away context a 1M model
+/// never needed trimmed. With the phase router on it is the smallest among
+/// the configured model and every phase model, since phase routing has no
+/// such fallback: a history that is fine on a 1M model is a prompt-too-long
+/// 400 once a phase routes to Haiku.
+///
+/// The routers are passed in rather than read from `config`: only the
+/// frontends that route know whether routing is on.
 pub fn compaction_window(
     config: &Config,
     router: Option<&crate::router::RouterConfig>,
     phase: Option<&crate::router::PhaseRouterConfig>,
 ) -> u64 {
-    let mut models: Vec<&str> = vec![&config.model];
-    if let Some(r) = router.filter(|r| r.enabled) {
-        models.extend([
-            r.low_model.as_str(),
-            r.medium_model.as_str(),
-            r.high_model.as_str(),
-            r.super_high_model.as_str(),
-        ]);
-    }
+    let window = crate::api::context_window_for_model;
+    let mut w = match router.filter(|r| r.enabled) {
+        Some(r) => crate::router::Complexity::ALL
+            .iter()
+            .map(|&t| r.model_for(t))
+            .filter(|m| !m.is_empty())
+            .map(window)
+            .max()
+            .unwrap_or_else(|| window(&config.model)),
+        None => window(&config.model),
+    };
     if let Some(p) = phase.filter(|p| p.enabled) {
-        models.extend([
+        for m in [
             p.research_model.as_str(),
             p.plan_model.as_str(),
             p.edit_model.as_str(),
             p.review_model.as_str(),
             p.default_model.as_str(),
-        ]);
+        ] {
+            if !m.is_empty() {
+                w = w.min(window(m));
+            }
+        }
     }
-    models
-        .into_iter()
-        .filter(|m| !m.is_empty())
-        .map(crate::api::context_window_for_model)
-        .min()
-        .unwrap_or(200_000)
+    w
 }
 
 /// How many recent messages snipCompact always keeps untouched.
@@ -559,18 +566,24 @@ mod tests {
     }
 
     #[test]
-    fn routed_sessions_compact_for_the_smallest_candidate() {
+    fn routed_sessions_compact_for_the_largest_tier() {
         let cfg = config();
         assert_eq!(compaction_window(&cfg, None, None), 1_000_000);
 
         let mut router = crate::router::RouterConfig::new(&cfg.model);
+        router.low_model = "ollama:qwen3-coder".into();
+        router.medium_model = "claude-haiku-4-5".into();
+        router.super_high_model = "claude-haiku-4-5".into();
         assert_eq!(
             compaction_window(&cfg, Some(&router), None),
             1_000_000,
             "router off"
         );
         router.enabled = true;
-        // Default low tier is Haiku 4.5 (200k).
+        // Turns go to a tier whose window holds the history, so a 200k low
+        // tier must not trim a history the 1M high tier holds.
+        assert_eq!(compaction_window(&cfg, Some(&router), None), 1_000_000);
+        router.high_model = "claude-haiku-4-5".into();
         assert_eq!(compaction_window(&cfg, Some(&router), None), 200_000);
 
         let mut phased = config();

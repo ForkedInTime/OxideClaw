@@ -174,6 +174,39 @@ pub async fn probe_ollama(base_url: &str, budget: std::time::Duration) -> Ollama
     }
 }
 
+/// Whether something accepts a TCP connection at `base_url`'s host and port
+/// within `budget`. Name lookup runs on a detached thread, as for the probe.
+pub async fn host_reachable(base_url: &str, budget: std::time::Duration) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    // `[::1]` arrives bracketed; the resolver wants the bare address.
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let connect = async move {
+        let addrs = resolve_detached(move || {
+            use std::net::ToSocketAddrs;
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+        })
+        .await
+        .ok()?;
+        for addr in addrs {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return Some(());
+            }
+        }
+        None
+    };
+    matches!(tokio::time::timeout(budget, connect).await, Ok(Some(())))
+}
+
 /// Resolves host names on a detached thread. reqwest's default resolver runs
 /// `getaddrinfo` under `spawn_blocking`, and dropping the runtime waits for
 /// that: an `OLLAMA_HOST` name with DNS down would hold the missing-credential

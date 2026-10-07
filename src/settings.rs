@@ -262,6 +262,10 @@ pub struct Settings {
     #[serde(rename = "disableSkillShellExecution")]
     pub disable_skill_shell_execution: Option<bool>,
 
+    /// The model router: tiers, switch and classifier. Takes precedence over
+    /// the flat `router*` keys below, which keep working.
+    pub router: Option<RouterSettings>,
+
     /// Enable smart model router — auto-routes tasks by complexity to different models.
     #[serde(rename = "routerEnabled")]
     pub router_enabled: Option<bool>,
@@ -343,6 +347,37 @@ pub struct Settings {
 
     #[serde(rename = "browserTimeoutMs")]
     pub browser_timeout_ms: Option<u64>,
+}
+
+/// The `router` block: `{"low": "ollama:qwen3-coder", "mid": "claude-sonnet-5",
+/// "high": "claude-opus-5"}`. Each tier is any model string `/model`
+/// accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterSettings {
+    /// On or off at startup. Unset: on once two or more tiers are set.
+    pub enabled: Option<bool>,
+    pub low: Option<String>,
+    #[serde(alias = "medium")]
+    pub mid: Option<String>,
+    pub high: Option<String>,
+    #[serde(alias = "super-high", alias = "super_high")]
+    pub super_high: Option<String>,
+    /// `"heuristic"` (default) or `"model"`: the low tier labels each prompt.
+    pub classifier: Option<String>,
+}
+
+impl RouterSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            low: other.low.or(self.low),
+            mid: other.mid.or(self.mid),
+            high: other.high.or(self.high),
+            super_high: other.super_high.or(self.super_high),
+            classifier: other.classifier.or(self.classifier),
+        }
+    }
 }
 
 /// Settings for phase-declarative model routing.
@@ -1027,6 +1062,10 @@ impl Settings {
             disable_skill_shell_execution: other
                 .disable_skill_shell_execution
                 .or(self.disable_skill_shell_execution),
+            router: match (self.router, other.router) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => b.or(a),
+            },
             router_enabled: other.router_enabled.or(self.router_enabled),
             router_budget: other.router_budget.or(self.router_budget),
             router_low_model: other.router_low_model.or(self.router_low_model),

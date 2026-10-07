@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use tracing::{debug, warn};
 
 pub use ollama::{
-    OllamaClient, OllamaProbe, is_ollama_model, list_ollama_models, probe_ollama,
+    OllamaClient, OllamaProbe, host_reachable, is_ollama_model, list_ollama_models, probe_ollama,
     strip_ollama_prefix,
 };
 pub use openai_compat::{
@@ -881,7 +881,6 @@ impl ApiBackend {
     }
 
     /// The Ollama host URL if this is an Ollama backend.
-    #[allow(dead_code)]
     pub fn ollama_host(&self) -> Option<&str> {
         match self {
             Self::Ollama(c) => Some(&c.base_url),

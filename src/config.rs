@@ -427,8 +427,12 @@ pub struct Config {
     /// runs a skill (`/<skill>` or the Skill tool), sub-agents included.
     pub disable_skill_shell_execution: bool,
 
-    /// Smart model router enabled on startup.
+    /// Smart model router enabled on startup: `router.enabled` /
+    /// `routerEnabled` when set, else on once two tiers are configured.
     pub router_enabled: bool,
+    /// How the router picks a tier (`router.classifier`).
+    #[serde(skip)]
+    pub router_classifier: crate::router::Classifier,
     /// Session budget in USD (None = unlimited).
     pub router_budget: Option<f64>,
     /// Router: model for low-complexity tasks.
@@ -563,6 +567,7 @@ impl Default for Config {
             sandbox_allow_network: true,
             disable_skill_shell_execution: false,
             router_enabled: false,
+            router_classifier: crate::router::Classifier::Heuristic,
             router_budget: None,
             router_low_model: None,
             router_medium_model: None,
@@ -598,6 +603,23 @@ impl Config {
             msg.push_str(why);
         }
         anyhow::anyhow!(msg)
+    }
+
+    /// A client for `model` with this config's credentials: the Anthropic
+    /// key or OAuth token, the Ollama host, the provider's own key variable.
+    pub fn backend_for(&self, model: &str) -> anyhow::Result<crate::api::ApiBackend> {
+        let is_non_anthropic =
+            crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
+        if !is_non_anthropic && self.api_key.is_empty() {
+            return Err(self.missing_credential_error());
+        }
+        crate::api::ApiBackend::new_with_auth(
+            model,
+            &self.api_key,
+            self.auth_is_oauth,
+            &self.ollama_host,
+            self.openai_api,
+        )
     }
 
     /// First run without an Anthropic credential: when the model needs one
@@ -852,6 +874,7 @@ impl Config {
             sandbox_allow_network: new.sandbox_allow_network,
             disable_skill_shell_execution: new.disable_skill_shell_execution,
             router_enabled: new.router_enabled,
+            router_classifier: new.router_classifier,
             router_budget: new.router_budget,
             router_low_model: new.router_low_model,
             router_medium_model: new.router_medium_model,
@@ -1132,15 +1155,41 @@ impl Config {
         self.disable_skill_shell_execution =
             settings.disable_skill_shell_execution.unwrap_or(false);
 
-        // Smart model router settings
-        self.router_enabled = settings.router_enabled.unwrap_or(false);
+        // Smart model router settings. The `router` block wins over the
+        // flat `router*` keys it replaces.
         self.router_budget = settings.router_budget;
+        let block = settings.router.clone().unwrap_or_default();
         // Tier models go to the API verbatim, so "haiku" must become a real id.
-        let tier = |m: Option<String>| m.map(|m| crate::commands::resolve_model_alias(&m));
-        self.router_low_model = tier(settings.router_low_model);
-        self.router_medium_model = tier(settings.router_medium_model);
-        self.router_high_model = tier(settings.router_high_model);
-        self.router_super_high_model = tier(settings.router_super_high_model);
+        let tier = |a: Option<String>, b: Option<String>| {
+            a.or(b)
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| crate::commands::resolve_model_alias(m.trim()))
+        };
+        self.router_low_model = tier(block.low, settings.router_low_model);
+        self.router_medium_model = tier(block.mid, settings.router_medium_model);
+        self.router_high_model = tier(block.high, settings.router_high_model);
+        self.router_super_high_model = tier(block.super_high, settings.router_super_high_model);
+        let configured = [
+            &self.router_low_model,
+            &self.router_medium_model,
+            &self.router_high_model,
+            &self.router_super_high_model,
+        ]
+        .iter()
+        .filter(|m| m.is_some())
+        .count();
+        self.router_enabled =
+            crate::router::starts_enabled(block.enabled.or(settings.router_enabled), configured);
+        self.router_classifier = crate::router::Classifier::Heuristic;
+        if let Some(c) = &block.classifier {
+            match crate::router::Classifier::parse(c) {
+                Some(c) => self.router_classifier = c,
+                None => self.settings_notices.push(format!(
+                    "Unknown router.classifier \"{c}\" in settings.json, using \"heuristic\". \
+                     Valid values: heuristic, model."
+                )),
+            }
+        }
         if let Some(a) = settings.autonomy {
             match crate::permissions::Autonomy::parse(&a) {
                 Some(mode) => self.autonomy = mode,
@@ -3392,6 +3441,106 @@ mod flag_settings_retarget_tests {
         assert_eq!(s.sandbox_enabled, Some(true));
         assert_eq!(s.sandbox_mode.as_deref(), Some("bwrap"));
         assert_eq!(s.model.as_deref(), Some("file-model"));
+    }
+
+    /// Router settings from a temp config dir (the global settings.json)
+    /// and `--settings`, never the developer's own files.
+    fn router_config(global: &str, flag: Option<&str>) -> Config {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("settings.json"), global).unwrap();
+        let mut c = Config {
+            model: "claude-sonnet-5".into(),
+            cwd: project.path().into(),
+            config_dir_override: Some(home.path().into()),
+            flag_settings: flag.map(|f| serde_json::from_str(f).unwrap()),
+            ..Config::default()
+        };
+        c.load_project();
+        c
+    }
+
+    /// The `router` block takes any backend's model per tier, and the flat
+    /// `router*` keys of earlier versions keep working under it.
+    #[test]
+    fn router_tiers_parse_from_the_block_and_the_old_keys() {
+        let c = router_config(
+            r#"{"router": {"low": "ollama:qwen3-coder", "mid": "sonnet", "high": "groq:llama-3.3-70b-versatile", "classifier": "model"}}"#,
+            None,
+        );
+        assert_eq!(c.router_low_model.as_deref(), Some("ollama:qwen3-coder"));
+        assert_eq!(c.router_medium_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            c.router_high_model.as_deref(),
+            Some("groq:llama-3.3-70b-versatile")
+        );
+        assert_eq!(c.router_super_high_model, None);
+        assert_eq!(c.router_classifier, crate::router::Classifier::Model);
+        let r = crate::router::RouterConfig::from_config(&c);
+        assert_eq!(
+            r.super_high_model, "claude-opus-5",
+            "default for an unset tier"
+        );
+
+        // Old keys alone, as an earlier version wrote them.
+        let old = router_config(
+            r#"{"routerEnabled": true, "routerLowModel": "haiku", "routerSuperHighModel": "ollama:big"}"#,
+            None,
+        );
+        assert!(old.router_enabled);
+        assert_eq!(old.router_low_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(old.router_super_high_model.as_deref(), Some("ollama:big"));
+
+        // Both: the block wins tier by tier; `medium` and `superHigh` are
+        // accepted spellings.
+        let both = router_config(
+            r#"{"routerLowModel": "haiku", "routerMediumModel": "ollama:a"}"#,
+            Some(r#"{"router": {"low": "ollama:b", "superHigh": "ollama:c"}}"#),
+        );
+        assert_eq!(both.router_low_model.as_deref(), Some("ollama:b"));
+        assert_eq!(both.router_medium_model.as_deref(), Some("ollama:a"));
+        assert_eq!(both.router_super_high_model.as_deref(), Some("ollama:c"));
+        let medium = router_config(r#"{"router": {"medium": "ollama:m"}}"#, None);
+        assert_eq!(medium.router_medium_model.as_deref(), Some("ollama:m"));
+
+        let bad = router_config(r#"{"router": {"classifier": "llm"}}"#, None);
+        assert_eq!(bad.router_classifier, crate::router::Classifier::Heuristic);
+        assert!(
+            bad.settings_notices
+                .iter()
+                .any(|n| n.contains("router.classifier")),
+            "{:?}",
+            bad.settings_notices
+        );
+    }
+
+    #[test]
+    fn the_router_starts_on_with_two_tiers_unless_switched_off() {
+        let on = |global: &str| router_config(global, None).router_enabled;
+        assert!(!on("{}"));
+        assert!(
+            !on(r#"{"router": {"low": "ollama:a"}}"#),
+            "one tier is not a router"
+        );
+        assert!(!on(r#"{"routerLowModel": "ollama:a"}"#));
+        assert!(on(
+            r#"{"router": {"low": "ollama:a", "high": "claude-opus-5"}}"#
+        ));
+        assert!(on(
+            r#"{"routerLowModel": "ollama:a", "routerHighModel": "opus"}"#
+        ));
+        assert!(!on(
+            r#"{"router": {"enabled": false, "low": "ollama:a", "high": "claude-opus-5"}}"#
+        ));
+        assert!(!on(
+            r#"{"routerEnabled": false, "routerLowModel": "ollama:a", "routerHighModel": "opus"}"#
+        ));
+        assert!(on(r#"{"router": {"enabled": true}}"#));
+        assert!(on(r#"{"routerEnabled": true}"#));
+        // The block's switch beats the old key.
+        assert!(!on(
+            r#"{"routerEnabled": true, "router": {"enabled": false}}"#
+        ));
     }
 
     /// `--bare` used to be applied after discovery, so AGENTS.md and the
