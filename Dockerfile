@@ -1,7 +1,8 @@
 # OxideClaw container: the static musl release binary on a minimal Alpine base
 # (git for worktrees and /undo, ca-certificates for the API, bash because the
 # Bash tool runs `$SHELL -c` and falls back to `bash`; busybox sh would make
-# every Bash tool call fail and the model writes bash syntax anyway).
+# every Bash tool call fail and the model writes bash syntax anyway; ripgrep
+# because Grep's built-in fallback is slower and does not honour .gitignore).
 #
 #   docker run --rm -it -e ANTHROPIC_API_KEY -v "$PWD:/work" ghcr.io/forkedintime/oxideclaw
 #
@@ -16,7 +17,7 @@ RUN apk add --no-cache curl \
  && chmod +x /oxideclaw
 
 FROM alpine:3.20
-RUN apk add --no-cache git ca-certificates bash \
+RUN apk add --no-cache git ca-certificates bash ripgrep \
  && adduser -D -s /bin/bash -h /home/oxide oxide
 ENV SHELL=/bin/bash
 COPY --from=fetch /oxideclaw /usr/local/bin/oxideclaw

@@ -320,13 +320,13 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
 }
 
 async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput> {
-    let pattern = if input.case_insensitive {
-        format!("(?i){}", input.pattern)
-    } else {
-        input.pattern.clone()
-    };
-
-    let re = Regex::new(&pattern)?;
+    // Same semantics as the rg path's `-U --multiline-dotall`: the pattern
+    // runs over the whole file, so it can span lines.
+    let re = regex::RegexBuilder::new(&input.pattern)
+        .case_insensitive(input.case_insensitive)
+        .multi_line(input.multiline)
+        .dot_matches_new_line(input.multiline)
+        .build()?;
 
     let search_path = match &input.path {
         Some(p) => {
@@ -347,13 +347,9 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
         ));
     }
 
-    let glob_re = input.glob.as_ref().and_then(|g| {
-        let escaped = regex::escape(g)
-            .replace(r"\*\*", ".*")
-            .replace(r"\*", "[^/]*")
-            .replace(r"\?", "[^/]");
-        Regex::new(&format!("(?i){}$", escaped)).ok()
-    });
+    let glob_re = input.glob.as_deref().and_then(glob_regex);
+    let before = input.before.or(input.context).unwrap_or(0) as usize;
+    let after = input.after.or(input.context).unwrap_or(0) as usize;
 
     let mut matched_files: Vec<String> = Vec::new();
     let mut content_lines: Vec<String> = Vec::new();
@@ -403,27 +399,44 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
             continue;
         };
 
-        let mut file_matched = false;
-        let mut file_count = 0usize;
+        let lines: Vec<&str> = contents.lines().collect();
+        let hits = matching_lines(&re, &contents, &lines, input.multiline);
 
-        for (i, line) in contents.lines().enumerate() {
-            if re.is_match(line) {
-                file_matched = true;
-                file_count += 1;
-                if input.output_mode == Some(OutputMode::Content) {
-                    content_lines.push(if input.line_numbers {
-                        format!("{}:{}: {}", path_str, i + 1, line)
+        if input.output_mode == Some(OutputMode::Content) {
+            // Context ranges, merged where they touch; `:` marks a matching
+            // line and `-` a context line, with `--` between groups, as rg does.
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            for &h in &hits {
+                let lo = h.saturating_sub(before);
+                let hi = (h + after).min(lines.len() - 1);
+                match ranges.last_mut() {
+                    Some(r) if lo <= r.1 + 1 => r.1 = r.1.max(hi),
+                    _ => ranges.push((lo, hi)),
+                }
+            }
+            for (k, &(lo, hi)) in ranges.iter().enumerate() {
+                if k > 0 && (before > 0 || after > 0) {
+                    content_lines.push("--".into());
+                }
+                for (i, line) in lines.iter().enumerate().take(hi + 1).skip(lo) {
+                    let sep = if hits.binary_search(&i).is_ok() {
+                        ':'
                     } else {
-                        format!("{}: {}", path_str, line)
+                        '-'
+                    };
+                    content_lines.push(if input.line_numbers {
+                        format!("{path_str}{sep}{}{sep} {line}", i + 1)
+                    } else {
+                        format!("{path_str}{sep} {line}")
                     });
                 }
             }
         }
 
-        if file_matched {
+        if !hits.is_empty() {
             match input.output_mode {
                 Some(OutputMode::Count) => {
-                    content_lines.push(format!("{}: {}", path_str, file_count));
+                    content_lines.push(format!("{}: {}", path_str, hits.len()));
                 }
                 None | Some(OutputMode::FilesWithMatches) => {
                     matched_files.push(path_str.into_owned());
@@ -449,6 +462,41 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
     }
 
     Ok(ToolOutput::success(output))
+}
+
+/// Indices of the lines holding a match, ascending. In multiline mode a
+/// match counts for every line it spans.
+fn matching_lines(re: &Regex, contents: &str, lines: &[&str], multiline: bool) -> Vec<usize> {
+    if !multiline {
+        return (0..lines.len())
+            .filter(|&i| re.is_match(lines[i]))
+            .collect();
+    }
+    let newlines: Vec<usize> = contents.match_indices('\n').map(|(i, _)| i).collect();
+    let line_of = |off: usize| newlines.partition_point(|&p| p < off);
+    let mut hits = std::collections::BTreeSet::new();
+    for m in re.find_iter(contents) {
+        let last = m.end().saturating_sub(1).max(m.start());
+        hits.extend(line_of(m.start())..=line_of(last));
+    }
+    hits.into_iter().filter(|&i| i < lines.len()).collect()
+}
+
+/// Translate a Grep `glob` filter into a regex over the file path. `**/`
+/// also matches no directory at all (`src/**/*.rs` covers `src/main.rs`,
+/// as in rg), and `{a,b}` alternations are expanded like the Glob tool's.
+fn glob_regex(g: &str) -> Option<Regex> {
+    let alts: Vec<String> = super::glob::expand_braces(g)
+        .iter()
+        .map(|g| {
+            regex::escape(g)
+                .replace(r"\*\*/", "(?:.*/)?")
+                .replace(r"\*\*", ".*")
+                .replace(r"\*", "[^/]*")
+                .replace(r"\?", "[^/]")
+        })
+        .collect();
+    Regex::new(&format!("(?i)(?:{})$", alts.join("|"))).ok()
 }
 
 #[cfg(test)]
@@ -623,5 +671,42 @@ mod search_scope_tests {
         for t in both(&ctx, json!({"pattern": "useState", "path": "build"})).await {
             assert!(t.contains("out.js"), "{t}");
         }
+    }
+
+    /// The walker (the only backend in the Docker image) ignored
+    /// `multiline` and `-A/-B/-C`, and `src/**/*.rs` skipped `src/main.rs`.
+    #[tokio::test]
+    async fn walker_honours_multiline_context_and_globstar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/main.rs", "a\nfn main() {\n    run();\n}\nz\n");
+        write(root, "src/web/app.tsx", "fn main() {}\n");
+        write(root, "other/x.rs", "fn main() {}\n");
+        let ctx = ToolContext::new(root.to_path_buf());
+        let run = |v: serde_json::Value| {
+            let input: GrepInput = serde_json::from_value(v).unwrap();
+            let ctx = &ctx;
+            async move { text(&run_with_regex(&input, ctx).await.unwrap()) }
+        };
+
+        let t = run(json!({"pattern": r"main\(\) \{\n\s+run", "multiline": true,
+                           "output_mode": "content", "-n": true}))
+        .await;
+        assert!(
+            t.contains(":2: fn main() {") && t.contains(":3:     run();"),
+            "{t}"
+        );
+
+        let t = run(json!({"pattern": "run", "output_mode": "content", "-C": 1, "-n": true})).await;
+        let got: Vec<&str> = t
+            .lines()
+            .map(|l| &l[l.find("main.rs").unwrap() + "main.rs".len()..])
+            .collect();
+        assert_eq!(got, ["-2- fn main() {", ":3:     run();", "-4- }"], "{t}");
+
+        let t = run(json!({"pattern": "fn main", "glob": "src/**/*.rs"})).await;
+        assert!(t.contains("main.rs") && !t.contains("x.rs"), "{t}");
+        let t = run(json!({"pattern": "fn main", "glob": "*.{rs,tsx}"})).await;
+        assert!(t.contains("main.rs") && t.contains("app.tsx"), "{t}");
     }
 }
