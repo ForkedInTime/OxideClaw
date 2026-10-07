@@ -7,44 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **The router starts on once two tiers are set.** With two or more tiers
-  configured and no `enabled` / `routerEnabled`, the router is on at
-  startup; `"enabled": false` keeps it off. Earlier versions needed
-  `routerEnabled: true` even with tiers set.
-- **`-p` and SDK sessions are routed.** `-p` without `--model` and SDK
-  sessions whose `session/start` names no `model` use the router settings,
-  as the TUI does. ACP sessions are not routed.
-- **Routed sessions compact against the largest usable tier.** Each turn
-  goes to a tier whose window holds the history, so compaction waits for
-  the largest window among the tiers a turn can still go to, instead of
-  the smallest. Tiers skipped for the session or without a credential do
-  not count.
-- **Router settings from an untrusted project are ignored.** The `router`
-  block, `routerEnabled: true` and the `router*Model` keys in a project's
-  `.claude/settings.json` decide which provider gets your prompts, so they
-  apply only after `/trust`; a project can still switch the router off.
-- **`oai:` uses OpenAI's Responses API.** Requests go to `/v1/responses`
-  with `store: false`, so nothing is kept on OpenAI's side. On reasoning
-  models (o-series, GPT-5 and later, Codex) the encrypted reasoning behind
-  each tool call comes back and is replayed with the next request of the
-  tool loop, so the model keeps its train of thought between calls (not
-  across `/model` or a resumed session). `effort` goes out as
-  `reasoning.effort` (`xhigh` on GPT-5.2+ and gpt-5.1-codex-max, at least
-  `high` on the GPT-5 `-pro` models), and `showThinkingSummaries` shows the
-  reasoning summaries; when OpenAI refuses them (an organization that is
-  not verified), OxideClaw says so once and carries on without them.
-  `"openaiApi": "chat"` in settings.json or `OXIDECLAW_OPENAI_API=chat`
-  goes back to Chat Completions; `"responses"` also uses the Responses API
-  for `openai-compat:` and `lmstudio:`. The named cloud presets (Groq,
-  OpenRouter, Gemini, ...) keep Chat Completions.
-- **OpenAI list prices.** `/cost` and `/budget` price `oai:` models per
-  family (GPT-5.x with its mini, nano and pro tiers, o1, o3, o3-pro,
-  o4-mini, GPT-4.1, GPT-4o) with each family's cached-input rate, instead
-  of GPT-4o's rate for every model. A model newer than the table is billed
-  at the dearest known rate of its tier and flagged as an estimate.
-
 ### Added
 
 - **Claude Code sessions import.** `oxideclaw config import-claude --sessions
@@ -166,15 +128,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the session with a note; one that is merely slow to report is kept.
   rust-analyzer builds into `target/rust-analyzer`, so it does not queue
   on the lock auto-fix's `cargo clippy` and `cargo test` hold.
-- **LSP tool.** `pylsp` is the Python server when `pyright-langserver` is
-  not installed. An open document gets a full-text `didChange` instead of
-  a second `didOpen`, so the server answers about the file's current text;
-  a file that is not UTF-8 is still queried, unsynced. Servers get
-  `shutdown` and `exit` when OxideClaw quits, and are killed only if they
-  have not gone a second later.
+- **Time to first frame.** `scripts/bench.py --first-frame` times each
+  tool from launch to its first screen in a 120x40 pseudo-terminal, with a
+  temporary `HOME` and no credentials; `--ollama-stub` answers Ollama's
+  model listing so the keyless path draws its real screen, and
+  `--self-test` checks the harness. BENCHMARKS.md has the method and
+  results.
 
 ### Changed
 
+- **The router starts on once two tiers are set.** With two or more tiers
+  configured and no `enabled` / `routerEnabled`, the router is on at
+  startup; `"enabled": false` keeps it off. Earlier versions needed
+  `routerEnabled: true` even with tiers set.
+- **`-p` and SDK sessions are routed.** `-p` without `--model` and SDK
+  sessions whose `session/start` names no `model` use the router settings,
+  as the TUI does. ACP sessions are not routed.
+- **Routed sessions compact against the largest usable tier.** Each turn
+  goes to a tier whose window holds the history, so compaction waits for
+  the largest window among the tiers a turn can still go to, instead of
+  the smallest. Tiers skipped for the session or without a credential do
+  not count.
+- **Router settings from an untrusted project are ignored.** The `router`
+  block, `routerEnabled: true` and the `router*Model` keys in a project's
+  `.claude/settings.json` decide which provider gets your prompts, so they
+  apply only after `/trust`; a project can still switch the router off.
+- **`oai:` uses OpenAI's Responses API.** Requests go to `/v1/responses`
+  with `store: false`, so nothing is kept on OpenAI's side. On reasoning
+  models (o-series, GPT-5 and later, Codex) the encrypted reasoning behind
+  each tool call comes back and is replayed with the next request of the
+  tool loop, so the model keeps its train of thought between calls (not
+  across `/model` or a resumed session). `effort` goes out as
+  `reasoning.effort` (`xhigh` on GPT-5.2+ and gpt-5.1-codex-max, at least
+  `high` on the GPT-5 `-pro` models), and `showThinkingSummaries` shows the
+  reasoning summaries; when OpenAI refuses them (an organization that is
+  not verified), OxideClaw says so once and carries on without them.
+  `"openaiApi": "chat"` in settings.json or `OXIDECLAW_OPENAI_API=chat`
+  goes back to Chat Completions; `"responses"` also uses the Responses API
+  for `openai-compat:` and `lmstudio:`. The named cloud presets (Groq,
+  OpenRouter, Gemini, ...) keep Chat Completions.
+- **OpenAI list prices.** `/cost` and `/budget` price `oai:` models per
+  family (GPT-5.x with its mini, nano and pro tiers, o1, o3, o3-pro,
+  o4-mini, GPT-4.1, GPT-4o) with each family's cached-input rate, instead
+  of GPT-4o's rate for every model. A model newer than the table is billed
+  at the dearest known rate of its tier and flagged as an estimate.
 - **`/undo`, `/redo` and `/rewind` are one timeline of turns.** `/undo [N]`
   (default 1) now takes the last N turns off the conversation and the saved
   session as well as reverting their files, so the model no longer sees
@@ -285,6 +282,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sandbox on Linux. Deny rules apply in every mode. A stored `auto-edit` or
   `full-auto` from an older version is changed to `ask` once, with a
   message.
+
+### Fixed
+
+Larger roadmap items (2026-10-07).
+
+- **`/undo` after an interrupted turn.** A turn that ended by Esc, a failed
+  request, the `/budget` stop or quit was never snapshotted, so `/undo`
+  left its edits in place and the next undo reverted them with the turn
+  before. Every turn end is now snapshotted.
+- **The router on a local session.** `/router on` on an Ollama or
+  OpenAI-compatible session sent the low, medium and super-high tiers to
+  Claude models unless you set them; unset tiers now stay on the session
+  model, and only tiers you name go elsewhere.
+- **OpenAI costs.** Every `oai:` model was billed at GPT-4o's rate; each
+  family now has its own list and cached-input price (see Changed).
+- **LSP tool.** Python files got no server without `pyright-langserver`;
+  `pylsp` now takes over. A file queried twice got a second `didOpen`,
+  so the server answered about stale text; it now gets a full-text
+  `didChange`.
+  Servers get `shutdown` and `exit` when OxideClaw quits, and are killed
+  only if they have not gone a second later.
 
 ### Fixed
 
@@ -694,9 +712,16 @@ Low-severity QA pass (2026-10-07).
   results put page-derived text inside a fence labelled as untrusted page
   data. The approval gate reads prices from the page itself, never from
   tool input.
-- **Untrusted repositories run no code through auto-fix**, and gitignored
-  files are never indexed, so secrets kept out of git never reach a model
-  (see Changed).
+- **Untrusted repositories run no code through auto-fix**, language
+  servers included, and gitignored files are never indexed, so secrets
+  kept out of git never reach a model (see Changed).
+- **Untrusted projects cannot choose your provider.** Router tiers,
+  `enabled: true` and the classifier in an untrusted project's
+  `.claude/settings.json` are ignored until `/trust`, so a cloned repo
+  cannot send your prompts to a model it picked.
+- **Session files are owner-only.** Transcripts hold your prompts and
+  tool output, so session files are now created 0600 in 0700
+  directories, imported Claude Code sessions included.
 
 ## [0.4.0] - 2026-09-11
 
