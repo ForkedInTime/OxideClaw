@@ -993,16 +993,37 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
                 let _ = std::fs::write(&claude_md, "# CLAUDE.md\n\n");
             }
-            let editor = std::env::var("VISUAL")
-                .or_else(|_| std::env::var("EDITOR"))
-                .unwrap_or_else(|_| "nano".to_string());
+            let editor = editor_command(std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
             // Suspend raw mode, run editor, restore
             suspend_tty();
-            let _ = tokio::process::Command::new(&editor)
-                .arg(&claude_md)
-                .status()
-                .await;
+            let status = editor_process(&editor, &claude_md).status().await;
             resume_tty();
+            match status {
+                Ok(s) if s.success() => {}
+                // sh's "command not found": the editor never ran.
+                Ok(s) if cfg!(unix) && s.code() == Some(127) => {
+                    app.entries.push(ChatEntry::error(format!(
+                        "Could not launch editor '{editor}': command not found. \
+                         Set $VISUAL or $EDITOR."
+                    )));
+                    app.scroll_to_bottom();
+                    return Ok(());
+                }
+                Ok(s) => {
+                    app.entries.push(ChatEntry::error(format!(
+                        "Editor '{editor}' exited with {s}; CLAUDE.md not reloaded."
+                    )));
+                    app.scroll_to_bottom();
+                    return Ok(());
+                }
+                Err(e) => {
+                    app.entries.push(ChatEntry::error(format!(
+                        "Could not launch editor '{editor}': {e}. Set $VISUAL or $EDITOR."
+                    )));
+                    app.scroll_to_bottom();
+                    return Ok(());
+                }
+            }
             // Reload CLAUDE.md into config; --bare never loads it.
             if !config.bare_mode {
                 config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
@@ -2729,6 +2750,42 @@ fn plugin_command_prompt(plugin: &str, command: &str, args: &str) -> String {
     prompt
 }
 
+/// The editor for /edit-claude-md: the first non-blank $VISUAL or $EDITOR.
+/// `VISUAL=""` used to win over a set $EDITOR and fail to launch.
+fn editor_command(visual: Option<String>, editor: Option<String>) -> String {
+    [visual, editor]
+        .into_iter()
+        .flatten()
+        .map(|e| e.trim().to_string())
+        .find(|e| !e.is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "nano" }.to_string())
+}
+
+/// Run `editor` on `path`. The variable is a command line, not a program
+/// name (`code --wait`, `emacsclient -t`): spawned verbatim it failed with
+/// ENOENT. Unix goes through the shell like git does; Windows splits on
+/// whitespace unless the whole value names an existing file.
+fn editor_process(editor: &str, path: &std::path::Path) -> tokio::process::Command {
+    if cfg!(windows) {
+        let (program, args): (&str, Vec<&str>) = if std::path::Path::new(editor).is_file() {
+            (editor, vec![])
+        } else {
+            let mut words = editor.split_whitespace();
+            (words.next().unwrap_or(editor), words.collect())
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).arg(path);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg("sh")
+            .arg(path);
+        cmd
+    }
+}
+
 /// The connected server a `/plugin:command` names. Tab completion builds
 /// the slug from the sanitized tool prefix with `_` turned into `-`, so a
 /// server called `brave_search` (or `my.server`) is offered as
@@ -2811,6 +2868,45 @@ mod tests {
             );
         }
         assert!(closed.iter().any(|n| n == "Read"), "non-shell tools stay");
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    #[test]
+    fn blank_visual_falls_through_to_editor() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(editor_command(some(""), some("vim")), "vim");
+        assert_eq!(editor_command(some("  "), None), editor_command(None, None));
+        assert_eq!(
+            editor_command(some("code --wait"), some("vim")),
+            "code --wait"
+        );
+        assert_eq!(editor_command(None, some(" hx ")), "hx");
+    }
+
+    /// `EDITOR="code --wait"` was spawned as a program named `code --wait`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn editor_value_with_arguments_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("my CLAUDE.md");
+        std::fs::write(&path, "old").unwrap();
+        let status = editor_process("printf '%s' edited >", &path)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+
+        let missing = editor_process("definitely-not-an-editor-xyz", &path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(missing.code(), Some(127));
     }
 }
 
