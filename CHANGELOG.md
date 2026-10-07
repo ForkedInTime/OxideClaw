@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Claude Code sessions import.** `oxideclaw config import-claude --sessions
+  [--list | <id>]` imports the current directory's Claude Code sessions as
+  resumable OxideClaw sessions. The history is the branch Claude Code's model
+  last saw: rewound branches are left out and a compacted session starts at
+  its summary. Sidechain, meta and queue records are skipped, tool calls are
+  paired with their results, unknown blocks and malformed lines are counted,
+  re-runs skip sessions already imported, files over 50 MiB are skipped, and
+  transcripts are read from `$CLAUDE_CONFIG_DIR` when set. The import counts
+  as activity for `cleanupPeriodDays`. Session files, imported or not, are
+  now created owner-only (0600, in a 0700 directory).
+  `~/.claude` is only read.
 - **Keyless start on a local Ollama.** With no Anthropic credential and no
   model chosen (`--model`, `ANTHROPIC_MODEL`, settings), the TUI and `-p`
   look for a running Ollama, pick a pulled model that can call tools and
