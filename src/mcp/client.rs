@@ -192,7 +192,7 @@ impl StdioTransport {
 /// `"command": "npx"` failed to spawn. Std quotes arguments safely when it
 /// runs a `.cmd`/`.bat` by full path.
 #[cfg(any(windows, test))]
-fn resolve_on_path(
+pub(crate) fn resolve_on_path(
     command: &str,
     path: Option<&std::ffi::OsStr>,
     pathext: Option<&std::ffi::OsStr>,

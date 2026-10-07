@@ -153,9 +153,9 @@ fn runnable_detected(cwd: &Path, cmd: String, path: Option<&std::ffi::OsStr>) ->
     // A project virtualenv is where Python tools usually live, and it is
     // often not activated in the shell oxideclaw was started from.
     if matches!(program.as_str(), "ruff" | "pytest")
-        && is_executable(&cwd.join(".venv/bin").join(&program))
+        && is_executable(&cwd.join(VENV_BIN).join(&program))
     {
-        return Some(format!(".venv/bin/{cmd}"));
+        return Some(format!("{VENV_BIN}{}{cmd}", std::path::MAIN_SEPARATOR));
     }
     let resolved = find_on_path(&program, path)?;
     if cmd.starts_with("cargo clippy") {
@@ -192,10 +192,24 @@ fn is_executable(p: &Path) -> bool {
     p.is_file() || p.with_extension("exe").is_file()
 }
 
+#[cfg(unix)]
+const VENV_BIN: &str = ".venv/bin";
+// Backslashes: cmd.exe reads `/Scripts` in `.venv/Scripts/ruff` as a switch.
+#[cfg(windows)]
+const VENV_BIN: &str = r".venv\Scripts";
+
+#[cfg(unix)]
 fn find_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
     std::env::split_paths(path?)
         .map(|dir| dir.join(program))
         .find(|p| is_executable(p))
+}
+
+/// npm and npx are `.cmd` shims on Windows, so a bare `dir\npm` or
+/// `dir\npm.exe` never matched and every JS check was dropped unseen.
+#[cfg(windows)]
+fn find_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    crate::mcp::client::resolve_on_path(program, path, std::env::var_os("PATHEXT").as_deref())
 }
 
 fn eslint_configured(cwd: &Path) -> bool {
@@ -251,9 +265,8 @@ pub fn should_trigger(config: &AutoFixConfig, autonomy_mode: &str) -> bool {
 
 /// Run a single command and return a `CommandResult`.
 ///
-/// `cmd` is a shell-style command string like `"cargo test"` or
-/// `"npm test"`. The first whitespace-separated token is the program,
-/// the rest are argv. `timeout_secs` caps total wall-clock runtime; if the
+/// `cmd` is a shell command line like `"cargo test"` or `"npm test"`, run
+/// by `sh -c` on Unix and `cmd /C` on Windows. `timeout_secs` caps total wall-clock runtime; if the
 /// process is still running past it we send SIGKILL and return
 /// `CommandResult::Timeout`. Pass `0` to wait indefinitely. Setting
 /// `cancel` (Esc in the TUI) kills the command the same way and returns
@@ -284,11 +297,15 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool
         crate::tools::bash::new_session(&mut c);
         c
     };
-    #[cfg(not(unix))]
+    // cmd.exe, which also runs `.cmd` shims such as npm and npx (process
+    // creation alone finds only `.exe`). `/S` with the outer quotes makes it
+    // strip exactly those, leaving the command's own quoting intact; `/D`
+    // skips AutoRun hooks from the registry.
+    #[cfg(windows)]
     let mut command = {
-        let mut parts = cmd.split_whitespace();
-        let mut c = Command::new(parts.next().unwrap_or_default());
-        c.args(parts);
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("cmd");
+        c.args(["/D", "/S", "/C"]).raw_arg(format!("\"{cmd}\""));
         c
     };
     let spawn = command
@@ -728,6 +745,39 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Windows ran checks by splitting on spaces and spawning the first word,
+    /// which cannot launch `.cmd` shims (npm, npx) or honour quotes and `&&`,
+    /// and detection looked only for `npm`/`npm.exe`, never `npm.cmd`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_checks_run_through_cmd_and_find_cmd_shims() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("shim.cmd"), "@exit /b 0\r\n").unwrap();
+        std::fs::write(td.path().join("in.txt"), "xa by\r\n").unwrap();
+        let run = |cmd: &str| super::run_command(td.path(), cmd, 60, &cancel);
+        assert!(
+            matches!(run("shim"), super::CommandResult::Pass),
+            "{:?}",
+            run("shim")
+        );
+        assert!(matches!(
+            run(r#"shim && findstr /c:"zzz" in.txt"#),
+            super::CommandResult::Fail { .. }
+        ));
+        let quoted = r#"findstr /c:"a b" in.txt"#;
+        assert!(
+            matches!(run(quoted), super::CommandResult::Pass),
+            "{:?}",
+            run(quoted)
+        );
+
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("npm.cmd"), "@exit /b 0\r\n").unwrap();
+        assert!(super::find_on_path("npm", Some(bin.path().as_os_str())).is_some());
+        assert!(super::find_on_path("npx", Some(bin.path().as_os_str())).is_none());
     }
 
     /// Esc only aborted the async task; the lint/test process it was
