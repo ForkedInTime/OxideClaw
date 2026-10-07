@@ -232,7 +232,7 @@ Run `/doctor` to check if your TTS setup is working, or `/voice test` to hear a 
 
 ## RAG Indexing
 
-Local codebase search powered by tree-sitter AST parsing and SQLite FTS5.
+Local codebase search: SQLite FTS5 (BM25) full-text search over tree-sitter symbol chunks.
 
 ### Supported Languages
 
@@ -240,10 +240,10 @@ Rust, Python, JavaScript, TypeScript, Go, Java, C, Bash
 
 ### How It Works
 
-1. tree-sitter parses source files into AST nodes (functions, structs, classes, methods)
-2. Symbols and code snippets are stored in a local SQLite database with FTS5 full-text search
-3. Queries match against symbol names, file paths, and code content
-4. Results are ranked by relevance and injected into the AI context
+1. The project is walked with git's ignore rules: `.gitignore` (at every level), `.git/info/exclude`, the global excludes file and `.ignore`. Ignored files (a `config.local.js` with keys, `.env.*` you keep out of git) are never indexed, so their contents never reach a model. Hidden directories and build/vendor directories (`target`, `node_modules`, `dist`, ...) are skipped too.
+2. tree-sitter parses source files into AST nodes (functions, structs, classes, methods)
+3. Each symbol becomes a chunk in a SQLite database with an FTS5 full-text index
+4. Queries match symbol names and code content, ranked by BM25, and the best chunks are injected into the AI context
 
 ### Usage
 
@@ -255,6 +255,12 @@ Rust, Python, JavaScript, TypeScript, Go, Java, C, Bash
 ```
 
 The index auto-updates when files change between queries. It lives in `.claude/rag.db` (with the project's `/memory` entries); the interactive TUI builds it on start, while `-p`, SDK and ACP sessions only use an index that already exists and never create one. OxideClaw adds `**/.claude/rag.db*` to the repo's private `.git/info/exclude` so `/checkpoint`, `/commit` and `/spawn merge` never commit it.
+
+**Where it runs.** The index builds on its own (at TUI startup and before each prompt, and is refreshed for `-p`, SDK and ACP turns once one exists) only when the working directory is inside a git repository. Elsewhere the TUI shows `Code index off: not inside a git repository` once and `-p`/SDK stay silent; `/index` still works there on request. Your home directory and `/` are never indexed, not even by `/index`.
+
+**Where it lives.** `$XDG_CACHE_HOME/oxideclaw/rag/<hash>.db` (default `~/.cache/oxideclaw/rag/`), where `<hash>` is the first 16 hex digits of the SHA-256 of the project's canonical path. Nothing is written into the project, and the cache can be deleted at any time. `/rag status` prints the path.
+
+Older versions kept the index in `<project>/.claude/rag.db`. On first use that file is deleted without being searched again, once its tables confirm it is an OxideClaw index; any memories in it move to `.claude/memory.db` first. A `.claude/rag.db` belonging to anything else is left alone.
 
 ---
 

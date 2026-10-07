@@ -112,7 +112,7 @@ How it compares with the agents people actually run. Every cell was checked agai
 |---|---|---|---|---|---|
 | Runtime | JavaScript (Bun-bundled binary) | Rust | Rust | Rust | **Rust, one static binary** |
 | License | Proprietary | MIT | MIT | GPL-3.0 | **Apache-2.0** |
-| Zero-setup codebase index (tree-sitter + FTS5) | ❌ | — | — | — | **✅ 8 languages** |
+| Zero-setup codebase index (tree-sitter + FTS5/BM25) | ❌ | — | — | — | **✅ 8 languages** |
 | Auto model routing | ❌ | ✅ DeepSeek tiers | — | — | **✅ any provider, by task complexity, `/budget` cap** |
 | Auto-fix loop (lint + tests + retry after every edit) | ❌ | — | — | — | **✅** |
 | Spoken replies in a cloned voice | ❌ | ✅ cloud TTS tool (MiMo), on request | — | ❌ | **✅ local XTTS v2, every reply** |
@@ -138,7 +138,9 @@ The first five rows are where OxideClaw stands apart. The rest is table stakes, 
 
 ### 🧠 &nbsp; Local codebase RAG — zero setup
 
-tree-sitter AST parsing, SQLite FTS5 semantic search. Index your whole repo in seconds. Indexes stay on disk and update incrementally.
+tree-sitter AST parsing, SQLite FTS5 (BM25) full-text search over tree-sitter symbol chunks. Index your whole repo in seconds; it updates incrementally before each prompt.
+
+The index follows git's rules: anything `.gitignore`, `.git/info/exclude`, your global excludes file or an `.ignore` file leaves out is never indexed, so it never reaches a model. It builds on its own only inside a git repository, and never for your home directory or `/`. It lives outside the project, in `$XDG_CACHE_HOME/oxideclaw/rag/` (default `~/.cache/oxideclaw/rag/`), one database per project.
 
 ```
 > /rag search TOCTOU
@@ -230,7 +232,7 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 # Inside the TUI
 /help                   # interactive command menu
 /model                  # pick a model (Claude + Ollama + 9 OpenAI-compat providers)
-/rag search <query>     # semantic codebase search
+/rag search <query>     # full-text codebase search
 /budget $5              # cap the bill
 /voice                  # voice I/O + TTS picker
 /spawn <task>           # parallel agent in a git worktree

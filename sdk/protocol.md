@@ -148,7 +148,7 @@ Search the codebase index. No API key needed — uses the local SQLite FTS5 inde
 }
 ```
 
-The index must be built first (run `oxideclaw` interactively and use `/rag index`, or the index is built automatically on first run).
+The index must be built first: the TUI builds it automatically when started inside a git repository, or run `/rag index` there. It lives in `$XDG_CACHE_HOME/oxideclaw/rag/` (default `~/.cache/oxideclaw/rag/`), skips everything git ignores, and is never built for the home directory or `/`.
 
 ---
 
