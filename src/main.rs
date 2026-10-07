@@ -365,8 +365,9 @@ enum Commands {
 #[derive(Subcommand)]
 enum ConfigSubcommand {
     /// Copy hooks, permission rules, apiKeyHelper or MCP servers from Claude
-    /// Code's ~/.claude/settings.json into OxideClaw's settings. With no
-    /// options, lists what is there and changes nothing. ~/.claude is only read.
+    /// Code's ~/.claude/settings.json into OxideClaw's settings, or this
+    /// project's Claude Code sessions into OxideClaw's. With no options, lists
+    /// the settings and changes nothing. ~/.claude is only read.
     ImportClaude {
         /// Import hooks (Claude Code's format is converted)
         #[arg(long)]
@@ -380,6 +381,18 @@ enum ConfigSubcommand {
         /// Import MCP servers OxideClaw does not have yet
         #[arg(long)]
         mcp: bool,
+        /// Import the current directory's Claude Code sessions that are not
+        /// imported yet, or only the one with this id (or id prefix)
+        #[arg(long, value_name = "ID")]
+        sessions: Option<Option<String>>,
+        /// With --sessions: list the current directory's Claude Code sessions
+        /// and change nothing
+        #[arg(
+            long,
+            requires = "sessions",
+            conflicts_with_all = ["hooks", "permissions", "api_key_helper", "mcp"]
+        )]
+        list: bool,
     },
 }
 
@@ -763,8 +776,9 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // A list-only `config import-claude` promises to change nothing. A
-    // flagged import still migrates first: it writes settings.json into the
-    // config dir, after which the automatic import would never run.
+    // flagged import still migrates first: it writes settings.json (or
+    // sessions) into OxideClaw's dirs, after which the automatic import would
+    // never run.
     let list_only_import = matches!(
         &cli.command,
         Some(Commands::Config {
@@ -773,8 +787,10 @@ async fn run() -> Result<()> {
                 permissions: false,
                 api_key_helper: false,
                 mcp: false,
+                sessions,
+                list,
             },
-        })
+        }) if sessions.is_none() || *list
     );
     if !list_only_import {
         prepare_config_dirs();
@@ -955,6 +971,8 @@ async fn run() -> Result<()> {
                         permissions,
                         api_key_helper,
                         mcp,
+                        sessions,
+                        list,
                     },
             } => {
                 let Some(claude) = Config::claude_code_dir() else {
@@ -966,8 +984,30 @@ async fn run() -> Result<()> {
                     api_key_helper: *api_key_helper,
                     mcp: *mcp,
                 };
-                for line in claude_import::import_claude(&claude, &Config::config_dir(), opts)? {
-                    println!("{line}");
+                // Settings are listed when nothing else was asked for.
+                if *hooks || *permissions || *api_key_helper || *mcp || sessions.is_none() {
+                    for line in claude_import::import_claude(&claude, &Config::config_dir(), opts)?
+                    {
+                        println!("{line}");
+                    }
+                }
+                if let Some(only) = sessions {
+                    let cwd = std::env::current_dir()?;
+                    let lines = if *list {
+                        anyhow::ensure!(only.is_none(), "--list takes no session id");
+                        session::claude_code::list(&claude, &cwd, &Config::sessions_dir()).await?
+                    } else {
+                        session::claude_code::import(
+                            &claude,
+                            &cwd,
+                            &Config::sessions_dir(),
+                            only.as_deref(),
+                        )
+                        .await?
+                    };
+                    for line in lines {
+                        println!("{line}");
+                    }
                 }
                 return Ok(());
             }

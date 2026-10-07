@@ -435,6 +435,11 @@ pub fn import_claude(
             dst.display(),
             src.display()
         ));
+        lines.push(
+            "`--sessions` imports the current directory's Claude Code sessions; \
+             `--sessions --list` shows them first."
+                .to_string(),
+        );
         return Ok(lines);
     }
 

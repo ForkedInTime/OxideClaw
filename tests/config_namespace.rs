@@ -120,6 +120,74 @@ fn first_run_migrates_once_and_writes_only_to_the_xdg_dir() {
     assert_eq!(snapshot(&h.claude()), before, "~/.claude must not change");
 }
 
+/// `config import-claude --sessions`: listing changes nothing (not even
+/// the first-run migration); importing runs the migration first, so the old
+/// OxideClaw sessions in ~/.claude/sessions still come along, then adds the
+/// project's Claude Code sessions once.
+#[test]
+fn claude_code_sessions_list_then_import_once() {
+    let h = Home::new();
+    let project = h.project.canonicalize().unwrap();
+    let dir_name: String = project
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let id = "5a1e0000-0000-4000-8000-000000000001";
+    let record = |kind: &str, ts: &str, content: serde_json::Value| {
+        serde_json::json!({
+            "type": kind, "uuid": ts, "sessionId": id, "cwd": project,
+            "timestamp": ts, "isSidechain": false,
+            "message": {"role": kind, "model": "claude-test-1", "content": content}
+        })
+        .to_string()
+    };
+    let transcript = [
+        record("user", "2026-02-01T10:00:00Z", "hello there".into()),
+        record(
+            "assistant",
+            "2026-02-01T10:00:01Z",
+            serde_json::json!([{"type": "text", "text": "hi"}]),
+        ),
+    ]
+    .join("\n");
+    let file = h
+        .claude()
+        .join("projects")
+        .join(dir_name)
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, transcript).unwrap();
+    let before = snapshot(&h.claude());
+    let stdout = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+
+    let out = stdout(&h.run(&["config", "import-claude", "--sessions", "--list"], &[]));
+    assert!(out.contains(id) && out.contains("hello there"), "{out}");
+    assert!(
+        !h.config().exists() && !h.home.join(".local").exists(),
+        "listing writes nothing"
+    );
+
+    let out = stdout(&h.run(&["config", "import-claude", "--sessions"], &[]));
+    assert!(out.contains("Imported 1 Claude Code session(s)"), "{out}");
+    let sessions = h.home.join(".local/share/oxideclaw/sessions");
+    assert!(sessions.join("abc.meta").is_file(), "migrated first");
+    let imported: Vec<serde_json::Value> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "meta"))
+        .map(|e| settings(&e.path()))
+        .filter(|m| m["claude_code_session"] == id)
+        .collect();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0]["name"], "hello there");
+
+    let out = stdout(&h.run(&["config", "import-claude", "--sessions"], &[]));
+    assert!(out.contains("imported already"), "{out}");
+    assert_eq!(snapshot(&h.claude()), before, "~/.claude must not change");
+}
+
 #[test]
 fn xdg_config_home_and_the_override_variables_pick_the_dir() {
     let h = Home::new();
