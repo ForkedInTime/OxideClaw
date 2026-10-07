@@ -1268,6 +1268,23 @@ impl LspDiagnostics {
             () = cancelled => return ServerReport::default(),
         };
 
+        // Other files the server has open may have changed since it was
+        // last sent them (`/undo`, a Bash edit): its view of them shapes
+        // the edited files' diagnostics.
+        let edited: Vec<PathBuf> = group.files.iter().map(|f| f.0.clone()).collect();
+        match tokio::time::timeout_at(deadline, client.refresh_open_documents(&edited)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) if !client.is_dead() => {}
+            Ok(Err(_)) => return give_up("exited".into()),
+            Err(_) => {
+                client.mark_dead();
+                return give_up(format!(
+                    "did not take the edited files within {}",
+                    seconds(config.timeout)
+                ));
+            }
+        }
+
         let mut synced = Vec::new();
         let mut files = Vec::new();
         for (path, baseline) in &group.files {
@@ -3068,6 +3085,40 @@ while True:
             &["--stdio".to_string()],
             f.project.path()
         ));
+    }
+
+    /// A file the server has open that changed on disk since (`/undo`
+    /// restored it) is sent again before the next check, even when that
+    /// check's edits are elsewhere: the server kept the old text.
+    #[test]
+    fn files_restored_since_the_last_check_are_resent() {
+        let f = fixture("ok");
+        let (a, b) = (f.file("a.py"), f.file("b.py"));
+        std::fs::write(&a, "x = 1\n").unwrap();
+        std::fs::write(&b, "def g(): pass\n").unwrap();
+        let action = f.check(
+            vec![(a.clone(), None), (b.clone(), None)],
+            &config(),
+            &trusted(),
+        );
+        assert!(
+            matches!(action, AutoFixAction::Continue { .. }),
+            "{action:?}"
+        );
+        std::fs::write(&b, "def f(): pass\n").unwrap();
+        std::fs::write(&a, "x = 2\n").unwrap();
+        let action = f.check(vec![(a, None)], &config(), &trusted());
+        assert!(
+            matches!(action, AutoFixAction::Continue { .. }),
+            "{action:?}"
+        );
+        let log = f.log();
+        let b_uri = crate::tools::lsp::path_to_uri(&b);
+        assert_eq!(
+            log.matches(&format!("didChange {b_uri}")).count(),
+            1,
+            "{log}"
+        );
     }
 
     /// The feedback stays bounded however many errors a file has.

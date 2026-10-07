@@ -431,6 +431,9 @@ impl Tool for LSPTool {
             // Convert file path to URI
             let uri = path_to_uri(&file_path);
 
+            client
+                .refresh_open_documents(std::slice::from_ref(&file_path))
+                .await?;
             // Open the document (or send its current text if it is already
             // open) so the server answers about what is on disk.
             // A file that is not UTF-8 (Latin-1 C, legacy Python) is queried
@@ -603,6 +606,7 @@ struct Published {
 
 /// What was last sent for one open document.
 struct DocState {
+    path: PathBuf,
     version: i64,
     text: String,
     /// The version and text sent before it.
@@ -1035,6 +1039,7 @@ impl LspClient {
         docs.insert(
             uri,
             DocState {
+                path: path.to_path_buf(),
                 version,
                 text,
                 previous,
@@ -1045,6 +1050,53 @@ impl LspClient {
             version,
             seq,
         })
+    }
+
+    /// Bring every open document but `except` in line with the disk. The
+    /// server reads an open document from us, never from disk, so one
+    /// changed since by anything else (`/undo`, a Bash `sed`, the user's
+    /// editor) skewed diagnostics and positions in every file using it. A
+    /// changed file gets its new text; one deleted or no longer UTF-8 is
+    /// closed, so the server goes back to the disk.
+    pub(crate) async fn refresh_open_documents(&self, except: &[PathBuf]) -> Result<()> {
+        let mut docs = self.documents.lock().await;
+        let open: Vec<(String, PathBuf)> = docs
+            .iter()
+            .filter(|(_, d)| !except.contains(&d.path))
+            .map(|(uri, d)| (uri.clone(), d.path.clone()))
+            .collect();
+        for (uri, path) in open {
+            let disk = tokio::fs::read_to_string(&path).await;
+            let Some(doc) = docs.get_mut(&uri) else {
+                continue;
+            };
+            match disk {
+                Ok(text) if text == doc.text => {}
+                Ok(text) => {
+                    let version = doc.version + 1;
+                    self.notify(
+                        "textDocument/didChange",
+                        json!({
+                            "textDocument": { "uri": uri, "version": version },
+                            "contentChanges": [{ "text": text }]
+                        }),
+                    )
+                    .await?;
+                    let old = std::mem::replace(&mut doc.text, text);
+                    doc.previous = Some((doc.version, old));
+                    doc.version = version;
+                }
+                Err(_) => {
+                    self.notify(
+                        "textDocument/didClose",
+                        json!({ "textDocument": { "uri": uri } }),
+                    )
+                    .await?;
+                    docs.remove(&uri);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn is_dead(&self) -> bool {
@@ -1181,7 +1233,7 @@ impl LspClient {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn path_to_uri(path: &Path) -> String {
+pub(crate) fn path_to_uri(path: &Path) -> String {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1966,6 +2018,54 @@ while True:
             text(&out)
         );
         assert!(client.is_dead(), "the next query must start a new server");
+    }
+
+    /// Documents opened earlier follow the disk: a file `/undo` or a Bash
+    /// command changed gets its new text, a deleted one is closed.
+    #[tokio::test]
+    async fn open_documents_follow_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, log) = fake_server(dir.path(), "ok");
+        let tool = LSPTool::default();
+        let client = lua_server(&tool, dir.path(), &server).await;
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|n| dir.path().join(format!("{n}.lua")));
+        for f in [&a, &b, &c, &d] {
+            std::fs::write(f, "local x = 1\n").unwrap();
+            client.sync_document(f).await.unwrap();
+        }
+        std::fs::write(&a, "local x = 2\n").unwrap();
+        std::fs::write(&b, "local x = 2\n").unwrap();
+        std::fs::remove_file(&c).unwrap();
+        client.refresh_open_documents(&[a.clone()]).await.unwrap();
+        // The server handles messages in order: once it answers, it has
+        // logged everything before.
+        let barrier = || client.request("shutdown", Value::Null);
+        barrier().await.unwrap();
+        let seen = std::fs::read_to_string(&log).unwrap();
+        let mut sent: Vec<&str> = seen
+            .lines()
+            .filter(|l| !l.starts_with("textDocument/didOpen") && l.contains(".lua"))
+            .collect();
+        sent.sort();
+        let uri = |p: &Path| path_to_uri(p);
+        assert_eq!(
+            sent,
+            [
+                format!("textDocument/didChange {}", uri(&b)),
+                format!("textDocument/didClose {}", uri(&c)),
+            ],
+            "{seen}"
+        );
+        // A later sync of the closed file opens it again.
+        std::fs::write(&c, "local y = 1\n").unwrap();
+        client.sync_document(&c).await.unwrap();
+        barrier().await.unwrap();
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            seen.matches(&format!("didOpen {}", uri(&c))).count(),
+            2,
+            "{seen}"
+        );
     }
 
     /// The tool starts servers the way auto-fix does: the executable itself
