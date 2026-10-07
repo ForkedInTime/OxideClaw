@@ -630,6 +630,7 @@ mod stale_text_tests {
             tokens_out: 0,
             cache_read_tokens: 0,
             cost_summary: String::new(),
+            cost_recorded: false,
             cache_write_tokens: 0,
             vim_mode: false,
             skills: &skills,

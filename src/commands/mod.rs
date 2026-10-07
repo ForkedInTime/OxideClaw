@@ -340,6 +340,9 @@ pub struct CommandContext<'a> {
     /// Session cost from the per-call cost tracker (the same numbers
     /// `/budget` and the status bar use).
     pub cost_summary: String,
+    /// Whether the cost tracker holds any API call this session. Survives
+    /// /clear and aborted turns, unlike the last-turn token fields.
+    pub cost_recorded: bool,
     pub vim_mode: bool,
     pub skills: &'a HashMap<String, Skill>,
     pub todo_state: &'a TodoState,

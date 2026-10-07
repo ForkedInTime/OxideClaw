@@ -782,6 +782,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 tokens_out: app.tokens_out,
                 cache_read_tokens: app.cache_read_tokens,
                 cost_summary: app.cost_tracker.summary(),
+                cost_recorded: !app.cost_tracker.by_model.is_empty(),
                 cache_write_tokens: app.cache_write_tokens,
                 vim_mode: app.vim_enabled,
                 skills,

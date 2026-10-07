@@ -48,7 +48,10 @@ pub(super) fn cmd_status(ctx: &CommandContext) -> CommandAction {
 }
 
 pub(super) fn cmd_cost(ctx: &CommandContext) -> CommandAction {
-    if ctx.tokens_in == 0 && ctx.tokens_out == 0 && ctx.cache_read_tokens == 0 {
+    // The tracker, not the last turn's token fields: those are only set when
+    // a turn completes and /clear zeroes them, so a turn stopped by /budget
+    // or Esc, or any spend before /clear, read as "nothing used".
+    if !ctx.cost_recorded {
         return CommandAction::Message("No tokens used in this session yet.".into());
     }
     // Every API call of the session, priced by the shared table. This used
@@ -547,5 +550,63 @@ mod stats_tests {
         assert!(text.contains("Saved sessions: 3"), "{text}");
         assert!(!text.contains("$15"), "{text}");
         assert!(!text.contains("Tokens in:  0"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod status_command_tests {
+    use super::*;
+
+    fn with_ctx<R>(
+        config: &Config,
+        edit: impl FnOnce(&mut CommandContext),
+        f: impl FnOnce(&CommandContext) -> R,
+    ) -> R {
+        let skills = std::collections::HashMap::new();
+        let todo = crate::tools::todo::TodoState::default();
+        let mut ctx = CommandContext {
+            config,
+            tokens_in: 0,
+            context_window: 200_000,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_summary: "Session cost: $0.0123".into(),
+            cost_recorded: false,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: &[],
+            brief_mode: false,
+            btw_note: None,
+        };
+        edit(&mut ctx);
+        f(&ctx)
+    }
+
+    fn message(a: CommandAction) -> String {
+        match a {
+            CommandAction::Message(m) => m,
+            _ => panic!("expected a message"),
+        }
+    }
+
+    /// A first turn stopped by /budget or Esc, or any spend before /clear,
+    /// leaves the last-turn token fields at zero though money was spent.
+    #[test]
+    fn cost_reports_tracked_spend_without_a_completed_turn() {
+        let config = Config::default();
+        let cost = with_ctx(
+            &config,
+            |c| c.cost_recorded = true,
+            |c| message(cmd_cost(c)),
+        );
+        assert!(cost.contains("Session cost: $0.0123"), "{cost}");
+        let none = with_ctx(&config, |_| {}, |c| message(cmd_cost(c)));
+        assert!(none.contains("No tokens used"), "{none}");
     }
 }
