@@ -124,6 +124,13 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "redo",
     "autocommit",
     "trust",
+    "spawn",
+    "lint",
+    "checkpoint",
+    "autonomy",
+    "reload",
+    "reload-settings",
+    "sessions",
 ];
 
 // ── Model catalogue ───────────────────────────────────────────────────────────
@@ -612,6 +619,28 @@ fn cmd_trust(args: &str) -> CommandAction {
         _ => return CommandAction::Message("Usage: /trust [status|revoke]".into()),
     };
     CommandAction::TrustProject { mode }
+}
+
+#[cfg(test)]
+mod completion_list_tests {
+    use super::{HELP_CATEGORIES, SLASH_COMMANDS};
+
+    /// Tab completion only offers SLASH_COMMANDS, so a command advertised in
+    /// /help but absent here (e.g. /spawn, /reload) never completed.
+    #[test]
+    fn every_help_command_tab_completes() {
+        for (cmd, _) in HELP_CATEGORIES.iter().flat_map(|(_, _, cmds)| cmds.iter()) {
+            let name = cmd
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_start_matches('/');
+            assert!(
+                SLASH_COMMANDS.contains(&name),
+                "/{name} is in /help but not tab-completable"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
