@@ -292,6 +292,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
                     history: turn_history,
+                    router: None,
                 })
                 .await;
             });
@@ -1343,6 +1344,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         budget_remaining_usd: budget_left,
                         session_id: sid3,
                         history: turn_history,
+                        router: None,
                     })
                     .await;
                 });
@@ -1725,6 +1727,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::RouterSet(enabled) => {
             app.router.enabled = enabled;
+            if enabled {
+                // Look at skipped tiers again: Ollama may be running now.
+                app.router.health.reset();
+            } else {
+                app.routed_model = None;
+            }
             let state = if app.router.enabled { "ON" } else { "OFF" };
             app.entries.push(ChatEntry::system(format!(
                 "Smart model router: {state}\n\
@@ -1742,18 +1750,31 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::RouterStatus => {
             let state = if app.router.enabled { "ON" } else { "OFF" };
             let savings = app.cost_tracker.routing_savings(&app.router.high_model);
+            let classifier = match app.router.classifier {
+                crate::router::Classifier::Heuristic => "keyword and length heuristic",
+                crate::router::Classifier::Model => {
+                    "the low tier labels each prompt (heuristic on timeout)"
+                }
+            };
             let mut text = format!(
                 "Smart Model Router: {state}\n\n\
                  Tier assignments:\n  \
                  Low complexity       → {}\n  \
                  Medium complexity    → {}\n  \
                  High complexity      → {}\n  \
-                 Super-High (1M ctx)  → {}\n",
+                 Super-High (1M ctx)  → {}\n\n\
+                 Classifier: {classifier}\n",
                 app.router.low_model,
                 app.router.medium_model,
                 app.router.high_model,
                 app.router.super_high_model,
             );
+            if let Some(m) = &app.routed_model {
+                text.push_str(&format!("Last turn ran on: {m}\n"));
+            }
+            for (model, why) in app.router.health.skipped() {
+                text.push_str(&format!("Skipped this session: {model} ({why})\n"));
+            }
             if savings > 0.001 {
                 text.push_str(&format!(
                     "\nEstimated savings from routing: ${:.4}",
@@ -1765,12 +1786,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
         }
         CommandAction::RouterSetTier { tier, model } => {
-            match tier.as_str() {
-                "low" => app.router.low_model = model.clone(),
-                "medium" => app.router.medium_model = model.clone(),
-                "high" => app.router.high_model = model.clone(),
-                "super-high" => app.router.super_high_model = model.clone(),
-                _ => {}
+            // Sent to the API verbatim, so "haiku" must become a real id.
+            let model = crate::commands::resolve_model_alias(&model);
+            if let Some(t) = crate::router::Complexity::parse(&tier) {
+                app.router.set_model(t, model.clone());
             }
             app.entries.push(ChatEntry::system(format!(
                 "Router {tier} tier set to: {model}"
@@ -2218,6 +2237,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
                     history: turn_history,
+                    router: None,
                 })
                 .await;
             });
@@ -2256,6 +2276,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     budget_remaining_usd: budget_left,
                     session_id: sid3,
                     history: turn_history,
+                    router: None,
                 })
                 .await;
             });
@@ -2476,6 +2497,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         budget_remaining_usd: budget_left,
                         session_id: sid4,
                         history: turn_history,
+                        router: None,
                     })
                     .await;
                 });

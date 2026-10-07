@@ -51,6 +51,69 @@ pub(super) struct ApiTask {
     /// Where the task publishes its history as it goes; the spawner keeps
     /// the other end in `App::turn_history`.
     pub(super) history: TurnHistory,
+    /// The model router, when it routes this turn: the task picks the tier
+    /// from the last user message and moves up a tier on failure.
+    pub(super) router: Option<crate::router::RouterConfig>,
+}
+
+/// Show `client`'s retry backoff in the transcript. Without this a
+/// rate-limited turn sits on a spinner for up to a minute with no
+/// explanation and reads as a freeze.
+fn notify_retries(client: &mut ApiBackend, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let notice_tx = tx.clone();
+    client.set_retry_notifier(std::sync::Arc::new(
+        move |n: &crate::api::retry::RetryNotice| {
+            let _ = notice_tx.send(AppEvent::SystemMessage(n.message()));
+        },
+    ));
+}
+
+/// Continue the turn one tier up after `trigger`, once per turn. True when
+/// it moved: `client` and `config.model` now serve the new tier.
+async fn escalate(
+    routing: &mut Option<crate::router::TurnRoute>,
+    trigger: crate::router::Trigger,
+    client: &mut ApiBackend,
+    config: &mut Config,
+    context_tokens: u64,
+    budget_left: Option<f64>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) -> bool {
+    let Some(route) = routing.as_mut() else {
+        return false;
+    };
+    let mut notices = Vec::new();
+    let next = route
+        .escalate(
+            config,
+            client,
+            context_tokens,
+            budget_left,
+            trigger,
+            &mut notices,
+        )
+        .await;
+    for n in notices {
+        let _ = tx.send(AppEvent::SystemMessage(n));
+    }
+    match next {
+        crate::router::Escalation::To(r) => {
+            let line = r.line();
+            *client = r.client;
+            notify_retries(client, tx);
+            config.model = r.model.clone();
+            let _ = tx.send(AppEvent::Routed {
+                model: r.model,
+                line,
+            });
+            true
+        }
+        crate::router::Escalation::OverBudget(line) => {
+            let _ = tx.send(AppEvent::SystemMessage(line));
+            false
+        }
+        crate::router::Escalation::None => false,
+    }
 }
 
 /// Loop detection: the same call getting the same result several times in
@@ -261,7 +324,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
         mut client,
         tools,
         mut messages,
-        config,
+        mut config,
         perm_state,
         system_prompt,
         tx,
@@ -270,19 +333,10 @@ pub(super) async fn run_api_task(task: ApiTask) {
         session_id,
         budget_remaining_usd,
         history,
+        router,
     } = task;
     let session_id = session_id.as_str();
-    // Surface the client's retry backoff in the transcript. Without this a
-    // rate-limited turn sits on a spinner for up to a minute with no
-    // explanation and reads as a freeze.
-    {
-        let notice_tx = tx.clone();
-        client.set_retry_notifier(std::sync::Arc::new(
-            move |n: &crate::api::retry::RetryNotice| {
-                let _ = notice_tx.send(AppEvent::SystemMessage(n.message()));
-            },
-        ));
-    }
+    notify_retries(&mut client, &tx);
     // This task's own spend, so a sub-agent is capped at what is left of
     // the budget rather than given all of it again.
     let mut task_cost = crate::cost::CostTracker::new();
@@ -297,6 +351,52 @@ pub(super) async fn run_api_task(task: ApiTask) {
             "Budget reached — not sending. Use /budget to raise or clear it.".into(),
         ));
         return;
+    }
+
+    // Pick the tier here rather than in the key handler: the model
+    // classifier is a network call, and the UI keeps drawing meanwhile.
+    let mut routing: Option<crate::router::TurnRoute> = None;
+    if let Some(router) = router {
+        let prompt = crate::router::last_prompt(&messages);
+        let context_tokens = crate::router::estimate_context_tokens(&system_prompt, &messages);
+        let outcome = router
+            .route(&config, &client, &prompt, context_tokens)
+            .await;
+        for n in outcome.notices {
+            let _ = tx.send(AppEvent::SystemMessage(n));
+        }
+        if let Some((model, u)) = &outcome.classifier_usage {
+            task_cost.record_with_cache(
+                model,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+            );
+            let _ = tx.send(AppEvent::usage(model, u));
+        }
+        match outcome.route {
+            Some(route) => {
+                let line = route.line();
+                client = route.client;
+                notify_retries(&mut client, &tx);
+                config.model = route.model.clone();
+                let _ = tx.send(AppEvent::Routed {
+                    model: route.model,
+                    line,
+                });
+                routing = Some(crate::router::TurnRoute::new(router, route.tier));
+            }
+            None => {
+                let _ = tx.send(AppEvent::Routed {
+                    model: config.model.clone(),
+                    line: format!(
+                        "Router: no tier is usable; this turn runs on {}.",
+                        config.model
+                    ),
+                });
+            }
+        }
     }
     let (child_usage_tx, mut child_usage_rx) = tokio::sync::mpsc::unbounded_channel();
     // Set up AskUserQuestion channel: tool → TUI dialog
@@ -334,7 +434,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
     // Retries consumed by the auto-fix loop within the current user turn.
     // Reset to 0 on every user prompt; the retry helper enforces the cap.
     let mut auto_fix_retries: u32 = 0;
-    loop {
+    'turn: loop {
         iterations += 1;
         if iterations > turn_limit {
             let _ = tx.send(AppEvent::TurnFailed(format!(
@@ -483,13 +583,46 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         continue;
                     }
 
+                    // The cheap tier failed the request itself: try the
+                    // next tier up before giving up. Not after text has
+                    // streamed, for the same reason as the retries above.
+                    if !streamed
+                        && crate::router::escalates_on(&err_str)
+                        && escalate(
+                            &mut routing,
+                            crate::router::Trigger::ApiError,
+                            &mut client,
+                            &mut config,
+                            crate::router::estimate_context_tokens(&system_prompt, &messages),
+                            task_cost.remaining(),
+                            &tx,
+                        )
+                        .await
+                    {
+                        continue 'turn;
+                    }
                     let _ = tx.send(AppEvent::TurnFailed(err_str));
                     return;
                 }
             }
         };
 
-        // Handle prompt_too_long: auto-compact and retry the outer loop
+        // Handle prompt_too_long: a routed turn first moves to a tier with
+        // a larger window; otherwise auto-compact and retry the outer loop.
+        if should_compact_retry
+            && escalate(
+                &mut routing,
+                crate::router::Trigger::ContextOverflow,
+                &mut client,
+                &mut config,
+                crate::router::estimate_context_tokens(&system_prompt, &messages),
+                task_cost.remaining(),
+                &tx,
+            )
+            .await
+        {
+            continue;
+        }
         if should_compact_retry {
             let _ = tx.send(AppEvent::SystemMessage(
                 "Prompt too long — auto-compacting context…".into(),
@@ -642,6 +775,26 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 return;
             }
             Some(StopReason::ToolUse) => {
+                // Malformed calls twice in a row: the model cannot drive the
+                // tools. The calls still get their (error) results below;
+                // the next request goes one tier up.
+                if let Some(route) = routing.as_mut() {
+                    let defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
+                    if route.malformed_twice(&response.content, &defs) {
+                        let context_tokens =
+                            crate::router::estimate_context_tokens(&system_prompt, &messages);
+                        escalate(
+                            &mut routing,
+                            crate::router::Trigger::MalformedToolCalls,
+                            &mut client,
+                            &mut config,
+                            context_tokens,
+                            task_cost.remaining(),
+                            &tx,
+                        )
+                        .await;
+                    }
+                }
                 // Set up a streaming channel so tools like Bash can send live output to the TUI
                 let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 let tx_stream = tx.clone();
@@ -713,6 +866,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 // model as a synthetic user turn via `continue`, up to
                 // `config.auto_fix.max_retries` times.
                 let mut auto_fix_touched: Vec<std::path::PathBuf> = Vec::new();
+                // A call that tripped the loop guard: (tool, streak). Its
+                // result is already in `results`.
+                let mut loop_hit: Option<(String, usize)> = None;
 
                 for block in &response.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
@@ -747,16 +903,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 is_error: Some(true),
                             });
                             if streak >= LOOP_THRESHOLD {
-                                end_turn_on_loop(
-                                    &tx,
-                                    &mut messages,
-                                    &mut results,
-                                    &response.usage,
-                                    &config.model,
-                                    name,
-                                    streak,
-                                );
-                                return;
+                                loop_hit = Some((name.clone(), streak));
+                                break;
                             }
                             continue;
                         }
@@ -791,16 +939,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                     is_error: Some(true),
                                 });
                                 if streak >= LOOP_THRESHOLD {
-                                    end_turn_on_loop(
-                                        &tx,
-                                        &mut messages,
-                                        &mut results,
-                                        &response.usage,
-                                        &config.model,
-                                        name,
-                                        streak,
-                                    );
-                                    return;
+                                    loop_hit = Some((name.clone(), streak));
+                                    break;
                                 }
                                 continue;
                             }
@@ -831,16 +971,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 is_error: Some(true),
                             });
                             if streak >= LOOP_THRESHOLD {
-                                end_turn_on_loop(
-                                    &tx,
-                                    &mut messages,
-                                    &mut results,
-                                    &response.usage,
-                                    &config.model,
-                                    name,
-                                    streak,
-                                );
-                                return;
+                                loop_hit = Some((name.clone(), streak));
+                                break;
                             }
                             continue;
                         }
@@ -950,16 +1082,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 ))],
                                 is_error: Some(true),
                             });
-                            end_turn_on_loop(
-                                &tx,
-                                &mut messages,
-                                &mut results,
-                                &response.usage,
-                                &config.model,
-                                name,
-                                same_call_streak,
-                            );
-                            return;
+                            loop_hit = Some((name.clone(), same_call_streak));
+                            break;
                         }
 
                         // Files this call wrote trigger the auto-fix check.
@@ -982,6 +1106,43 @@ pub(super) async fn run_api_task(task: ApiTask) {
                             is_error: if output.is_error { Some(true) } else { None },
                         });
                     }
+                }
+
+                if let Some((name, streak)) = loop_hit {
+                    // A routed turn gets one more try a tier up, with the
+                    // repeated results in front of it.
+                    let context_tokens =
+                        crate::router::estimate_context_tokens(&system_prompt, &messages);
+                    if escalate(
+                        &mut routing,
+                        crate::router::Trigger::Loop,
+                        &mut client,
+                        &mut config,
+                        context_tokens,
+                        task_cost.remaining(),
+                        &tx,
+                    )
+                    .await
+                    {
+                        messages.push(Message {
+                            role: Role::User,
+                            content: std::mem::take(&mut results),
+                        });
+                        close_dangling_tool_uses(&mut messages);
+                        publish_history(&history, &messages, &[]);
+                        loop_guard = LoopGuard::default();
+                        continue 'turn;
+                    }
+                    end_turn_on_loop(
+                        &tx,
+                        &mut messages,
+                        &mut results,
+                        &response.usage,
+                        &config.model,
+                        &name,
+                        streak,
+                    );
+                    return;
                 }
 
                 // ── Auto-fix check with retry loop ───────────────────────────
@@ -1428,6 +1589,7 @@ mod loop_guard_tests {
             session_id: "s".into(),
             budget_remaining_usd: None,
             history: TurnHistory::default(),
+            router: None,
         })
         .await;
 
@@ -1479,6 +1641,7 @@ mod loop_guard_tests {
             session_id: "s".into(),
             budget_remaining_usd: budget,
             history: TurnHistory::default(),
+            router: None,
         };
         (task, rx)
     }
@@ -1957,5 +2120,128 @@ mod loop_guard_tests {
         );
         assert!(edited_paths("Edit", &edit, &ToolOutput::error("no")).is_empty());
         assert!(edited_paths("Read", &edit, &ToolOutput::success("ok")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::router::fake_chat::{self, Reply};
+
+    /// A routed turn whose tiers all live on one fake Ollama host: "yes"
+    /// is a low-tier prompt.
+    async fn routed_task(
+        reply: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+        dir: &std::path::Path,
+    ) -> (
+        ApiTask,
+        mpsc::UnboundedReceiver<AppEvent>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (host, seen) = fake_chat::start(reply).await;
+        let config = Config {
+            model: "ollama:big".into(),
+            ollama_host: host,
+            cwd: dir.to_path_buf(),
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&config.model);
+        router.enabled = true;
+        router.low_model = "ollama:small".into();
+        router.medium_model = "ollama:mid".into();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = ApiTask {
+            client: config.backend_for(&config.model).unwrap(),
+            tools: Vec::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "yes".into() }],
+            }],
+            config,
+            perm_state: PermissionState::new(false, &[], &[]),
+            system_prompt: String::new(),
+            tx,
+            plan_mode: false,
+            skill_no_shell: false,
+            session_id: "s".into(),
+            budget_remaining_usd: None,
+            history: TurnHistory::default(),
+            router: Some(router),
+        };
+        (task, rx, seen)
+    }
+
+    /// The low tier fails; the turn finishes one tier up, the status line
+    /// learns both models, and the escalation is one line.
+    #[tokio::test]
+    async fn a_failed_low_tier_turn_finishes_one_tier_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (task, mut rx, seen) = routed_task(
+            |model, _| match model {
+                "small" => Reply::Status(400, r#"{"error":"unsupported tool format"}"#),
+                _ => Reply::Text("fixed"),
+            },
+            dir.path(),
+        )
+        .await;
+        run_api_task(task).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["small", "mid"]);
+        let (mut routed, mut done, mut failed) = (Vec::new(), None, None);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Routed { model, line } => routed.push((model, line)),
+                AppEvent::Done { model_used, .. } => done = Some(model_used),
+                AppEvent::TurnFailed(e) => failed = Some(e),
+                _ => {}
+            }
+        }
+        assert_eq!(failed, None);
+        assert_eq!(done.as_deref(), Some("ollama:mid"));
+        assert_eq!(routed.len(), 2, "{routed:?}");
+        assert_eq!(routed[0].0, "ollama:small");
+        assert!(routed[0].1.contains("heuristic"), "{}", routed[0].1);
+        assert_eq!(routed[1].0, "ollama:mid");
+        assert!(
+            routed[1].1.contains("API error on ollama:small"),
+            "{}",
+            routed[1].1
+        );
+    }
+
+    /// The loop detector on the cheap tier: the turn continues one tier up
+    /// with the repeated results in its history instead of pausing.
+    #[tokio::test]
+    async fn a_loop_on_the_low_tier_escalates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut task, mut rx, seen) = routed_task(
+            |model, _| match model {
+                "small" => Reply::Tool("Read", r#"{"file_path":"missing.rs"}"#),
+                _ => Reply::Text("the file does not exist"),
+            },
+            dir.path(),
+        )
+        .await;
+        task.tools = vec![std::sync::Arc::new(crate::tools::file_read::FileReadTool) as DynTool];
+        run_api_task(task).await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["small", "small", "small", "mid"]
+        );
+        let mut done = None;
+        let mut loop_paused = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Done { messages, .. } => done = Some(messages),
+                AppEvent::SystemMessage(m) if m.contains("Loop detected") => loop_paused = true,
+                _ => {}
+            }
+        }
+        assert!(!loop_paused);
+        let messages = done.expect("turn finished");
+        // Every tool_use answered, the last word is the mid tier's.
+        assert_eq!(messages.last().unwrap().role, Role::Assistant);
+        assert_eq!(messages.len(), 8);
     }
 }

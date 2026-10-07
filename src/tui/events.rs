@@ -64,6 +64,10 @@ pub enum AppEvent {
     CompactFailed(String),
     /// Informational notice from the harness (not from Claude)
     SystemMessage(String),
+    /// The router sent this turn (or the rest of it, after an escalation)
+    /// to `model`. `line` is shown when the model differs from the last
+    /// routed one.
+    Routed { model: String, line: String },
     /// Auto-fix skipped its lint and test run because the project is not
     /// trusted. Shown once per session, not after every edit.
     AutoFixUntrusted,

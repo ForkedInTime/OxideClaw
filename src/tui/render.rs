@@ -14,7 +14,7 @@
 ///   > user message
 /// > ● assistant response
 ///   > _
-use crate::tui::app::{App, EntryKind};
+use crate::tui::app::{App, EntryKind, pretty_model_name};
 use crate::tui::markdown;
 use ratatui::{
     Frame,
@@ -958,10 +958,14 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         ));
     }
 
-    // Router indicator
+    // Router indicator, with the model the latest turn went to
     if app.router.enabled {
+        let text = match &app.routed_model {
+            Some(m) => format!("  │  ROUTER → {}", pretty_model_name(m)),
+            None => "  │  ROUTER".to_string(),
+        };
         left_spans.push(Span::styled(
-            "  │  ROUTER",
+            text,
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),

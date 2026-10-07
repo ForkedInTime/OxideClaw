@@ -717,6 +717,8 @@ pub struct App {
 
     /// Smart model router configuration.
     pub router: crate::router::RouterConfig,
+    /// The model the router sent the latest turn to, for the status line.
+    pub routed_model: Option<String>,
     /// Session cost tracker with per-model breakdown.
     pub cost_tracker: crate::cost::CostTracker,
     /// Context window the status bar's ctx % is measured against; the main
@@ -874,6 +876,7 @@ impl App {
             pending_clone_tier: None,
             pending_rewind: None,
             router: crate::router::RouterConfig::new(model),
+            routed_model: None,
             cost_tracker: crate::cost::CostTracker::new(),
             context_window: crate::api::context_window_for_model(model),
             browser_session: None,
@@ -1519,6 +1522,13 @@ impl App {
             AppEvent::SystemMessage(msg) => {
                 self.entries.push(ChatEntry::system(msg));
                 self.scroll_to_bottom();
+            }
+            AppEvent::Routed { model, line } => {
+                if self.routed_model.as_deref() != Some(model.as_str()) {
+                    self.entries.push(ChatEntry::system(line));
+                    self.scroll_to_bottom();
+                }
+                self.routed_model = Some(model);
             }
             AppEvent::AutoFixUntrusted => {
                 if !std::mem::replace(&mut self.auto_fix_untrusted_noticed, true) {

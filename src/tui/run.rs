@@ -537,18 +537,7 @@ fn scroll_off_screen(out: &mut impl io::Write, rows: u16, lines: u16) -> io::Res
 /// fails on the first request, so an Anthropic model without a credential is
 /// refused here, at startup and on /model alike.
 fn backend_for_model(config: &Config, model: &str) -> Result<ApiBackend> {
-    let is_non_anthropic =
-        crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
-    if !is_non_anthropic && config.api_key.is_empty() {
-        return Err(config.missing_credential_error());
-    }
-    ApiBackend::new_with_auth(
-        model,
-        &config.api_key,
-        config.auth_is_oauth,
-        &config.ollama_host,
-        config.openai_api,
-    )
+    config.backend_for(model)
 }
 
 /// /model and the model picker. The client is built first: switching
@@ -691,23 +680,9 @@ async fn run_loop(
         app.theme = theme.clone();
     }
     // Apply router settings from config (loaded from settings.json)
-    if config.router_enabled {
-        app.router.enabled = true;
-    }
+    app.router = crate::router::RouterConfig::from_config(&config);
     if let Some(budget) = config.router_budget {
         app.cost_tracker.set_budget(budget);
-    }
-    if let Some(ref m) = config.router_low_model {
-        app.router.low_model = m.clone();
-    }
-    if let Some(ref m) = config.router_medium_model {
-        app.router.medium_model = m.clone();
-    }
-    if let Some(ref m) = config.router_high_model {
-        app.router.high_model = m.clone();
-    }
-    if let Some(ref m) = config.router_super_high_model {
-        app.router.super_high_model = m.clone();
     }
     let mut messages: Vec<Message> = Vec::new();
     let mut last_tokens_in: u64 = 0;

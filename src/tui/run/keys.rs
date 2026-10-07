@@ -592,8 +592,11 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 
             // Model routing: phase routing takes priority over complexity routing.
             // 1. Phase router (if enabled) — research/plan/edit/review → specific model
-            // 2. Complexity router (if enabled) — low/medium/high/super-high → model tier
+            // 2. Complexity router (if enabled) — low/medium/high/super-high → model
+            //    tier on any backend, picked inside the task (the classifier
+            //    may take a model call) and escalated there on failure
             // 3. Fallback: config.model unchanged
+            let mut router = None;
             if config.phase_router.enabled
                 && !crate::api::is_ollama_model(&config.model)
                 && !crate::api::is_openai_compat_model(&config.model)
@@ -610,19 +613,8 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         cfg.model = routed_model;
                     }
                 }
-            } else if app.router.enabled
-                && !crate::api::is_ollama_model(&config.model)
-                && !crate::api::is_openai_compat_model(&config.model)
-            {
-                let complexity = crate::router::detect_complexity(&final_text);
-                let routed_model = app.router.model_for(complexity).to_string();
-                if routed_model != config.model {
-                    app.entries.push(ChatEntry::system(format!(
-                        "Router: {complexity} complexity → {}",
-                        crate::tui::app::pretty_model_name(&routed_model)
-                    )));
-                    cfg.model = routed_model;
-                }
+            } else if app.router.enabled {
+                router = Some(app.router.clone());
             }
             let c2 = match routed_client(config, client, &cfg.model) {
                 Ok(c) => c,
@@ -669,6 +661,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     budget_remaining_usd: budget_left,
                     session_id: sid2,
                     history: turn_history,
+                    router,
                 })
                 .await;
             });
