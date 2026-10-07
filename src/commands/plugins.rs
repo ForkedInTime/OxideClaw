@@ -90,20 +90,30 @@ pub(super) fn cmd_plugin(args: &str) -> CommandAction {
     }
 }
 
+/// plugins.json lives where `/plugin install` and `/plugin remove` keep it
+/// (~/.claude), not in the XDG-aware config dir; reading it from there made
+/// the listings come up empty under XDG_CONFIG_HOME or CLAUDE_CONFIG_DIR.
+fn plugins_json_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claude")
+        .join("plugins.json")
+}
+
 pub(super) fn plugin_marketplace_list() -> CommandAction {
-    let plugins_path = Config::claude_dir().join("plugins.json");
-    let content = std::fs::read_to_string(&plugins_path).unwrap_or_default();
+    plugin_marketplace_list_in(&plugins_json_path())
+}
+
+fn plugin_marketplace_list_in(plugins_path: &std::path::Path) -> CommandAction {
+    let content = std::fs::read_to_string(plugins_path).unwrap_or_default();
     let plugins: serde_json::Value =
         serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
 
     if let Some(obj) = plugins.as_object() {
+        // Install records {"spec": "<owner/repo or package>", "marketplace": bool}.
         let marketplace_plugins: Vec<_> = obj
             .iter()
-            .filter(|(_, v)| {
-                v.get("source")
-                    .and_then(|s| s.as_str())
-                    .is_some_and(|s| s.contains("marketplace") || s.contains("github"))
-            })
+            .filter(|(_, v)| v.get("marketplace").and_then(|m| m.as_bool()) == Some(true))
             .collect();
         if marketplace_plugins.is_empty() {
             CommandAction::Message(
@@ -114,12 +124,9 @@ pub(super) fn plugin_marketplace_list() -> CommandAction {
         } else {
             let lines: Vec<String> = marketplace_plugins
                 .iter()
-                .map(|(name, v)| {
-                    let src = v
-                        .get("source")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    format!("  {name}  (from {src})")
+                .map(|(name, v)| match v.get("spec").and_then(|s| s.as_str()) {
+                    Some(spec) => format!("  {name}  (from github.com/{spec})"),
+                    None => format!("  {name}"),
                 })
                 .collect();
             CommandAction::Message(format!("Marketplace plugins\n\n{}", lines.join("\n")))
@@ -248,8 +255,7 @@ pub(super) fn plugin_manage_list() -> CommandAction {
     let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
     let val: serde_json::Value = serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
 
-    let plugins_path = Config::claude_dir().join("plugins.json");
-    let plugins_content = std::fs::read_to_string(&plugins_path).unwrap_or_default();
+    let plugins_content = std::fs::read_to_string(plugins_json_path()).unwrap_or_default();
     let plugins: serde_json::Value =
         serde_json::from_str(&plugins_content).unwrap_or(serde_json::json!({}));
 
@@ -435,4 +441,43 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
     );
 
     CommandAction::Message(format!("{header}{content}"))
+}
+
+#[cfg(test)]
+mod marketplace_list_tests {
+    use super::*;
+
+    /// The list filtered on a "source" field that install never writes, so it
+    /// always said none were installed right after `/plugin marketplace add`.
+    #[test]
+    fn lists_plugins_installed_from_the_marketplace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.json");
+        // The shape track_plugin_in writes.
+        std::fs::write(
+            &path,
+            r#"{"context-mode": {"spec": "mksglu/context-mode", "marketplace": true},
+                "server-github": {"spec": "@modelcontextprotocol/server-github", "marketplace": false}}"#,
+        )
+        .unwrap();
+        let CommandAction::Message(m) = plugin_marketplace_list_in(&path) else {
+            panic!("expected a message");
+        };
+        assert!(
+            m.contains("context-mode  (from github.com/mksglu/context-mode)"),
+            "{m}"
+        );
+        assert!(!m.contains("server-github"), "{m}");
+    }
+
+    #[test]
+    fn reports_none_when_only_registry_plugins_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.json");
+        std::fs::write(&path, r#"{"x": {"spec": "x", "marketplace": false}}"#).unwrap();
+        let CommandAction::Message(m) = plugin_marketplace_list_in(&path) else {
+            panic!("expected a message");
+        };
+        assert!(m.starts_with("No marketplace plugins installed."), "{m}");
+    }
 }
