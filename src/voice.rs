@@ -2,9 +2,10 @@
 ///
 /// Recording: uses system `arecord` (Linux) or `sox` if available.
 /// Transcription: tries in priority order:
-///   1. Local `whisper` CLI (OpenAI whisper or whisper.cpp)
+///   1. Local `whisper` CLI (openai-whisper)
 ///   2. OpenAI-compatible /v1/audio/transcriptions API endpoint
-///      (reads WHISPER_API_KEY, else OPENAI_API_KEY, from env)
+///      (reads WHISPER_API_KEY, else OPENAI_API_KEY, from env), also used
+///      when local whisper fails or hears nothing
 ///
 /// Usage:
 ///   /voice          — show status + setup instructions
@@ -39,8 +40,11 @@ pub fn find_recorder() -> Option<RecorderBackend> {
     }
 }
 
+/// Only openai-whisper's CLI: whisper.cpp binaries take different flags and
+/// need a ggml model file, so driving them like `whisper` printed usage and
+/// "transcribed" nothing.
 pub fn local_whisper_available() -> bool {
-    which("whisper") || which("whisper-cpp") || which("whisper.cpp")
+    which("whisper")
 }
 
 /// The transcription API key and the variable it came from. The
@@ -190,66 +194,70 @@ pub async fn transcribe(api_url: Option<&str>, api_key: Option<&str>) -> Result<
         return Err(anyhow!("No recording found at {}", wav.display()));
     }
 
+    let key = api_key.map(|s| s.to_string()).or_else(voice_api_key);
+
     // Try local whisper first (no API key needed, works offline)
     if local_whisper_available() {
-        return transcribe_local(&wav).await;
+        let local = transcribe_local(&wav).await;
+        if local_transcript_is_final(&local, key.is_some()) {
+            return local;
+        }
     }
 
     // Fall back to OpenAI-compatible API
-    let key = api_key
-        .map(|s| s.to_string())
-        .or_else(voice_api_key)
-        .ok_or_else(|| {
-            anyhow!(
-                "No transcription available.\n\
+    let key = key.ok_or_else(|| {
+        anyhow!(
+            "No transcription available.\n\
              Set WHISPER_API_KEY or OPENAI_API_KEY env var,\n\
              or install whisper: pip install openai-whisper"
-            )
-        })?;
+        )
+    })?;
 
     let url = api_url.unwrap_or("https://api.openai.com/v1/audio/transcriptions");
     transcribe_api(&wav, url, &key).await
 }
 
-async fn transcribe_local(wav: &std::path::Path) -> Result<String> {
-    // Try whisper CLI tools in order
-    for binary in &["whisper", "whisper-cpp", "whisper.cpp"] {
-        if which(binary) {
-            // Use std::env::temp_dir() — never hardcode /tmp.
-            // TMPDIR can be /mnt/Storage/tmp, /var/folders/..., or any custom path.
-            // The --output_dir passed to whisper MUST match so we can find the .txt output.
-            let tmp_dir = std::env::temp_dir();
-            let tmp_dir_str = tmp_dir.to_string_lossy();
-            let out = Command::new(binary)
-                .args([
-                    &wav.display().to_string(),
-                    "--model",
-                    "base",
-                    "--output_format",
-                    "txt",
-                    "--fp16",
-                    "False",
-                    "--output_dir",
-                    tmp_dir_str.as_ref(),
-                ])
-                .output()
-                .await?;
+/// Whether the local whisper result stands. A failure or an empty
+/// transcript (whisper erroring out, or a broken install) used to be final
+/// even with an API key set, so voice input and spoken approvals just died.
+fn local_transcript_is_final(local: &Result<String>, have_api_key: bool) -> bool {
+    !have_api_key || matches!(local, Ok(text) if !text.is_empty())
+}
 
-            if out.status.success() {
-                // whisper writes <filename>.txt in output_dir
-                let txt_path = tmp_dir
-                    .join(wav.file_stem().unwrap_or_default())
-                    .with_extension("txt");
-                if let Ok(text) = tokio::fs::read_to_string(&txt_path).await {
-                    let _ = tokio::fs::remove_file(&txt_path).await;
-                    return Ok(text.trim().to_string());
-                }
-                // Some versions print to stdout
-                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
-            }
-        }
+async fn transcribe_local(wav: &std::path::Path) -> Result<String> {
+    // Use std::env::temp_dir() — never hardcode /tmp.
+    // TMPDIR can be /mnt/Storage/tmp, /var/folders/..., or any custom path.
+    // The --output_dir passed to whisper MUST match so we can find the .txt output.
+    let tmp_dir = std::env::temp_dir();
+    let tmp_dir_str = tmp_dir.to_string_lossy();
+    let out = Command::new("whisper")
+        .args([
+            &wav.display().to_string(),
+            "--model",
+            "base",
+            "--output_format",
+            "txt",
+            "--fp16",
+            "False",
+            "--output_dir",
+            tmp_dir_str.as_ref(),
+        ])
+        .output()
+        .await?;
+
+    if !out.status.success() {
+        return Err(anyhow!("Local whisper transcription failed"));
     }
-    Err(anyhow!("Local whisper transcription failed"))
+    // whisper writes <filename>.txt in output_dir
+    let txt_path = tmp_dir
+        .join(wav.file_stem().unwrap_or_default())
+        .with_extension("txt");
+    if let Ok(text) = tokio::fs::read_to_string(&txt_path).await {
+        let _ = tokio::fs::remove_file(&txt_path).await;
+        return Ok(text.trim().to_string());
+    }
+    // Some versions print to stdout
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 async fn transcribe_api(wav: &std::path::Path, url: &str, api_key: &str) -> Result<String> {
@@ -1630,6 +1638,22 @@ pub async fn speak_cloned(
 
     play_wav(&wav_out, stop_rx).await?;
     Ok(truncated)
+}
+
+#[cfg(test)]
+mod transcription_fallback_tests {
+    use super::local_transcript_is_final;
+    use anyhow::anyhow;
+
+    #[test]
+    fn a_failed_or_empty_local_transcript_falls_back_to_the_api() {
+        assert!(!local_transcript_is_final(&Err(anyhow!("usage")), true));
+        assert!(!local_transcript_is_final(&Ok(String::new()), true));
+        assert!(local_transcript_is_final(&Ok("hello".into()), true));
+        // Without a key the local result is all there is.
+        assert!(local_transcript_is_final(&Err(anyhow!("usage")), false));
+        assert!(local_transcript_is_final(&Ok(String::new()), false));
+    }
 }
 
 #[cfg(test)]
