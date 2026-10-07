@@ -301,7 +301,7 @@ fn bwrap_wrap_with_home(
 /// The shell inside the namespace sandboxes: bash, the Bash tool's
 /// contract, or `/bin/sh` on hosts without it (Alpine/BusyBox), where a
 /// hard-coded `bash` failed every command.
-fn sandbox_shell() -> &'static str {
+pub fn sandbox_shell() -> &'static str {
     if crate::tools::bash::has_bash() {
         "bash"
     } else {
@@ -327,6 +327,12 @@ pub fn firejail_wrap(command: &str, _cwd: &std::path::Path, allow_network: bool)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/// Whether `apply_sandbox` wraps the command in a POSIX-quoted
+/// `bwrap ... -- bash -c '<cmd>'` string. Keep in step with its arms.
+pub fn wraps_in_shell(mode: &str) -> bool {
+    matches!(mode, "bwrap" | "firejail")
+}
 
 /// Apply sandboxing to a command string based on the active mode.
 /// Returns (final_command, error_message_if_blocked).

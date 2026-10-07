@@ -1809,10 +1809,16 @@ impl Config {
 
         // Name the shell the Bash tool will actually run, not the login shell:
         // telling the model "fish" while bash parses its commands misleads it.
-        let shell = crate::tools::bash::bash_tool_shell(
-            self.default_shell.as_deref(),
-            std::env::var("SHELL").ok().as_deref(),
-        );
+        // In a bwrap/firejail jail that is the jail's shell, whatever
+        // defaultShell says.
+        let shell = if self.sandbox_enabled && crate::sandbox::wraps_in_shell(&self.sandbox_mode) {
+            crate::sandbox::sandbox_shell().to_string()
+        } else {
+            crate::tools::bash::bash_tool_shell(
+                self.default_shell.as_deref(),
+                std::env::var("SHELL").ok().as_deref(),
+            )
+        };
         let shell_name = crate::tools::bash::shell_file_name(&shell).to_string();
 
         let os_version = std::process::Command::new("uname")

@@ -377,6 +377,22 @@ pub fn shell_file_name(shell: &str) -> &str {
 /// tcsh login shell heredocs, `if ...; then` and `$?` would all fail to parse.
 /// Where bash is not installed (Alpine/BusyBox, SHELL=/bin/sh) a POSIX login
 /// shell, else `sh`, beats a shell that does not exist.
+/// The shell that parses the Bash tool's final command string. A bwrap or
+/// firejail wrapper quotes the command for a POSIX shell (`'\''`); fish or
+/// PowerShell read that quoting differently, so the command could close the
+/// quote and run on the host outside the jail. Only `/bin/sh` may parse it,
+/// and bash runs the command inside the jail either way.
+pub fn command_shell(
+    sandbox_mode: Option<&str>,
+    default_shell: Option<&str>,
+    login_shell: Option<&str>,
+) -> String {
+    if sandbox_mode.is_some_and(crate::sandbox::wraps_in_shell) {
+        return "/bin/sh".to_string();
+    }
+    bash_tool_shell(default_shell, login_shell)
+}
+
 pub fn bash_tool_shell(default_shell: Option<&str>, login_shell: Option<&str>) -> String {
     bash_tool_shell_with(default_shell, login_shell, has_bash)
 }
@@ -481,7 +497,8 @@ impl Tool for BashTool {
         let stream_tx = ctx.stream_tx.clone();
         let cwd = ctx.cwd.clone();
         let extra_env = ctx.env.clone();
-        let shell = bash_tool_shell(
+        let shell = command_shell(
+            ctx.sandbox_mode.as_deref(),
             ctx.default_shell.as_deref(),
             std::env::var("SHELL").ok().as_deref(),
         );
@@ -726,6 +743,33 @@ mod shell_choice_tests {
         // An explicit defaultShell is the user's choice and always wins.
         assert_eq!(shell(Some("powershell"), Some("/bin/bash")), "powershell");
         assert_eq!(shell(Some("/usr/bin/fish"), None), "/usr/bin/fish");
+    }
+
+    /// A bwrap/firejail wrapper is POSIX-quoted; run under a fish
+    /// `defaultShell`, `echo \'; rm -rf ~ #` closed the quote and ran
+    /// `rm -rf ~` on the host, outside the jail.
+    #[test]
+    fn a_wrapped_command_is_parsed_by_a_posix_shell() {
+        for default in [Some("/usr/bin/fish"), Some("pwsh"), None] {
+            for mode in ["bwrap", "firejail"] {
+                assert_eq!(
+                    command_shell(Some(mode), default, Some("/usr/bin/fish")),
+                    "/bin/sh",
+                    "{mode} {default:?}"
+                );
+            }
+            for mode in [Some("strict"), None] {
+                assert_eq!(
+                    command_shell(mode, default, Some("/bin/bash")),
+                    bash_tool_shell(default, Some("/bin/bash")),
+                    "{mode:?} {default:?}"
+                );
+            }
+        }
+        assert_eq!(
+            command_shell(Some("strict"), Some("/usr/bin/fish"), None),
+            "/usr/bin/fish"
+        );
     }
 
     /// Alpine/BusyBox ship no bash and set SHELL=/bin/sh: every Bash tool
