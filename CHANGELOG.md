@@ -112,6 +112,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without it. Mid-request `input_required` elicitations are declined; a
   sampling or roots request fails that call, since OxideClaw serves
   neither.
+- **Language-server errors in the auto-fix loop.** After an edit in a
+  `/trust`ed project, each edited file inside the project also goes to its
+  language server, the one the `LSP` tool uses (rust-analyzer,
+  typescript-language-server, pyright or pylsp, gopls, clangd, ...), while
+  lint and tests run. New errors join their output as
+  `file:line:col message`, at most 30 lines; errors the file already had
+  are left out. Servers run project code, so none starts in an untrusted
+  folder and one auto-fix starts runs under the Bash sandbox when that is
+  on. Settings under `autoFixLoop`: `lsp` (default `true`), `lspSettleMs`
+  (default 2000: how long to keep listening after a file's first report),
+  `lspTimeoutMs` (default 10000, at most 60000: the cap on the whole step,
+  start-up included) and `lspWarnings` (default `false`). A server that
+  cannot start, is refused by the sandbox, crashes, or does not answer
+  `initialize` or take the files within the cap is dropped for the rest of
+  the session with a note; one that is merely slow to report is kept.
+  rust-analyzer builds into `target/rust-analyzer`, so it does not queue
+  on the lock auto-fix's `cargo clippy` and `cargo test` hold.
+- **LSP tool.** `pylsp` is the Python server when `pyright-langserver` is
+  not installed. An open document gets a full-text `didChange` instead of
+  a second `didOpen`, so the server answers about the file's current text;
+  a file that is not UTF-8 is still queried, unsynced. Servers get
+  `shutdown` and `exit` when OxideClaw quits, and are killed only if they
+  have not gone a second later.
 
 ### Changed
 

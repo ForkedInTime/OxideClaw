@@ -67,7 +67,7 @@ impl LspPool {
             cache.remove(&key);
         }
         let client = LspClient::connect(command, args, root, launch).await?;
-        client.initialize(root).await?;
+        client.initialize(command, root).await?;
         let client = Arc::new(client);
         cache.insert(key, Arc::clone(&client));
         Ok(client)
@@ -289,8 +289,9 @@ impl Tool for LSPTool {
 
         // Open the document (or send its current text if it is already
         // open) so the server answers about what is on disk.
-        if file_path.is_file() {
-            client.sync_document(&file_path).await?;
+        // A file that is not UTF-8 (Latin-1 C, legacy Python) is queried
+        // without syncing, as before: the server reads it from disk.
+        if file_path.is_file() && client.sync_document(&file_path).await.is_ok() {
             // Small delay to let server process the document
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
@@ -482,6 +483,18 @@ fn doc_key(path: &Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     path.to_path_buf()
+}
+
+/// `initializationOptions` for `command`. rust-analyzer builds into
+/// `target/rust-analyzer` rather than `target/`: its workspace load runs
+/// `cargo check` for build scripts and proc macros, which would otherwise
+/// queue on the build-directory lock with auto-fix's own `cargo clippy` and
+/// `cargo test` (and the user's builds) and hold them past their timeout.
+fn initialization_options(command: &str) -> Value {
+    match command {
+        "rust-analyzer" => json!({ "cargo": { "targetDir": true } }),
+        _ => json!({}),
+    }
 }
 
 fn frame(msg: &Value) -> Result<String> {
@@ -693,15 +706,30 @@ impl LspClient {
             return Err(anyhow!("language server exited"));
         }
         let mut stdin = self.stdin.lock().await;
+        // A write dropped part-way (a caller's timeout on a server that has
+        // stopped reading) leaves half a frame on the pipe: nothing sent
+        // after it would parse, so the client is dead from then on.
+        struct DeadUnlessDone<'a>(&'a AtomicBool, bool);
+        impl Drop for DeadUnlessDone<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut guard = DeadUnlessDone(&self.dead, false);
         let written = async {
             stdin.write_all(frame.as_bytes()).await?;
             stdin.flush().await
         }
         .await;
-        if written.is_err() {
-            self.dead.store(true, Ordering::SeqCst);
-        }
+        guard.1 = written.is_ok();
         Ok(written?)
+    }
+
+    /// Stop using this client: the pool starts a new server next time.
+    pub(crate) fn mark_dead(&self) {
+        self.dead.store(true, Ordering::SeqCst);
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -729,7 +757,7 @@ impl LspClient {
         self.send_raw(message(None, method, params)).await
     }
 
-    async fn initialize(&self, root: &Path) -> Result<()> {
+    async fn initialize(&self, command: &str, root: &Path) -> Result<()> {
         let root_uri = path_to_uri(root);
         self.request(
             "initialize",
@@ -752,7 +780,7 @@ impl LspClient {
                         "symbol": { "dynamicRegistration": false }
                     }
                 },
-                "initializationOptions": {}
+                "initializationOptions": initialization_options(command)
             }),
         )
         .await?;
@@ -837,8 +865,12 @@ impl LspClient {
     /// Wait until every synced document has diagnostics for its new text,
     /// then `settle` longer for the follow-ups servers send (a fast syntax
     /// pass, then a semantic one); never past `deadline`, and not after
-    /// `cancel` is set. Returns each document's diagnostics by then, `None`
-    /// for one with nothing new.
+    /// `cancel` is set. Servers such as rust-analyzer publish only when a
+    /// document's diagnostics change, so a document the server has reported
+    /// on before counts as unchanged once the server has published nothing
+    /// for `settle`. Returns each document's diagnostics by then (its last
+    /// published set when nothing new came), `None` for one the server has
+    /// never reported on.
     pub(crate) async fn wait_for_diagnostics(
         &self,
         synced: &[Synced],
@@ -847,30 +879,47 @@ impl LspClient {
         cancel: &AtomicBool,
     ) -> Vec<Option<Vec<Value>>> {
         let mut seq = self.publish_seq.clone();
+        seq.borrow_and_update();
         let mut settled_at: Option<Instant> = None;
+        let mut last_publish = Instant::now();
         loop {
             let now = Instant::now();
-            if settled_at.is_none() && synced.iter().all(|s| self.fresh(s).is_some()) {
+            let fresh: Vec<bool> = synced.iter().map(|s| self.fresh(s).is_some()).collect();
+            if settled_at.is_none() && fresh.iter().all(|f| *f) {
                 settled_at = Some(now + settle);
             }
+            let reported = synced
+                .iter()
+                .zip(&fresh)
+                .all(|(s, f)| *f || self.published_for(&s.path).is_some());
+            let quiet_at = reported.then_some(last_publish + settle);
             if now >= deadline
                 || settled_at.is_some_and(|t| now >= t)
+                || quiet_at.is_some_and(|t| now >= t)
                 || cancel.load(Ordering::SeqCst)
                 || self.dead.load(Ordering::SeqCst)
             {
                 break;
             }
             // Short slices, so Esc is noticed.
-            let wake = settled_at
-                .unwrap_or(deadline)
-                .min(deadline)
-                .min(now + Duration::from_millis(100));
-            if let Ok(Err(_)) = tokio::time::timeout_at(wake, seq.changed()).await {
+            let wake = [settled_at, quiet_at, Some(now + Duration::from_millis(100))]
+                .into_iter()
+                .flatten()
+                .fold(deadline, Instant::min);
+            match tokio::time::timeout_at(wake, seq.changed()).await {
+                Ok(Ok(())) => last_publish = Instant::now(),
                 // The reader is gone: the server exited.
-                break;
+                Ok(Err(_)) => break,
+                Err(_) => {}
             }
         }
-        synced.iter().map(|s| self.fresh(s)).collect()
+        synced
+            .iter()
+            .map(|s| {
+                self.fresh(s)
+                    .or_else(|| self.published_for(&s.path).map(|p| p.diagnostics))
+            })
+            .collect()
     }
 
     /// `shutdown`, then `exit`; the process is killed if it has not exited
@@ -879,7 +928,9 @@ impl LspClient {
         if !self.dead.load(Ordering::SeqCst) {
             let second = Duration::from_secs(1);
             let _ = tokio::time::timeout(second, self.request("shutdown", Value::Null)).await;
-            let _ = self.notify("exit", Value::Null).await;
+            // A server that stopped reading its input would hold this write
+            // (and quitting) forever.
+            let _ = tokio::time::timeout(second, self.notify("exit", Value::Null)).await;
         }
         let child = self.child.lock().ok().and_then(|mut c| c.take());
         if let Some(mut child) = child
@@ -1139,7 +1190,7 @@ mod lifecycle_tests {
             .unwrap();
         let init = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            client.initialize(dir.path()),
+            client.initialize(&cmd, dir.path()),
         )
         .await;
         assert!(
@@ -1354,5 +1405,82 @@ mod cache_tests {
         assert!(Arc::ptr_eq(&a, &b), "second call must hit the cache");
         let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(starts, 1, "server spawned {starts} times");
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    /// rust-analyzer's own builds stay out of the `target/` dir auto-fix's
+    /// cargo commands lock.
+    #[test]
+    fn rust_analyzer_gets_its_own_target_dir() {
+        assert_eq!(
+            initialization_options("rust-analyzer"),
+            json!({ "cargo": { "targetDir": true } })
+        );
+        assert_eq!(initialization_options("pyright-langserver"), json!({}));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sync_tests {
+    use super::*;
+
+    /// A file that is not UTF-8 is still queried, unsynced, as before.
+    #[tokio::test]
+    async fn a_file_that_is_not_utf8_is_still_queried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("server");
+        // Answers every request with a null result.
+        std::fs::write(
+            &server,
+            r#"#!/usr/bin/env python3
+import json, sys
+while True:
+    n = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        line = line.strip()
+        if not line:
+            break
+        k, v = line.split(b":", 1)
+        if k.strip().lower() == b"content-length":
+            n = int(v)
+    m = json.loads(sys.stdin.buffer.read(n))
+    if "id" in m and "method" in m:
+        b = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": None}).encode()
+        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+        sys.stdout.buffer.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.path().join("legacy.lua");
+        std::fs::write(&file, b"-- caf\xe9\nlocal x = 1\n").unwrap();
+
+        let tool = LSPTool::default();
+        // The tool's server for .lua, already running (from the cache).
+        tool.pool
+            .client_for(
+                "lua-language-server",
+                &[],
+                dir.path(),
+                &Launch::Program(server),
+            )
+            .await
+            .unwrap();
+        let out = tool
+            .execute(
+                json!({"operation": "hover", "file_path": "legacy.lua", "line": 1, "character": 6}),
+                &ToolContext::new(dir.path().to_path_buf()),
+            )
+            .await
+            .expect("a Latin-1 file made the query fail");
+        assert!(!out.is_error);
     }
 }

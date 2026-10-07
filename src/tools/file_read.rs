@@ -246,7 +246,7 @@ async fn read_section(
 /// touching the filesystem (so this works for files that don't exist yet,
 /// unlike `Path::canonicalize`). Leading `..`s are preserved — they're what
 /// `resolve_path_safe` uses to detect attempted escapes.
-fn clean_path(p: &Path) -> PathBuf {
+pub(crate) fn clean_path(p: &Path) -> PathBuf {
     let mut out: Vec<Component<'_>> = Vec::new();
     for c in p.components() {
         match c {

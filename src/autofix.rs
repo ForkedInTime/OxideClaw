@@ -1019,29 +1019,40 @@ pub struct LspBaseline {
 
 /// Record `path` (absolute) before an edit: its text, and the diagnostics a
 /// running server (looked up on `search`, a PATH) already has for it.
-/// Starts nothing.
+/// Starts nothing, and reads nothing for a file no server would check.
 pub async fn capture_lsp_baseline(
     pool: &LspPool,
     root: &Path,
     path: &Path,
     search: Option<&std::ffi::OsStr>,
 ) -> LspBaseline {
-    let content = match std::fs::metadata(path) {
+    if !in_root(root, path) {
+        return LspBaseline::default();
+    }
+    let Some((command, args, _)) = crate::tools::lsp::installed_server(path, search) else {
+        return LspBaseline::default();
+    };
+    let content = match tokio::fs::metadata(path).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
-        Ok(m) if m.len() <= MAX_BASELINE_BYTES => std::fs::read_to_string(path).ok(),
+        Ok(m) if m.len() <= MAX_BASELINE_BYTES => tokio::fs::read_to_string(path).await.ok(),
         _ => None,
     };
-    let diagnostics = match crate::tools::lsp::installed_server(path, search) {
-        Some((command, args, _)) => pool
-            .running(command, &args, root)
-            .await
-            .and_then(|c| c.diagnostics(path)),
-        None => None,
-    };
+    let diagnostics = pool
+        .running(command, &args, root)
+        .await
+        .and_then(|c| c.diagnostics(path));
     LspBaseline {
         content,
         diagnostics,
     }
+}
+
+/// Whether `path` is inside `root`, `..` resolved. Servers are started in
+/// the trusted project and only see its files: one outside it would make
+/// gopls or tsserver load that file's own module, in a folder never trusted.
+fn in_root(root: &Path, path: &Path) -> bool {
+    use crate::tools::file_read::clean_path;
+    clean_path(path).starts_with(clean_path(root))
 }
 
 /// Language-server diagnostics for the files a round of edits wrote. The
@@ -1104,11 +1115,11 @@ fn seconds(d: Duration) -> String {
 }
 
 impl LspDiagnostics {
-    /// The installed servers for the edited files, skipping any the check
-    /// has given up on this session.
+    /// The installed servers for the edited files inside the project,
+    /// skipping any the check has given up on this session.
     fn servers(&self) -> Vec<ServerFiles<'_>> {
         let mut groups: Vec<ServerFiles> = Vec::new();
-        for file in &self.files {
+        for file in self.files.iter().filter(|f| in_root(&self.root, &f.0)) {
             let Some((command, args, exe)) =
                 crate::tools::lsp::installed_server(&file.0, self.search_path.as_deref())
             else {
@@ -1186,7 +1197,8 @@ impl LspDiagnostics {
 
     /// One server: start it if needed (sandboxed like the lint and test
     /// commands), send the files, wait. A server that cannot start, exits,
-    /// or does not answer by `deadline` is given up on for the session.
+    /// or does not answer `initialize` or take the files by `deadline` is
+    /// given up on for the session.
     async fn ask(
         &self,
         group: &ServerFiles<'_>,
@@ -1234,12 +1246,26 @@ impl LspDiagnostics {
         let mut synced = Vec::new();
         let mut files = Vec::new();
         for (path, baseline) in &group.files {
-            // A file deleted since is simply not checked.
-            if let Ok(s) = client.sync_document(path).await {
-                synced.push(s);
-                files.push((path, baseline));
-            } else if client.is_dead() {
-                return give_up("exited".into());
+            if cancel.load(Ordering::SeqCst) {
+                return ServerReport::default();
+            }
+            // A server that stopped reading its input blocks this write once
+            // the text outgrows the pipe buffer: the cap covers it too.
+            match tokio::time::timeout_at(deadline, client.sync_document(path)).await {
+                Ok(Ok(s)) => {
+                    synced.push(s);
+                    files.push((path, baseline));
+                }
+                // A file deleted since is simply not checked.
+                Ok(Err(_)) if !client.is_dead() => {}
+                Ok(Err(_)) => return give_up("exited".into()),
+                Err(_) => {
+                    client.mark_dead();
+                    return give_up(format!(
+                        "did not take the edited files within {}",
+                        seconds(config.timeout)
+                    ));
+                }
             }
         }
         if synced.is_empty() {
@@ -1251,22 +1277,28 @@ impl LspDiagnostics {
         if cancel.load(Ordering::SeqCst) {
             return ServerReport::default();
         }
+        if client.is_dead() {
+            return give_up("exited".into());
+        }
 
+        // A live server that has said nothing about a file yet (a slow cold
+        // start, or one that publishes only on change and found the file
+        // clean) is kept: the next check asks it again.
         let mut report = ServerReport::default();
+        let mut silent = 0;
         for ((path, baseline), published) in files.into_iter().zip(published) {
             let problems = published.map(|diags| {
                 let after = std::fs::read_to_string(path).ok();
                 new_problems(&diags, baseline.as_ref(), after.as_deref(), config.warnings)
             });
+            silent += usize::from(problems.is_none());
             report.files.push((path.clone(), problems));
         }
-        if report.files.iter().any(|(_, p)| p.is_none()) {
-            let why = if client.is_dead() {
-                "exited".to_string()
-            } else {
-                format!("did not report within {}", seconds(config.timeout))
-            };
-            report.note = give_up(why).note;
+        if silent > 0 {
+            report.note = Some(format!(
+                "[auto-fix] {command} reported nothing on {silent} edited file(s) within {}",
+                seconds(config.timeout)
+            ));
         }
         report
     }
@@ -2611,12 +2643,15 @@ mod lsp_check_tests {
 
     static NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
 
-    /// `mode`: `ok`, `hang` (never answers `initialize`).
+    /// `mode`: `ok`, `hang` (never answers `initialize`), `same` (publishes
+    /// only when a document's diagnostics change, like rust-analyzer),
+    /// `silent` (never publishes), `deaf` (stops reading its input after
+    /// `initialized`).
     fn fake_server(bin: &Path, log: &Path, mode: &str) {
         use std::os::unix::fs::PermissionsExt;
         let script = format!(
             r#"#!/usr/bin/env python3
-import json, sys
+import json, sys, time
 LOG, MODE = {log:?}, {mode:?}
 def log(s):
     with open(LOG, "a") as f:
@@ -2640,6 +2675,7 @@ def send(msg):
     sys.stdout.buffer.flush()
 log("start")
 held = []
+last = {{}}
 while True:
     m = read()
     if m is None:
@@ -2648,8 +2684,11 @@ while True:
     if method == "initialize":
         if MODE != "hang":
             send({{"jsonrpc": "2.0", "id": m["id"], "result": {{"capabilities": {{"textDocumentSync": 1}}}}}})
+    elif method == "initialized" and MODE == "deaf":
+        log("deaf")
+        time.sleep(60)
     elif method in ("textDocument/didOpen", "textDocument/didChange"):
-        log(method)
+        log(method + " " + m["params"]["textDocument"]["uri"])
         doc = m["params"]["textDocument"]
         text = doc["text"] if "text" in doc else m["params"]["contentChanges"][-1]["text"]
         diags = []
@@ -2658,7 +2697,11 @@ while True:
                 if word in l:
                     c = l.index(word)
                     diags.append({{"range": {{"start": {{"line": i, "character": c}}, "end": {{"line": i, "character": c + 3}}}}, "severity": sev, "message": "bad " + l.strip()}})
-        held.append({{"uri": doc["uri"], "version": doc["version"], "diagnostics": diags}})
+        if MODE == "silent" or (MODE == "same" and last.get(doc["uri"]) == diags):
+            log("unchanged")
+        else:
+            held.append({{"uri": doc["uri"], "version": doc["version"], "diagnostics": diags}})
+        last[doc["uri"]] = diags
         # Like pyright: ask for configuration and wait for the answer.
         send({{"jsonrpc": "2.0", "id": 1, "method": "workspace/configuration", "params": {{"items": [{{}}]}}}})
     elif "method" not in m and m.get("id") == 1:
@@ -2926,5 +2969,183 @@ while True:
         f.rt.block_on(f.pool.shutdown());
         let log = f.log();
         assert!(log.ends_with("shutdown\nexit\n"), "{log}");
+    }
+
+    /// rust-analyzer publishes only when a file's diagnostics change. An
+    /// edit that keeps them as they were (still clean, or the same error
+    /// still there) neither holds the turn to the cap nor drops the server.
+    #[test]
+    fn a_server_that_publishes_only_changes_is_kept() {
+        let f = fixture("same");
+        let file = f.file("app.py");
+        let cfg = config();
+        let edit = |text: &str| {
+            let before = f.baseline(&file);
+            std::fs::write(&file, text).unwrap();
+            let started = std::time::Instant::now();
+            let action = f.check(vec![(file.clone(), Some(before))], &cfg, &trusted());
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(2), "took {took:?}: {action:?}");
+            action
+        };
+        let passed = |action: &AutoFixAction| {
+            matches!(action, AutoFixAction::Continue { status: Some(s) }
+                if s == "[auto-fix] checks passed")
+        };
+
+        let first = edit("x = 1\n");
+        assert!(passed(&first), "{first:?}");
+        let clean = edit("x = 1\n# still clean\n");
+        assert!(passed(&clean), "{clean:?}");
+        let error = edit("x = 1\ny = ERR\n");
+        let AutoFixAction::Retry { feedback, .. } = &error else {
+            panic!("expected a retry: {error:?}");
+        };
+        assert!(feedback.contains("app.py:2:5 bad y = ERR"), "{feedback}");
+        // The error stays where it was: nothing new, nothing published.
+        let kept = edit("x = 1\ny = ERR\n# note\n");
+        assert!(passed(&kept), "{kept:?}");
+
+        let log = f.log();
+        assert_eq!(log.matches("unchanged").count(), 2, "{log}");
+        assert_eq!(log.matches("start").count(), 1, "{log}");
+        assert!(!f.pool.gave_up(
+            "pyright-langserver",
+            &["--stdio".to_string()],
+            f.project.path()
+        ));
+    }
+
+    /// A live server that says nothing by the cap (a slow cold start) is
+    /// noted but kept, and asked again next time.
+    #[test]
+    fn a_server_with_nothing_to_say_yet_is_not_given_up() {
+        let f = fixture("silent");
+        let file = f.file("app.py");
+        std::fs::write(&file, "y = ERR\n").unwrap();
+        let mut cfg = config();
+        cfg.lsp.timeout = Duration::from_secs(1);
+        for _ in 0..2 {
+            let action = f.check(vec![(file.clone(), None)], &cfg, &trusted());
+            let AutoFixAction::Continue {
+                status: Some(status),
+            } = &action
+            else {
+                panic!("expected a note: {action:?}");
+            };
+            assert!(
+                status
+                    .contains("pyright-langserver reported nothing on 1 edited file(s) within 1s"),
+                "{status}"
+            );
+            assert!(!status.contains("off for this session"), "{status}");
+        }
+        let log = f.log();
+        assert_eq!(log.matches("didOpen").count(), 1, "{log}");
+        assert_eq!(log.matches("didChange").count(), 1, "{log}");
+    }
+
+    /// A server that stops reading its input cannot hold the turn past the
+    /// cap by blocking the write of a large file.
+    #[test]
+    fn a_server_that_stops_reading_is_given_up_within_the_cap() {
+        let f = fixture("deaf");
+        let file = f.file("big.py");
+        std::fs::write(&file, "x = 1\n".repeat(400_000)).unwrap();
+        let mut cfg = config();
+        cfg.lsp.timeout = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let action = f.check(vec![(file, None)], &cfg, &trusted());
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+        let AutoFixAction::Continue {
+            status: Some(status),
+        } = &action
+        else {
+            panic!("expected a note: {action:?}");
+        };
+        assert!(
+            status.contains("pyright-langserver did not take the edited files within 2s"),
+            "{status}"
+        );
+        assert!(f.log().contains("deaf"), "{}", f.log());
+    }
+
+    /// Quitting is bounded too when a server stops reading mid-write.
+    #[test]
+    fn shutdown_does_not_hang_on_a_server_that_stopped_reading() {
+        let f = fixture("deaf");
+        let file = f.file("big.py");
+        std::fs::write(&file, "x = 1\n".repeat(400_000)).unwrap();
+        let exe = f.bin.path().join("pyright-langserver");
+        let args = vec!["--stdio".to_string()];
+        let root = f.project.path().to_path_buf();
+        f.rt.block_on(async {
+            let client = f
+                .pool
+                .client_for("pyright-langserver", &args, &root, &Launch::Program(exe))
+                .await
+                .unwrap();
+            // Holds the input stream, stuck once the pipe is full.
+            let stuck = tokio::spawn(async move { client.sync_document(&file).await.is_ok() });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            tokio::time::timeout(Duration::from_secs(10), f.pool.shutdown())
+                .await
+                .expect("shutdown hung");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let _ = tokio::time::timeout(Duration::from_secs(5), stuck).await;
+        });
+    }
+
+    /// Only files inside the trusted project go to its servers.
+    #[test]
+    fn files_outside_the_project_are_not_opened() {
+        let f = fixture("ok");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("other.py");
+        std::fs::write(&outside, "y = ERR\n").unwrap();
+        let sneaky = f.project.path().join("..").join(
+            elsewhere
+                .path()
+                .strip_prefix(f.project.path().parent().unwrap())
+                .unwrap_or(elsewhere.path())
+                .join("other.py"),
+        );
+        let action = f.check(vec![(outside.clone(), None)], &config(), &trusted());
+        assert!(
+            matches!(action, AutoFixAction::Continue { status: None }),
+            "{action:?}"
+        );
+        assert!(!f.log.exists(), "a server started: {}", f.log());
+        assert!(f.baseline(&outside).content.is_none());
+
+        let inside = f.file("app.py");
+        std::fs::write(&inside, "y = 1\n").unwrap();
+        let action = f.check(
+            vec![(inside, None), (outside, None), (sneaky, None)],
+            &config(),
+            &trusted(),
+        );
+        assert!(
+            matches!(action, AutoFixAction::Continue { .. }),
+            "{action:?}"
+        );
+        let log = f.log();
+        assert_eq!(log.matches("didOpen").count(), 1, "{log}");
+        assert!(log.contains("app.py") && !log.contains("other.py"), "{log}");
+    }
+
+    /// No server for the file: the baseline reads nothing.
+    #[test]
+    fn a_file_no_server_checks_gets_an_empty_baseline() {
+        let f = fixture("ok");
+        let file = f.file("data.json");
+        std::fs::write(&file, "{}").unwrap();
+        let b = f.baseline(&file);
+        assert!(b.content.is_none() && b.diagnostics.is_none());
+        let py = f.file("app.py");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        assert_eq!(f.baseline(&py).content.as_deref(), Some("x = 1\n"));
     }
 }
