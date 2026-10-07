@@ -307,7 +307,7 @@ Optional. Each prompt goes to one of four tiers, and a tier can be any model `/m
 }
 ```
 
-The router starts on once two or more tiers are set. `"enabled": false` keeps it off; `"enabled": true` turns it on with fewer, and unset tiers keep their defaults. With one tier or none and no `enabled`, it stays off. `/router on` and `/router off` switch it for the session. `/router` (or `/router status`) shows the tiers, the classifier, the model the last turn ran on, any skipped tiers and the estimated savings. Routing applies in the TUI, in `-p` (unless `--model` names the model for the run) and in SDK sessions whose `session/start` names no `model`. ACP sessions are not routed.
+The router starts on once two or more tiers are set in the `router` block. `"enabled": false` keeps it off; `"enabled": true` turns it on with fewer, and unset tiers keep their defaults. With one tier or none and no `enabled`, it stays off. `/router on` and `/router off` switch it for the session. `/router` (or `/router status`) shows the tiers, the classifier, the model the last turn ran on, any skipped tiers and the estimated savings. Routing applies in the TUI, in `-p` (unless `--model` names the model for the run) and in SDK sessions whose `session/start` names no `model`. ACP sessions are not routed.
 
 | Tier | Default on a Claude session | Default on an Ollama or OpenAI-compatible session | Example |
 |-----------|-----------|-----------|---------|
@@ -320,9 +320,9 @@ On a local or OpenAI-compatible session, only the tiers you name go to another p
 
 Tiers, `enabled: true` and the classifier in a project's `.claude/settings.json` apply only once the project is `/trust`ed, since they decide which provider gets your prompts. An untrusted project can still switch the router off.
 
-Compaction measures the history against the largest window among the tiers a turn can still go to; tiers skipped for the session or without a credential do not count, and with none left the session model's window applies.
+Compaction measures the history against the largest window among the tiers a turn can still go to; tiers skipped for the session or without a credential do not count, and with none left the session model's window applies. Inside a turn, once the tier is picked, it measures against that tier's window: the tier is picked once per prompt, and Ollama truncates an overflow silently rather than failing over.
 
-**Picking the tier.** By default a keyword and length heuristic scores the prompt: signal words such as debug, refactor or audit, prompt length, code blocks and file paths. With `"classifier": "model"` the low tier is asked for a one-word label (`low`, `mid`, `high` or `super-high`) under a strict prompt, with 16 output tokens and 3 seconds. On a timeout, an error or any other answer the heuristic decides. The classifier's call is billed like any other turn and counts in `/cost` and `/budget`. When the history is too large for the chosen tier's window, the turn goes to the next tier up that holds it.
+**Picking the tier.** By default a keyword and length heuristic scores the prompt: signal words such as debug, refactor or audit, prompt length, code blocks and file paths. With `"classifier": "model"` the low tier is asked for a one-word label (`low`, `mid`, `high` or `super-high`) under a strict prompt, with 16 output tokens and 3 seconds. A non-Claude low tier gets 1024 output tokens, since a model that reasons first (OpenAI's GPT-5 and o-series, Gemini 2.5, qwen3) spends its reasoning against that cap, and an OpenAI reasoning model is asked for its lowest effort (`minimal`, `none` or `low`). The first word of the answer is the label. On a timeout, an error or any other answer the heuristic decides. The classifier's call is billed like any other turn and counts in `/cost` and `/budget`. When the history is too large for the chosen tier's window, the turn goes to the next tier up that holds it.
 
 **Escalation.** Sometimes a turn on a lower tier fails in a way that suggests the model is out of its depth:
 
@@ -333,7 +333,7 @@ Compaction measures the history against the largest window among the tiers a tur
 
 The turn then continues once on the next tier up, from where it stopped, and one dim line says so. It does not escalate if resending the history at the next tier's input price could pass what is left of `/budget`. It also does not escalate once text from the failed response has been shown.
 
-**Unavailable tiers.** Some tiers can't be used: their backend has no credential (no Anthropic key, no `GROQ_API_KEY`, no `OPENAI_BASE_URL`, ...), or their self-hosted server (Ollama, LM Studio, `openai-compat:`) does not accept a connection within 1.5 seconds. The router skips such a tier for the rest of the session and says so once. Its turns go to the next usable tier up (or down when there is none). `/router on` checks again.
+**Unavailable tiers.** Some tiers can't be used: their backend has no credential (no Anthropic key, no `GROQ_API_KEY`, no `OPENAI_BASE_URL`, ...), or their self-hosted server (Ollama, LM Studio, `openai-compat:`) does not accept a connection within 1.5 seconds. A server that requests reach through `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (and not `NO_PROXY`) is not probed; its errors show up on the turn instead. The router skips such a tier for the rest of the session and says so once. Its turns go to the next usable tier up (or down when there is none). `/router on` checks again.
 
 **Seeing where a turn went.** In the TUI, the status bar shows `ROUTER → <model>` and the chat gets one dim line whenever the routed model changes. In `-p`, `--verbose` prints a `[router] ...` line on stderr. SDK hosts get a [`model/routed`](sdk/protocol.md#modelrouted) notification, and `turn/completed` carries the model that finished the turn.
 
@@ -346,7 +346,7 @@ The turn then continues once on the next tier up, from where it stopped, and one
 /router super-high <model>
 ```
 
-Earlier versions used flat keys (`routerEnabled`, `routerLowModel`, `routerMediumModel`, `routerHighModel`, `routerSuperHighModel`). They still work, and the `router` block wins where both set a tier.
+Earlier versions used flat keys (`routerEnabled`, `routerLowModel`, `routerMediumModel`, `routerHighModel`, `routerSuperHighModel`). They still work, and the `router` block wins where both set a tier. Tiers set only with the flat keys do not switch the router on: that takes `routerEnabled: true`, `"enabled": true` or `/router on`, as before.
 
 ---
 

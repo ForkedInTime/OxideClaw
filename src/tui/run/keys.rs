@@ -601,6 +601,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 && !crate::api::is_ollama_model(&config.model)
                 && !crate::api::is_openai_compat_model(&config.model)
             {
+                // The phase router never sends `Routed`: a model left from
+                // an earlier complexity-routed turn would stay on screen.
+                app.routed_model = None;
                 let phase = crate::router::detect_phase(&final_text);
                 if phase != crate::router::Phase::Default {
                     let routed_model = config.phase_router.model_for(phase).to_string();

@@ -366,9 +366,23 @@ pub struct RouterSettings {
     pub super_high: Option<String>,
     /// `"heuristic"` (default) or `"model"`: the low tier labels each prompt.
     pub classifier: Option<String>,
+    /// Which of low, mid, high, super-high came from a flat `router*Model`
+    /// key. Those keys date from the opt-in router, so they never switch
+    /// the router on by themselves.
+    #[serde(skip)]
+    pub(crate) flat_tiers: [bool; 4],
 }
 
 impl RouterSettings {
+    /// How many tiers are set in a `router` block, not by a flat key.
+    pub(crate) fn block_tiers(&self) -> usize {
+        [&self.low, &self.mid, &self.high, &self.super_high]
+            .iter()
+            .zip(self.flat_tiers)
+            .filter(|(m, flat)| m.is_some() && !flat)
+            .count()
+    }
+
     fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.low.is_none()
@@ -379,6 +393,15 @@ impl RouterSettings {
     }
 
     fn merge(self, other: Self) -> Self {
+        let mut flat_tiers = self.flat_tiers;
+        for (i, set) in [&other.low, &other.mid, &other.high, &other.super_high]
+            .iter()
+            .enumerate()
+        {
+            if set.is_some() {
+                flat_tiers[i] = other.flat_tiers[i];
+            }
+        }
         Self {
             enabled: other.enabled.or(self.enabled),
             low: other.low.or(self.low),
@@ -386,6 +409,7 @@ impl RouterSettings {
             high: other.high.or(self.high),
             super_high: other.super_high.or(self.super_high),
             classifier: other.classifier.or(self.classifier),
+            flat_tiers,
         }
     }
 }
@@ -1061,6 +1085,12 @@ impl Settings {
             high: self.router_high_model.clone(),
             super_high: self.router_super_high_model.clone(),
             classifier: None,
+            flat_tiers: [
+                self.router_low_model.is_some(),
+                self.router_medium_model.is_some(),
+                self.router_high_model.is_some(),
+                self.router_super_high_model.is_some(),
+            ],
         };
         if !flat.is_empty() {
             self.router = Some(flat.merge(self.router.take().unwrap_or_default()));

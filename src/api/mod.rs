@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 pub use ollama::{
     OllamaClient, OllamaProbe, host_reachable, is_ollama_model, list_ollama_models, probe_ollama,
-    strip_ollama_prefix,
+    proxy_applies, strip_ollama_prefix,
 };
 pub use openai_compat::{
     OpenAiApi, OpenAiCompatClient, PROVIDERS, is_openai_compat_model, parse_provider_model,

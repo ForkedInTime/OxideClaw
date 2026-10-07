@@ -47,10 +47,12 @@ pub fn thresholds(window: u64) -> (u64, u64, u64) {
 
 /// The window to compact against.
 ///
-/// With the model router on it is the largest usable tier's: each turn goes
-/// to a tier whose window holds the history (or escalates to one on
-/// overflow), so compacting for the smallest tier would throw away context a
-/// 1M model never needed trimmed. A tier skipped this session (no
+/// With the model router on it is the largest usable tier's: each prompt
+/// goes to a tier whose window holds the history, so compacting for the
+/// smallest tier would throw away context a 1M model never needed trimmed.
+/// That holds between prompts only: the tier is picked once per prompt, a
+/// provider that rejects an overflow escalates at most once, and Ollama
+/// truncates silently instead, so inside a turn use [`turn_window`]. A tier skipped this session (no
 /// credential, host down) never takes a turn, so its window does not count;
 /// with none usable it is the session model's. With the phase router on it
 /// is the smallest among
@@ -89,6 +91,13 @@ pub fn compaction_window(
         }
     }
     w
+}
+
+/// The window to compact against inside a turn, whose tier is fixed:
+/// [`compaction_window`], capped at the window of `config.model`, the model
+/// the next request goes to.
+pub fn turn_window(config: &Config, router: Option<&crate::router::RouterConfig>) -> u64 {
+    compaction_window(config, router, None).min(crate::api::context_window_for_model(&config.model))
 }
 
 /// How many recent messages snipCompact always keeps untouched.
@@ -599,6 +608,27 @@ mod tests {
         );
         // Headless and SDK sessions never phase-route.
         assert_eq!(compaction_window(&phased, None, None), 1_000_000);
+    }
+
+    /// Inside a turn the tier is fixed: a prompt routed to a 128k Ollama
+    /// tier must compact for 128k, not wait for the 1M tier's 850k, since
+    /// Ollama truncates an overflow silently.
+    #[test]
+    fn a_routed_turn_compacts_for_the_tier_it_runs_on() {
+        let mut cfg = Config {
+            api_key: "sk-ant-test".into(),
+            ..config()
+        };
+        let mut router = crate::router::RouterConfig::new(&cfg.model);
+        router.enabled = true;
+        router.low_model = "ollama:qwen3-coder".into();
+        assert_eq!(compaction_window(&cfg, Some(&router), None), 1_000_000);
+        assert_eq!(turn_window(&cfg, Some(&router)), 1_000_000);
+        // The turn was routed to the low tier: config.model is that tier.
+        cfg.model = "ollama:qwen3-coder".into();
+        assert_eq!(compaction_window(&cfg, Some(&router), None), 1_000_000);
+        assert_eq!(turn_window(&cfg, Some(&router)), 128_000);
+        assert_eq!(turn_window(&cfg, None), 128_000);
     }
 
     /// Every turn goes to the Ollama tier when the 1M Claude tier has no

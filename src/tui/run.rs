@@ -681,6 +681,14 @@ async fn run_loop(
     }
     // Apply router settings from config (loaded from settings.json)
     app.router = crate::router::RouterConfig::from_config(&config);
+    let off_machine = app.router.tiers_off_machine(&config.model);
+    if !off_machine.is_empty() {
+        app.entries.push(ChatEntry::system(format!(
+            "The router is on: some prompts from this local session go to {}. \
+             /router off keeps every prompt on this machine.",
+            off_machine.join(", ")
+        )));
+    }
     if let Some(budget) = config.router_budget {
         app.cost_tracker.set_budget(budget);
     }
@@ -1550,7 +1558,7 @@ async fn run_loop(
                             session: &mut session,
                             saved_count: &mut saved_count,
                             mcp_statuses: &mcp_statuses,
-                                        spawn_registry: &spawn_registry,
+                            spawn_registry: &spawn_registry,
                         }).await?;
                     }
                     Event::Mouse(mouse) => {

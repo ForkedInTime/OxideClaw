@@ -584,6 +584,16 @@ impl Default for Config {
     }
 }
 
+/// Router switch, classifier and the four tiers (see `Config::router_fingerprint`).
+pub type RouterFingerprint = (
+    bool,
+    crate::router::Classifier,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl Config {
     /// The "No Anthropic credential found" error, with the reason an
     /// apiKeyHelper was ignored when one was.
@@ -1063,7 +1073,7 @@ impl Config {
     fn load_project(&mut self) {
         // ── Settings files: global (<config dir>/settings.json) → project (./.claude/settings.json)
         // → --settings. Env vars applied after (higher priority than settings).
-        let settings = self.load_settings();
+        let mut settings = self.load_settings();
         self.apply_browser_settings(&settings);
         if let Some(model) = settings.model {
             self.model = crate::commands::resolve_model_alias(&model);
@@ -1171,37 +1181,17 @@ impl Config {
         // `router` block wins over the flat `router*` keys it replaces;
         // `Settings::merge` folds them per file, so a later file still wins.
         self.router_budget = settings.router_budget;
-        let block = settings.router.clone().unwrap_or_default();
-        // Tier models go to the API verbatim, so "haiku" must become a real id.
-        let tier = |a: Option<String>, b: Option<String>| {
-            a.or(b)
-                .filter(|m| !m.trim().is_empty())
-                .map(|m| crate::commands::resolve_model_alias(m.trim()))
+        let router = crate::settings::Settings {
+            router: settings.router.take(),
+            router_enabled: settings.router_enabled,
+            router_low_model: settings.router_low_model.take(),
+            router_medium_model: settings.router_medium_model.take(),
+            router_high_model: settings.router_high_model.take(),
+            router_super_high_model: settings.router_super_high_model.take(),
+            ..Default::default()
         };
-        self.router_low_model = tier(block.low, settings.router_low_model);
-        self.router_medium_model = tier(block.mid, settings.router_medium_model);
-        self.router_high_model = tier(block.high, settings.router_high_model);
-        self.router_super_high_model = tier(block.super_high, settings.router_super_high_model);
-        let configured = [
-            &self.router_low_model,
-            &self.router_medium_model,
-            &self.router_high_model,
-            &self.router_super_high_model,
-        ]
-        .iter()
-        .filter(|m| m.is_some())
-        .count();
-        self.router_enabled =
-            crate::router::starts_enabled(block.enabled.or(settings.router_enabled), configured);
-        self.router_classifier = crate::router::Classifier::Heuristic;
-        if let Some(c) = &block.classifier {
-            match crate::router::Classifier::parse(c) {
-                Some(c) => self.router_classifier = c,
-                None => self.settings_notices.push(format!(
-                    "Unknown router.classifier \"{c}\" in settings.json, using \"heuristic\". \
-                     Valid values: heuristic, model."
-                )),
-            }
+        if let Some(why) = self.apply_router_settings(&router) {
+            self.settings_notices.push(why);
         }
         if let Some(a) = settings.autonomy {
             match crate::permissions::Autonomy::parse(&a) {
@@ -1397,6 +1387,58 @@ impl Config {
         let settings = self.load_settings();
         self.project_trusted = settings.project_trusted;
         self.apply_auto_fix_settings(settings.auto_fix.as_ref());
+        // Router tiers are trust-gated too; an unknown classifier was
+        // already reported at startup.
+        let _ = self.apply_router_settings(&settings);
+    }
+
+    /// Apply the router tiers, switch and classifier from merged settings.
+    /// Returns a notice for an unknown classifier.
+    fn apply_router_settings(&mut self, settings: &crate::settings::Settings) -> Option<String> {
+        let block = settings.router.clone().unwrap_or_default();
+        // Only tiers from a `router` block switch the router on: the flat
+        // keys belong to the old opt-in router, and a settings.json that
+        // still has them must not start sending a local session's prompts
+        // to a cloud tier.
+        let configured = block.block_tiers();
+        // Tier models go to the API verbatim, so "haiku" must become a real id.
+        let tier = |a: &Option<String>, b: &Option<String>| {
+            a.clone()
+                .or_else(|| b.clone())
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| crate::commands::resolve_model_alias(m.trim()))
+        };
+        self.router_low_model = tier(&block.low, &settings.router_low_model);
+        self.router_medium_model = tier(&block.mid, &settings.router_medium_model);
+        self.router_high_model = tier(&block.high, &settings.router_high_model);
+        self.router_super_high_model = tier(&block.super_high, &settings.router_super_high_model);
+        self.router_enabled =
+            crate::router::starts_enabled(block.enabled.or(settings.router_enabled), configured);
+        self.router_classifier = crate::router::Classifier::Heuristic;
+        let c = block.classifier.as_ref()?;
+        match crate::router::Classifier::parse(c) {
+            Some(c) => {
+                self.router_classifier = c;
+                None
+            }
+            None => Some(format!(
+                "Unknown router.classifier \"{c}\" in settings.json, using \"heuristic\". \
+                 Valid values: heuristic, model."
+            )),
+        }
+    }
+
+    /// The router fields `RouterConfig::from_config` reads, to tell whether
+    /// a settings change moved them.
+    pub fn router_fingerprint(&self) -> RouterFingerprint {
+        (
+            self.router_enabled,
+            self.router_classifier,
+            self.router_low_model.clone(),
+            self.router_medium_model.clone(),
+            self.router_high_model.clone(),
+            self.router_super_high_model.clone(),
+        )
     }
 
     /// The autonomy mode the permission gates apply.
@@ -3587,8 +3629,23 @@ mod flag_settings_retarget_tests {
         assert!(on(
             r#"{"router": {"low": "ollama:a", "high": "claude-opus-5"}}"#
         ));
-        assert!(on(
+        // The flat keys come from the opt-in router: they never switch it
+        // on by themselves, so a local session stays local.
+        assert!(!on(
             r#"{"routerLowModel": "ollama:a", "routerHighModel": "opus"}"#
+        ));
+        assert!(!on(
+            r#"{"routerLowModel": "claude-haiku-4-5", "routerHighModel": "claude-opus-5"}"#
+        ));
+        assert!(on(
+            r#"{"routerEnabled": true, "routerLowModel": "ollama:a", "routerHighModel": "opus"}"#
+        ));
+        // A block tier plus a flat one is still one block tier.
+        assert!(!on(
+            r#"{"routerLowModel": "ollama:a", "router": {"high": "claude-opus-5"}}"#
+        ));
+        assert!(on(
+            r#"{"routerLowModel": "ollama:a", "router": {"low": "ollama:b", "high": "claude-opus-5"}}"#
         ));
         assert!(!on(
             r#"{"router": {"enabled": false, "low": "ollama:a", "high": "claude-opus-5"}}"#
@@ -3744,6 +3801,42 @@ mod flag_settings_retarget_tests {
         assert!(!cfg.project_trusted);
         assert!(cfg.auto_fix.enabled);
         assert_eq!(cfg.auto_fix.lint_command, None);
+    }
+
+    /// A project's router tiers are trust-gated: /trust brings them in and
+    /// revoking takes them out, without a restart.
+    #[test]
+    fn refresh_trust_applies_the_projects_router_tiers() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+        std::fs::write(
+            project.path().join(".claude/settings.json"),
+            r#"{"router": {"low": "ollama:a", "high": "ollama:b"}}"#,
+        )
+        .unwrap();
+        let mut cfg = Config {
+            cwd: project.path().into(),
+            config_dir_override: Some(home.path().into()),
+            ..Config::default()
+        };
+        cfg.refresh_trust();
+        let untrusted = cfg.router_fingerprint();
+        assert!(!cfg.router_enabled);
+        assert_eq!(cfg.router_low_model, None);
+
+        let trust = serde_json::json!({ "trustedProjects": [project.path()] }).to_string();
+        std::fs::write(home.path().join("settings.json"), trust).unwrap();
+        cfg.refresh_trust();
+        assert!(cfg.router_enabled);
+        assert_eq!(cfg.router_low_model.as_deref(), Some("ollama:a"));
+        assert!(cfg.router_fingerprint() != untrusted);
+
+        std::fs::write(home.path().join("settings.json"), "{}").unwrap();
+        cfg.refresh_trust();
+        assert!(!cfg.router_enabled);
+        assert_eq!(cfg.router_high_model, None);
+        assert!(cfg.router_fingerprint() == untrusted);
     }
 
     #[test]

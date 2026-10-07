@@ -138,9 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The router starts on once two tiers are set.** With two or more tiers
-  configured and no `enabled` / `routerEnabled`, the router is on at
-  startup; `"enabled": false` keeps it off. Earlier versions needed
-  `routerEnabled: true` even with tiers set.
+  in the `router` block and no `enabled` / `routerEnabled`, the router is
+  on at startup; `"enabled": false` keeps it off. Earlier versions needed
+  `routerEnabled: true` even with tiers set, and tiers set only with the
+  flat `router*Model` keys still do.
 - **`-p` and SDK sessions are routed.** `-p` without `--model` and SDK
   sessions whose `session/start` names no `model` use the router settings,
   as the TUI does. ACP sessions are not routed.
@@ -148,7 +149,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes to a tier whose window holds the history, so compaction waits for
   the largest window among the tiers a turn can still go to, instead of
   the smallest. Tiers skipped for the session or without a credential do
-  not count.
+  not count. Within a turn, once its tier is picked, the history is
+  measured against that tier's window, since Ollama truncates an overflow
+  silently.
 - **Router settings from an untrusted project are ignored.** The `router`
   block, `routerEnabled: true` and the `router*Model` keys in a project's
   `.claude/settings.json` decide which provider gets your prompts, so they

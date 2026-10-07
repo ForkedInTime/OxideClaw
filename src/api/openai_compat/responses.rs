@@ -74,6 +74,26 @@ pub(crate) fn reasoning_effort(bare: &str, level: &str) -> Option<&'static str> 
     }
 }
 
+/// The least reasoning `bare` takes, for a call that needs one word back
+/// (the router's classifier). GPT-5 (5.0, mini and nano included) goes down
+/// to `minimal`, GPT-5.1 and later to `none`; the o-series and Codex start
+/// at `low`, and GPT-5 `-pro` models at `high`.
+pub(crate) fn lowest_effort(bare: &str) -> &'static str {
+    let m = bare.to_ascii_lowercase();
+    let version = gpt_version(&m);
+    if m.contains("-pro") && version.is_some_and(|(major, _)| major >= 5) {
+        return "high";
+    }
+    if m.contains("codex") {
+        return "low";
+    }
+    match version {
+        Some((5, 0)) => "minimal",
+        Some(v) if v >= (5, 1) => "none",
+        _ => "low",
+    }
+}
+
 // ─── Reasoning carried between requests ──────────────────────────────────────
 
 /// One output item of a finished turn, in the order the model produced it.
@@ -1501,6 +1521,13 @@ mod tests {
         assert_eq!(reasoning_effort("gpt-5.5-pro", "xhigh"), Some("xhigh"));
         assert_eq!(reasoning_effort("o3-pro", "low"), Some("low"));
         assert_eq!(reasoning_effort("gpt-5-mini", "low"), Some("low"));
+        assert_eq!(lowest_effort("gpt-5-mini"), "minimal");
+        assert_eq!(lowest_effort("gpt-5-nano"), "minimal");
+        assert_eq!(lowest_effort("gpt-5.1"), "none");
+        assert_eq!(lowest_effort("gpt-5.4-mini"), "none");
+        assert_eq!(lowest_effort("o4-mini"), "low");
+        assert_eq!(lowest_effort("gpt-5.1-codex"), "low");
+        assert_eq!(lowest_effort("gpt-5-pro"), "high");
         assert_eq!(gpt_version("gpt-5-mini"), Some((5, 0)));
         assert_eq!(gpt_version("gpt-5.2-codex"), Some((5, 2)));
     }
@@ -1632,6 +1659,43 @@ mod tests {
             ]),
             "{body}"
         );
+    }
+
+    /// The router's classifier on a GPT-5 mini low tier: 16 output tokens
+    /// were spent on reasoning at the default effort, so every prompt was
+    /// billed and the heuristic decided anyway.
+    #[tokio::test]
+    async fn the_classifier_asks_a_reasoning_model_for_its_lowest_effort() {
+        let turn = sse(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress", "output": []}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": []}}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "gAAAAB"}}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}}),
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 1, "content_index": 0,
+                   "delta": "low", "logprobs": []}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "low", "annotations": []}]}}),
+            completed(usage(120, 0, 70, 64)),
+        ]);
+        let (url, req) = serve(turn).await;
+        let backend = crate::api::ApiBackend::OpenAiCompat(responses_client(url));
+        let (label, usage) = crate::router::classify(
+            &backend,
+            "oai:gpt-5-mini",
+            "what does this function do?",
+            std::time::Duration::from_secs(10),
+            crate::api::OpenAiApi::Auto,
+        )
+        .await;
+        assert_eq!(label, Ok(crate::router::Complexity::Low));
+        assert!(usage.is_some(), "billed");
+        let (_, body) = req.await.unwrap();
+        assert_eq!(body["reasoning"]["effort"], "minimal", "{body}");
+        assert!(body["max_output_tokens"].as_u64().unwrap() >= 512, "{body}");
     }
 
     /// OpenAI refuses reasoning summaries to organizations that are not

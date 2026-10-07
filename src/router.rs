@@ -220,6 +220,24 @@ impl RouterConfig {
         r
     }
 
+    /// Tier models that would take a local session's prompts off this
+    /// machine: empty unless the router is on and `session_model` runs on
+    /// Ollama or LM Studio.
+    pub fn tiers_off_machine(&self, session_model: &str) -> Vec<String> {
+        let local = |m: &str| m.starts_with("ollama:") || m.starts_with("lmstudio:");
+        if !self.enabled || !local(session_model) {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for tier in Complexity::ALL {
+            let m = self.model_for(tier);
+            if !m.is_empty() && !local(m) && !out.iter().any(|o| o == m) {
+                out.push(m.to_string());
+            }
+        }
+        out
+    }
+
     /// Select the model for a given complexity level.
     pub fn model_for(&self, complexity: Complexity) -> &str {
         match complexity {
@@ -666,6 +684,11 @@ const REACH_TIMEOUT: Duration = Duration::from_millis(1500);
 /// answering something other than the question.
 const CLASSIFIER_MAX_TOKENS: u32 = 16;
 
+/// The cap for a classifier that may think first (an OpenAI reasoning
+/// model, or a thinking model behind Ollama or Chat Completions): reasoning
+/// tokens count against the cap, and 16 is spent before any label.
+const CLASSIFIER_REASONING_MAX_TOKENS: u32 = 1024;
+
 /// The prompt the classifier sees, cut to this many characters.
 const CLASSIFIER_PROMPT_CHARS: usize = 4000;
 
@@ -760,9 +783,14 @@ impl RouterConfig {
                         "heuristic: the low tier cannot classify".to_string(),
                     ),
                     Some(client) => {
-                        let (label, usage) =
-                            classify(&client, &self.low_model, prompt, self.classifier_timeout)
-                                .await;
+                        let (label, usage) = classify(
+                            &client,
+                            &self.low_model,
+                            prompt,
+                            self.classifier_timeout,
+                            config.openai_api,
+                        )
+                        .await;
                         out.classifier_usage = usage.map(|u| (self.low_model.clone(), u));
                         match label {
                             Ok(c) => (c, "classifier".to_string()),
@@ -892,8 +920,10 @@ pub fn client_for(
 }
 
 /// Why a self-hosted tier cannot be used, if its host refuses or ignores a
-/// connection. Cloud providers are not probed: their failures surface as
-/// API errors, which escalate.
+/// connection. Named cloud providers are not probed, and neither is a host
+/// requests reach through a proxy (`HTTPS_PROXY` and friends, minus
+/// `NO_PROXY`): a direct connect says nothing about it. Their failures
+/// surface as API errors, which escalate.
 async fn unreachable_host(client: &ApiBackend, model: &str) -> Option<String> {
     let base = match client {
         ApiBackend::Ollama(_) => client.ollama_host()?.to_string(),
@@ -905,6 +935,9 @@ async fn unreachable_host(client: &ApiBackend, model: &str) -> Option<String> {
         }
         _ => return None,
     };
+    if crate::api::proxy_applies(&base) {
+        return None;
+    }
     if crate::api::host_reachable(&base, REACH_TIMEOUT).await {
         None
     } else {
@@ -914,15 +947,32 @@ async fn unreachable_host(client: &ApiBackend, model: &str) -> Option<String> {
 
 /// Ask `model` for a one-word tier label. Err says why the heuristic has to
 /// answer instead; the usage is whatever the call was billed.
-async fn classify(
+pub(crate) async fn classify(
     client: &ApiBackend,
     model: &str,
     prompt: &str,
     timeout: Duration,
+    api: crate::api::OpenAiApi,
 ) -> (Result<Complexity, String>, Option<Usage>) {
+    // An OpenAI reasoning model thinks at its default effort unless told
+    // otherwise, and its reasoning tokens count against the cap: ask for the
+    // least it takes and leave room for it. Other non-Claude models may
+    // think too (Gemini 2.5, qwen3, deepseek-r1), so they get the room.
+    let reasoning = crate::api::openai_compat::responses_reasoning_model(model, api);
+    let output_config = reasoning.then(|| {
+        let bare = crate::api::parse_provider_model(model).map_or(model, |(_, b)| b);
+        crate::api::thinking::OutputConfig {
+            effort: crate::api::openai_compat::responses::lowest_effort(bare).into(),
+        }
+    });
+    let may_think = crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
     let request = MessagesRequest {
         model: model.to_string(),
-        max_tokens: CLASSIFIER_MAX_TOKENS,
+        max_tokens: if may_think {
+            CLASSIFIER_REASONING_MAX_TOKENS
+        } else {
+            CLASSIFIER_MAX_TOKENS
+        },
         system: SystemContent::Plain(CLASSIFIER_SYSTEM.into()),
         messages: vec![Message {
             role: Role::User,
@@ -933,7 +983,7 @@ async fn classify(
         tools: Vec::new(),
         stream: None,
         thinking: None,
-        output_config: None,
+        output_config,
         betas: Vec::new(),
         session_id: None,
         explicit_max_tokens: true,
@@ -961,9 +1011,17 @@ async fn classify(
             _ => None,
         })
         .collect();
-    let label = answer
-        .trim()
-        .trim_matches(|c: char| matches!(c, '.' | '"' | '\'' | '`' | '*'));
+    // A thinking model may lead with its reasoning in `<think>` tags; the
+    // label is the first word after it.
+    let visible = match answer.split_once("</think>") {
+        Some((_, rest)) => rest,
+        None => answer.as_str(),
+    };
+    let label = visible
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| matches!(c, '.' | ',' | ':' | '"' | '\'' | '`' | '*'));
     match Complexity::parse(label) {
         Some(c) => (Ok(c), Some(response.usage)),
         None => {
@@ -1306,6 +1364,22 @@ mod tests {
         // On with two, unless switched off.
         assert!(starts_enabled(None, 2));
         assert!(!starts_enabled(Some(false), 4));
+    }
+
+    /// A local session with the router on names the tiers that leave the
+    /// machine; off, or on a cloud session, there is nothing to say.
+    #[test]
+    fn a_local_session_names_its_off_machine_tiers() {
+        let mut r = RouterConfig::new("ollama:qwen3-coder");
+        r.set_model(Complexity::Low, "claude-haiku-4-5".into());
+        r.set_model(Complexity::SuperHigh, "claude-haiku-4-5".into());
+        assert!(r.tiers_off_machine("ollama:qwen3-coder").is_empty(), "off");
+        r.enabled = true;
+        assert_eq!(
+            r.tiers_off_machine("ollama:qwen3-coder"),
+            vec!["claude-haiku-4-5".to_string()]
+        );
+        assert!(r.tiers_off_machine("claude-sonnet-5").is_empty());
     }
 
     /// The classifier gets 3 s in use; past its timeout the heuristic

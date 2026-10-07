@@ -3,9 +3,7 @@
 use crate::api::types::*;
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::browser::middleware::MiddlewareVerdict;
-use crate::compact::{
-    CompactNeeded, compact_needed, compaction_window, snip_compact, summarize_compact,
-};
+use crate::compact::{CompactNeeded, compact_needed, snip_compact, summarize_compact, turn_window};
 use crate::config::Config;
 use crate::rag;
 use crate::tools::{DynTool, ToolContext};
@@ -589,8 +587,10 @@ impl QueryEngine {
                 break;
             }
 
-            // Context compaction check
-            let window = compaction_window(&self.config, routing.as_ref().map(|r| &r.router), None);
+            // Context compaction check, against the tier this turn runs on:
+            // the router picks once per prompt, and Ollama truncates an
+            // overflow silently instead of failing over to a larger tier.
+            let window = turn_window(&self.config, routing.as_ref().map(|r| &r.router));
             let mut summarise_after_tools = false;
             let context_tokens = response.usage.context_tokens();
             match compact_needed(context_tokens, window) {

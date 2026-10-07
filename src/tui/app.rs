@@ -895,6 +895,8 @@ impl App {
         // kept routing hard prompts to the startup model after /model. A tier
         // pinned to something else (router.high, /router high) stays.
         self.router.follow_session_model(&self.model, &model);
+        // The last routing result was for the old model's tiers.
+        self.routed_model = None;
         self.model_short = pretty_model_name(&model);
         self.model = model;
     }
@@ -2140,7 +2142,9 @@ mod set_model_router_tests {
     #[test]
     fn high_tier_follows_model_switch() {
         let mut app = App::new("claude-opus-5", std::path::Path::new("/tmp"));
+        app.routed_model = Some("claude-haiku-4-5".into());
         app.set_model("claude-sonnet-5".into());
+        assert_eq!(app.routed_model, None, "the status bar drops the old route");
         assert_eq!(app.router.high_model, "claude-sonnet-5");
         assert_eq!(
             app.router.model_for(crate::router::Complexity::High),

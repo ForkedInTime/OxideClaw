@@ -559,11 +559,9 @@ impl SdkSession {
             // tools), prompt-cache hits included, is the real measure of
             // how full the context window is.
             let context_tok = response.usage.context_tokens();
-            let window = crate::compact::compaction_window(
-                &self.config,
-                routing.as_ref().map(|r| &r.router),
-                None,
-            );
+            // The tier is fixed for the rest of this prompt: measure against it.
+            let window =
+                crate::compact::turn_window(&self.config, routing.as_ref().map(|r| &r.router));
             let used_pct = ((context_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
             self.send_notif(SdkNotification::ContextHealth {
                 session_id: self.session_id.clone(),

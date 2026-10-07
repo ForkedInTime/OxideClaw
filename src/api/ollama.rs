@@ -207,6 +207,82 @@ pub async fn host_reachable(base_url: &str, budget: std::time::Duration) -> bool
     matches!(tokio::time::timeout(budget, connect).await, Ok(Some(())))
 }
 
+/// Whether reqwest sends a request to `base_url` through a proxy from the
+/// environment (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, minus
+/// `NO_PROXY`). A direct TCP probe says nothing about such a host: it may
+/// be reachable only through the proxy.
+pub fn proxy_applies(base_url: &str) -> bool {
+    proxy_applies_with(base_url, |k| {
+        std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+    })
+}
+
+fn proxy_applies_with(base_url: &str, env: impl Fn(&str) -> Option<String>) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let either = |a: &str, b: &str| env(a).or_else(|| env(b));
+    let proxy = match url.scheme() {
+        "https" => either("HTTPS_PROXY", "https_proxy"),
+        "http" => either("HTTP_PROXY", "http_proxy"),
+        _ => None,
+    }
+    .or_else(|| either("ALL_PROXY", "all_proxy"));
+    if proxy.is_none() {
+        return false;
+    }
+    let bypassed = either("NO_PROXY", "no_proxy").is_some_and(|list| {
+        list.split(',').map(str::trim).any(|entry| {
+            let entry = entry.to_ascii_lowercase();
+            if let Some((net, bits)) = entry.split_once('/') {
+                return in_cidr(&host, net, bits);
+            }
+            // An entry may carry a port; the host part is what matches.
+            let entry = match entry.rsplit_once(':') {
+                Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => {
+                    h.to_string()
+                }
+                _ => entry,
+            };
+            let entry = entry.trim_start_matches("*.").trim_start_matches('.');
+            !entry.is_empty()
+                && (entry == "*" || host == entry || host.ends_with(&format!(".{entry}")))
+        })
+    });
+    !bypassed
+}
+
+/// Whether `host` is an IP address inside `net/bits` (a `NO_PROXY` entry
+/// such as `10.0.0.0/8`).
+fn in_cidr(host: &str, net: &str, bits: &str) -> bool {
+    use std::net::IpAddr;
+    let (Ok(host), Ok(net), Ok(bits)) = (
+        host.parse::<IpAddr>(),
+        net.parse::<IpAddr>(),
+        bits.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    match (host, net) {
+        (IpAddr::V4(h), IpAddr::V4(n)) if bits <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            u32::from(h) & mask == u32::from(n) & mask
+        }
+        (IpAddr::V6(h), IpAddr::V6(n)) if bits <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            u128::from(h) & mask == u128::from(n) & mask
+        }
+        _ => false,
+    }
+}
+
 /// Resolves host names on a detached thread. reqwest's default resolver runs
 /// `getaddrinfo` under `spawn_blocking`, and dropping the runtime waits for
 /// that: an `OLLAMA_HOST` name with DNS down would hold the missing-credential
@@ -534,6 +610,49 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    /// A host reached through HTTPS_PROXY must not be probed directly: the
+    /// direct connect fails where reqwest, through the proxy, gets there.
+    #[test]
+    fn proxy_applies_follows_the_proxy_variables_and_no_proxy() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let https = env(&[("HTTPS_PROXY", "http://proxy:3128")]);
+        assert!(proxy_applies_with("https://my.azure.example/v1", https));
+        assert!(
+            !proxy_applies_with("http://localhost:11434", https),
+            "http only via HTTP_PROXY"
+        );
+        assert!(!proxy_applies_with("https://x.example", env(&[])));
+        assert!(proxy_applies_with(
+            "http://10.0.0.5:8000/v1",
+            env(&[("all_proxy", "socks5://p:1080")])
+        ));
+        let no = env(&[
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("NO_PROXY", "localhost, .corp.example,10.0.0.5:8000"),
+        ]);
+        assert!(!proxy_applies_with("https://localhost:1234/v1", no));
+        assert!(!proxy_applies_with("https://vllm.corp.example/v1", no));
+        assert!(!proxy_applies_with("https://corp.example/v1", no));
+        assert!(!proxy_applies_with("https://10.0.0.5:8000/v1", no));
+        assert!(proxy_applies_with("https://api.fireworks.ai/v1", no));
+        let cidr = env(&[
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("NO_PROXY", "127.0.0.0/8,10.0.0.0/8,::1"),
+        ]);
+        assert!(!proxy_applies_with("https://10.20.30.40/v1", cidr));
+        assert!(!proxy_applies_with("https://127.0.0.1:1234/v1", cidr));
+        assert!(!proxy_applies_with("https://[::1]:1234/v1", cidr));
+        assert!(proxy_applies_with("https://11.0.0.1/v1", cidr));
+        let all = env(&[("HTTPS_PROXY", "http://proxy:3128"), ("no_proxy", "*")]);
+        assert!(!proxy_applies_with("https://api.fireworks.ai/v1", all));
+    }
 
     fn models(list: &[(&str, Option<&[&str]>)]) -> Vec<(String, Option<Vec<String>>)> {
         list.iter()

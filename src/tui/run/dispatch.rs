@@ -2058,7 +2058,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                                  apiKeyHelper and MCP servers, and OLLAMA_HOST / \
                                  ANTHROPIC_MODEL from its .env, will be ignored — restart \
                                  oxideclaw to apply. Auto-fix stops running its lint and \
-                                 test commands now."
+                                 test commands now, and its router tiers stop getting \
+                                 prompts now."
                             ),
                             Err(e) => format!("Could not save trust: {e}"),
                         }
@@ -2072,7 +2073,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
                              servers will be honoured, and so will OLLAMA_HOST / ANTHROPIC_MODEL \
                              from its .env — restart oxideclaw to apply. Auto-fix runs its \
-                             lint and test commands from the next edit."
+                             lint and test commands from the next edit, and its router tiers \
+                             apply from the next prompt."
                         ),
                         Err(e) => format!("Could not save trust: {e}"),
                     }
@@ -2093,7 +2095,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::system(msg));
             // Auto-fix reads trust and its settings per edit, so a change
             // applies at once, including the project's own autoFixLoop block.
+            let router_before = config.router_fingerprint();
             config.refresh_trust();
+            // The project's router tiers are trust-gated: a revoked
+            // project's tiers must stop getting prompts now. Rebuild only
+            // when they moved, so `/router on|off` and `/router <tier>`
+            // made this session survive an unrelated /trust.
+            if config.router_fingerprint() != router_before {
+                let health = std::mem::take(&mut app.router.health);
+                app.router = crate::router::RouterConfig::from_config(config);
+                app.router.health = health;
+                app.routed_model = None;
+            }
         }
         CommandAction::AutoCommitStatus => {
             let cwd_ok = oxideclaw::autocommit::is_git_repo(&config.cwd);
