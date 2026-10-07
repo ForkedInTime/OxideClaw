@@ -18,8 +18,9 @@ impl Tool for TeamCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create a named agent team for multi-agent coordination. \
-         Members can communicate via SendMessage. \
+        "Create a named agent team (~/.claude/teams/<name>.json). \
+         Experimental: this only records the team; it does not start any agents, \
+         and SendMessage only writes file mailboxes that no OxideClaw agent reads. \
          Requires OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1."
     }
 

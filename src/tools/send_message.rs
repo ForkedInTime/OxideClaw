@@ -3,9 +3,11 @@
 /// Enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1.
 ///
 /// The TS predecessor integrates with a full mailbox/team-file
-/// infrastructure and in-process routing. This implementation uses
-/// the file-based mailbox protocol (same format) so agents running
-/// in separate processes can exchange messages.
+/// infrastructure and in-process routing. This implementation only writes
+/// file mailboxes; nothing in OxideClaw reads them yet (there is no
+/// teammate-spawn path), and the layout is not Claude Code's
+/// `teams/<team>/inboxes/<name>.json`. Every result says so, so the model
+/// does not assume a teammate received anything.
 ///
 /// Mailbox layout: ~/.claude/mailboxes/<team>/<recipient>/messages/<uuid>.json
 use crate::tools::{Tool, ToolContext, ToolOutput};
@@ -14,6 +16,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 pub struct SendMessageTool;
+
+const NOT_DELIVERED: &str = "Written to the file mailbox only. Nothing in OxideClaw reads \
+     mailboxes, so no running OxideClaw agent receives this; an external process must read it.";
 
 /// A team or teammate name is used as a path component under
 /// `~/.claude/{teams,mailboxes}`. Anything but `[A-Za-z0-9_-]` (or the
@@ -39,9 +44,11 @@ impl Tool for SendMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to an agent teammate (swarm protocol). \
+        "Write a message to an agent teammate's file mailbox \
+         (~/.claude/mailboxes/<team>/<name>/messages/). \
          Enabled when OXIDECLAW_EXPERIMENTAL_AGENT_TEAMS=1. \
-         Use to coordinate with other Claude agents in a team. \
+         Experimental: nothing in OxideClaw reads these mailboxes, so no running \
+         OxideClaw agent receives the message; only an external process can. \
          The 'to' field is a teammate name or '*' to broadcast."
     }
 
@@ -174,7 +181,7 @@ impl Tool for SendMessageTool {
             }
 
             let mut message = format!(
-                "Message broadcast to {} teammate(s): {}",
+                "Message written to the mailboxes of {} teammate(s): {}",
                 members.len(),
                 members.join(", ")
             );
@@ -189,7 +196,9 @@ impl Tool for SendMessageTool {
                 "success": true,
                 "message": message,
                 "recipients": members,
-                "skipped": skipped
+                "skipped": skipped,
+                "delivered": false,
+                "note": NOT_DELIVERED
             });
             return Ok(ToolOutput::success(result.to_string()));
         }
@@ -218,9 +227,11 @@ impl Tool for SendMessageTool {
                     )?;
                     let result = json!({
                         "success": true,
-                        "message": format!("Shutdown request sent to {}. Request ID: {}", to, request_id),
+                        "message": format!("Shutdown request written to {}'s mailbox. Request ID: {}", to, request_id),
                         "request_id": request_id,
-                        "target": to
+                        "target": to,
+                        "delivered": false,
+                        "note": NOT_DELIVERED
                     });
                     return Ok(ToolOutput::success(result.to_string()));
                 }
@@ -265,18 +276,20 @@ impl Tool for SendMessageTool {
                         &timestamp,
                     )?;
                     let msg = if approve {
-                        format!(
-                            "Shutdown approved. Sent confirmation to team-lead. Agent {} is now exiting.",
-                            sender_name
-                        )
+                        "Shutdown approval written to team-lead's mailbox.".to_string()
                     } else {
                         format!(
-                            "Shutdown rejected. Reason: \"{}\". Continuing to work.",
+                            "Shutdown rejection written to team-lead's mailbox. Reason: \"{}\".",
                             reason
                         )
                     };
-                    let result =
-                        json!({ "success": true, "message": msg, "request_id": request_id });
+                    let result = json!({
+                        "success": true,
+                        "message": msg,
+                        "request_id": request_id,
+                        "delivered": false,
+                        "note": NOT_DELIVERED
+                    });
                     return Ok(ToolOutput::success(result.to_string()));
                 }
                 "plan_approval_response" => {
@@ -308,12 +321,20 @@ impl Tool for SendMessageTool {
                         &timestamp,
                     )?;
                     let msg = if approve {
-                        format!("Plan approved for {}.", to)
+                        format!("Plan approval written to {}'s mailbox.", to)
                     } else {
-                        format!("Plan rejected for {} with feedback: \"{}\"", to, feedback)
+                        format!(
+                            "Plan rejection written to {}'s mailbox with feedback: \"{}\"",
+                            to, feedback
+                        )
                     };
-                    let result =
-                        json!({ "success": true, "message": msg, "request_id": request_id });
+                    let result = json!({
+                        "success": true,
+                        "message": msg,
+                        "request_id": request_id,
+                        "delivered": false,
+                        "note": NOT_DELIVERED
+                    });
                     return Ok(ToolOutput::success(result.to_string()));
                 }
                 _ => {
@@ -331,7 +352,9 @@ impl Tool for SendMessageTool {
 
         let result = json!({
             "success": true,
-            "message": format!("Message sent to {}'s inbox", to),
+            "message": format!("Message written to {}'s mailbox", to),
+            "delivered": false,
+            "note": NOT_DELIVERED,
             "routing": {
                 "sender": sender_name,
                 "target": format!("@{}", to),
