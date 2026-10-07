@@ -177,7 +177,8 @@ pub struct Settings {
     #[serde(rename = "cleanupPeriodDays")]
     pub cleanup_period_days: Option<u32>,
 
-    /// Default shell for the Bash tool. "bash" (default) or "powershell".
+    /// Default shell for the Bash tool, e.g. "bash" or "powershell". Unset:
+    /// $SHELL when it is bash or zsh, otherwise "bash".
     #[serde(rename = "defaultShell")]
     pub default_shell: Option<String>,
 

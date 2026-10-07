@@ -240,7 +240,7 @@ fn bwrap_wrap_with_home(
          --unshare-pid \
          --new-session \
          --die-with-parent \
-         -- /bin/sh -c {shell_quoted}",
+         -- bash -c {shell_quoted}",
         cwd = cwd_quoted,
         home_binds = home_binds,
         net_flag = net_flag,
@@ -258,7 +258,7 @@ pub fn firejail_wrap(command: &str, _cwd: &std::path::Path, allow_network: bool)
     // full egress, so the same setting meant different things in the two modes.
     let net_flag = if allow_network { "" } else { "--net=none " };
     format!(
-        "firejail --quiet --private-tmp --noroot {net_flag}-- /bin/sh -c {cmd}",
+        "firejail --quiet --private-tmp --noroot {net_flag}-- bash -c {cmd}",
         net_flag = net_flag,
         cmd = shell_quote(command),
     )
@@ -325,8 +325,8 @@ pub fn apply_sandbox(
 }
 
 /// Sandbox gate for command-executing tools that the namespace wrappers cannot
-/// wrap. `bwrap_wrap` / `firejail_wrap` hard-code `/bin/sh -c`, so routing a
-/// PowerShell command through them would hand the script to `sh` and change its
+/// wrap. `bwrap_wrap` / `firejail_wrap` hard-code `bash -c`, so routing a
+/// PowerShell command through them would hand the script to bash and change its
 /// meaning entirely.
 ///
 /// Pattern blocking still applies in every mode. For the namespace modes there
@@ -340,7 +340,7 @@ pub fn guard_unwrappable_tool(command: &str, mode: &str, tool: &str) -> Result<(
         "strict" => Ok(()),
         other => Err(format!(
             "The {tool} tool cannot be sandboxed under mode '{other}' — the {other} \
-             wrapper executes through /bin/sh, which would not run a PowerShell \
+             wrapper executes through bash, which would not run a PowerShell \
              script correctly. Refusing rather than running it unsandboxed. \
              Use /sandbox enable strict, or use the Bash tool instead."
         )),
@@ -469,6 +469,18 @@ mod tests {
             !allowed.contains("--net=none"),
             "network must be allowed: {allowed}"
         );
+    }
+
+    /// The Bash tool's commands are bash. /bin/sh is dash on Debian/Ubuntu,
+    /// where `source` and `[[ ]]` exit 127 inside the sandbox.
+    #[test]
+    fn namespace_wrappers_run_commands_with_bash() {
+        let bw = bwrap_wrap("echo hi", Path::new("/tmp"), true);
+        let fj = firejail_wrap("echo hi", Path::new("/tmp"), true);
+        for w in [&bw, &fj] {
+            assert!(w.contains("-- bash -c 'echo hi'"), "{w}");
+            assert!(!w.contains("/bin/sh"), "{w}");
+        }
     }
 
     #[test]
@@ -630,7 +642,7 @@ mod tests {
         );
     }
 
-    /// PowerShell cannot be wrapped by the namespace modes (they exec /bin/sh),
+    /// PowerShell cannot be wrapped by the namespace modes (they exec bash),
     /// so the gate must refuse rather than run it outside the active sandbox.
     #[test]
     fn unwrappable_tool_gate_fails_closed_on_namespace_modes() {

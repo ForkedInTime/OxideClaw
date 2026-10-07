@@ -69,7 +69,7 @@ pub struct ToolContext {
     /// Optional channel for plan mode tools to toggle plan mode.
     pub plan_mode_tx: Option<tokio::sync::mpsc::UnboundedSender<bool>>,
     /// Default shell for the Bash tool ("bash", "powershell", etc.).
-    /// None = use $SHELL env var or "bash" as fallback.
+    /// None = $SHELL when it is bash or zsh, else "bash" (see `bash_tool_shell`).
     pub default_shell: Option<String>,
     /// `env` from settings.json, set on every Bash / PowerShell command.
     pub env: std::collections::HashMap<String, String>,

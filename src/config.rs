@@ -1375,15 +1375,13 @@ impl Config {
             .map(|o| o.status.success())
             .unwrap_or(false);
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
-        let shell_name = if shell.contains("zsh") {
-            "zsh"
-        } else if shell.contains("bash") {
-            "bash"
-        } else {
-            &shell
-        }
-        .to_string();
+        // Name the shell the Bash tool will actually run, not the login shell:
+        // telling the model "fish" while bash parses its commands misleads it.
+        let shell = crate::tools::bash::bash_tool_shell(
+            self.default_shell.as_deref(),
+            std::env::var("SHELL").ok().as_deref(),
+        );
+        let shell_name = crate::tools::bash::shell_file_name(&shell).to_string();
 
         let os_version = std::process::Command::new("uname")
             .arg("-sr")
@@ -2349,6 +2347,19 @@ mod external_system_prompt_tests {
             !prompt.contains("noreply@anthropic.com"),
             "an external model's commits must not be attributed to Anthropic"
         );
+    }
+
+    /// The env block must name the shell the Bash tool runs, not $SHELL.
+    #[test]
+    fn env_block_names_the_bash_tool_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            cwd: dir.path().to_path_buf(),
+            default_shell: Some("/opt/pwsh/pwsh.exe".into()),
+            ..Default::default()
+        };
+        let prompt = cfg.build_system_prompt();
+        assert!(prompt.contains("Shell: pwsh\n"), "{prompt}");
     }
 
     #[test]

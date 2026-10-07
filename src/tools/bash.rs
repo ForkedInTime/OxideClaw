@@ -283,6 +283,35 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// File name of a shell path without a Windows `.exe` suffix, e.g.
+/// `/usr/bin/bash` -> `bash`, `C:\Git\bin\bash.exe` -> `bash`.
+pub fn shell_file_name(shell: &str) -> &str {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    match name.len().checked_sub(4) {
+        Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".exe") => &name[..i],
+        _ => name,
+    }
+}
+
+/// The interpreter the Bash tool runs commands with: the `defaultShell`
+/// setting, else the login shell only when it speaks bash syntax, else `bash`.
+/// The tool contract and the model's commands are bash; under a fish, nu or
+/// tcsh login shell heredocs, `if ...; then` and `$?` would all fail to parse.
+pub fn bash_tool_shell(default_shell: Option<&str>, login_shell: Option<&str>) -> String {
+    if let Some(s) = default_shell {
+        return s.to_string();
+    }
+    login_shell
+        .filter(|s| {
+            matches!(
+                shell_file_name(s).to_ascii_lowercase().as_str(),
+                "bash" | "zsh"
+            )
+        })
+        .unwrap_or("bash")
+        .to_string()
+}
+
 pub struct BashTool;
 
 #[derive(Deserialize)]
@@ -350,11 +379,10 @@ impl Tool for BashTool {
         let stream_tx = ctx.stream_tx.clone();
         let cwd = ctx.cwd.clone();
         let extra_env = ctx.env.clone();
-        // Resolve shell: ctx.default_shell → $SHELL env var → "bash"
-        let shell = ctx
-            .default_shell
-            .clone()
-            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "bash".into()));
+        let shell = bash_tool_shell(
+            ctx.default_shell.as_deref(),
+            std::env::var("SHELL").ok().as_deref(),
+        );
 
         let fut = async move {
             let mut cmd = Command::new(&shell);
@@ -570,5 +598,43 @@ mod tests {
         let pid = field("pid=");
         assert_eq!(field("pgrp="), pid, "{text}");
         assert_eq!(field("sid="), pid, "{text}");
+    }
+}
+
+#[cfg(test)]
+mod shell_choice_tests {
+    use super::*;
+
+    #[test]
+    fn non_bash_login_shells_fall_back_to_bash() {
+        for login in [
+            "/usr/bin/fish",
+            "/usr/bin/nu",
+            "/bin/tcsh",
+            "xonsh",
+            "/bin/sh",
+        ] {
+            assert_eq!(bash_tool_shell(None, Some(login)), "bash", "{login}");
+        }
+        assert_eq!(bash_tool_shell(None, None), "bash");
+        for login in ["/bin/bash", "/usr/local/bin/zsh", r"C:\Git\bin\bash.exe"] {
+            assert_eq!(bash_tool_shell(None, Some(login)), login);
+        }
+        // An explicit defaultShell is the user's choice and always wins.
+        assert_eq!(
+            bash_tool_shell(Some("powershell"), Some("/bin/bash")),
+            "powershell"
+        );
+        assert_eq!(
+            bash_tool_shell(Some("/usr/bin/fish"), None),
+            "/usr/bin/fish"
+        );
+    }
+
+    #[test]
+    fn shell_file_name_strips_dirs_and_exe() {
+        assert_eq!(shell_file_name("/usr/bin/zsh"), "zsh");
+        assert_eq!(shell_file_name(r"C:\Git\bin\bash.EXE"), "bash");
+        assert_eq!(shell_file_name("bash"), "bash");
     }
 }
