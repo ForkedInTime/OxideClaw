@@ -212,7 +212,8 @@ Follow-up QA pass (medium-severity findings, 2026-10-07).
   before the prompt response, timed-out permission prompts are closed, a
   "never" approval timeout no longer aborts the sidecar, and
   `session/cancel` stops a running tool. MCP: `${VAR}` placeholders are
-  expanded, `npx` servers start on Windows, a stalled HTTP response times
+  expanded (from the server's `env` block too; a shell variable in an
+  `sh -c` arg is written `$d` or `${d:-}`), `npx` servers start on Windows, a stalled HTTP response times
   out, server requests are answered, a dead stdio server fails fast, and
   tools with the same sanitized name stay distinct.
 - **Tools.** Bash runs bash (not a fish/nu/tcsh login shell or the

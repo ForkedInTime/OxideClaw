@@ -125,13 +125,7 @@ impl McpManager {
         let x = |v: &str| expand_vars(v, &lookup);
         match cfg {
             McpServerConfig::Stdio(s) => {
-                let command = x(&s.command)?;
-                let args = s.args.iter().map(|a| x(a)).collect::<Result<Vec<_>, _>>()?;
-                let env = s
-                    .env
-                    .iter()
-                    .map(|(k, v)| Ok((k.clone(), x(v)?)))
-                    .collect::<anyhow::Result<_>>()?;
+                let (command, args, env) = expand_stdio(s, &lookup)?;
                 McpClient::connect_stdio(name, &command, &args, &env, cwd).await
             }
             McpServerConfig::Http(h) => {
@@ -157,6 +151,33 @@ impl McpManager {
             })
             .collect()
     }
+}
+
+/// A stdio server's command, args and env with placeholders expanded. `env`
+/// is expanded against the process env first; `command` and `args` then
+/// also see the server's own `env` block, so `--port ${MY_PORT}` with
+/// `MY_PORT` set there works.
+fn expand_stdio(
+    s: &crate::mcp::types::StdioServerConfig,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<(
+    String,
+    Vec<String>,
+    std::collections::HashMap<String, String>,
+)> {
+    let env: std::collections::HashMap<String, String> = s
+        .env
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), expand_vars(v, lookup)?)))
+        .collect::<anyhow::Result<_>>()?;
+    let lookup2 = |k: &str| env.get(k).cloned().or_else(|| lookup(k));
+    let command = expand_vars(&s.command, &lookup2)?;
+    let args = s
+        .args
+        .iter()
+        .map(|a| expand_vars(a, &lookup2))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((command, args, env))
 }
 
 /// Expand `${NAME}` and `${NAME:-default}` as Claude Code does in
@@ -199,7 +220,11 @@ fn expand_vars(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> anyhow::Resu
             (Some(v), _) => out.push_str(&v),
             (None, Some(d)) => out.push_str(d),
             (None, None) => {
-                anyhow::bail!("environment variable {var} is not set (used as ${{{var}}})")
+                anyhow::bail!(
+                    "environment variable {var} is not set (used as ${{{var}}}); \
+                     a shell variable in an `sh -c` arg must be written as ${var} \
+                     without braces, or as ${{{var}:-}}"
+                )
             }
         }
         rest = &body[end + 1..];
@@ -233,6 +258,30 @@ mod expand_tests {
         assert_eq!(x("${EMPTY:-fallback}"), "fallback");
         assert_eq!(x("${EMPTY}"), "");
         assert_eq!(x("plain"), "plain");
+    }
+
+    /// A placeholder set only in the server's own `env` block failed the
+    /// server ("MY_PORT is not set") instead of reaching its args.
+    #[test]
+    fn args_see_the_servers_own_env() {
+        let s: crate::mcp::types::StdioServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "server",
+            "args": ["--port", "${MY_PORT}", "--auth", "${AUTH}"],
+            "env": {"MY_PORT": "8123", "AUTH": "Bearer ${TOKEN}"}
+        }))
+        .unwrap();
+        let (cmd, args, server_env) = super::expand_stdio(&s, &env).unwrap();
+        assert_eq!(cmd, "server");
+        assert_eq!(args, ["--port", "8123", "--auth", "Bearer s3cret"]);
+        assert_eq!(server_env["AUTH"], "Bearer s3cret");
+
+        // A shell-local `${d}` is still an error, now with a hint.
+        let s: crate::mcp::types::StdioServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "sh", "args": ["-c", "d=$(mktemp -d); exec server --dir ${d}"]
+        }))
+        .unwrap();
+        let err = super::expand_stdio(&s, &env).unwrap_err().to_string();
+        assert!(err.contains("without braces"), "{err}");
     }
 
     #[test]
