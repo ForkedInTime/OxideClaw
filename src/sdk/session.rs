@@ -168,7 +168,13 @@ impl SdkSession {
         // 2. Retrieve RAG context (silently ignore errors). It goes in the
         // user turn: `system` must stay byte-identical for the whole
         // conversation or replayed thinking-block signatures are rejected.
-        let rag_context = self.retrieve_rag_context(&prompt);
+        let rag_context = {
+            let cwd = self.config.cwd.clone();
+            let q = prompt.clone();
+            tokio::task::spawn_blocking(move || Self::retrieve_rag_context(&cwd, &q))
+                .await
+                .unwrap_or_default()
+        };
 
         // UserPromptSubmit hooks may add context or stop the prompt, as in the TUI.
         let prompt = match self.hooks() {
@@ -787,14 +793,21 @@ impl SdkSession {
 
     /// Retrieve relevant code context from the local RAG index.
     /// Returns a formatted context block, or empty string on any failure.
-    fn retrieve_rag_context(&self, user_input: &str) -> String {
-        let db = match rag::RagDb::open(&self.config.cwd) {
+    fn retrieve_rag_context(cwd: &std::path::Path, user_input: &str) -> String {
+        let db = match rag::RagDb::open(cwd) {
             Ok(db) => db,
             Err(_) => return String::new(),
         };
 
         if db.chunk_count().unwrap_or(0) == 0 {
             return String::new();
+        }
+
+        // Only the TUI indexes on its own; without this, print/SDK/ACP turns
+        // inject whatever a past TUI run stored, including deleted files and
+        // code this session already edited. Incremental, so cheap when idle.
+        if let Err(e) = rag::indexer::index_project(&db, cwd, false) {
+            debug!("RAG refresh failed: {e}");
         }
 
         let results = match rag::search::search(&db, user_input, 20) {
@@ -937,6 +950,25 @@ mod approval_wait_tests {
 mod cancel_tests {
     use super::*;
     use std::time::Duration;
+
+    /// SDK/ACP sessions never indexed, so turn 2's context could not see code
+    /// turn 1 wrote; the index must be refreshed before each search.
+    #[test]
+    fn rag_context_sees_files_added_after_the_index_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.rs"), "fn unrelated_helper() {}\n").unwrap();
+        let db = rag::RagDb::open(dir.path()).unwrap();
+        rag::indexer::index_project(&db, dir.path(), true).unwrap();
+        drop(db);
+
+        std::fs::write(
+            dir.path().join("billing.rs"),
+            "/// Compute the invoice total.\nfn compute_invoice_total() -> u32 { 0 }\n",
+        )
+        .unwrap();
+        let ctx = SdkSession::retrieve_rag_context(dir.path(), "compute invoice total");
+        assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
 
     fn offline_session() -> (SdkSession, mpsc::UnboundedReceiver<SdkNotification>) {
         let cfg = crate::config::Config {

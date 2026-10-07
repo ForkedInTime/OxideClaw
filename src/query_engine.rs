@@ -188,7 +188,13 @@ impl QueryEngine {
         // `system` for the first request only changed `system` mid-
         // conversation, which invalidates the signed thinking blocks replayed
         // on the next request (a 400 on Opus 5.5 / Fable 5.1 / Sonnet 5.5).
-        let rag_context = self.retrieve_rag_context(&user_input);
+        let rag_context = {
+            let cwd = self.config.cwd.clone();
+            let q = user_input.clone();
+            tokio::task::spawn_blocking(move || Self::retrieve_rag_context(&cwd, &q))
+                .await
+                .unwrap_or_default()
+        };
         let mut content = vec![ContentBlock::Text { text: user_input }];
         if !rag_context.is_empty() {
             content.push(ContentBlock::Text { text: rag_context });
@@ -925,9 +931,9 @@ impl QueryEngine {
 
     /// Retrieve relevant code context from the local RAG index.
     /// Returns a formatted context block, or empty string if RAG is unavailable.
-    fn retrieve_rag_context(&self, user_input: &str) -> String {
+    fn retrieve_rag_context(cwd: &std::path::Path, user_input: &str) -> String {
         // Only inject RAG if the index exists
-        let db = match rag::RagDb::open(&self.config.cwd) {
+        let db = match rag::RagDb::open(cwd) {
             Ok(db) => db,
             Err(_) => return String::new(),
         };
@@ -935,6 +941,13 @@ impl QueryEngine {
         // Skip if the index is empty (not yet built)
         if db.chunk_count().unwrap_or(0) == 0 {
             return String::new();
+        }
+
+        // Only the TUI indexes on its own; without this, print/SDK/ACP turns
+        // inject whatever a past TUI run stored, including deleted files and
+        // code this session already edited. Incremental, so cheap when idle.
+        if let Err(e) = rag::indexer::index_project(&db, cwd, false) {
+            debug!("RAG refresh failed: {e}");
         }
 
         // Fetch more candidates, then filter by relevance threshold
@@ -1065,6 +1078,25 @@ pub(crate) mod scripted_api_tests {
             }
         });
         (format!("http://{addr}"), seen)
+    }
+
+    /// Print mode never indexed, so it searched whatever a past TUI run left
+    /// in rag.db: code added since then was invisible to the injected context.
+    #[test]
+    fn rag_context_sees_files_added_after_the_index_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.rs"), "fn unrelated_helper() {}\n").unwrap();
+        let db = rag::RagDb::open(dir.path()).unwrap();
+        rag::indexer::index_project(&db, dir.path(), true).unwrap();
+        drop(db);
+
+        std::fs::write(
+            dir.path().join("billing.rs"),
+            "/// Compute the invoice total.\nfn compute_invoice_total() -> u32 { 0 }\n",
+        )
+        .unwrap();
+        let ctx = QueryEngine::retrieve_rag_context(dir.path(), "compute invoice total");
+        assert!(ctx.contains("compute_invoice_total"), "{ctx}");
     }
 
     /// RAG text went into `system` on the first request of a prompt only,
