@@ -1023,10 +1023,9 @@ pub fn migrate_legacy_refs(cwd: &Path) -> anyhow::Result<u32> {
     // (`recovery` cannot be both a ref and a directory of refs).
     if let Ok(sha) =
         git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", LEGACY_RECOVERY_REF]))
+        && git_output(git_cmd(cwd).args(["update-ref", "-d", LEGACY_RECOVERY_REF, &sha])).is_ok()
     {
-        if git_output(git_cmd(cwd).args(["update-ref", "-d", LEGACY_RECOVERY_REF, &sha])).is_ok() {
-            let _ = git_output(git_cmd(cwd).args(["update-ref", &recovery_ref("legacy"), &sha]));
-        }
+        let _ = git_output(git_cmd(cwd).args(["update-ref", &recovery_ref("legacy"), &sha]));
     }
     let mut moved = 0u32;
     for line in String::from_utf8(out.stdout)?.lines() {
