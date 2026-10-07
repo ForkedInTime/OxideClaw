@@ -829,13 +829,16 @@ async fn speak_via_server(
 /// Returns `Ok(true)` if truncated (hit word limit), `Ok(false)` if complete, `Err` on failure.
 pub async fn speak(
     text: &str,
-    _voice_model: Option<&str>,
+    voice_model: Option<&str>,
     stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
     let mut stop_rx = stop_rx;
+    let clone = speaker_clone(
+        voice_model,
+        voice_clone_sample_path().filter(|p| p.exists()),
+    );
     // ── Try XTTS v2 server first (fastest — model pre-loaded in VRAM) ──────
     if xtts_server_running() {
-        let clone = voice_clone_sample_path().filter(|p| p.exists());
         match speak_via_server(text, clone.as_deref(), &mut stop_rx).await {
             Err(_) if xtts_available() => {}
             done => return done,
@@ -844,9 +847,7 @@ pub async fn speak(
 
     // ── XTTS v2 CLI fallback (cold start each call) ───────────────────────
     if xtts_available() {
-        if let Some(clone_path) = voice_clone_sample_path()
-            && clone_path.exists()
-        {
+        if let Some(clone_path) = clone {
             return speak_cloned(text, &clone_path, stop_rx).await;
         }
         return speak_xtts_default(text, stop_rx).await;
@@ -858,6 +859,28 @@ pub async fn speak(
          uv tool install TTS --python 3.11 \\\n    \
          --with 'transformers<4.46' --with 'torch<2.6' --with 'torchaudio<2.6'"
     ))
+}
+
+/// The clone sample to speak with, given the `/voice model` choice and the
+/// recorded clone (if any). Picking the default speaker must win over a
+/// recorded clone; any other choice (none yet, or the clone itself) uses the
+/// clone when there is one.
+fn speaker_clone(voice_model: Option<&str>, clone: Option<PathBuf>) -> Option<PathBuf> {
+    if voice_model == Some(XTTS_DEFAULT_SPEAKER) {
+        return None;
+    }
+    clone
+}
+
+/// The id `/voice model` should mark as active: what `speak` will use.
+pub fn active_voice_id(voice_model: Option<&str>) -> String {
+    match speaker_clone(
+        voice_model,
+        voice_clone_sample_path().filter(|p| p.exists()),
+    ) {
+        Some(p) => p.display().to_string(),
+        None => XTTS_DEFAULT_SPEAKER.to_string(),
+    }
 }
 
 /// Synthesise using only the default speaker — ignores any voice clone.
@@ -1607,6 +1630,26 @@ pub async fn speak_cloned(
 
     play_wav(&wav_out, stop_rx).await?;
     Ok(truncated)
+}
+
+#[cfg(test)]
+mod speaker_choice_tests {
+    use super::{XTTS_DEFAULT_SPEAKER, speaker_clone};
+    use std::path::PathBuf;
+
+    #[test]
+    fn picking_the_default_speaker_overrides_a_recorded_clone() {
+        let clone = || Some(PathBuf::from("/data/voice-clone/sample.wav"));
+        assert_eq!(speaker_clone(Some(XTTS_DEFAULT_SPEAKER), clone()), None);
+        // No choice yet, or the clone itself: the clone speaks.
+        assert_eq!(speaker_clone(None, clone()), clone());
+        assert_eq!(
+            speaker_clone(Some("/data/voice-clone/sample.wav"), clone()),
+            clone()
+        );
+        // A saved clone choice whose sample was removed falls back.
+        assert_eq!(speaker_clone(Some("/gone/sample.wav"), None), None);
+    }
 }
 
 #[cfg(test)]

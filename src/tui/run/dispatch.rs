@@ -697,10 +697,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .to_string(),
                 ));
             } else {
-                let current = config
-                    .tts_voice_model
-                    .clone()
-                    .unwrap_or_else(|| crate::voice::XTTS_DEFAULT_SPEAKER.to_string());
+                let current = crate::voice::active_voice_id(config.tts_voice_model.as_deref());
                 let mut lines = vec![format!("Voice models ({})\n", voices.len())];
                 let mut ids = Vec::new();
                 for (i, (name, path)) in voices.iter().enumerate() {
