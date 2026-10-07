@@ -278,8 +278,41 @@ pub(crate) struct OaiFunctionDelta {
 
 #[derive(Deserialize)]
 pub(crate) struct OaiUsage {
+    /// Every prompt token, prompt-cache hits included.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// OpenAI (also Groq, OpenRouter, Gemini): `cached_tokens` is the part
+    /// of `prompt_tokens` read from the prompt cache.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OaiPromptTokensDetails>,
+    /// DeepSeek: the part of `prompt_tokens` that hit its context cache
+    /// (the rest is `prompt_cache_miss_tokens`).
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OaiPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+}
+
+impl From<OaiUsage> for Usage {
+    /// `prompt_tokens` counts cache hits; `Usage` keeps them apart (as the
+    /// Anthropic API does) so cost prices them at the cached rate.
+    fn from(u: OaiUsage) -> Self {
+        let cached = u
+            .prompt_cache_hit_tokens
+            .or(u.prompt_tokens_details.and_then(|d| d.cached_tokens))
+            .unwrap_or(0)
+            .min(u.prompt_tokens);
+        Usage {
+            input_tokens: u.prompt_tokens - cached,
+            output_tokens: u.completion_tokens,
+            cache_read_input_tokens: cached,
+            cache_creation_input_tokens: 0,
+        }
+    }
 }
 
 // ─── Shared translation: Anthropic ↔ OpenAI ─────────────────────────────────
@@ -652,8 +685,7 @@ pub(crate) async fn parse_oai_stream(
         };
 
         if let Some(usage) = chunk.usage {
-            result.usage.input_tokens = usage.prompt_tokens;
-            result.usage.output_tokens = usage.completion_tokens;
+            result.usage = usage.into();
         }
 
         for choice in chunk.choices {
@@ -1240,6 +1272,127 @@ mod api_key_tests {
 }
 
 #[cfg(test)]
+mod cached_usage_tests {
+    use super::stream_error_tests::parse;
+    use crate::cost::CostTracker;
+
+    /// One reply whose final chunk carries `usage`, as with
+    /// `stream_options.include_usage`.
+    macro_rules! reply_with_usage {
+        ($usage:literal) => {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":",
+                $usage,
+                "}\n\n",
+                "data: [DONE]\n\n",
+            )
+        };
+    }
+
+    /// OpenAI counts cache hits inside `prompt_tokens` and reports them in
+    /// `prompt_tokens_details.cached_tokens`; they used to be billed at the
+    /// full input rate, overstating cost and tripping /budget early.
+    #[tokio::test]
+    async fn openai_cached_tokens_are_billed_as_cache_reads() {
+        let r = parse(reply_with_usage!(
+            r#"{"prompt_tokens":10000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":8000,"audio_tokens":0}}"#
+        ))
+        .await
+        .unwrap();
+        let u = &r.usage;
+        assert_eq!(
+            (u.input_tokens, u.cache_read_input_tokens, u.output_tokens),
+            (2_000, 8_000, 100)
+        );
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.context_tokens(), 10_000, "context still counts the hits");
+
+        let mut t = CostTracker::new();
+        t.record_with_cache(
+            "oai:gpt-4o",
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
+        // 2K in at $2.50 + 8K cached at $1.25 + 100 out at $10, per MTok.
+        assert!(
+            (t.total_cost_usd - 0.016).abs() < 1e-12,
+            "{}",
+            t.total_cost_usd
+        );
+        assert_eq!(t.last_input_tokens, 10_000);
+    }
+
+    /// DeepSeek splits `prompt_tokens` into cache hits and misses.
+    #[tokio::test]
+    async fn deepseek_cache_hits_are_billed_as_cache_reads() {
+        let r = parse(reply_with_usage!(
+            r#"{"prompt_tokens":10000,"completion_tokens":100,"prompt_cache_hit_tokens":9000,"prompt_cache_miss_tokens":1000}"#
+        ))
+        .await
+        .unwrap();
+        let u = &r.usage;
+        assert_eq!(
+            (u.input_tokens, u.cache_read_input_tokens, u.output_tokens),
+            (1_000, 9_000, 100)
+        );
+
+        let mut t = CostTracker::new();
+        t.record_with_cache(
+            "deepseek:deepseek-chat",
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
+        // 1K miss at $0.27 + 9K hit at $0.07 + 100 out at $1.10, per MTok.
+        assert!(
+            (t.total_cost_usd - 0.00101).abs() < 1e-12,
+            "{}",
+            t.total_cost_usd
+        );
+    }
+
+    /// Servers without prompt caching report usage exactly as before.
+    #[tokio::test]
+    async fn usage_without_cache_fields_is_unchanged() {
+        for body in [
+            reply_with_usage!(r#"{"prompt_tokens":3000,"completion_tokens":7}"#),
+            reply_with_usage!(
+                r#"{"prompt_tokens":3000,"completion_tokens":7,"prompt_tokens_details":null}"#
+            ),
+            reply_with_usage!(
+                r#"{"prompt_tokens":3000,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":null}}"#
+            ),
+            reply_with_usage!(
+                r#"{"prompt_tokens":3000,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":0}}"#
+            ),
+        ] {
+            let u = parse(body).await.unwrap().usage;
+            assert_eq!(
+                (u.input_tokens, u.output_tokens, u.cache_read_input_tokens),
+                (3_000, 7, 0),
+                "{body}"
+            );
+        }
+    }
+
+    /// A server reporting more hits than prompt tokens must not underflow.
+    #[tokio::test]
+    async fn cache_hits_never_exceed_the_prompt() {
+        let u = parse(reply_with_usage!(
+            r#"{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":500}}"#
+        ))
+        .await
+        .unwrap()
+        .usage;
+        assert_eq!((u.input_tokens, u.cache_read_input_tokens), (0, 100));
+    }
+}
+
+#[cfg(test)]
 mod max_tokens_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1402,7 +1555,7 @@ mod stream_error_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Serves `body` as one SSE response and parses it.
-    async fn parse(body: &'static str) -> Result<StreamedResponse> {
+    pub(super) async fn parse(body: &'static str) -> Result<StreamedResponse> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
