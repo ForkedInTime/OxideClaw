@@ -65,11 +65,7 @@ pub fn voice_api_key() -> Option<String> {
 }
 
 fn which(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::distro::which(cmd)
 }
 
 // ── Temp file path ────────────────────────────────────────────────────────────

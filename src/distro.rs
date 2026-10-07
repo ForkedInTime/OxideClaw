@@ -19,44 +19,11 @@ impl Distro {
     /// Detect the running distro by checking release files and available package managers.
     pub fn detect() -> Self {
         // Check /etc/os-release for ID field — most reliable
-        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-            let id = content
-                .lines()
-                .find(|l| l.starts_with("ID=") || l.starts_with("ID_LIKE="))
-                .and_then(|l| l.split('=').nth(1))
-                .unwrap_or("")
-                .trim_matches('"')
-                .to_lowercase();
-
-            if id.contains("arch")
-                || id.contains("manjaro")
-                || id.contains("endeavour")
-                || id.contains("garuda")
-                || id.contains("artix")
-            {
-                return Distro::Arch;
-            }
-            if id.contains("debian")
-                || id.contains("ubuntu")
-                || id.contains("mint")
-                || id.contains("pop")
-                || id.contains("elementary")
-                || id.contains("kali")
-            {
-                return Distro::Debian;
-            }
-            if id.contains("fedora")
-                || id.contains("rhel")
-                || id.contains("centos")
-                || id.contains("alma")
-                || id.contains("rocky")
-                || id.contains("ol")
-            {
-                return Distro::Fedora;
-            }
-            if id.contains("opensuse") || id.contains("suse") {
-                return Distro::OpenSuse;
-            }
+        if let Some(d) = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|content| Self::from_os_release(&content))
+        {
+            return d;
         }
         // Fallback: check for well-known release files
         if Path::new("/etc/arch-release").exists() {
@@ -87,6 +54,60 @@ impl Distro {
         Distro::Unknown
     }
 
+    /// Classify by os-release `ID`, then `ID_LIKE` (e.g. `ID=zorin`,
+    /// `ID_LIKE="ubuntu debian"`).
+    fn from_os_release(content: &str) -> Option<Self> {
+        let field = |key: &str| {
+            content
+                .lines()
+                .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+                .map(|v| {
+                    v.trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_lowercase()
+                })
+        };
+        [field("ID"), field("ID_LIKE")]
+            .into_iter()
+            .flatten()
+            .find_map(|id| Self::from_id(&id))
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        if id.contains("arch")
+            || id.contains("manjaro")
+            || id.contains("endeavour")
+            || id.contains("garuda")
+            || id.contains("artix")
+        {
+            return Some(Distro::Arch);
+        }
+        if id.contains("debian")
+            || id.contains("ubuntu")
+            || id.contains("mint")
+            || id.contains("pop")
+            || id.contains("elementary")
+            || id.contains("kali")
+        {
+            return Some(Distro::Debian);
+        }
+        // Oracle Linux's ID is the bare token `ol`; a substring check also
+        // matched `solus` and handed it `dnf`.
+        if id.contains("fedora")
+            || id.contains("rhel")
+            || id.contains("centos")
+            || id.contains("alma")
+            || id.contains("rocky")
+            || id.split_whitespace().any(|t| t == "ol")
+        {
+            return Some(Distro::Fedora);
+        }
+        if id.contains("opensuse") || id.contains("suse") {
+            return Some(Distro::OpenSuse);
+        }
+        None
+    }
+
     /// Human-readable distro name for display.
     pub fn name(&self) -> &'static str {
         match self {
@@ -99,34 +120,40 @@ impl Distro {
     }
 }
 
-fn which(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Looks `cmd` up on PATH in-process. Shelling out to `which` reported every
+/// tool missing where `which` itself is not installed (Arch `base`, minimal
+/// Fedora/RHEL images), so /install-missing reinstalled present packages and
+/// voice/TTS refused to start.
+pub(crate) fn which(cmd: &str) -> bool {
+    which_in(cmd, std::env::var_os("PATH").as_deref())
+}
+
+fn which_in(cmd: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    crate::autofix::find_on_path(cmd, path).is_some()
 }
 
 // ── Package manager ───────────────────────────────────────────────────────────
 
 /// Returns the base install command (without package names) for the distro.
-/// On Arch, prefers yay > paru > sudo pacman.
-pub fn install_prefix(distro: &Distro) -> String {
-    match distro {
+/// On Arch, prefers yay > paru > sudo pacman. `None` when the package manager
+/// is unknown: guessing `apt` handed Alpine, NixOS, Void and macOS a command
+/// that /install-missing would run and that could only fail.
+pub fn install_prefix(distro: &Distro) -> Option<String> {
+    Some(match distro {
         Distro::Arch => {
             if which("yay") {
-                return "yay -S --noconfirm".into();
+                return Some("yay -S --noconfirm".into());
             }
             if which("paru") {
-                return "paru -S --noconfirm".into();
+                return Some("paru -S --noconfirm".into());
             }
             "sudo pacman -S --noconfirm".into()
         }
         Distro::Debian => "sudo apt install -y".into(),
         Distro::Fedora => "sudo dnf install -y".into(),
         Distro::OpenSuse => "sudo zypper install -y".into(),
-        Distro::Unknown => "sudo apt install -y".into(), // best guess
-    }
+        Distro::Unknown => return None,
+    })
 }
 
 // ── Tool → package name mapping ───────────────────────────────────────────────
@@ -314,23 +341,87 @@ pub fn find_missing(distro: &Distro) -> Vec<MissingTool> {
     missing
 }
 
-/// Build the single consolidated install command for all missing system packages.
-/// Returns None if nothing needs to be installed via the package manager.
-pub fn build_install_command(missing: &[MissingTool], distro: &Distro) -> Option<String> {
-    let packages: Vec<&str> = missing
+/// The distinct system packages behind `missing`, sorted.
+pub fn system_packages(missing: &[MissingTool]) -> Vec<&'static str> {
+    let mut pkgs: Vec<&str> = missing
         .iter()
         .filter_map(|m| m.package)
         // Deduplicate (e.g. arecord+aplay both map to alsa-utils)
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
+    pkgs.sort(); // stable order
+    pkgs
+}
 
-    if packages.is_empty() {
+/// Build the single consolidated install command for all missing system packages.
+/// Returns None if nothing needs to be installed via the package manager, or
+/// the package manager is unknown.
+pub fn build_install_command(missing: &[MissingTool], distro: &Distro) -> Option<String> {
+    let pkgs = system_packages(missing);
+    if pkgs.is_empty() {
         return None;
     }
-
-    let prefix = install_prefix(distro);
-    let mut pkgs: Vec<&str> = packages.into_iter().collect();
-    pkgs.sort(); // stable order
+    let prefix = install_prefix(distro)?;
     Some(format!("{prefix} {}", pkgs.join(" ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_release_ids_map_to_package_managers() {
+        for (content, want) in [
+            ("ID=solus\nNAME=Solus\n", None),
+            ("ID=\"ol\"\nID_LIKE=\"fedora\"\n", Some(Distro::Fedora)),
+            (
+                "ID=zorin\nID_LIKE=\"ubuntu debian\"\n",
+                Some(Distro::Debian),
+            ),
+            ("ID_LIKE=arch\nID=endeavouros\n", Some(Distro::Arch)),
+            ("ID=alpine\n", None),
+            ("ID=nixos\n", None),
+            ("ID=\"opensuse-tumbleweed\"\n", Some(Distro::OpenSuse)),
+        ] {
+            assert_eq!(Distro::from_os_release(content), want, "{content:?}");
+        }
+    }
+
+    /// Unknown distros used to get `sudo apt install -y`, which
+    /// /install-missing then ran.
+    #[test]
+    fn unknown_distro_gets_no_install_command() {
+        assert_eq!(install_prefix(&Distro::Unknown), None);
+        let missing = [MissingTool {
+            tool: Tool::Git,
+            package: Some("git"),
+            manual_note: None,
+        }];
+        assert_eq!(build_install_command(&missing, &Distro::Unknown), None);
+        assert_eq!(system_packages(&missing), ["git"]);
+        assert_eq!(
+            build_install_command(&missing, &Distro::Debian).as_deref(),
+            Some("sudo apt install -y git")
+        );
+    }
+
+    /// Probes walk PATH in-process: the `which` binary is absent from
+    /// minimal installs, which made every tool read as missing.
+    #[cfg(unix)]
+    #[test]
+    fn which_scans_path_without_the_which_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("probe-tool");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("plain-file"), "").unwrap();
+        // PATH holds only this dir, so a `which` subprocess could not be found.
+        let path = Some(dir.path().as_os_str());
+        assert!(which_in("probe-tool", path));
+        assert!(!which_in("plain-file", path), "not executable");
+        assert!(!which_in("which", path));
+        assert!(!which_in("probe-tool", None));
+    }
 }

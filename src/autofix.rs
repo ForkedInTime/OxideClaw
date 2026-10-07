@@ -199,7 +199,10 @@ const VENV_BIN: &str = ".venv/bin";
 const VENV_BIN: &str = r".venv\Scripts";
 
 #[cfg(unix)]
-fn find_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+pub(crate) fn find_on_path(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
     std::env::split_paths(path?)
         .map(|dir| dir.join(program))
         .find(|p| is_executable(p))
@@ -208,7 +211,10 @@ fn find_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> Option<std::pa
 /// npm and npx are `.cmd` shims on Windows, so a bare `dir\npm` or
 /// `dir\npm.exe` never matched and every JS check was dropped unseen.
 #[cfg(windows)]
-fn find_on_path(program: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+pub(crate) fn find_on_path(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
     crate::mcp::client::resolve_on_path(program, path, std::env::var_os("PATHEXT").as_deref())
 }
 

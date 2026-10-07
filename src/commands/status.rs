@@ -312,11 +312,14 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
 }
 
 pub(super) fn install_one_liner(distro: &crate::distro::Distro, pkg: &str) -> String {
-    format!("{} {pkg}", crate::distro::install_prefix(distro))
+    match crate::distro::install_prefix(distro) {
+        Some(prefix) => format!("{prefix} {pkg}"),
+        None => format!("install {pkg} with your package manager"),
+    }
 }
 
 pub(super) fn cmd_install_missing() -> CommandAction {
-    use crate::distro::{Distro, build_install_command, find_missing};
+    use crate::distro::{Distro, build_install_command, find_missing, system_packages};
 
     let distro = Distro::detect();
     let missing = find_missing(&distro);
@@ -329,6 +332,10 @@ pub(super) fn cmd_install_missing() -> CommandAction {
 
     match build_install_command(&missing, &distro) {
         Some(cmd) => CommandAction::RunInstall(cmd),
+        None if !system_packages(&missing).is_empty() => CommandAction::Message(format!(
+            "Could not detect your package manager. Install these packages manually:\n\n  {}",
+            system_packages(&missing).join(" ")
+        )),
         None => {
             // Only pip/manual installs missing — no package manager command to run
             let notes: Vec<String> = missing
