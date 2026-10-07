@@ -333,3 +333,55 @@ fn installers_ask_for_assets_the_workflow_produces() {
         .unwrap();
     assert!(upload.contains("${{ matrix.artifact }}.sha256"), "{upload}");
 }
+
+/// Every package manifest sends people to this repository, not the
+/// pre-rename RustyClaw one, and describes the same product without the
+/// retracted "cost-aware routing" headline (the router is opt-in).
+#[test]
+fn package_metadata_points_at_oxideclaw() {
+    const HOME: &str = "https://github.com/ForkedInTime/OxideClaw";
+    assert_eq!(env!("CARGO_PKG_HOMEPAGE"), HOME);
+    assert_eq!(env!("CARGO_PKG_REPOSITORY"), HOME);
+
+    let npm: serde_json::Value =
+        serde_json::from_str(include_str!("../npm/package.json")).expect("package.json parses");
+    assert_eq!(npm["homepage"].as_str(), Some(HOME));
+
+    let brew = include_str!("../contrib/homebrew/oxideclaw.rb");
+    let pkgbuild = include_str!("../contrib/aur/PKGBUILD");
+    let srcinfo = include_str!("../contrib/aur/.SRCINFO");
+    assert!(brew.contains(&format!("homepage \"{HOME}\"")));
+    assert!(pkgbuild.contains(&format!("url=\"{HOME}\"")));
+    assert!(srcinfo.contains(&format!("url = {HOME}")));
+
+    let field = |text: &str, prefix: &str| -> String {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} line"))
+            .trim_matches('"')
+            .to_string()
+    };
+    let brew_desc = field(brew, "desc ");
+    let pkgdesc = field(pkgbuild, "pkgdesc=");
+    assert_eq!(field(srcinfo, "pkgdesc = "), pkgdesc, ".SRCINFO is stale");
+    assert!(
+        brew_desc.len() <= 80,
+        "brew audit rejects desc over 80 chars"
+    );
+    for (file, text) in [
+        ("Cargo.toml", include_str!("../Cargo.toml")),
+        ("npm/package.json", include_str!("../npm/package.json")),
+        ("contrib/homebrew/oxideclaw.rb", brew),
+        ("contrib/aur/PKGBUILD", pkgbuild),
+    ] {
+        assert!(!text.contains("RustyClaw"), "{file} points at RustyClaw");
+    }
+    for (what, desc) in [
+        ("Cargo.toml", env!("CARGO_PKG_DESCRIPTION")),
+        ("npm", npm["description"].as_str().unwrap()),
+        ("brew", &brew_desc),
+        ("AUR", &pkgdesc),
+    ] {
+        assert!(!desc.contains("cost-aware"), "{what} description: {desc}");
+    }
+}

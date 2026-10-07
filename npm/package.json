@@ -1,7 +1,7 @@
 {
   "name": "oxideclaw",
   "version": "0.4.0",
-  "description": "Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning, autonomous browser, ACP for editors. Claude, Ollama, OpenAI-compatible.",
+  "description": "Provider-neutral single-binary coding agent: zero-setup codebase index, /budget spend cap, worktree agents, auto-fix loop, optional local voice cloning, autonomous browser, ACP for editors. Claude, Ollama, OpenAI-compatible.",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/ForkedInTime/OxideClaw.git" },
   "homepage": "https://github.com/ForkedInTime/OxideClaw",

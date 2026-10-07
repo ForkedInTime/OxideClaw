@@ -1,5 +1,5 @@
 pkgbase = oxideclaw-bin
-	pkgdesc = Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning. Claude, Ollama, OpenAI-compatible.
+	pkgdesc = Provider-neutral single-binary coding agent: zero-setup codebase index, /budget spend cap, worktree agents, auto-fix loop, optional local voice cloning. Claude, Ollama, OpenAI-compatible.
 	pkgver = 0.4.0
 	pkgrel = 1
 	url = https://github.com/ForkedInTime/OxideClaw

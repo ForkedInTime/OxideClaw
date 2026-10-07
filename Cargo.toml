@@ -6,9 +6,10 @@ edition = "2024"
 # self_update) need 1.88; README.md quotes this number and
 # scripts/readme-lint.sh checks it.
 rust-version = "1.88"
-description = "Single-binary coding agent: zero-setup codebase index, cost-aware model routing, worktree agents, auto-fix loop, voice cloning. Claude, Ollama, and OpenAI-compatible backends."
+description = "Provider-neutral single-binary coding agent: zero-setup codebase index, /budget spend cap, worktree agents, auto-fix loop, optional local voice cloning. Claude, Ollama, OpenAI-compatible."
 license = "Apache-2.0"
 repository = "https://github.com/ForkedInTime/OxideClaw"
+homepage = "https://github.com/ForkedInTime/OxideClaw"
 keywords = ["cli", "ai", "coding-agent", "claude", "ollama"]
 categories = ["command-line-utilities", "development-tools"]
 # Keep the crates.io tarball small: images, CI, packaging, dev scripts and

@@ -2,7 +2,7 @@
 # github.com/ForkedInTime/homebrew-oxideclaw; kept here as the source of
 # truth and copied there on each release.
 class Oxideclaw < Formula
-  desc "Single-binary coding agent: codebase index, cost-aware routing, worktree agents, voice"
+  desc "Provider-neutral coding agent: code index, spend cap, worktree agents, voice"
   homepage "https://github.com/ForkedInTime/OxideClaw"
   version "0.4.0"
   license "Apache-2.0"
