@@ -54,7 +54,7 @@ brew install ForkedInTime/oxideclaw/oxideclaw
 npm install -g oxideclaw
 ```
 
-**Cargo (builds from source, any platform with Rust 1.86+):**
+**Cargo (builds from source, any platform with Rust 1.88+):**
 ```bash
 cargo install oxideclaw
 ```

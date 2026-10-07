@@ -6,6 +6,8 @@
 #   2. README.md "N CDP tools" claim matches count of browser tool impls
 #   3. README.md "N providers" claim matches count of named entries in the
 #      OpenAI-compat provider registry
+#   4. README.md keeps the 'Autonomous browser agent' row
+#   5. README.md "Rust X.Y+" matches Cargo.toml rust-version
 #
 # Exit non-zero on any drift, with a clear message pointing at both the
 # claim and the source of truth so fixes take seconds, not minutes.
@@ -56,6 +58,17 @@ if grep -qF "Autonomous browser agent" README.md; then
 else
   err "README.md missing 'Autonomous browser agent' row (expected after /browse ship)"
   err "  fix: add an 'Autonomous browser agent' row to the comparison table"
+fi
+
+# ── 5. Minimum Rust version ──────────────────────────────────────────────────
+msrv=$(grep -E '^rust-version\s*=' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+msrv_claim=$(grep -oE 'Rust [0-9]+\.[0-9]+\+' README.md | head -1 | grep -oE '[0-9]+\.[0-9]+')
+
+if [ -n "$msrv" ] && [ "$msrv" = "$msrv_claim" ]; then
+  ok "README.md \"Rust ${msrv_claim}+\" matches Cargo.toml rust-version"
+else
+  err "README.md claims \"Rust ${msrv_claim}+\" but Cargo.toml rust-version is \"${msrv}\""
+  err "  fix: keep README.md's Cargo install line and Cargo.toml rust-version in step"
 fi
 
 # ── Result ───────────────────────────────────────────────────────────────────
