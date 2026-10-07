@@ -9,8 +9,10 @@ use std::collections::HashMap;
 pub(crate) struct ModelPrice {
     pub(crate) input: f64,
     pub(crate) output: f64,
-    /// Cache-read price as a fraction of `input`. Writes (5-minute TTL) are
-    /// always 1.25× input.
+    /// Cache-read price as a fraction of `input`: the provider's published
+    /// cached-input rate, or 1.0 where none is known, so a cache hit is
+    /// never priced below what it may cost. Writes (5-minute TTL) are always
+    /// 1.25× input.
     cache_read_mult: f64,
     /// True when this is an approximation (a rough third-party rate or the
     /// unknown-model fallback) rather than a known published rate. Surfaced in
@@ -45,10 +47,11 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         estimated: false,
         fallback: false,
     };
+    // No cached-input rate known: a cache hit costs the full input rate.
     let rough = |input: f64, output: f64| ModelPrice {
         input,
         output,
-        cache_read_mult: 0.1,
+        cache_read_mult: 1.0,
         estimated: true,
         fallback: false,
     };
@@ -108,32 +111,48 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         // `gemini-2.5-flash` reads `gemini-2-5-flash`. Flash-Lite before
         // Flash, which it contains. An unrecognised Gemini model gets the
         // dearest current rate so a /budget cap errs early, not late.
+        // Implicit and explicit cache hits are 75% off (2.5 and later; some
+        // models now charge less), so a quarter of input is an upper bound.
+        let gemini = |input: f64, output: f64| ModelPrice {
+            cache_read_mult: 0.25,
+            ..rough(input, output)
+        };
         if id.contains("gemma") {
             // Gemma on the Gemini API has no paid rate.
             rough(0.0, 0.0)
         } else if id.contains("flash-lite") {
-            rough(0.10, 0.40)
+            gemini(0.10, 0.40)
         } else if id.contains("gemini-3") && id.contains("flash") {
-            rough(0.50, 3.0)
+            gemini(0.50, 3.0)
         } else if id.contains("gemini-2-0-flash") {
-            rough(0.10, 0.40)
+            gemini(0.10, 0.40)
         } else if id.contains("flash") {
-            rough(0.30, 2.50)
+            gemini(0.30, 2.50)
         } else if id.contains("gemini-2-5-pro") {
-            rough(1.25, 10.0)
+            gemini(1.25, 10.0)
         } else {
-            rough(2.0, 12.0)
+            gemini(2.0, 12.0)
         }
     } else if m.contains("groq:") || m.contains("together:") {
         // Rough estimate for hosted open-source models
         rough(0.5, 1.0)
     } else if m.contains("deepseek:") {
-        rough(0.27, 1.10)
+        // DeepSeek-V3's list rates: $0.27 cache miss, $0.07 cache hit, $1.10
+        // out. Later DeepSeek models charge less for a hit, never more.
+        ModelPrice {
+            cache_read_mult: 0.07 / 0.27,
+            ..rough(0.27, 1.10)
+        }
     } else if m.contains("mistral:") {
         rough(2.0, 6.0)
     } else if m.contains("oai:") || m.contains("openai:") {
-        // GPT-4o class pricing
-        rough(2.5, 10.0)
+        // GPT-4o class pricing. Cached input is half price on GPT-4o, the
+        // largest share OpenAI charges (GPT-4.1 and o-series: a quarter,
+        // GPT-5: a tenth).
+        ModelPrice {
+            cache_read_mult: 0.5,
+            ..rough(2.5, 10.0)
+        }
     } else {
         // Unknown model — fall back to Sonnet-tier rates so a budget still
         // functions, but flag it: an unrecognised model may be an order of
@@ -696,5 +715,35 @@ mod price_table_tests {
         let mut t = super::CostTracker::new();
         t.record_with_cache("claude-sonnet-5", 100, 0, 9_000, 900);
         assert_eq!(t.last_input_tokens, 10_000, "context counts cached tokens");
+    }
+
+    /// Cached input on OpenAI-compatible providers is priced at the
+    /// provider's published cached rate, or at the full input rate where
+    /// none is known: a cache hit is never priced below what it may cost.
+    #[test]
+    fn cache_reads_use_provider_cached_rates_or_full_input() {
+        let m = 1_000_000;
+        for (model, cached_per_m) in [
+            ("oai:gpt-4o", 1.25),
+            ("openai:gpt-4.1", 1.25),
+            ("deepseek:deepseek-chat", 0.07),
+            ("deepseek:deepseek-reasoner", 0.07),
+            ("gemini:gemini-2.5-flash", 0.075),
+            ("gemini:gemini-2.5-pro", 0.3125),
+        ] {
+            let got = model_price(model).cost(0, 0, m, 0);
+            assert!((got - cached_per_m).abs() < 1e-9, "{model}: {got}");
+        }
+        for model in [
+            "groq:llama-3.3-70b",
+            "together:mixtral",
+            "mistral:mistral-large",
+            "venice:llama-3.3-70b",
+            "openai-compat:my-model",
+            "openrouter:openai/gpt-4o",
+        ] {
+            let p = model_price(model);
+            assert_eq!(p.cost(0, 0, m, 0), p.cost(m, 0, 0, 0), "{model}");
+        }
     }
 }
