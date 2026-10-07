@@ -21,6 +21,10 @@ pub(crate) struct ModelPrice {
     /// True only for the unknown-model Sonnet-tier fallback, so `/cost` does
     /// not tell a DeepSeek or Groq user their model was not recognised.
     fallback: bool,
+    /// `(threshold, input, output)`: a call whose prompt (uncached input
+    /// plus cache reads and writes) exceeds `threshold` tokens is billed at
+    /// these rates instead, as Gemini Pro does above 200k.
+    long_context: Option<(u64, f64, f64)>,
 }
 
 /// Cache writes with the default 5-minute TTL bill at 1.25× the input rate.
@@ -30,11 +34,16 @@ impl ModelPrice {
     /// USD for one API call's usage. `input` excludes cached tokens, which the
     /// API reports separately.
     pub(crate) fn cost(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+        let prompt = input + cache_read + cache_write;
+        let (inp, out) = match self.long_context {
+            Some((threshold, i, o)) if prompt > threshold => (i, o),
+            _ => (self.input, self.output),
+        };
         let per_m = |tokens: u64, rate: f64| tokens as f64 / 1_000_000.0 * rate;
-        per_m(input, self.input)
-            + per_m(output, self.output)
-            + per_m(cache_read, self.input * self.cache_read_mult)
-            + per_m(cache_write, self.input * CACHE_WRITE_MULT)
+        per_m(input, inp)
+            + per_m(output, out)
+            + per_m(cache_read, inp * self.cache_read_mult)
+            + per_m(cache_write, inp * CACHE_WRITE_MULT)
     }
 }
 
@@ -46,6 +55,7 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         cache_read_mult: 0.1,
         estimated: false,
         fallback: false,
+        long_context: None,
     };
     // No cached-input rate known: a cache hit costs the full input rate.
     let rough = |input: f64, output: f64| ModelPrice {
@@ -54,6 +64,7 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         cache_read_mult: 1.0,
         estimated: true,
         fallback: false,
+        long_context: None,
     };
     // OpenRouter spells versions with dots (`anthropic/claude-opus-4.1`);
     // the generation checks below are written against Anthropic's dashes.
@@ -110,17 +121,16 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         // Google's paid-tier list prices (2026); dots are dashes by now, so
         // `gemini-2.5-flash` reads `gemini-2-5-flash`. Flash-Lite before
         // Flash, which it contains. An unrecognised Gemini model gets the
-        // dearest current rate so a /budget cap errs early, not late.
-        // Implicit and explicit cache hits are 75% off (2.5 and later; some
-        // models now charge less), so a quarter of input is an upper bound.
+        // dearest current rate (Gemini 3 Pro above 200k prompt tokens) so a
+        // /budget cap errs early, not late. Implicit and explicit cache hits
+        // are 75% off (2.5 and later; some models now charge less), so a
+        // quarter of input is an upper bound. Pro bills a prompt over 200k
+        // tokens at a higher rate, cache reads included.
         let gemini = |input: f64, output: f64| ModelPrice {
             cache_read_mult: 0.25,
             ..rough(input, output)
         };
-        if id.contains("gemma") {
-            // Gemma on the Gemini API has no paid rate.
-            rough(0.0, 0.0)
-        } else if id.contains("flash-lite") {
+        if id.contains("flash-lite") {
             gemini(0.10, 0.40)
         } else if id.contains("gemini-3") && id.contains("flash") {
             gemini(0.50, 3.0)
@@ -129,13 +139,19 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         } else if id.contains("flash") {
             gemini(0.30, 2.50)
         } else if id.contains("gemini-2-5-pro") {
-            gemini(1.25, 10.0)
+            ModelPrice {
+                long_context: Some((200_000, 2.50, 15.0)),
+                ..gemini(1.25, 10.0)
+            }
         } else if id.contains("gemini-3") && id.contains("pro") {
-            gemini(2.0, 12.0)
+            ModelPrice {
+                long_context: Some((200_000, 4.0, 18.0)),
+                ..gemini(2.0, 12.0)
+            }
         } else {
             // No published cached rate for an unrecognised model: a cache
             // hit costs the full input rate.
-            rough(2.0, 12.0)
+            rough(4.0, 18.0)
         }
     } else if m.contains("groq:") || m.contains("together:") {
         // Rough estimate for hosted open-source models
@@ -556,7 +572,6 @@ mod tests {
             ("gemini:gemini-2.5-flash-lite", 0.10, 0.40),
             ("gemini:gemini-2.5-pro", 1.25, 10.0),
             ("gemini:gemini-3-pro-preview", 2.0, 12.0),
-            ("gemini:gemma-3-27b-it", 0.0, 0.0),
         ] {
             let p = model_price(model);
             assert!(p.estimated, "{model}");
@@ -737,6 +752,9 @@ mod price_table_tests {
     #[test]
     fn cache_reads_use_provider_cached_rates_or_full_input() {
         let m = 1_000_000;
+        // Under Gemini Pro's 200k long-context threshold: a tenth of a
+        // million, so a tenth of the per-million rate.
+        let tenth = 100_000;
         for (model, cached_per_m) in [
             ("oai:gpt-4o", 1.25),
             ("openai:gpt-4.1", 1.25),
@@ -746,8 +764,8 @@ mod price_table_tests {
             ("gemini:gemini-2.5-pro", 0.3125),
             ("gemini:gemini-3-pro-preview", 0.5),
         ] {
-            let got = model_price(model).cost(0, 0, m, 0);
-            assert!((got - cached_per_m).abs() < 1e-9, "{model}: {got}");
+            let got = model_price(model).cost(0, 0, tenth, 0);
+            assert!((got - cached_per_m / 10.0).abs() < 1e-9, "{model}: {got}");
         }
         for model in [
             "groq:llama-3.3-70b",
@@ -783,5 +801,26 @@ mod price_table_tests {
         let p = model_price("openai-compat:my-claude-proxy");
         assert!(p.fallback);
         assert!((p.cost(0, 0, m, 0) - 3.0).abs() < 1e-9);
+    }
+    /// Gemini Pro bills a prompt over 200k tokens at its long-context rate;
+    /// with a 1M window those prompts are normal, and the flat rate priced
+    /// them at half, so /budget undercounted.
+    #[test]
+    fn gemini_pro_long_context_prompts_use_the_higher_rate() {
+        let mut t = crate::cost::CostTracker::new();
+        t.record_with_cache("gemini:gemini-2.5-pro", 300_000, 0, 0, 0);
+        assert!(
+            (t.total_cost_usd - 0.75).abs() < 1e-9,
+            "{}",
+            t.total_cost_usd
+        );
+        let p = model_price("gemini:gemini-3-pro-preview");
+        // At the threshold: the base rate. Above it, cache reads count
+        // towards the prompt and are doubled too.
+        assert!((p.cost(200_000, 0, 0, 0) - 0.4).abs() < 1e-9);
+        assert!((p.cost(100_000, 1_000_000, 200_000, 0) - (0.4 + 18.0 + 0.2)).abs() < 1e-9);
+        // An unrecognised Gemini model is priced at the dearest rate.
+        let u = model_price("gemini:gemini-9-ultra");
+        assert_eq!((u.input, u.output), (4.0, 18.0));
     }
 }

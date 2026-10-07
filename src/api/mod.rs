@@ -638,15 +638,30 @@ pub fn context_window_for_model(model: &str) -> u64 {
         };
         return if one_million { 1_000_000 } else { 200_000 };
     }
-    // Gemma before Gemini: Google's endpoint serves Gemma under the same
-    // `gemini:` prefix, and a 1M guess there means compaction never fires
-    // before the server rejects the request.
+    // Gemma before Gemini, so an id naming both is not given 1M: a guess
+    // above the real window means compaction never fires before the server
+    // rejects the request.
     if m.contains("gemma") {
-        // Gemma 3 takes 128k; Gemma 1 and 2 (`gemma-7b`, `gemma2-9b`) 8k.
-        if ["gemma-3", "gemma3"].iter().any(|k| m.contains(k)) {
+        // Gemma 3n and Gemma 3 1B before Gemma 3, which "gemma3n" contains.
+        if ["gemma-3n", "gemma3n", "gemma-3-1b", "gemma3:1b"]
+            .iter()
+            .any(|k| m.contains(k))
+        {
+            32_768
+        } else if ["gemma-3", "gemma3"].iter().any(|k| m.contains(k)) {
             131_072
-        } else {
+        } else if [
+            "gemma-2", "gemma2", "gemma-7b", "gemma-2b", "gemma:7b", "gemma:2b",
+        ]
+        .iter()
+        .any(|k| m.contains(k))
+        {
+            // Gemma 1 and 2: 8k.
             8_192
+        } else {
+            // Newer generations: assume the modern window rather than
+            // undercount.
+            131_072
         }
     } else if m.contains("gemini") {
         // Gemini 2.x and 3 take 1M input tokens on Google's endpoint and
@@ -760,9 +775,15 @@ mod context_window_tests {
         assert_eq!(w("gemini:gemini-2.5-flash"), 1_048_576);
         assert_eq!(w("openrouter:google/gemini-3-pro-preview"), 1_048_576);
         assert_eq!(w("gemma-7b-it"), 8_192);
-        assert_eq!(w("gemini:gemma-3-27b-it"), 131_072);
-        assert_eq!(w("gemini:gemma-2-9b-it"), 8_192);
+        assert_eq!(w("openrouter:google/gemma-3-27b-it"), 131_072);
+        assert_eq!(w("openrouter:google/gemma-2-9b-it"), 8_192);
         assert_eq!(w("ollama:gemma3:27b"), 131_072);
+        assert_eq!(w("ollama:gemma3:1b"), 32_768);
+        assert_eq!(w("openrouter:google/gemma-3n-e4b-it"), 32_768);
+        assert_eq!(w("ollama:gemma3n:e4b"), 32_768);
+        assert_eq!(w("ollama:gemma3:12b"), 131_072);
+        assert_eq!(w("ollama:gemma2:9b"), 8_192);
+        assert_eq!(w("ollama:gemma4"), 131_072);
         assert_eq!(w("something-new"), 200_000);
     }
 }

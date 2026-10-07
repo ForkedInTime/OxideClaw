@@ -28,10 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back to `GOOGLE_API_KEY`; both load from your own `.env` and, like every
   provider key, are refused from an untrusted project `.env`. Gemini 3
   thought signatures are kept and sent back with tool-call follow-ups, which
-  Google otherwise rejects. Gemini models get their 1M context window (Gemma
-  on the same endpoint keeps its smaller one), Google's "input token count
-  exceeds the maximum" error triggers compaction, and `/cost` and `/budget`
-  use rough Gemini rates instead of the unknown-model Sonnet rate.
+  Google otherwise rejects. Gemini models get their 1M context window,
+  Google's "input token count exceeds the maximum" error triggers
+  compaction, and `/cost` and `/budget` use rough Gemini rates instead of
+  the unknown-model Sonnet rate, with Pro's higher rate for prompts over
+  200k tokens and thinking tokens billed as output.
 - **GEMINI.md.** A project set up for Gemini CLI keeps its instructions:
   `GEMINI.md` is found by the same rules as `CLAUDE.md` and `AGENTS.md`
   (config dir, then root or home down to the working directory, symlinks
@@ -64,8 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the SDK's `cost/updated` carry `cache_read_tokens` and
   `cache_write_tokens`, and library callers can resume an `SdkSession`
   from a saved history.
+
 ### Changed
 
+- **`tokens_in` on OpenAI-compatible providers excludes cache hits.** In
+  the `-p` JSON result and the SDK's `cost/updated` `input_tokens`, cached
+  prompt tokens are now reported as `cache_read_tokens` instead of being
+  counted in `tokens_in`; the full prompt size is `tokens_in +
+  cache_read_tokens + cache_write_tokens`.
 - **`--allowed-tools` / `--disallowed-tools` take permission rules.** Each
   value can be a tool name or a rule such as `Bash(git status:*)` or
   `WebFetch(domain:example.com)`, separated by commas or spaces, as separate

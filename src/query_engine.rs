@@ -1025,8 +1025,9 @@ impl QueryEngine {
 }
 
 /// The `-p --output-format json|stream-json` result object. `tokens_in`
-/// excludes prompt-cache reads and writes, as on the wire, so they are
-/// reported alongside: their sum is the full prompt size.
+/// excludes prompt-cache reads and writes (Anthropic's convention; for
+/// OpenAI-compatible backends it is `prompt_tokens` minus cached tokens), so
+/// they are reported alongside: their sum is the full prompt size.
 fn result_json(text: &str, usage: &Usage) -> serde_json::Value {
     serde_json::json!({
         "type": "result",

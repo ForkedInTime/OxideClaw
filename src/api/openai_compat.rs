@@ -289,6 +289,10 @@ pub(crate) struct OaiUsage {
     /// (the rest is `prompt_cache_miss_tokens`).
     #[serde(default)]
     pub prompt_cache_hit_tokens: Option<u64>,
+    /// Gemini's thinking tokens are billed as output but left out of
+    /// `completion_tokens`; `total_tokens` counts them.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -306,9 +310,15 @@ impl From<OaiUsage> for Usage {
             .or(u.prompt_tokens_details.and_then(|d| d.cached_tokens))
             .unwrap_or(0)
             .min(u.prompt_tokens);
+        // Everything past the prompt is billed as output: the same as
+        // `completion_tokens` where total = prompt + completion (OpenAI,
+        // DeepSeek, Groq), plus the thinking where it is not (Gemini).
+        let output = u.total_tokens.map_or(u.completion_tokens, |t| {
+            u.completion_tokens.max(t.saturating_sub(u.prompt_tokens))
+        });
         Usage {
             input_tokens: u.prompt_tokens - cached,
-            output_tokens: u.completion_tokens,
+            output_tokens: output,
             cache_read_input_tokens: cached,
             cache_creation_input_tokens: 0,
         }
@@ -1288,6 +1298,26 @@ mod cached_usage_tests {
                 "data: [DONE]\n\n",
             )
         };
+    }
+
+    /// Gemini thinks by default and bills the thought tokens as output, but
+    /// reports them only in `total_tokens`: a thinking turn was priced at
+    /// its visible answer alone.
+    #[tokio::test]
+    async fn thinking_tokens_outside_completion_tokens_are_billed_as_output() {
+        let r = parse(reply_with_usage!(
+            r#"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1650}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!((r.usage.input_tokens, r.usage.output_tokens), (1_000, 650));
+        // Where total = prompt + completion nothing changes.
+        let r = parse(reply_with_usage!(
+            r#"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.usage.output_tokens, 50);
     }
 
     /// OpenAI counts cache hits inside `prompt_tokens` and reports them in
