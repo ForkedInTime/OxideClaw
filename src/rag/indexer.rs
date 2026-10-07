@@ -426,8 +426,6 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
             true
         });
 
-    // Batch insert with a transaction for speed
-    let tx = db.conn.unchecked_transaction()?;
     // Every indexable file we saw this pass; anything in the index that is
     // not here was deleted or renamed and gets pruned below.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -523,11 +521,15 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
             }
         };
 
-        // Delete old chunks for this file
-        tx.execute("DELETE FROM code_chunks WHERE file_path = ?1", [&rel_path])?;
-
-        // Extract and insert new chunks
         let chunks = extract_chunks(&rel_path, &source, lang_name, ts_lang);
+
+        // One short transaction per file, opened only after the read and
+        // parse: /memory writes share this database and give up after the
+        // 5 s busy timeout, so the write lock must never span the whole walk.
+        // Starting with the DELETE takes the lock through the busy handler
+        // instead of upgrading a read snapshot (SQLITE_BUSY_SNAPSHOT).
+        let tx = db.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM code_chunks WHERE file_path = ?1", [&rel_path])?;
         for chunk in &chunks {
             tx.execute(
                 "INSERT INTO code_chunks (file_path, symbol_name, symbol_kind, language, start_line, end_line, content, mtime)
@@ -544,6 +546,7 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
                 ],
             )?;
         }
+        tx.commit()?;
 
         chunks_added += chunks.len() as i64;
         files_indexed += 1;
@@ -552,17 +555,21 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
 
     // Prune chunks whose file is gone. Files that became too large or
     // unreadable this pass were still *seen*, so their old chunks stay.
-    let indexed: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT DISTINCT file_path FROM code_chunks")?;
+    let stale: Vec<String> = {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT DISTINCT file_path FROM code_chunks")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.flatten().collect()
+        rows.flatten().filter(|p| !seen.contains(p)).collect()
     };
-    for stale in indexed.into_iter().filter(|p| !seen.contains(p)) {
-        tx.execute("DELETE FROM code_chunks WHERE file_path = ?1", [&stale])?;
-        debug!("Pruned {stale}: file no longer present");
+    if !stale.is_empty() {
+        let tx = db.conn.unchecked_transaction()?;
+        for path in &stale {
+            tx.execute("DELETE FROM code_chunks WHERE file_path = ?1", [path])?;
+            debug!("Pruned {path}: file no longer present");
+        }
+        tx.commit()?;
     }
-
-    tx.commit()?;
 
     Ok(IndexResult {
         files_scanned,
@@ -587,6 +594,51 @@ mod tests {
             std::fs::write(&full, content).unwrap();
         }
         tmp
+    }
+
+    /// The indexer used to hold one write transaction across the whole walk
+    /// and parse, so a /memory write on another connection waited out its
+    /// busy timeout and failed with "database is locked".
+    #[test]
+    fn memory_writes_are_not_locked_out_while_indexing() {
+        let body: String = (0..40)
+            .map(|i| format!("pub fn helper_{i}(x: u32) -> u32 {{ x + {i} }}\n"))
+            .collect();
+        let files: Vec<(String, String)> = (0..300)
+            .map(|i| (format!("src/m{i}.rs"), body.clone()))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let tmp = setup_project(&refs);
+        drop(RagDb::open(tmp.path()).unwrap());
+
+        let root = tmp.path().to_path_buf();
+        let indexer = std::thread::spawn(move || {
+            let db = RagDb::open(&root).unwrap();
+            let started = Instant::now();
+            index_project(&db, &root, true).unwrap();
+            started.elapsed()
+        });
+
+        let writer = rusqlite::Connection::open(tmp.path().join(".claude/rag.db")).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_millis(500))
+            .unwrap();
+        let mut writes = 0;
+        while !indexer.is_finished() {
+            writer
+                .execute(
+                    "INSERT INTO memory (key, value) VALUES (?1, 'v')",
+                    [format!("k{writes}")],
+                )
+                .unwrap_or_else(|e| panic!("memory write {writes} failed: {e}"));
+            writes += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let took = indexer.join().unwrap();
+        assert!(writes > 0, "indexing finished in {took:?} before any write");
     }
 
     /// Chunks for a file that no longer exists must not survive an
