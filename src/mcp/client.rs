@@ -1390,15 +1390,25 @@ impl McpClient {
                 let Err(e) = legacy else {
                     return legacy;
                 };
+                // A recognized modern error to `initialize` identifies a
+                // modern server, which must not be treated as legacy
+                // (versioning.mdx), even while the probe is still out.
+                if let Ok(Era::Modern(capabilities)) = self.read_probe_error(&e) {
+                    return Ok((Protocol::Modern, capabilities));
+                }
                 // A modern server that was slow to start has answered the
                 // probe by now, and rejected `initialize`.
-                return match tokio::time::timeout(LATE_PROBE_GRACE, &mut probe).await {
-                    Ok(reply) => match self.read_probe(reply) {
-                        Ok(Era::Modern(capabilities)) => Ok((Protocol::Modern, capabilities)),
-                        _ => Err(e),
-                    },
-                    Err(_) => Err(e),
-                };
+                if let Ok(reply) = tokio::time::timeout(LATE_PROBE_GRACE, &mut probe).await
+                    && let Ok(Era::Modern(capabilities)) = self.read_probe(reply)
+                {
+                    return Ok((Protocol::Modern, capabilities));
+                }
+                // A slow-starting server read the queued probe and quit.
+                return Err(if self.transport.is_closed() {
+                    ProbeExited.into()
+                } else {
+                    e
+                });
             }
         };
         self.initialize(offer).await.map_err(|e| {
@@ -1412,19 +1422,22 @@ impl McpClient {
 
     /// Classify the probe's answer.
     fn read_probe(&self, reply: Result<Value>) -> Result<Era> {
-        let error = match reply {
-            Ok(result) => {
-                return match result.get("supportedVersions").and_then(Value::as_array) {
-                    Some(versions) => self.pick_version(
-                        versions,
-                        result.get("capabilities").cloned().unwrap_or(json!({})),
-                    ),
-                    // Not a DiscoverResult: a server that answers anything.
-                    None => Ok(Era::Legacy(LEGACY_PROTOCOL_VERSIONS[0])),
-                };
-            }
-            Err(e) => e,
-        };
+        match reply {
+            Ok(result) => match result.get("supportedVersions").and_then(Value::as_array) {
+                Some(versions) => self.pick_version(
+                    versions,
+                    result.get("capabilities").cloned().unwrap_or(json!({})),
+                ),
+                // Not a DiscoverResult: a server that answers anything.
+                None => Ok(Era::Legacy(LEGACY_PROTOCOL_VERSIONS[0])),
+            },
+            Err(e) => self.read_probe_error(&e),
+        }
+    }
+
+    /// Classify an error the server sent: one of the revision's own errors
+    /// means modern, anything else legacy.
+    fn read_probe_error(&self, error: &anyhow::Error) -> Result<Era> {
         match error.downcast_ref::<RpcError>() {
             // Modern, but not this version: use one it lists.
             Some(rpc) if rpc.code == UNSUPPORTED_PROTOCOL_VERSION => {
@@ -1478,10 +1491,12 @@ impl McpClient {
             "capabilities": {},
             "clientInfo": client_info()
         });
-        let init = self
-            .send("initialize", params, &[])
-            .await
-            .map_err(|e| anyhow!("MCP initialize failed for '{}': {}", self.server_name, e))?;
+        let init = self.send("initialize", params, &[]).await.map_err(|e| {
+            // Context, not a new error: the RpcError stays readable for
+            // era detection after a probe timeout.
+            let msg = format!("MCP initialize failed for '{}': {}", self.server_name, e);
+            e.context(msg)
+        })?;
         let version = init
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -2596,6 +2611,16 @@ done"#
         )
     }
 
+    /// `script`, but the process exits when it reads `server/discover`.
+    /// (`legacy_stdio_script` alone answers the probe: its `_meta` hits the
+    /// "unexpected _meta" arm before the unknown-method one.)
+    #[cfg(unix)]
+    fn exits_on_discover(script: String) -> String {
+        let quit = r#"case "$l" in *'"method":"server/discover"'*) echo exited >> seen.log; exit 1;; esac
+"#;
+        script.replacen(READ_LOOP, &format!("{READ_LOOP}{quit}"), 1)
+    }
+
     #[cfg(unix)]
     async fn stdio_client(dir: &std::path::Path, script: String) -> Result<McpClient> {
         let args = vec!["-c".to_string(), script];
@@ -2731,7 +2756,7 @@ done"#
     #[tokio::test]
     async fn stdio_server_that_exits_on_the_probe_is_restarted_for_the_handshake() {
         let dir = tempfile::tempdir().unwrap();
-        let script = legacy_stdio_script("exit 1");
+        let script = exits_on_discover(legacy_stdio_script(":"));
         let client = stdio_client(dir.path(), script).await.unwrap();
         assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
         assert_eq!(
@@ -2742,6 +2767,7 @@ done"#
             "legacy echoed again"
         );
         let log = seen(dir.path());
+        assert!(log.contains("exited"), "{log}");
         assert_eq!(log.matches("server/discover").count(), 1, "{log}");
         assert_eq!(log.matches(r#""method":"initialize""#).count(), 1, "{log}");
     }
@@ -2762,6 +2788,29 @@ done"#
                 .unwrap(),
             "modern echoed late"
         );
+    }
+
+    /// A legacy server slow to start (an `npx -y` cold start) that quits
+    /// on the probe it reads only after the probe timeout is still started
+    /// again without the probe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_slow_server_that_exits_on_the_late_probe_is_restarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!("sleep 1\n{}", exits_on_discover(legacy_stdio_script(":")));
+        let client = stdio_client(dir.path(), script).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
+        assert_eq!(
+            client
+                .call_tool("echo", json!({"text": "cold"}))
+                .await
+                .unwrap(),
+            "legacy echoed cold"
+        );
+        let log = seen(dir.path());
+        assert!(log.contains("exited"), "{log}");
+        assert_eq!(log.matches("server/discover").count(), 1, "{log}");
+        assert_eq!(log.matches(r#""method":"initialize""#).count(), 1, "{log}");
     }
 
     /// (e): an elicitation in an `input_required` result is declined and
@@ -3125,6 +3174,33 @@ done"#
         );
         assert_eq!(client.protocol, Protocol::Legacy("2024-11-05".into()));
         assert_eq!(client.call_tool("echo", json!({})).await.unwrap(), "pong");
+    }
+
+    /// A modern server whose probe is still unanswered after the timeout
+    /// (a cold replica) but whose `initialize` gets a modern
+    /// `UnsupportedProtocolVersionError` is used as modern, not failed.
+    #[tokio::test]
+    async fn modern_error_to_initialize_after_a_probe_timeout_means_modern() {
+        let (url, seen) = http_server(|head, body| match body["method"].as_str()? {
+            "server/discover" => None,
+            "initialize" => rpc_err(
+                400,
+                &body["id"],
+                -32022,
+                json!({"supported": ["2026-07-28"], "requested": "2025-06-18"}),
+            ),
+            _ => modern_http(head, body),
+        })
+        .await;
+        let client = http_client(&url).await.unwrap();
+        assert_eq!(client.protocol, Protocol::Modern);
+        assert_eq!(client.tools.len(), 2, "{:?}", client.tools);
+        let seen = seen.lock().unwrap();
+        let methods: Vec<&str> = seen
+            .iter()
+            .map(|(_, b)| b["method"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(methods, ["server/discover", "initialize", "tools/list"]);
     }
 
     /// `UnsupportedProtocolVersionError` marks a modern server: the client
