@@ -149,13 +149,15 @@ impl NetPolicy {
     /// `.local`, `.lan`, ...) only when private destinations are allowed.
     fn check_unresolved_name(&self, name: &str) -> Result<()> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
-        if METADATA_NAMES.contains(&name.as_str()) {
+        // Exact names, plus search-domain forms such as AWS's regional
+        // `instance-data.<region>.compute.internal`.
+        let metadata_in_local_domain = name.split_once('.').is_some_and(|(first, rest)| {
+            METADATA_LABELS.contains(&first) && has_local_suffix(rest)
+        });
+        if METADATA_NAMES.contains(&name.as_str()) || metadata_in_local_domain {
             bail!("{name} is a cloud metadata endpoint and is never fetched");
         }
-        let local = !name.contains('.')
-            || LOCAL_SUFFIXES
-                .iter()
-                .any(|s| name.strip_suffix(s).is_some_and(|r| r.ends_with('.')));
+        let local = !name.contains('.') || has_local_suffix(&name);
         if local && !self.allow_private {
             bail!(
                 "{name} did not resolve here and looks like a local-network name; set allowPrivateNetworkFetch: true to let the proxy resolve it"
@@ -211,6 +213,18 @@ const METADATA_NAMES: [&str; 5] = [
     "instance-data.ec2.internal",
 ];
 
+/// First labels that name a cloud metadata service when the rest of the
+/// name is a local-network domain.
+const METADATA_LABELS: [&str; 2] = ["metadata", "instance-data"];
+
+/// `name` is, or ends in, one of [`LOCAL_SUFFIXES`].
+fn has_local_suffix(name: &str) -> bool {
+    LOCAL_SUFFIXES.iter().any(|s| {
+        name.strip_suffix(s)
+            .is_some_and(|r| r.is_empty() || r.ends_with('.'))
+    })
+}
+
 /// Suffixes of names that only exist on a local network (special-use and
 /// de-facto private TLDs).
 const LOCAL_SUFFIXES: [&str; 10] = [
@@ -263,6 +277,21 @@ pub async fn fetch(
     .await
 }
 
+/// The proxy the environment names for `url`, per scheme as reqwest's own
+/// system-proxy lookup does, or `None` when there is none or `NO_PROXY`
+/// covers the host.
+fn env_chain(env: impl Fn(&str) -> Option<String>, url: &Url) -> Option<Url> {
+    let host = url.host_str()?;
+    let vars: &[&str] = if url.scheme() == "https" {
+        &["HTTPS_PROXY", "ALL_PROXY"]
+    } else {
+        &["HTTP_PROXY", "ALL_PROXY"]
+    };
+    EnvProxy::from_vars(env, vars)
+        .filter(|p| !no_proxy_covers(&p.no_proxy, host))
+        .map(|p| p.url)
+}
+
 /// `fetch` with the proxy variables read through `env` and names resolved
 /// by `lookup`.
 async fn fetch_with_env<L, F>(
@@ -283,15 +312,7 @@ where
             .host_str()
             .ok_or_else(|| anyhow!("URL has no host: {current}"))?
             .to_string();
-        // Per scheme, as reqwest's own system-proxy lookup does.
-        let vars: &[&str] = if current.scheme() == "https" {
-            &["HTTPS_PROXY", "ALL_PROXY"]
-        } else {
-            &["HTTP_PROXY", "ALL_PROXY"]
-        };
-        let chain = EnvProxy::from_vars(&env, vars)
-            .filter(|p| !no_proxy_covers(&p.no_proxy, &host))
-            .map(|p| p.url);
+        let chain = env_chain(&env, &current);
         // `no_proxy` drops reqwest's implicit HTTP(S)_PROXY, which would
         // send even a pinned, policy-checked host to a proxy that resolves
         // it again, and could not resolve a name only that proxy knows.
@@ -1565,14 +1586,22 @@ mod tests {
                 "http://metadata/",
                 "http://instance-data/latest/",
                 "http://metadata.goog/",
+                "http://instance-data.eu-west-1.compute.internal/latest/meta-data/",
+                "http://metadata.us-central1-a.c.project.internal/",
             ] {
                 let err = route_of(policy, u).await.err().expect(u);
                 assert!(err.to_string().contains("metadata"), "{u}: {err}");
             }
-            assert!(matches!(
-                route_of(policy, "https://proxy-only.example.com/").await,
-                Ok(Route::Upstream(_))
-            ));
+            // Only a local domain makes the label a metadata name.
+            for u in [
+                "https://proxy-only.example.com/",
+                "https://metadata.example.com/",
+            ] {
+                assert!(
+                    matches!(route_of(policy, u).await, Ok(Route::Upstream(_))),
+                    "{u}"
+                );
+            }
         }
         for u in [
             "http://intranet/",
@@ -1632,6 +1661,40 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "nothing may reach the proxy"
         );
+    }
+
+    /// A NO_PROXY host that resolves to a public address skips the proxy
+    /// and is pinned to the checked address; other hosts keep the proxy.
+    #[tokio::test]
+    async fn no_proxy_public_hosts_get_the_pinned_direct_route() {
+        let env = vars(&[
+            ("HTTP_PROXY", "http://proxy:3128"),
+            ("NO_PROXY", "public.example"),
+        ]);
+        let bypassed = Url::parse("http://public.example/").unwrap();
+        assert_eq!(env_chain(&env, &bypassed), None);
+        assert_eq!(
+            env_chain(&env, &Url::parse("http://other.example/").unwrap()),
+            Some(Url::parse("http://proxy:3128").unwrap())
+        );
+        // Without NO_PROXY the same public host goes to the proxy.
+        let proxied = vars(&[("HTTP_PROXY", "http://proxy:3128")]);
+        assert!(env_chain(&proxied, &bypassed).is_some());
+
+        match route(
+            &NetPolicy::STRICT,
+            &bypassed,
+            env_chain(&env, &bypassed),
+            &fake_dns,
+        )
+        .await
+        .unwrap()
+        {
+            Route::Direct(addrs) => {
+                assert_eq!(addrs, vec!["93.184.215.14:80".parse().unwrap()])
+            }
+            Route::Upstream(p) => panic!("NO_PROXY host sent to the proxy {p}"),
+        }
     }
 
     /// A redirect served through the proxy is checked like the first hop.
