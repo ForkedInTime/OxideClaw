@@ -437,12 +437,8 @@ fn seed_index(cwd: &Path, tree: &str, temp_index: &Path) -> anyhow::Result<()> {
     }
     // No index yet, or one mid-merge (`read-tree -m` refuses unmerged entries).
     let _ = std::fs::remove_file(temp_index);
-    let s = temp_index_cmd(cwd, temp_index)
-        .args(["read-tree", tree])
-        .status()?;
-    if !s.success() {
-        anyhow::bail!("git read-tree {tree} failed");
-    }
+    git_output(temp_index_cmd(cwd, temp_index).args(["read-tree", tree]))
+        .map_err(|e| anyhow::anyhow!("git read-tree {tree} failed: {e}"))?;
     Ok(())
 }
 
@@ -465,32 +461,25 @@ fn stage_worktree(
         // a HEAD that tracks it) would ride along into every later snapshot
         // and make /undo delete the live file. `-f`: that stale copy matches
         // neither the file nor HEAD, and plain `rm --cached` refuses it.
-        let rm = temp_index_cmd(cwd, temp_index)
-            .args([
-                "rm",
-                "--cached",
-                "-f",
-                "-r",
-                "-q",
-                "--ignore-unmatch",
-                "--",
-                RAG_DB_PATHSPEC,
-            ])
-            .stdout(Stdio::null())
-            .status()?;
-        if !rm.success() {
-            anyhow::bail!("git rm --cached {RAG_DB_PATHSPEC} failed");
-        }
+        git_output(temp_index_cmd(cwd, temp_index).args([
+            "rm",
+            "--cached",
+            "-f",
+            "-r",
+            "-q",
+            "--ignore-unmatch",
+            "--",
+            RAG_DB_PATHSPEC,
+        ]))
+        .map_err(|e| anyhow::anyhow!("git rm --cached {RAG_DB_PATHSPEC} failed: {e}"))?;
     }
-    let add_status = temp_index_cmd(cwd, temp_index)
-        // Whole tree from any subdirectory, minus OxideClaw's own SQLite
-        // index/memory store: snapshotting it stored a binary blob per turn,
-        // and /undo overwrote the live database (rolling back memories).
-        .args(["add", "-A", "--", ":(top)", RAG_DB_EXCLUDE])
-        .status()?;
-    if !add_status.success() {
-        anyhow::bail!("git add -A failed");
-    }
+    // Whole tree from any subdirectory, minus OxideClaw's own SQLite
+    // index/memory store: snapshotting it stored a binary blob per turn, and
+    // /undo overwrote the live database (rolling back memories).
+    // Captured, like every git call here: this runs under the raw-mode TUI,
+    // and warnings such as "adding embedded git repository" landed on it.
+    git_output(temp_index_cmd(cwd, temp_index).args(["add", "-A", "--", ":(top)", RAG_DB_EXCLUDE]))
+        .map_err(|e| anyhow::anyhow!("git add -A failed: {e}"))?;
     git_output(temp_index_cmd(cwd, temp_index).args(["write-tree"]))
 }
 
@@ -659,10 +648,16 @@ pub fn snapshot_turn(
         Some(sha) if ref_exists => sha.as_str(),
         _ => "",
     };
-    let update_status = git_cmd(cwd)
+    let update = git_cmd(cwd)
         .args(["update-ref", &ref_name, &commit_sha, expected_old])
-        .status()?;
-    if !update_status.success() {
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !update.status.success() {
+        tracing::debug!(
+            "autoCommit update-ref {ref_name}: {}",
+            String::from_utf8_lossy(&update.stderr).trim()
+        );
         // The commit object is already written and reachable by sha, so nothing
         // the user did is lost — we simply refuse to move the ref over someone
         // else's work.
@@ -831,13 +826,12 @@ pub fn restore_to(
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
-    let read_status = git_cmd(cwd)
-        .env("GIT_INDEX_FILE", &temp_index)
-        .args(["read-tree", &tree_sha])
-        .status()?;
-    if !read_status.success() {
-        anyhow::bail!("git read-tree {tree_sha} failed");
-    }
+    git_output(
+        git_cmd(cwd)
+            .env("GIT_INDEX_FILE", &temp_index)
+            .args(["read-tree", &tree_sha]),
+    )
+    .map_err(|e| anyhow::anyhow!("git read-tree {tree_sha} failed: {e}"))?;
 
     // Index paths are repo-relative, and checkout-index run from a
     // subdirectory skips files outside it, so restore from the top level:
@@ -851,22 +845,22 @@ pub fn restore_to(
         .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
     let prefix = format!("{}/", toplevel.display());
     if !changed.is_empty() {
-        use std::io::Write;
-        let mut child = git_cmd(&toplevel)
+        // The path list goes in through a file: with stderr captured too, a
+        // child blocked on a full stderr pipe would never drain stdin.
+        let paths = td.path().join("restore.paths");
+        std::fs::write(&paths, &changed)?;
+        let out = git_cmd(&toplevel)
             .env("GIT_INDEX_FILE", &temp_index)
             .args(["checkout-index", "-f", "-z", "--stdin", "--prefix", &prefix])
-            .stdin(Stdio::piped())
-            .spawn()?;
-        // Dropping stdin closes it, so checkout-index sees EOF.
-        let written = child
-            .stdin
-            .take()
-            .map(|mut w| w.write_all(&changed))
-            .transpose();
-        let checkout_status = child.wait()?;
-        written?;
-        if !checkout_status.success() {
-            anyhow::bail!("git checkout-index --prefix={prefix} failed");
+            .stdin(std::fs::File::open(&paths)?)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git checkout-index --prefix={prefix} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
     }
 
@@ -965,16 +959,15 @@ fn save_unrecorded_worktree(
         &parents,
         "oxideclaw: working tree saved before /undo or /redo",
     )?;
-    let status = git_cmd(cwd)
-        .args([
-            "update-ref",
-            recovery,
-            &sha,
-            previous.as_deref().unwrap_or(""),
-        ])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("could not save un-snapshotted edits to {recovery}; nothing was restored");
+    if let Err(e) = git_output(git_cmd(cwd).args([
+        "update-ref",
+        recovery,
+        &sha,
+        previous.as_deref().unwrap_or(""),
+    ])) {
+        anyhow::bail!(
+            "could not save un-snapshotted edits to {recovery}; nothing was restored ({e})"
+        );
     }
     Ok((Some(sha), live_tree))
 }
@@ -1031,13 +1024,8 @@ pub fn migrate_legacy_refs(cwd: &Path) -> anyhow::Result<u32> {
     if let Ok(sha) =
         git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", LEGACY_RECOVERY_REF]))
     {
-        let deleted = git_cmd(cwd)
-            .args(["update-ref", "-d", LEGACY_RECOVERY_REF, &sha])
-            .status();
-        if matches!(deleted, Ok(s) if s.success()) {
-            let _ = git_cmd(cwd)
-                .args(["update-ref", &recovery_ref("legacy"), &sha])
-                .status();
+        if git_output(git_cmd(cwd).args(["update-ref", "-d", LEGACY_RECOVERY_REF, &sha])).is_ok() {
+            let _ = git_output(git_cmd(cwd).args(["update-ref", &recovery_ref("legacy"), &sha]));
         }
     }
     let mut moved = 0u32;
@@ -1049,14 +1037,13 @@ pub fn migrate_legacy_refs(cwd: &Path) -> anyhow::Result<u32> {
             continue;
         };
         let new = format!("{SHADOW_REF_PREFIX}{rest}");
-        let created = git_cmd(cwd).args(["update-ref", &new, sha]).status();
-        if !matches!(created, Ok(s) if s.success()) {
-            tracing::warn!("autoCommit migrate: could not create {new}");
+        if let Err(e) = git_output(git_cmd(cwd).args(["update-ref", &new, sha])) {
+            tracing::warn!("autoCommit migrate: could not create {new}: {e}");
             continue;
         }
-        match git_cmd(cwd).args(["update-ref", "-d", old]).status() {
-            Ok(s) if s.success() => moved += 1,
-            _ => tracing::warn!("autoCommit migrate: could not delete {old}"),
+        match git_output(git_cmd(cwd).args(["update-ref", "-d", old])) {
+            Ok(_) => moved += 1,
+            Err(e) => tracing::warn!("autoCommit migrate: could not delete {old}: {e}"),
         }
     }
     Ok(moved)
@@ -1102,9 +1089,8 @@ pub fn prune_old_refs(cwd: &Path, keep: u32, current_session: Option<&str>) -> a
 
     let mut deleted = 0u32;
     for r in &to_delete {
-        let status = git_cmd(cwd).args(["update-ref", "-d", r]).status();
-        match status {
-            Ok(s) if s.success() => {
+        match git_output(git_cmd(cwd).args(["update-ref", "-d", r])) {
+            Ok(_) => {
                 deleted += 1;
                 // The session's saved edits go with it, or they would keep
                 // every pruned snapshot alive through their parents.
@@ -1113,12 +1099,11 @@ pub fn prune_old_refs(cwd: &Path, keep: u32, current_session: Option<&str>) -> a
                     if let Ok(sha) =
                         git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", &rec]))
                     {
-                        let _ = git_cmd(cwd).args(["update-ref", "-d", &rec, &sha]).status();
+                        let _ = git_output(git_cmd(cwd).args(["update-ref", "-d", &rec, &sha]));
                     }
                 }
             }
-            Ok(_) => tracing::warn!("autoCommit prune: failed to delete {r}"),
-            Err(e) => tracing::warn!("autoCommit prune: error deleting {r}: {e}"),
+            Err(e) => tracing::warn!("autoCommit prune: failed to delete {r}: {e}"),
         }
     }
     Ok(deleted)
@@ -1451,6 +1436,74 @@ mod snapshot_tests {
             let parent = String::from_utf8(out.stdout).unwrap().trim().to_string();
             assert_eq!(parent, commits[i - 1], "chain broken at index {i}");
         }
+    }
+
+    /// Snapshots run under the raw-mode TUI, so git must never write to the
+    /// terminal: an untracked nested repo made `add -A` print a 13-line
+    /// warning onto the viewport, and a lost compare-and-swap a `fatal:`.
+    /// fd 2 cannot be captured in-process, so the scenario runs in a child
+    /// copy of this test binary and the parent reads its stderr.
+    #[test]
+    fn git_warnings_never_reach_the_terminal() {
+        const CHILD: &str = "OXIDECLAW_TEST_GIT_STDERR_CHILD";
+        let name = "autocommit::snapshot_tests::git_warnings_never_reach_the_terminal";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "child failed: {stderr}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "child did not run the scenario"
+            );
+            assert!(!stderr.contains("embedded"), "{stderr}");
+            assert!(!stderr.contains("fatal"), "{stderr}");
+            return;
+        }
+        let td = init_test_repo();
+        initial_commit(td.path());
+        let nested = td.path().join("vendor");
+        fs::create_dir_all(&nested).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        ] {
+            assert!(git_cmd(&nested).args(args).status().unwrap().success());
+        }
+        write_file(td.path(), "a.txt", "1\n");
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        let outcome =
+            snapshot_turn(td.path(), &cfg, "s", "t", 1, &mut commits, &mut pos, None).unwrap();
+        assert!(
+            matches!(outcome, SnapshotOutcome::Committed { .. }),
+            "{outcome:?}"
+        );
+
+        // Another instance moved the ref: the CAS fails.
+        let head = resolve_head(td.path()).unwrap();
+        git_output(git_cmd(td.path()).args(["update-ref", &shadow_ref("s"), &head])).unwrap();
+        write_file(td.path(), "a.txt", "2\n");
+        let outcome =
+            snapshot_turn(td.path(), &cfg, "s", "t", 2, &mut commits, &mut pos, None).unwrap();
+        assert!(
+            matches!(outcome, SnapshotOutcome::Conflict { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]
