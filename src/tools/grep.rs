@@ -318,7 +318,19 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
 
     if text.trim().is_empty() {
         if failed {
-            return Ok(ToolOutput::error(format!("rg failed: {stderr}")));
+            // A bad regex or a missing path is a failed search. rg also
+            // exits 2 for one unreadable file (a root-owned docker volume),
+            // which must not turn every negative search into an error.
+            if rg_failure_is_fatal(input, &search_path) {
+                return Ok(ToolOutput::error(format!("rg failed: {stderr}")));
+            }
+            if !stderr.is_empty() {
+                let note: Vec<&str> = stderr.lines().take(5).collect();
+                return Ok(ToolOutput::success(format!(
+                    "No matches found.\n[rg errors]\n{}",
+                    note.join("\n")
+                )));
+            }
         }
         return Ok(ToolOutput::success("No matches found."));
     }
@@ -329,6 +341,16 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
     }
 
     Ok(ToolOutput::success(text))
+}
+
+/// Whether an rg exit 2 with no output means the search itself failed (bad
+/// regex, missing path) rather than some files being unreadable.
+fn rg_failure_is_fatal(input: &GrepInput, search_path: &Path) -> bool {
+    !search_path.exists()
+        || regex::RegexBuilder::new(&input.pattern)
+            .case_insensitive(input.case_insensitive)
+            .build()
+            .is_err()
 }
 
 async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput> {
@@ -714,6 +736,32 @@ mod search_scope_tests {
 
         let out = rg(json!({"pattern": "foo", "output_mode": "content", "-n": true})).await;
         assert!(text(&out).contains(":2:foo(1)"), "{}", text(&out));
+
+        // One unreadable file is not a failed search.
+        let fatal = |v: serde_json::Value, p: &Path| {
+            rg_failure_is_fatal(&serde_json::from_value(v).unwrap(), p)
+        };
+        assert!(!fatal(json!({"pattern": "nothing-here"}), dir.path()));
+        assert!(fatal(json!({"pattern": "foo("}), dir.path()));
+        assert!(fatal(json!({"pattern": "x"}), &dir.path().join("missing")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            write(dir.path(), "locked/b.rs", "secret\n");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root reads it anyway; the check only means something otherwise.
+            if std::fs::read_dir(&locked).is_err() {
+                let out = rg(json!({"pattern": "nothing-here"})).await;
+                assert!(!out.is_error, "{}", text(&out));
+                assert!(
+                    text(&out).starts_with("No matches found."),
+                    "{}",
+                    text(&out)
+                );
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// The walker (the only backend in the Docker image) ignored

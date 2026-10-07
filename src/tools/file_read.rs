@@ -132,7 +132,7 @@ impl Tool for FileReadTool {
         let offset = input.offset.unwrap_or(1).saturating_sub(1); // convert to 0-indexed
         let limit = input.limit.unwrap_or(MAX_LINES_DEFAULT);
 
-        let end = (offset + limit).min(total_lines);
+        let end = offset.saturating_add(limit).min(total_lines);
         let selected = &lines[offset.min(total_lines)..end];
 
         // Format with line numbers (cat -n style), 1-indexed
@@ -175,7 +175,7 @@ async fn read_section(
     let mut capped = false;
     let mut line = Vec::new();
 
-    'lines: while line_no < offset + limit {
+    'lines: while line_no < offset.saturating_add(limit) {
         line.clear();
         let keep = line_no >= offset;
         let mut saw_bytes = false;
@@ -317,6 +317,26 @@ mod tests {
         let tail = text(&read(&ctx, json!({"file_path": "big.txt", "offset": 2001})).await);
         assert!(tail.contains("2500\tl2500"), "{tail}");
         assert!(!tail.contains("showing lines"), "{tail}");
+    }
+
+    /// `offset + limit` wrapped (or panicked) for a huge model-supplied
+    /// limit, reading nothing.
+    #[tokio::test]
+    async fn huge_limit_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, "a\nb\nc\n").unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let out = text(
+            &read(
+                &ctx,
+                json!({"file_path": "f.txt", "offset": 2, "limit": usize::MAX}),
+            )
+            .await,
+        );
+        assert!(out.contains("2\tb\n3\tc"), "{out}");
+        let out = read_section(&f, 1, usize::MAX, 6).await.unwrap();
+        assert!(out.contains("2\tb") && out.contains("3\tc"), "{out}");
     }
 
     #[tokio::test]
