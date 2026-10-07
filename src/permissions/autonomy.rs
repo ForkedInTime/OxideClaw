@@ -1,0 +1,528 @@
+//! Autonomy modes: how much the permission gate approves on its own.
+//!
+//! The mode only adjusts what the rules leave open. A `permissions.deny`
+//! rule (or an SDK host's deny list) refuses a call in every mode, and an
+//! explicit allow rule still allows in every mode but `suggest`.
+
+use serde::{Deserialize, Serialize};
+use std::path::{Component, Path};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Autonomy {
+    /// Every edit prompts, even one an allow rule or `[a]lways` covers; the
+    /// auto-fix loop does not run.
+    Suggest,
+    /// Edits and commands prompt unless a rule allows them.
+    #[default]
+    Ask,
+    /// Edits inside the project are pre-approved, except to the files in
+    /// [`is_protected`]; commands still prompt.
+    AutoEdit,
+    /// Everything is pre-approved. Only with a bwrap or firejail sandbox.
+    FullAuto,
+}
+
+/// What a mode says about one call, before the rules are consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Prompt even if a rule allows it (`suggest` on an edit).
+    Prompt,
+    /// Allow it without a prompt unless a rule denies it.
+    PreApproved,
+    /// The rules decide.
+    Rules,
+}
+
+/// The tools that write files.
+pub const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// Directories whose contents a pre-approved edit must not touch: VCS and
+/// agent state, CI, git hook managers, and what auto-fix's runners execute
+/// or load (`.cargo/config.toml` runners, the `.venv` ruff/pytest).
+const PROTECTED_DIRS: &[&str] = &[
+    ".git",
+    ".claude",
+    ".oxideclaw",
+    ".agents",
+    ".github",
+    ".gitlab",
+    ".circleci",
+    ".buildkite",
+    ".woodpecker",
+    ".husky",
+    ".githooks",
+    ".cargo",
+    ".venv",
+];
+
+/// File names (lowercase) that are hook, CI or build/test-runner config: an
+/// unprompted edit to one becomes code execution on the next auto-fix check
+/// or CI run.
+const PROTECTED_FILES: &[&str] = &[
+    ".mcp.json",
+    ".gitlab-ci.yml",
+    ".travis.yml",
+    ".drone.yml",
+    ".woodpecker.yml",
+    "azure-pipelines.yml",
+    "bitbucket-pipelines.yml",
+    "appveyor.yml",
+    "jenkinsfile",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yml",
+    ".lefthook.yaml",
+    "package.json",
+    ".npmrc",
+    "cargo.toml",
+    "build.rs",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    "conftest.py",
+    "pytest.ini",
+    "setup.py",
+    "setup.cfg",
+    "pyproject.toml",
+    "tox.ini",
+    "noxfile.py",
+    "makefile",
+    "gnumakefile",
+    "justfile",
+    ".justfile",
+];
+
+/// Name prefixes: `.env`, `.env.local`, `.envrc` (direnv runs it), and the
+/// ESLint configs `npx eslint` executes.
+const PROTECTED_PREFIXES: &[&str] = &[".env", "eslint.config.", ".eslintrc"];
+
+/// MSBuild projects and the `.props` / `.targets` files they import.
+const PROTECTED_EXTENSIONS: &[&str] = &["csproj", "fsproj", "vbproj", "props", "targets"];
+
+impl Autonomy {
+    pub const ALL: [Autonomy; 4] = [Self::Suggest, Self::Ask, Self::AutoEdit, Self::FullAuto];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "suggest" => Some(Self::Suggest),
+            "ask" => Some(Self::Ask),
+            "auto-edit" => Some(Self::AutoEdit),
+            "full-auto" => Some(Self::FullAuto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Suggest => "suggest",
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto-edit",
+            Self::FullAuto => "full-auto",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::FullAuto => 0,
+            Self::AutoEdit => 1,
+            Self::Ask => 2,
+            Self::Suggest => 3,
+        }
+    }
+
+    /// Prompts at least wherever `other` does.
+    pub fn at_least_as_strict_as(self, other: Self) -> bool {
+        self.rank() >= other.rank()
+    }
+
+    /// The mode the gates apply: `full-auto` without a usable bwrap or
+    /// firejail sandbox (see [`full_auto_blocker`]) is `ask`.
+    pub fn effective(self, sandbox_enabled: bool, sandbox_mode: &str) -> Self {
+        if self == Self::FullAuto && full_auto_blocker(sandbox_enabled, sandbox_mode).is_some() {
+            Self::Ask
+        } else {
+            self
+        }
+    }
+
+    /// This mode's say on `tool` called with `input` in project `project`.
+    pub fn verdict(self, tool: &str, input: &serde_json::Value, project: &Path) -> Verdict {
+        self.verdict_with_home(tool, input, project, dirs::home_dir().as_deref())
+    }
+
+    pub(crate) fn verdict_with_home(
+        self,
+        tool: &str,
+        input: &serde_json::Value,
+        project: &Path,
+        home: Option<&Path>,
+    ) -> Verdict {
+        let edit = EDIT_TOOLS.contains(&tool);
+        match self {
+            Self::Suggest if edit => Verdict::Prompt,
+            Self::AutoEdit if edit && edit_preapproved(tool, input, project, home) => {
+                Verdict::PreApproved
+            }
+            // Leaving plan mode is the user's review of the plan, not a
+            // permission: full-auto does not answer it for them.
+            Self::FullAuto if tool == "ExitPlanMode" => Verdict::Rules,
+            Self::FullAuto if edit && project_holds_home(project, home) => Verdict::Rules,
+            Self::FullAuto => Verdict::PreApproved,
+            _ => Verdict::Rules,
+        }
+    }
+}
+
+impl std::fmt::Display for Autonomy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why `full-auto` cannot be used with this sandbox setting, or `None` when
+/// it can: it needs bwrap or firejail, enabled and installed, on Linux.
+pub fn full_auto_blocker(sandbox_enabled: bool, sandbox_mode: &str) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return Some(
+            "full-auto is unavailable on this platform until a native sandbox ships: it \
+             requires bwrap or firejail, which exist only on Linux."
+                .into(),
+        );
+    }
+    if !sandbox_enabled || !crate::sandbox::mode_enforces_isolation(sandbox_mode) {
+        return Some(
+            "full-auto requires the bwrap or firejail sandbox: run /sandbox enable bwrap \
+             (or firejail) first."
+                .into(),
+        );
+    }
+    let installed = match sandbox_mode {
+        "bwrap" => crate::sandbox::bwrap_available(),
+        _ => crate::sandbox::firejail_available(),
+    };
+    (!installed).then(|| {
+        format!(
+            "full-auto requires the {sandbox_mode} sandbox, but {sandbox_mode} is not \
+             installed."
+        )
+    })
+}
+
+/// Run from `$HOME` (or a directory above it), "the project" is every
+/// dotfile the user has: no edit is pre-approved there.
+fn project_holds_home(project: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    home.starts_with(project) || real(home).starts_with(real(project))
+}
+
+/// The files an edit tool call writes, or `None` when its input names none.
+fn edit_paths<'a>(tool: &str, input: &'a serde_json::Value) -> Option<Vec<&'a str>> {
+    let field = |v: &'a serde_json::Value, key: &str| v.get(key).and_then(|p| p.as_str());
+    let paths: Vec<&str> = match tool {
+        "Write" | "Edit" => vec![field(input, "file_path")?],
+        "NotebookEdit" => vec![field(input, "notebook_path")?],
+        "MultiEdit" => input
+            .get("edits")?
+            .as_array()?
+            .iter()
+            .map(|e| field(e, "file_path"))
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// `auto-edit`'s rule: every file the call writes is inside `project` (after
+/// resolving symlinks) and none is protected, and `project` is not `$HOME`.
+fn edit_preapproved(
+    tool: &str,
+    input: &serde_json::Value,
+    project: &Path,
+    home: Option<&Path>,
+) -> bool {
+    if project_holds_home(project, home) {
+        return false;
+    }
+    let Some(paths) = edit_paths(tool, input) else {
+        return false;
+    };
+    let real_root = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    paths
+        .iter()
+        .all(|p| path_preapproved(p, project, &real_root))
+}
+
+fn path_preapproved(file: &str, project: &Path, real_root: &Path) -> bool {
+    // The tools' own resolution: `~` expanded, relative paths joined to the
+    // project and refused when they climb out of it.
+    let Ok(path) = crate::tools::file_read::resolve_path(file, project) else {
+        return false;
+    };
+    let lexical = std::path::PathBuf::from(super::normalize_lexically(&path.to_string_lossy()));
+    // A symlink inside the project can point anywhere, `.git/hooks` included.
+    let real = crate::tools::resolve_for_sensitivity_check(&lexical);
+    let Ok(rel) = real.strip_prefix(real_root) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() || is_protected(rel) {
+        return false;
+    }
+    lexical
+        .strip_prefix(project)
+        .map_or(true, |rel| !is_protected(rel))
+}
+
+/// Whether `rel` (relative to the project root) is a file `auto-edit` still
+/// prompts for. Compared case-insensitively, as macOS and Windows resolve
+/// `.GIT/hooks` to `.git/hooks`.
+pub fn is_protected(rel: &Path) -> bool {
+    let names: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let Some(file) = names.last() else {
+        return true;
+    };
+    names.iter().any(|n| PROTECTED_DIRS.contains(&n.as_str()))
+        || PROTECTED_FILES.contains(&file.as_str())
+        || PROTECTED_PREFIXES.iter().any(|p| file.starts_with(p))
+        || Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| PROTECTED_EXTENSIONS.contains(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn write(path: &str) -> serde_json::Value {
+        json!({"file_path": path, "content": "x"})
+    }
+
+    #[test]
+    fn names_round_trip_and_unknown_names_are_refused() {
+        for a in Autonomy::ALL {
+            assert_eq!(Autonomy::parse(a.as_str()), Some(a));
+            assert_eq!(
+                serde_json::to_value(a).unwrap(),
+                json!(a.as_str()),
+                "config serialises the same names"
+            );
+        }
+        assert_eq!(Autonomy::parse(" Full-Auto "), Some(Autonomy::FullAuto));
+        assert_eq!(Autonomy::parse("read-only"), None);
+        assert_eq!(Autonomy::default(), Autonomy::Ask);
+    }
+
+    #[test]
+    fn protected_paths_are_recognised_anywhere_in_the_project() {
+        for p in [
+            ".git/hooks/pre-commit",
+            "sub/.git/config",
+            ".claude/settings.json",
+            ".oxideclaw/x",
+            ".agents/skills/a/SKILL.md",
+            ".mcp.json",
+            ".env",
+            ".env.production",
+            ".envrc",
+            ".github/workflows/ci.yml",
+            ".gitlab-ci.yml",
+            ".husky/pre-commit",
+            ".pre-commit-config.yaml",
+            "package.json",
+            "web/package.json",
+            "Cargo.toml",
+            "crates/x/build.rs",
+            "conftest.py",
+            "tests/conftest.py",
+            "pytest.ini",
+            "Makefile",
+            "justfile",
+            "setup.py",
+            "pyproject.toml",
+            "tox.ini",
+            "app/App.csproj",
+            "Directory.Build.targets",
+            ".cargo/config.toml",
+            ".venv/bin/pytest",
+            "eslint.config.mjs",
+            ".GIT/hooks/pre-push",
+        ] {
+            assert!(is_protected(Path::new(p)), "{p}");
+        }
+        for p in [
+            "src/main.rs",
+            "README.md",
+            "docs/github.md",
+            "src/environment.rs",
+            "tests/test_app.py",
+            "Cargo.lock",
+        ] {
+            assert!(!is_protected(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn auto_edit_pre_approves_only_unprotected_edits_inside_the_project() {
+        let proj = tempfile::tempdir().unwrap();
+        let root = proj.path();
+        let home = Some(Path::new("/nonexistent-home"));
+        let v = |tool: &str, input: serde_json::Value| {
+            Autonomy::AutoEdit.verdict_with_home(tool, &input, root, home)
+        };
+        assert_eq!(v("Write", write("src/a.rs")), Verdict::PreApproved);
+        let abs = root.join("src/b.rs").to_string_lossy().into_owned();
+        assert_eq!(v("Edit", write(&abs)), Verdict::PreApproved);
+        assert_eq!(
+            v("NotebookEdit", json!({"notebook_path": "nb.ipynb"})),
+            Verdict::PreApproved
+        );
+        assert_eq!(
+            v(
+                "MultiEdit",
+                json!({"edits": [{"file_path": "a.rs"}, {"file_path": "b.rs"}]})
+            ),
+            Verdict::PreApproved
+        );
+
+        // Outside the project, through `..`, `~` or an absolute path.
+        assert_eq!(v("Write", write("../x.rs")), Verdict::Rules);
+        assert_eq!(v("Write", write("/etc/hosts")), Verdict::Rules);
+        assert_eq!(v("Write", write("~/.bashrc")), Verdict::Rules);
+        let climb = format!("{}/src/../../x", root.display());
+        assert_eq!(v("Write", write(&climb)), Verdict::Rules);
+        // One protected file makes the whole MultiEdit prompt.
+        assert_eq!(
+            v(
+                "MultiEdit",
+                json!({"edits": [{"file_path": "a.rs"}, {"file_path": "Cargo.toml"}]})
+            ),
+            Verdict::Rules
+        );
+        assert_eq!(v("MultiEdit", json!({"edits": []})), Verdict::Rules);
+        assert_eq!(v("Write", json!({})), Verdict::Rules);
+        assert_eq!(v("Write", write(".git/hooks/pre-commit")), Verdict::Rules);
+        assert_eq!(v("Edit", write(".github/workflows/ci.yml")), Verdict::Rules);
+        // Commands and other tools are left to the rules.
+        assert_eq!(v("Bash", json!({"command": "ls"})), Verdict::Rules);
+        assert_eq!(v("mcp__fs__write_file", json!({})), Verdict::Rules);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_project_or_into_a_protected_dir_is_not_pre_approved() {
+        let proj = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = proj.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.join(".git/hooks"), root.join("hooks")).unwrap();
+        let v = |p: &str| Autonomy::AutoEdit.verdict_with_home("Write", &write(p), root, None);
+        assert_eq!(v("out/x.rs"), Verdict::Rules);
+        assert_eq!(v("hooks/pre-commit"), Verdict::Rules);
+        assert_eq!(v("src/x.rs"), Verdict::PreApproved);
+    }
+
+    #[test]
+    fn no_edit_is_pre_approved_when_the_project_is_home_or_above_it() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        for root in [h, h.parent().unwrap()] {
+            for mode in [Autonomy::AutoEdit, Autonomy::FullAuto] {
+                assert_eq!(
+                    mode.verdict_with_home("Write", &write("notes.txt"), root, Some(h)),
+                    Verdict::Rules,
+                    "{mode} in {}",
+                    root.display()
+                );
+            }
+        }
+        // A project inside $HOME is fine.
+        let proj = h.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert_eq!(
+            Autonomy::AutoEdit.verdict_with_home("Write", &write("a.rs"), &proj, Some(h)),
+            Verdict::PreApproved
+        );
+    }
+
+    #[test]
+    fn suggest_prompts_every_edit_and_full_auto_pre_approves_the_rest() {
+        let root = Path::new("/proj");
+        let home = Some(Path::new("/home/u"));
+        for tool in EDIT_TOOLS {
+            assert_eq!(
+                Autonomy::Suggest.verdict_with_home(tool, &write("a"), root, home),
+                Verdict::Prompt,
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            Autonomy::Suggest.verdict_with_home("Bash", &json!({"command": "ls"}), root, home),
+            Verdict::Rules
+        );
+        for tool in ["Bash", "Write", "mcp__fs__write_file", "PowerShell"] {
+            assert_eq!(
+                Autonomy::FullAuto.verdict_with_home(tool, &write("/etc/x"), root, home),
+                Verdict::PreApproved,
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            Autonomy::FullAuto.verdict_with_home("ExitPlanMode", &json!({}), root, home),
+            Verdict::Rules
+        );
+        for tool in ["Bash", "Write"] {
+            assert_eq!(
+                Autonomy::Ask.verdict_with_home(tool, &write("a"), root, home),
+                Verdict::Rules
+            );
+        }
+    }
+
+    #[test]
+    fn full_auto_falls_back_to_ask_without_an_isolating_sandbox() {
+        for (enabled, mode) in [(false, "bwrap"), (true, "strict"), (true, "nonsense")] {
+            assert!(
+                full_auto_blocker(enabled, mode).is_some(),
+                "{enabled} {mode}"
+            );
+            assert_eq!(Autonomy::FullAuto.effective(enabled, mode), Autonomy::Ask);
+        }
+        assert_eq!(
+            Autonomy::AutoEdit.effective(false, "strict"),
+            Autonomy::AutoEdit
+        );
+        if !cfg!(target_os = "linux") {
+            assert!(full_auto_blocker(true, "bwrap").is_some());
+        } else if crate::sandbox::bwrap_available() {
+            assert_eq!(full_auto_blocker(true, "bwrap"), None);
+            assert_eq!(
+                Autonomy::FullAuto.effective(true, "bwrap"),
+                Autonomy::FullAuto
+            );
+        } else {
+            let why = full_auto_blocker(true, "bwrap").unwrap();
+            assert!(why.contains("not installed"), "{why}");
+        }
+    }
+
+    #[test]
+    fn strictness_orders_the_modes() {
+        assert!(Autonomy::Suggest.at_least_as_strict_as(Autonomy::Ask));
+        assert!(Autonomy::Ask.at_least_as_strict_as(Autonomy::Ask));
+        assert!(Autonomy::Ask.at_least_as_strict_as(Autonomy::AutoEdit));
+        assert!(!Autonomy::AutoEdit.at_least_as_strict_as(Autonomy::Ask));
+        assert!(!Autonomy::FullAuto.at_least_as_strict_as(Autonomy::AutoEdit));
+    }
+}

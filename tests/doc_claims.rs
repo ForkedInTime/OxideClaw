@@ -152,10 +152,10 @@ fn comparison_table_names_the_major_agents_and_three_unique_rows() {
 #[test]
 fn autofix_is_gated_on_trust_and_readme_says_so() {
     let config = oxideclaw::config::Config::default();
-    assert_eq!(config.autonomy, "auto-edit");
+    assert_eq!(config.autonomy, oxideclaw::permissions::Autonomy::Ask);
     assert!(oxideclaw::autofix::should_trigger(
         &config.auto_fix,
-        &config.autonomy
+        config.autonomy
     ));
     assert!(!config.project_trusted);
     let dir = tempfile::tempdir().unwrap();
@@ -167,7 +167,7 @@ fn autofix_is_gated_on_trust_and_readme_says_so() {
     let action = oxideclaw::autofix::run_auto_fix_check(
         dir.path(),
         &config.auto_fix,
-        &config.autonomy,
+        config.autonomy,
         0,
         &untrusted,
         &std::sync::atomic::AtomicBool::new(false),

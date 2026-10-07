@@ -122,6 +122,12 @@ impl SdkSession {
         }
 
         let interactive = capabilities.interactive_approval;
+        // The user's /autonomy mode fills in what the host's policy leaves
+        // open, as the TUI and -p gates apply it.
+        let policy_engine = Arc::new(
+            PolicyEngine::new(policy, interactive)
+                .with_autonomy(config.effective_autonomy(), &config.cwd),
+        );
         let (child_usage_tx, child_usage_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
@@ -132,7 +138,7 @@ impl SdkSession {
             tools,
             messages: Vec::new(),
             cost_tracker,
-            policy_engine: Arc::new(PolicyEngine::new(policy, interactive)),
+            policy_engine,
             capabilities,
             tools_used_this_turn: Vec::new(),
             skill_shell_blocked: false,
@@ -655,7 +661,8 @@ impl SdkSession {
             crate::permissions::PermissionGate::new(
                 crate::permissions::PermissionState::new(false, &[], &self.config.permissions_deny)
                     .with_cwd(&self.config.cwd),
-                false,
+                // The host policy the asker consults applies the mode.
+                crate::permissions::Autonomy::Ask,
                 Some(Arc::new(child_asker)),
             )
             .with_asker_for_all_tools(),
@@ -722,7 +729,7 @@ impl SdkSession {
                 continue;
             }
 
-            let decision = self.policy_engine.evaluate(name);
+            let decision = self.policy_engine.evaluate(name, input);
 
             match decision {
                 ApprovalDecision::Deny => {

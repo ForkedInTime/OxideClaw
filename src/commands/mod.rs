@@ -250,8 +250,8 @@ pub enum CommandAction {
     RouterSetTier { tier: String, model: String },
     /// Create a git checkpoint commit (auto-stash of working changes)
     GitCheckpoint(Option<String>),
-    /// Set autonomy level: "suggest", "auto-edit", "full-auto"
-    SetAutonomy(String),
+    /// Switch the session's autonomy mode (full-auto only with its sandbox).
+    SetAutonomy(crate::permissions::Autonomy),
     /// Spawn a background agent in a git worktree
     SpawnAgent(String),
     /// List all spawned background agents
@@ -439,7 +439,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
             Some(args.to_string())
         }),
         "lint" => cmd_lint(ctx),
-        "autonomy" => cmd_autonomy(args),
+        "autonomy" => cmd_autonomy(args, ctx.config.autonomy),
         "add-dir" => cmd_add_dir(args, ctx),
         "pr_comments" => cmd_pr_comments(args, ctx),
         "usage" => cmd_usage(ctx),

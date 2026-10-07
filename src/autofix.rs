@@ -13,6 +13,7 @@
 //!   - `format_feedback_message` — build the anti-cheat retry prompt
 //!   - `run_auto_fix_check`   — top-level decision helper returning `AutoFixAction`
 
+use crate::permissions::Autonomy;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,7 +76,7 @@ impl Containment {
 /// When should the auto-fix check run?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoFixTrigger {
-    /// Only run when `/autonomy` mode is `auto-edit` or `full-auto`.
+    /// Run in every `/autonomy` mode but `suggest`.
     Autonomous,
     /// Run after every edit regardless of autonomy.
     Always,
@@ -299,18 +300,15 @@ fn read_package_json(cwd: &Path) -> Option<serde_json::Value> {
 
 /// Check if the auto-fix loop should trigger right now.
 ///
-/// `autonomy_mode` is a &str matching the current autonomy level:
-/// `"read-only"`, `"plan-only"`, `"auto-edit"`, or `"full-auto"`.
-pub fn should_trigger(config: &AutoFixConfig, autonomy_mode: &str) -> bool {
+/// `autonomy_mode` is the session's current `/autonomy` mode.
+pub fn should_trigger(config: &AutoFixConfig, autonomy_mode: Autonomy) -> bool {
     if !config.enabled {
         return false;
     }
     match config.trigger {
         AutoFixTrigger::Off => false,
         AutoFixTrigger::Always => true,
-        AutoFixTrigger::Autonomous => {
-            matches!(autonomy_mode, "auto-edit" | "full-auto")
-        }
+        AutoFixTrigger::Autonomous => autonomy_mode != Autonomy::Suggest,
     }
 }
 
@@ -770,15 +768,14 @@ pub enum AutoFixAction {
 
 /// Run lint + tests and decide what the TUI turn loop should do next.
 ///
-/// `autonomy_mode` is the current autonomy string (`"read-only"` /
-/// `"plan-only"` / `"auto-edit"` / `"full-auto"`).
+/// `autonomy_mode` is the session's current `/autonomy` mode.
 /// `retries_used` is the number of retries *already consumed* by this
 /// user-prompt turn (so the first call passes `0`). Nothing runs unless
 /// `containment.trusted`; what does run goes through its sandbox.
 pub fn run_auto_fix_check(
     cwd: &Path,
     config: &AutoFixConfig,
-    autonomy_mode: &str,
+    autonomy_mode: Autonomy,
     retries_used: u32,
     containment: &Containment,
     cancel: &AtomicBool,
@@ -1145,7 +1142,7 @@ mod tests {
         let action = super::run_auto_fix_check(
             proj.path(),
             &cfg,
-            "auto-edit",
+            crate::permissions::Autonomy::AutoEdit,
             0,
             &trusted(),
             &NOT_CANCELLED,
@@ -1538,8 +1535,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action =
-            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         assert!(
             matches!(action, AutoFixAction::Continue { .. }),
             "got {action:?}"
@@ -1557,8 +1560,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action =
-            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         match action {
             AutoFixAction::Retry { feedback, status } => {
                 assert!(feedback.contains("Your last edits failed"));
@@ -1581,8 +1590,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action =
-            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 1, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            1,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         match action {
             AutoFixAction::Retry { feedback, status } => {
                 assert!(feedback.contains("## Tests"));
@@ -1603,8 +1618,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action =
-            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            3,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         match action {
             AutoFixAction::GiveUp { status } => {
                 assert!(status.contains("cap reached"));
@@ -1626,8 +1647,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action =
-            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         match action {
             AutoFixAction::Continue { status } => {
                 assert!(status.is_none(), "trigger off should be silent");
@@ -1647,8 +1674,30 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "suggest", 0, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::Suggest,
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
+    }
+
+    /// The default mode became `ask` (prompted edits, as `auto-edit` was);
+    /// the loop must keep running after approved edits there.
+    #[test]
+    fn the_autonomous_trigger_runs_in_every_mode_but_suggest() {
+        let cfg = AutoFixConfig::default();
+        assert_eq!(cfg.trigger, AutoFixTrigger::Autonomous);
+        for mode in Autonomy::ALL {
+            assert_eq!(
+                should_trigger(&cfg, mode),
+                mode != Autonomy::Suggest,
+                "{mode}"
+            );
+        }
     }
 
     #[test]
@@ -1662,8 +1711,14 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action =
-            run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &trusted(), &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            0,
+            &trusted(),
+            &NOT_CANCELLED,
+        );
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
     }
 
@@ -1689,7 +1744,7 @@ mod tests {
         let action = run_auto_fix_check(
             dir.path(),
             &marker_cfg(),
-            "auto-edit",
+            Autonomy::AutoEdit,
             0,
             &untrusted,
             &NOT_CANCELLED,
@@ -1709,7 +1764,7 @@ mod tests {
         let action = run_auto_fix_check(
             proj.path(),
             &cfg,
-            "auto-edit",
+            Autonomy::AutoEdit,
             0,
             &untrusted,
             &NOT_CANCELLED,
@@ -1721,7 +1776,7 @@ mod tests {
         let action = run_auto_fix_check(
             empty.path(),
             &cfg,
-            "auto-edit",
+            Autonomy::AutoEdit,
             0,
             &untrusted,
             &NOT_CANCELLED,
@@ -1737,7 +1792,7 @@ mod tests {
                 trigger: AutoFixTrigger::Off,
                 ..marker_cfg()
             },
-            "auto-edit",
+            Autonomy::AutoEdit,
             0,
             &untrusted,
             &NOT_CANCELLED,
@@ -1754,7 +1809,7 @@ mod tests {
         let action = run_auto_fix_check(
             dir.path(),
             &marker_cfg(),
-            "auto-edit",
+            Autonomy::AutoEdit,
             0,
             &trusted(),
             &NOT_CANCELLED,
@@ -1783,7 +1838,14 @@ mod tests {
             test_command: Some("touch test.marker # rm -rf /".to_string()),
             ..marker_cfg()
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &strict, &NOT_CANCELLED);
+        let action = run_auto_fix_check(
+            dir.path(),
+            &cfg,
+            Autonomy::AutoEdit,
+            0,
+            &strict,
+            &NOT_CANCELLED,
+        );
         match action {
             AutoFixAction::Continue { status: Some(s) } => {
                 assert!(s.contains("Blocked by strict sandbox"), "{s}")
@@ -1799,7 +1861,7 @@ mod tests {
         let action = run_auto_fix_check(
             dir.path(),
             &marker_cfg(),
-            "auto-edit",
+            Autonomy::AutoEdit,
             0,
             &broken,
             &NOT_CANCELLED,

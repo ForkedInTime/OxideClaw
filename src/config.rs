@@ -343,6 +343,12 @@ pub struct Config {
     #[serde(skip)]
     pub settings_load_errors: Vec<String>,
 
+    /// Settings that loaded but were not applied as written (an unknown or
+    /// project-loosened `autonomy`, a `full-auto` without its sandbox), one
+    /// line each. Shown where `settings_load_errors` are.
+    #[serde(skip)]
+    pub settings_notices: Vec<String>,
+
     /// Active sandbox mode: "strict", "bwrap", or "firejail".
     pub sandbox_mode: String,
 
@@ -418,10 +424,10 @@ pub struct Config {
     /// Router: model for super-high-complexity tasks (1M context).
     pub router_super_high_model: Option<String>,
 
-    /// Autonomy level: "suggest" | "auto-edit" | "full-auto".
-    /// "suggest" forces a prompt for every Write/Edit/MultiEdit and skips the
-    /// auto-fix loop; the other two use the normal permission rules.
-    pub autonomy: String,
+    /// Autonomy mode (`/autonomy`, `autonomy` in settings.json). The gates
+    /// apply [`Config::effective_autonomy`], which turns a `full-auto`
+    /// without its sandbox into `ask`.
+    pub autonomy: crate::permissions::Autonomy,
 
     /// Auto-capture notable decisions/preferences from assistant responses into memory.
     pub memory_auto_capture: bool,
@@ -512,6 +518,7 @@ impl Default for Config {
             untrusted_project_config: Vec::new(),
             project_trusted: false,
             settings_load_errors: Vec::new(),
+            settings_notices: Vec::new(),
             api_key_helper_rejected: Vec::new(),
             startup_notice: None,
             sandbox_mode: "strict".to_string(),
@@ -542,7 +549,7 @@ impl Default for Config {
             router_medium_model: None,
             router_high_model: None,
             router_super_high_model: None,
-            autonomy: "auto-edit".to_string(),
+            autonomy: crate::permissions::Autonomy::Ask,
             memory_auto_capture: false,
             phase_router: crate::router::PhaseRouterConfig::default(),
             auto_fix: crate::autofix::AutoFixConfig::default(),
@@ -791,6 +798,7 @@ impl Config {
             untrusted_project_config: new.untrusted_project_config,
             project_trusted: new.project_trusted,
             settings_load_errors: new.settings_load_errors,
+            settings_notices: new.settings_notices,
             sandbox_mode: new.sandbox_mode,
             voice_enabled: new.voice_enabled,
             voice_api_url: new.voice_api_url,
@@ -945,6 +953,7 @@ impl Config {
         self.untrusted_project_config = settings.untrusted_project_config;
         self.project_trusted = settings.project_trusted;
         self.settings_load_errors = settings.load_errors;
+        self.settings_notices = settings.notices;
         self.disable_all_hooks = settings.disable_all_hooks.unwrap_or(false);
         // v2.1.91: reject cleanupPeriodDays: 0 — it's ambiguous (off? or delete
         // everything immediately?). Warn and treat as unset.
@@ -993,7 +1002,17 @@ impl Config {
         self.router_high_model = tier(settings.router_high_model);
         self.router_super_high_model = tier(settings.router_super_high_model);
         if let Some(a) = settings.autonomy {
-            self.autonomy = a;
+            match crate::permissions::Autonomy::parse(&a) {
+                Some(mode) => self.autonomy = mode,
+                None => self.settings_notices.push(format!(
+                    "Unknown autonomy \"{a}\" in settings.json, using \"{}\". Valid modes: \
+                     suggest, ask, auto-edit, full-auto.",
+                    self.autonomy
+                )),
+            }
+        }
+        if let Some(why) = self.fall_back_from_full_auto() {
+            self.settings_notices.push(why);
         }
         self.memory_auto_capture = settings.memory_auto_capture.unwrap_or(false);
 
@@ -1152,6 +1171,24 @@ impl Config {
     }
 
     /// Settings files for `self.cwd`, with `--settings` on top.
+    /// The autonomy mode the permission gates apply.
+    pub fn effective_autonomy(&self) -> crate::permissions::Autonomy {
+        self.autonomy
+            .effective(self.sandbox_enabled, &self.sandbox_mode)
+    }
+
+    /// `full-auto` without a usable bwrap or firejail sandbox falls back to
+    /// `ask`; returns the line that says so, or `None` when nothing changed.
+    pub fn fall_back_from_full_auto(&mut self) -> Option<String> {
+        use crate::permissions::{Autonomy, autonomy::full_auto_blocker};
+        if self.autonomy != Autonomy::FullAuto {
+            return None;
+        }
+        let why = full_auto_blocker(self.sandbox_enabled, &self.sandbox_mode)?;
+        self.autonomy = Autonomy::Ask;
+        Some(format!("Autonomy is \"ask\", not \"full-auto\": {why}"))
+    }
+
     pub(crate) fn load_settings(&self) -> crate::settings::Settings {
         let settings = crate::settings::Settings::load_in(&self.global_config_dir(), &self.cwd);
         match &self.flag_settings {
@@ -3234,5 +3271,64 @@ mod keyless_ollama_tests {
         let took = start.elapsed();
         assert!(took >= std::time::Duration::from_millis(700), "{took:?}");
         assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+    }
+}
+
+#[cfg(test)]
+mod autonomy_load_tests {
+    use super::*;
+    use crate::permissions::Autonomy;
+
+    /// `full-auto` without bwrap/firejail starts as `ask` and says why;
+    /// unknown names are reported instead of silently meaning something.
+    #[test]
+    fn loading_full_auto_without_its_sandbox_falls_back_to_ask() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let load = |settings: &str| {
+            std::fs::write(home.path().join("settings.json"), settings).unwrap();
+            let mut c = Config {
+                cwd: project.path().into(),
+                config_dir_override: Some(home.path().into()),
+                ..Config::default()
+            };
+            c.load_project();
+            c
+        };
+        let c = load(r#"{"autonomy": "full-auto", "sandboxEnabled": false}"#);
+        assert_eq!(c.autonomy, Autonomy::Ask);
+        assert!(
+            c.settings_notices
+                .iter()
+                .any(|n| n.contains("full-auto") && n.contains("sandbox")),
+            "{:?}",
+            c.settings_notices
+        );
+        let c =
+            load(r#"{"autonomy": "full-auto", "sandboxEnabled": true, "sandboxMode": "strict"}"#);
+        assert_eq!(c.autonomy, Autonomy::Ask);
+
+        let c = load(r#"{"autonomy": "auto-edit"}"#);
+        assert_eq!(c.autonomy, Autonomy::AutoEdit);
+        assert!(c.settings_notices.is_empty(), "{:?}", c.settings_notices);
+
+        let c = load(r#"{"autonomy": "yolo"}"#);
+        assert_eq!(c.autonomy, Autonomy::Ask);
+        assert!(c.settings_notices[0].contains("yolo"));
+    }
+
+    /// Turning the sandbox off under full-auto drops to ask; the gates
+    /// resolve the same way if anything else changes the sandbox.
+    #[test]
+    fn full_auto_needs_the_sandbox_it_was_started_with() {
+        let mut c = Config {
+            autonomy: Autonomy::FullAuto,
+            sandbox_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(c.effective_autonomy(), Autonomy::Ask);
+        assert!(c.fall_back_from_full_auto().is_some());
+        assert_eq!(c.autonomy, Autonomy::Ask);
+        assert_eq!(c.fall_back_from_full_auto(), None);
     }
 }

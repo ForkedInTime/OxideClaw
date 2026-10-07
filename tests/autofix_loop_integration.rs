@@ -9,6 +9,7 @@
 use oxideclaw::autofix::{
     AutoFixAction, AutoFixConfig, AutoFixTrigger, Containment, run_auto_fix_check,
 };
+use oxideclaw::permissions::Autonomy;
 use std::fs;
 use std::sync::atomic::AtomicBool;
 use tempfile::tempdir;
@@ -39,7 +40,7 @@ fn empty_dir_no_runners_continues_silently() {
     let action = run_auto_fix_check(
         dir.path(),
         &cfg,
-        "auto-edit",
+        Autonomy::AutoEdit,
         0,
         &trusted(),
         &AtomicBool::new(false),
@@ -63,7 +64,7 @@ fn cargo_project_detects_and_passes_with_overrides() {
     let action = run_auto_fix_check(
         dir.path(),
         &cfg,
-        "auto-edit",
+        Autonomy::AutoEdit,
         0,
         &trusted(),
         &AtomicBool::new(false),
@@ -87,7 +88,7 @@ fn lint_fail_under_cap_returns_retry_with_anticheat() {
     let action = run_auto_fix_check(
         dir.path(),
         &cfg,
-        "auto-edit",
+        Autonomy::AutoEdit,
         0,
         &trusted(),
         &AtomicBool::new(false),
@@ -114,7 +115,7 @@ fn cap_reached_returns_giveup_with_working_tree_note() {
     let action = run_auto_fix_check(
         dir.path(),
         &cfg,
-        "auto-edit",
+        Autonomy::AutoEdit,
         3,
         &trusted(),
         &AtomicBool::new(false),
@@ -129,7 +130,7 @@ fn cap_reached_returns_giveup_with_working_tree_note() {
 }
 
 #[test]
-fn trigger_autonomous_skips_in_read_only_mode() {
+fn trigger_autonomous_skips_in_suggest_mode() {
     let dir = tempdir().unwrap();
     let mut cfg = base_cfg();
     cfg.trigger = AutoFixTrigger::Autonomous;
@@ -138,7 +139,7 @@ fn trigger_autonomous_skips_in_read_only_mode() {
     let action = run_auto_fix_check(
         dir.path(),
         &cfg,
-        "read-only",
+        Autonomy::Suggest,
         0,
         &trusted(),
         &AtomicBool::new(false),
@@ -157,7 +158,7 @@ fn trigger_off_short_circuits() {
     let action = run_auto_fix_check(
         dir.path(),
         &cfg,
-        "full-auto",
+        Autonomy::FullAuto,
         0,
         &trusted(),
         &AtomicBool::new(false),

@@ -2,7 +2,11 @@
 //!
 //! Evaluation order: deny > ask > auto_approve > allow.
 //! Unlisted tools: ask (if interactive_approval) or deny (if not).
+//! The user's `/autonomy` mode fills in for unlisted tools and forces a
+//! prompt for edits under `suggest`; it never overrides the host's deny or
+//! ask lists.
 
+use crate::permissions::{Autonomy, Verdict};
 use crate::sdk::protocol::Policy;
 
 /// What should happen when a tool is called.
@@ -22,6 +26,8 @@ pub enum ApprovalDecision {
 pub struct PolicyEngine {
     policy: Policy,
     interactive_approval: bool,
+    autonomy: Autonomy,
+    project: std::path::PathBuf,
 }
 
 impl PolicyEngine {
@@ -29,33 +35,50 @@ impl PolicyEngine {
         Self {
             policy,
             interactive_approval,
+            autonomy: Autonomy::Ask,
+            project: std::path::PathBuf::new(),
         }
     }
 
-    /// Evaluate a tool name against the policy.
-    pub fn evaluate(&self, tool_name: &str) -> ApprovalDecision {
-        // Deny takes highest priority
-        if self.policy.deny.iter().any(|t| t == tool_name) {
+    /// Apply the user's autonomy mode (already resolved for the sandbox)
+    /// to calls in `project`.
+    pub fn with_autonomy(mut self, autonomy: Autonomy, project: &std::path::Path) -> Self {
+        self.autonomy = autonomy;
+        self.project = project.to_path_buf();
+        self
+    }
+
+    /// Evaluate a call to `tool_name` with `input` against the policy.
+    pub fn evaluate(&self, tool_name: &str, input: &serde_json::Value) -> ApprovalDecision {
+        let listed = |list: &[String]| list.iter().any(|t| t == tool_name);
+        // Deny takes highest priority, then the host's explicit ask.
+        if listed(&self.policy.deny) {
             return ApprovalDecision::Deny;
         }
-        // Ask is next
-        if self.policy.ask.iter().any(|t| t == tool_name) {
-            return ApprovalDecision::Ask;
-        }
-        // Auto-approve
-        if self.policy.auto_approve.iter().any(|t| t == tool_name) {
-            return ApprovalDecision::AutoApprove;
-        }
-        // Allow (silent)
-        if self.policy.allow.iter().any(|t| t == tool_name) {
-            return ApprovalDecision::Allow;
-        }
-        // Not in any list — depends on interactive_approval capability
-        if self.interactive_approval {
+        let ask = if self.interactive_approval {
             ApprovalDecision::Ask
         } else {
             ApprovalDecision::Deny
+        };
+        if listed(&self.policy.ask) {
+            return ApprovalDecision::Ask;
         }
+        let verdict = self.autonomy.verdict(tool_name, input, &self.project);
+        if verdict == Verdict::Prompt {
+            return ask;
+        }
+        if listed(&self.policy.auto_approve) {
+            return ApprovalDecision::AutoApprove;
+        }
+        // Allow (silent)
+        if listed(&self.policy.allow) {
+            return ApprovalDecision::Allow;
+        }
+        // Not in any list: the autonomy mode, then interactive_approval.
+        if verdict == Verdict::PreApproved {
+            return ApprovalDecision::AutoApprove;
+        }
+        ask
     }
 
     /// Get the approval timeout in seconds.
@@ -87,7 +110,7 @@ impl crate::permissions::PermissionAsker for SdkPolicyAsker {
     ) -> Option<crate::permissions::PermissionDecision> {
         use crate::permissions::PermissionDecision;
         use crate::sdk::session::{ApprovalOutcome, await_approval};
-        match self.policy.evaluate(tool_name) {
+        match self.policy.evaluate(tool_name, input) {
             ApprovalDecision::Allow | ApprovalDecision::AutoApprove => {
                 return Some(PermissionDecision::Allow);
             }

@@ -1,6 +1,7 @@
 //! Integration tests for auto-rollback core logic — TDD, written before implementation.
 
 use oxideclaw::autofix::{AutoFixConfig, AutoFixTrigger, detect_test_command, should_trigger};
+use oxideclaw::permissions::Autonomy;
 use std::fs;
 use tempfile::TempDir;
 
@@ -73,9 +74,9 @@ fn test_should_trigger_off() {
         trigger: AutoFixTrigger::Off,
         ..AutoFixConfig::default()
     };
-    assert!(!should_trigger(&cfg, "auto-edit"));
-    assert!(!should_trigger(&cfg, "full-auto"));
-    assert!(!should_trigger(&cfg, "read-only"));
+    assert!(!should_trigger(&cfg, Autonomy::AutoEdit));
+    assert!(!should_trigger(&cfg, Autonomy::FullAuto));
+    assert!(!should_trigger(&cfg, Autonomy::Suggest));
 }
 
 #[test]
@@ -84,10 +85,10 @@ fn test_should_trigger_always() {
         trigger: AutoFixTrigger::Always,
         ..AutoFixConfig::default()
     };
-    assert!(should_trigger(&cfg, "read-only"));
-    assert!(should_trigger(&cfg, "plan-only"));
-    assert!(should_trigger(&cfg, "auto-edit"));
-    assert!(should_trigger(&cfg, "full-auto"));
+    assert!(should_trigger(&cfg, Autonomy::Suggest));
+    assert!(should_trigger(&cfg, Autonomy::Ask));
+    assert!(should_trigger(&cfg, Autonomy::AutoEdit));
+    assert!(should_trigger(&cfg, Autonomy::FullAuto));
 }
 
 #[test]
@@ -96,18 +97,18 @@ fn test_should_trigger_autonomous_auto_edit() {
         trigger: AutoFixTrigger::Autonomous,
         ..AutoFixConfig::default()
     };
-    assert!(should_trigger(&cfg, "auto-edit"));
-    assert!(should_trigger(&cfg, "full-auto"));
+    assert!(should_trigger(&cfg, Autonomy::Ask));
+    assert!(should_trigger(&cfg, Autonomy::AutoEdit));
+    assert!(should_trigger(&cfg, Autonomy::FullAuto));
 }
 
 #[test]
-fn test_should_trigger_autonomous_read_only() {
+fn test_should_trigger_autonomous_suggest() {
     let cfg = AutoFixConfig {
         trigger: AutoFixTrigger::Autonomous,
         ..AutoFixConfig::default()
     };
-    assert!(!should_trigger(&cfg, "read-only"));
-    assert!(!should_trigger(&cfg, "plan-only"));
+    assert!(!should_trigger(&cfg, Autonomy::Suggest));
 }
 
 #[test]
@@ -117,8 +118,8 @@ fn test_should_trigger_disabled() {
         trigger: AutoFixTrigger::Always,
         ..AutoFixConfig::default()
     };
-    assert!(!should_trigger(&cfg, "auto-edit"));
-    assert!(!should_trigger(&cfg, "full-auto"));
+    assert!(!should_trigger(&cfg, Autonomy::AutoEdit));
+    assert!(!should_trigger(&cfg, Autonomy::FullAuto));
 }
 
 // ── default config ────────────────────────────────────────────────────────────

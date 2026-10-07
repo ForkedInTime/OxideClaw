@@ -586,6 +586,9 @@ async fn run_loop(
                 &config.settings_load_errors,
             )));
     }
+    for line in &config.settings_notices {
+        app.entries.push(ChatEntry::system(line.clone()));
+    }
     for why in &config.api_key_helper_rejected {
         app.entries.push(ChatEntry::system(why.clone()));
     }

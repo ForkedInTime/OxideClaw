@@ -11,7 +11,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub mod autonomy;
 pub mod gate;
+pub use autonomy::{Autonomy, Verdict};
 pub use gate::{GateOutcome, PermissionAsker, PermissionGate};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +92,16 @@ impl PermissionState {
     pub fn with_cwd(self, cwd: &Path) -> Self {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).cwd = Some(cwd.to_path_buf());
         self
+    }
+
+    /// The project root relative paths resolve against.
+    pub fn cwd(&self) -> PathBuf {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
     }
 
     /// Check with optional tool input for prefix-rule matching.

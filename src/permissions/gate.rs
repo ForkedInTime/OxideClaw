@@ -10,7 +10,7 @@
 //! have needed one.
 
 use super::{
-    CheckResult, PermissionDecision, PermissionState, blocked_entry_matches,
+    Autonomy, CheckResult, PermissionDecision, PermissionState, Verdict, blocked_entry_matches,
     check_compound_command, describe_tool_call, is_command_tool,
 };
 use std::sync::Arc;
@@ -48,9 +48,9 @@ pub enum GateOutcome {
 #[derive(Clone)]
 pub struct PermissionGate {
     state: PermissionState,
-    /// `autonomy: "suggest"` — Write/Edit always prompt, even if a rule
-    /// would allow them.
-    suggest_mode: bool,
+    /// What the mode pre-approves or forces to a prompt (see
+    /// [`Autonomy::verdict`]); never what a deny rule refuses.
+    autonomy: Autonomy,
     asker: Option<Arc<dyn PermissionAsker>>,
     /// Tools refused outright for this turn (plan mode, skill turns), each
     /// with the reason the model is told. Inherited by sub-agents through
@@ -65,12 +65,12 @@ pub struct PermissionGate {
 impl PermissionGate {
     pub fn new(
         state: PermissionState,
-        suggest_mode: bool,
+        autonomy: Autonomy,
         asker: Option<Arc<dyn PermissionAsker>>,
     ) -> Self {
         Self {
             state,
-            suggest_mode,
+            autonomy,
             asker,
             blocked: Vec::new(),
             ask_every_tool: false,
@@ -111,8 +111,8 @@ impl PermissionGate {
     }
 
     /// A gate for an engine with no human attached (`-p`, SDK-less
-    /// headless use). Settings/CLI allow and deny rules still apply;
-    /// anything that would need a prompt is refused.
+    /// headless use). Settings/CLI allow and deny rules and the autonomy
+    /// mode still apply; anything that would need a prompt is refused.
     pub fn headless(cfg: &crate::config::Config) -> Self {
         Self::new(
             PermissionState::new(
@@ -121,7 +121,7 @@ impl PermissionGate {
                 &cfg.permissions_deny,
             )
             .with_cwd(&cfg.cwd),
-            false,
+            cfg.effective_autonomy(),
             None,
         )
     }
@@ -138,7 +138,7 @@ impl PermissionGate {
     pub fn bypass_with_deny(deny: &[String], cwd: &std::path::Path) -> Self {
         Self::new(
             PermissionState::new(true, &[], deny).with_cwd(cwd),
-            false,
+            Autonomy::Ask,
             None,
         )
     }
@@ -161,17 +161,17 @@ impl PermissionGate {
         } else {
             self.state.check_with_input(tool_name, Some(input))
         };
-        // Suggest mode only turns an Allow into a prompt: a deny rule must
-        // still refuse outright instead of becoming one more routine approval.
-        let check = match check {
-            CheckResult::Allow
-                if self.ask_every_tool
-                    || (self.suggest_mode
-                        && matches!(tool_name, "Write" | "Edit" | "MultiEdit")) =>
-            {
-                CheckResult::Ask
-            }
-            c => c,
+        // The mode moves a call between Allow and Ask, never out of Deny: a
+        // deny rule refuses outright in every mode instead of becoming one
+        // more routine approval.
+        let check = match (
+            check,
+            self.autonomy.verdict(tool_name, input, &self.state.cwd()),
+        ) {
+            (CheckResult::Allow, Verdict::Prompt) => CheckResult::Ask,
+            (CheckResult::Ask, Verdict::PreApproved) => CheckResult::Allow,
+            (CheckResult::Allow, _) if self.ask_every_tool => CheckResult::Ask,
+            (c, _) => c,
         };
 
         match check {
@@ -250,7 +250,7 @@ mod tests {
         let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
         PermissionGate::new(
             PermissionState::new(false, &allow, &[]),
-            false,
+            Autonomy::Ask,
             asker.map(|a| a as Arc<dyn PermissionAsker>),
         )
     }
@@ -368,7 +368,7 @@ mod tests {
         let allow = vec!["Write".to_string()];
         let g = PermissionGate::new(
             PermissionState::new(false, &allow, &[]),
-            true,
+            Autonomy::Suggest,
             Some(asker.clone() as Arc<dyn PermissionAsker>),
         );
         assert_eq!(
@@ -384,7 +384,7 @@ mod tests {
         let deny = vec!["Write(./secrets/**)".to_string()];
         let g = PermissionGate::new(
             PermissionState::new(false, &[], &deny).with_cwd(std::path::Path::new("/proj")),
-            true,
+            Autonomy::Suggest,
             Some(asker.clone() as Arc<dyn PermissionAsker>),
         );
         let out = g
@@ -403,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn deny_rules_win_over_everything() {
         let deny = vec!["Bash".to_string()];
-        let g = PermissionGate::new(PermissionState::new(true, &[], &deny), false, None);
+        let g = PermissionGate::new(PermissionState::new(true, &[], &deny), Autonomy::Ask, None);
         // Even with bypass on, an explicit deny is still a deny.
         let out = g.decide("Bash", &json!({"command": "id"})).await;
         assert!(matches!(out, GateOutcome::Denied(_)), "{out:?}");
@@ -518,6 +518,163 @@ mod tests {
             plan.decide("Read", &json!({"file_path": "a"})).await,
             GateOutcome::Allowed
         );
+    }
+
+    /// `auto-edit` and `full-auto` were stored and never read: every mode
+    /// but `suggest` prompted for exactly the same calls. Each mode against
+    /// edits inside the project, of protected files and outside it, a
+    /// command, and a deny rule.
+    #[tokio::test]
+    async fn each_mode_against_the_tool_call_matrix() {
+        let proj = tempfile::tempdir().unwrap();
+        let root = proj.path();
+        let outside = tempfile::tempdir().unwrap();
+        let w = |p: &str| json!({"file_path": p, "content": "x"});
+        let out_path = outside.path().join("x.rs").to_string_lossy().into_owned();
+        let protected = [
+            ".git/hooks/pre-commit",
+            ".claude/settings.json",
+            ".oxideclaw/x",
+            ".agents/skills/s/SKILL.md",
+            ".mcp.json",
+            ".env.local",
+            ".github/workflows/ci.yml",
+            ".gitlab-ci.yml",
+            ".husky/pre-commit",
+            "package.json",
+            "Cargo.toml",
+            "build.rs",
+            "conftest.py",
+            "pytest.ini",
+            "Makefile",
+            "justfile",
+            "setup.py",
+            "pyproject.toml",
+            "tox.ini",
+            "App.csproj",
+        ];
+        // (call, prompts under: suggest, ask, auto-edit, full-auto)
+        let mut calls: Vec<(&str, serde_json::Value, [bool; 4])> = vec![
+            ("Write", w("src/a.rs"), [true, true, false, false]),
+            ("Edit", w("src/a.rs"), [true, true, false, false]),
+            (
+                "MultiEdit",
+                json!({"edits": [{"file_path": "a.rs"}, {"file_path": "b.rs"}]}),
+                [true, true, false, false],
+            ),
+            (
+                "NotebookEdit",
+                json!({"notebook_path": "nb.ipynb"}),
+                [true, true, false, false],
+            ),
+            ("Write", w(&out_path), [true, true, true, false]),
+            ("Write", w("../escape.rs"), [true, true, true, false]),
+            (
+                "Bash",
+                json!({"command": "cargo build"}),
+                [true, true, true, false],
+            ),
+            ("mcp__fs__write_file", json!({}), [true, true, true, false]),
+            ("ExitPlanMode", json!({}), [true, true, true, true]),
+        ];
+        for p in protected {
+            calls.push(("Write", w(p), [true, true, true, false]));
+        }
+        let modes = [
+            Autonomy::Suggest,
+            Autonomy::Ask,
+            Autonomy::AutoEdit,
+            Autonomy::FullAuto,
+        ];
+        for (i, mode) in modes.into_iter().enumerate() {
+            for (tool, input, prompts) in &calls {
+                let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+                let g = PermissionGate::new(
+                    PermissionState::new(false, &[], &[]).with_cwd(root),
+                    mode,
+                    Some(asker.clone() as Arc<dyn PermissionAsker>),
+                );
+                assert_eq!(g.decide(tool, input).await, GateOutcome::Allowed);
+                assert_eq!(
+                    asker.asked().len(),
+                    usize::from(prompts[i]),
+                    "{mode}: {tool} {input}"
+                );
+            }
+            // A deny rule refuses without a prompt in every mode.
+            let asker = Scripted::new(vec![Some(PermissionDecision::Allow)]);
+            let deny = vec!["Edit(./src/**)".to_string(), "Bash(cargo:*)".to_string()];
+            let g = PermissionGate::new(
+                PermissionState::new(false, &[], &deny).with_cwd(root),
+                mode,
+                Some(asker.clone() as Arc<dyn PermissionAsker>),
+            );
+            for (tool, input) in [
+                ("Write", w("src/a.rs")),
+                ("Bash", json!({"command": "cargo build"})),
+            ] {
+                let out = g.decide(tool, &input).await;
+                assert!(
+                    matches!(out, GateOutcome::Denied(_)),
+                    "{mode}: {tool} {out:?}"
+                );
+            }
+            assert!(asker.asked().is_empty(), "{mode}: a denied call prompted");
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_edit_pre_approves_nothing_when_the_project_is_home() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let asker = Scripted::new(vec![Some(PermissionDecision::Deny)]);
+        let g = PermissionGate::new(
+            PermissionState::new(false, &[], &[]).with_cwd(&home),
+            Autonomy::AutoEdit,
+            Some(asker.clone() as Arc<dyn PermissionAsker>),
+        );
+        let out = g
+            .decide("Write", &json!({"file_path": "notes.txt", "content": "x"}))
+            .await;
+        assert!(matches!(out, GateOutcome::Denied(_)), "{out:?}");
+        assert_eq!(asker.asked().len(), 1, "the edit must have prompted");
+    }
+
+    /// `-p` has no one to ask: auto-edit runs in-project edits, commands are
+    /// still refused, and full-auto without its sandbox is `ask`.
+    #[tokio::test]
+    async fn headless_gate_applies_the_configured_mode() {
+        let proj = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config {
+            cwd: proj.path().to_path_buf(),
+            autonomy: Autonomy::AutoEdit,
+            ..crate::config::Config::default()
+        };
+        let edit = json!({"file_path": "src/a.rs", "content": "x"});
+        let bash = json!({"command": "ls"});
+        let g = PermissionGate::headless(&cfg);
+        assert_eq!(g.decide("Write", &edit).await, GateOutcome::Allowed);
+        assert!(matches!(
+            g.decide("Write", &json!({"file_path": "Makefile"})).await,
+            GateOutcome::Denied(_)
+        ));
+        assert!(matches!(
+            g.decide("Bash", &bash).await,
+            GateOutcome::Denied(_)
+        ));
+
+        cfg.autonomy = Autonomy::FullAuto;
+        cfg.sandbox_enabled = false;
+        let g = PermissionGate::headless(&cfg);
+        assert!(matches!(
+            g.decide("Bash", &bash).await,
+            GateOutcome::Denied(_)
+        ));
+        assert!(matches!(
+            g.decide("Write", &edit).await,
+            GateOutcome::Denied(_)
+        ));
     }
 
     #[tokio::test]

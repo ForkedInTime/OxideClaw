@@ -99,6 +99,11 @@ pub struct Settings {
     #[serde(skip)]
     pub load_errors: Vec<String>,
 
+    /// Settings that loaded but are not applied as written, one line each
+    /// (a project `autonomy` looser than the user's).
+    #[serde(skip)]
+    pub notices: Vec<String>,
+
     /// Why an `apiKeyHelper` was stripped for its file's permissions, as a
     /// user-facing line. Otherwise the only trace was the log file and the
     /// user saw just "No Anthropic credential found".
@@ -276,12 +281,15 @@ pub struct Settings {
     #[serde(rename = "routerSuperHighModel")]
     pub router_super_high_model: Option<String>,
 
-    /// Autonomy level for file modifications: "suggest", "auto-edit", "full-auto".
-    /// - "suggest": ask before every Write/Edit/MultiEdit, even when an allow
-    ///   rule covers it; the auto-fix loop does not run
-    /// - "auto-edit": normal permission rules apply (default)
-    /// - "full-auto": currently the same as "auto-edit"; neither skips the
-    ///   Write/Edit prompt unless a permissions.allow / always-allow rule does
+    /// Autonomy mode (see `permissions::Autonomy`):
+    /// - "suggest": every edit prompts, even one an allow rule covers; the
+    ///   auto-fix loop does not run
+    /// - "ask" (default): edits and commands prompt unless a rule allows them
+    /// - "auto-edit": edits inside the project need no prompt, except to VCS,
+    ///   agent, CI, hook and build/test-runner config; commands still prompt
+    /// - "full-auto": no prompts at all, only under a bwrap or firejail sandbox
+    ///
+    /// Deny rules hold in every mode. A project file may only make it stricter.
     pub autonomy: Option<String>,
 
     /// Auto-capture notable decisions/preferences from assistant responses into persistent memory.
@@ -602,10 +610,11 @@ impl Settings {
     /// host, Chrome binary or CDP endpoint — and
     /// cannot switch off the user's own hooks with `disableAllHooks`, re-enable
     /// the browser tools with `browserEnabled`, delete
-    /// the user's sessions with `cleanupPeriodDays`, loosen `autonomy` or
+    /// the user's sessions with `cleanupPeriodDays`, loosen
     /// `browseDefaultPolicy`, or replace the user's `browseApprovalPatterns`.
     /// Deny rules and settings that only tighten still apply. What was
-    /// dropped is listed in `untrusted_project_config`.
+    /// dropped is listed in `untrusted_project_config`. No project, trusted
+    /// or not, loosens `autonomy`; that is reported in `notices`.
     pub fn merge_with_trust(
         global: Settings,
         mut project: Settings,
@@ -613,6 +622,27 @@ impl Settings {
         trusted: bool,
     ) -> Settings {
         let mut dropped: Vec<String> = Vec::new();
+        // Trusted or not, a project's autonomy may only tighten the user's:
+        // an unprompted mode is the user's own choice, and project files
+        // written while `auto-edit` and `full-auto` still prompted must not
+        // turn the prompts off now that they mean what they say.
+        let mut notices = Vec::new();
+        if let Some(a) = project.autonomy.take() {
+            use crate::permissions::Autonomy;
+            let user = global
+                .autonomy
+                .as_deref()
+                .and_then(Autonomy::parse)
+                .unwrap_or_default();
+            match Autonomy::parse(&a) {
+                Some(mode) if mode.at_least_as_strict_as(user) => project.autonomy = Some(a),
+                _ => notices.push(format!(
+                    "This project's settings set autonomy \"{a}\" — ignored: a project may \
+                     only make it stricter than yours (\"{user}\"). Use /autonomy or your \
+                     own settings.json to change it."
+                )),
+            }
+        }
         let mcp_extra = if trusted {
             mcp_extra
         } else {
@@ -707,11 +737,6 @@ impl Settings {
             if project.cleanup_period_days.take().is_some() {
                 dropped.push("cleanupPeriodDays".into());
             }
-            // Only the strictest values may override the user's choice.
-            if project.autonomy.as_deref().is_some_and(|a| a != "suggest") {
-                project.autonomy = None;
-                dropped.push("autonomy".into());
-            }
             if project
                 .browse_default_policy
                 .as_deref()
@@ -749,6 +774,7 @@ impl Settings {
             merged = merged.merge(extra);
         }
         merged.untrusted_project_config = dropped;
+        merged.notices.extend(notices);
         merged.project_trusted = trusted;
         merged
     }
@@ -1033,6 +1059,11 @@ impl Settings {
             load_errors: {
                 let mut v = self.load_errors;
                 v.extend(other.load_errors);
+                v
+            },
+            notices: {
+                let mut v = self.notices;
+                v.extend(other.notices);
                 v
             },
             helper_rejected: {
@@ -1354,12 +1385,17 @@ mod project_trust_tests {
             merged.browse_approval_patterns,
             Some(vec!["(?i)transfer".to_string()])
         );
-        for key in ["cleanupPeriodDays", "autonomy", "browseDefaultPolicy"] {
+        for key in ["cleanupPeriodDays", "browseDefaultPolicy"] {
             assert!(
                 merged.untrusted_project_config.contains(&key.to_string()),
                 "{key} should be reported"
             );
         }
+        assert!(
+            merged.notices[0].contains("full-auto"),
+            "{:?}",
+            merged.notices
+        );
 
         let tightening = Settings {
             autonomy: Some("suggest".into()),
@@ -1375,12 +1411,53 @@ mod project_trust_tests {
             Some(vec!["(?i)transfer".to_string(), "(?i)wire".to_string()])
         );
         assert!(merged.untrusted_project_config.is_empty());
+        assert!(merged.notices.is_empty());
 
         let trusted = Settings::merge_with_trust(global, project(), None, true);
         assert_eq!(trusted.cleanup_period_days, Some(1));
-        assert_eq!(trusted.autonomy.as_deref(), Some("full-auto"));
+        assert_eq!(trusted.autonomy.as_deref(), Some("suggest"));
         assert_eq!(trusted.browse_default_policy.as_deref(), Some("pattern"));
         assert_eq!(trusted.browse_approval_patterns, Some(vec![]));
+    }
+
+    /// Project files written while `auto-edit` and `full-auto` still
+    /// prompted must not switch anyone to unprompted edits: a project,
+    /// trusted or not, may only tighten the user's mode.
+    #[test]
+    fn a_project_autonomy_only_tightens_the_users() {
+        let merge = |user: Option<&str>, proj: &str, trusted: bool| {
+            let global = Settings {
+                autonomy: user.map(Into::into),
+                ..Settings::default()
+            };
+            let project = Settings {
+                autonomy: Some(proj.into()),
+                ..Settings::default()
+            };
+            Settings::merge_with_trust(global, project, None, trusted)
+        };
+        for trusted in [false, true] {
+            for (user, proj, kept) in [
+                (None, "auto-edit", None),
+                (None, "full-auto", None),
+                (None, "nonsense", None),
+                (None, "suggest", Some("suggest")),
+                (None, "ask", Some("ask")),
+                (Some("auto-edit"), "ask", Some("ask")),
+                (Some("full-auto"), "auto-edit", Some("auto-edit")),
+                (Some("auto-edit"), "full-auto", None),
+                (Some("suggest"), "ask", None),
+            ] {
+                let m = merge(user, proj, trusted);
+                assert_eq!(
+                    m.autonomy.as_deref(),
+                    kept.or(user),
+                    "user {user:?}, project {proj}, trusted {trusted}"
+                );
+                assert_eq!(m.notices.is_empty(), kept.is_some(), "{:?}", m.notices);
+                assert!(!m.untrusted_project_config.contains(&"autonomy".into()));
+            }
+        }
     }
 
     /// A repo must not pick the browser binary or hand the browsing

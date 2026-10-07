@@ -683,7 +683,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 let build_gate = |plan: bool, skill_shell: bool| {
                     let gate = PermissionGate::new(
                         perm_state.clone(),
-                        config.autonomy == "suggest",
+                        config.effective_autonomy(),
                         Some(std::sync::Arc::new(TuiAsker { tx: tx.clone() })),
                     )
                     .with_blocked_tools(if plan {
@@ -984,7 +984,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     let work_cwd = crate::tools::session_cwd(&tools, &config.cwd);
                     // Lint and tests can run for minutes; keep them off the
                     // async worker that also drives the UI channel.
-                    let (auto_fix, autonomy) = (config.auto_fix.clone(), config.autonomy.clone());
+                    let (auto_fix, autonomy) = (config.auto_fix.clone(), config.autonomy);
                     // Trust is the launch project's: a worktree it entered
                     // holds the same repo. The sandbox is the Bash tool's.
                     let containment = crate::autofix::Containment {
@@ -1007,7 +1007,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         crate::autofix::run_auto_fix_check(
                             &work_cwd,
                             &auto_fix,
-                            &autonomy,
+                            autonomy,
                             auto_fix_retries,
                             &containment,
                             &cancel,
@@ -1757,7 +1757,7 @@ mod loop_guard_tests {
         let (mut t, mut rx) = task(url, dir.path(), None);
         t.tools = vec![std::sync::Arc::new(FakeWrite)];
         t.perm_state = PermissionState::new(false, &["Write".into()], &[]);
-        t.config.autonomy = "auto-edit".into();
+        t.config.autonomy = crate::permissions::Autonomy::AutoEdit;
         t.config.project_trusted = true;
         t.config.auto_fix = crate::autofix::AutoFixConfig {
             trigger: crate::autofix::AutoFixTrigger::Always,
@@ -1797,8 +1797,8 @@ mod loop_guard_tests {
         }
     }
 
-    /// The default `auto-edit` autonomy ran the project's lint and test
-    /// commands after every edit, trusted folder or not.
+    /// Auto-fix ran the project's lint and test commands after every edit,
+    /// trusted folder or not.
     #[tokio::test]
     async fn an_untrusted_project_edit_runs_no_auto_fix_command() {
         use crate::query_engine::scripted_api_tests::{serve, sse};
@@ -1811,7 +1811,7 @@ mod loop_guard_tests {
         let (mut t, mut rx) = task(url, dir.path(), None);
         t.tools = vec![std::sync::Arc::new(FakeWrite)];
         t.perm_state = PermissionState::new(false, &["Write".into()], &[]);
-        t.config.autonomy = "auto-edit".into();
+        t.config.autonomy = crate::permissions::Autonomy::AutoEdit;
         assert!(!t.config.project_trusted);
         t.config.auto_fix = crate::autofix::AutoFixConfig {
             lint_command: Some("touch lint.marker".into()),
@@ -1833,6 +1833,47 @@ mod loop_guard_tests {
         }
         assert_eq!(untrusted, 1);
         assert!(done);
+    }
+
+    /// `/autonomy auto-edit` was stored and never read: the TUI prompted
+    /// for an in-project Write in every mode. Now auto-edit runs it without
+    /// a prompt and the default `ask` still prompts.
+    #[tokio::test]
+    async fn the_tui_gate_applies_the_autonomy_mode() {
+        use crate::permissions::Autonomy;
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        for (mode, prompted) in [(Autonomy::AutoEdit, false), (Autonomy::Ask, true)] {
+            let done = sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            );
+            let (url, _) = serve(vec![write_a_txt_response(), done]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let (mut t, mut rx) = task(url, dir.path(), None);
+            t.tools = vec![std::sync::Arc::new(FakeWrite)];
+            t.perm_state = PermissionState::new(false, &[], &[]).with_cwd(dir.path());
+            t.config.autonomy = mode;
+            let handle = tokio::spawn(run_api_task(t));
+            let (mut asked, mut result) = (0, None);
+            while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
+            {
+                match ev {
+                    // Dropping the reply denies the call.
+                    AppEvent::PermissionRequest { tool_name, .. } => {
+                        assert_eq!(tool_name, "Write");
+                        asked += 1;
+                    }
+                    AppEvent::ToolResult { text, .. } => result = Some(text),
+                    AppEvent::Done { .. } => break,
+                    AppEvent::TurnFailed(e) => panic!("turn failed: {e}"),
+                    _ => {}
+                }
+            }
+            handle.await.unwrap();
+            assert_eq!(asked, usize::from(prompted), "{mode}");
+            let result = result.expect("the Write got a result");
+            assert_eq!(result.contains("written"), !prompted, "{mode}: {result}");
+        }
     }
 
     /// A connection that dies after the headers but before any text is

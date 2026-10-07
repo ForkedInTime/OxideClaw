@@ -743,6 +743,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 serde_json::Value::Bool(enabled),
             );
             let mut msg = String::new();
+            if let Some(why) = config.fall_back_from_full_auto() {
+                msg.push_str(&why);
+                msg.push_str("\n\n");
+            }
             // Enabling is the moment the user forms a belief about how
             // protected they are. If the active mode cannot enforce
             // anything, say so here rather than burying it in status.
@@ -1189,6 +1193,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 config.sandbox_mode = mode;
                 reloaded.push("sandboxMode");
             }
+            let autonomy_fallback = config.fall_back_from_full_auto();
 
             // Reload CLAUDE.md + AGENTS.md; --bare never loads them.
             if !config.bare_mode {
@@ -1208,6 +1213,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     reloaded.join(", ")
                 )
             };
+            if let Some(why) = autonomy_fallback {
+                msg.push('\n');
+                msg.push_str(&why);
+            }
             // Otherwise a typo reads as "no changes detected".
             if !settings.load_errors.is_empty() {
                 msg.push('\n');
@@ -1818,10 +1827,19 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             )));
             app.scroll_to_bottom();
         }
-        CommandAction::SetAutonomy(level) => {
-            config.autonomy = level.clone();
-            app.entries
-                .push(ChatEntry::system(format!("Autonomy set to: {level}")));
+        CommandAction::SetAutonomy(mode) => {
+            use crate::permissions::{Autonomy, autonomy::full_auto_blocker};
+            let blocker = (mode == Autonomy::FullAuto)
+                .then(|| full_auto_blocker(config.sandbox_enabled, &config.sandbox_mode))
+                .flatten();
+            let msg = match blocker {
+                Some(why) => format!("{why}\nAutonomy stays {}.", config.autonomy),
+                None => {
+                    config.autonomy = mode;
+                    format!("Autonomy set to: {mode}")
+                }
+            };
+            app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
         CommandAction::GitCheckpoint(msg) => {

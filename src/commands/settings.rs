@@ -226,22 +226,31 @@ pub(super) fn cmd_permissions(ctx: &CommandContext) -> CommandAction {
     )
 }
 
-pub(super) fn cmd_autonomy(args: &str) -> CommandAction {
-    let level = args.trim().to_lowercase();
-    match level.as_str() {
-        "suggest" | "auto-edit" | "full-auto" => CommandAction::SetAutonomy(level),
-        "" => CommandAction::Message(
-            "Autonomy levels:\n  \
-             suggest   — ask before every Write/Edit/MultiEdit, even always-allowed ones;\n              \
-             the auto-fix loop does not run\n  \
-             auto-edit — normal permission rules (default): Write/Edit ask unless allowed\n              \
-             with 'a' or permissions.allow; the auto-fix loop runs\n  \
-             full-auto — currently the same as auto-edit\n\n\
-             Usage: /autonomy <level>"
-                .into(),
-        ),
-        _ => CommandAction::Message(format!(
-            "Unknown autonomy level: '{level}'. Use: suggest, auto-edit, or full-auto"
+pub(super) fn cmd_autonomy(args: &str, current: crate::permissions::Autonomy) -> CommandAction {
+    use crate::permissions::Autonomy;
+    let level = args.trim();
+    if level.is_empty() {
+        return CommandAction::Message(format!(
+            "Autonomy: {current}\n\n  \
+             suggest   — every edit prompts, even one permissions.allow or [a]lways\n              \
+             covers; the auto-fix loop does not run\n  \
+             ask       — (default) edits and commands prompt unless permissions.allow\n              \
+             or [a]lways covers them\n  \
+             auto-edit — edits inside the project run without a prompt, except to .git/,\n              \
+             .claude/, .env*, .mcp.json, CI, hook and build/test config (package.json,\n              \
+             Cargo.toml, Makefile, conftest.py, ...); never when started in $HOME;\n              \
+             commands still prompt\n  \
+             full-auto — nothing prompts; needs /sandbox enable bwrap (or firejail), Linux only\n\n\
+             permissions.deny rules hold in every mode. /autonomy lasts for this session;\n\
+             set \"autonomy\" in settings.json to keep it.\n\n\
+             Usage: /autonomy <mode>"
+        ));
+    }
+    match Autonomy::parse(level) {
+        Some(mode) => CommandAction::SetAutonomy(mode),
+        None => CommandAction::Message(format!(
+            "Unknown autonomy mode: '{level}'. Use one of: {}",
+            Autonomy::ALL.map(Autonomy::as_str).join(", ")
         )),
     }
 }
@@ -663,19 +672,36 @@ mod hooks_command_tests {
 mod autonomy_command_tests {
     use super::{CommandAction, cmd_autonomy};
 
-    /// PermissionGate only special-cases "suggest"; the bare /autonomy text
-    /// used to promise prompt-free edits for auto-edit/full-auto.
+    /// `/autonomy` described auto-edit and full-auto as "currently the same
+    /// as auto-edit"; they now pre-approve, and the text must say what each
+    /// still prompts for.
     #[test]
-    fn levels_are_described_as_they_behave() {
-        let CommandAction::Message(text) = cmd_autonomy("") else {
-            panic!("bare /autonomy should print the levels");
+    fn modes_are_described_as_they_behave() {
+        use crate::permissions::Autonomy;
+        let CommandAction::Message(text) = cmd_autonomy("", Autonomy::AutoEdit) else {
+            panic!("bare /autonomy should print the modes");
         };
-        assert!(!text.contains("without asking"), "{text}");
-        assert!(!text.contains("auto-apply"), "{text}");
-        assert!(text.contains("currently the same as auto-edit"), "{text}");
+        assert!(text.starts_with("Autonomy: auto-edit"), "{text}");
+        assert!(!text.contains("currently the same"), "{text}");
+        for needle in [
+            "(default)",
+            ".git/",
+            "Cargo.toml",
+            "$HOME",
+            "bwrap",
+            "permissions.deny",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        for mode in Autonomy::ALL {
+            assert!(matches!(
+                cmd_autonomy(&mode.as_str().to_uppercase(), Autonomy::Ask),
+                CommandAction::SetAutonomy(m) if m == mode
+            ));
+        }
         assert!(matches!(
-            cmd_autonomy("Full-Auto"),
-            CommandAction::SetAutonomy(l) if l == "full-auto"
+            cmd_autonomy("read-only", Autonomy::Ask),
+            CommandAction::Message(m) if m.contains("Unknown")
         ));
     }
 }

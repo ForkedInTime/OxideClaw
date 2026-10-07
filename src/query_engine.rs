@@ -1680,7 +1680,7 @@ pub(crate) mod scripted_api_tests {
             .unwrap()
             .with_permission_gate(crate::permissions::PermissionGate::new(
                 crate::permissions::PermissionState::new(true, &[], &[]),
-                false,
+                crate::permissions::Autonomy::Ask,
                 None,
             ));
         let r = e
@@ -1840,7 +1840,7 @@ mod permission_wiring_tests {
         let marker = dir.path().join("marker.txt");
         let gate = PermissionGate::new(
             PermissionState::new(false, &[], &[]),
-            false,
+            crate::permissions::Autonomy::Ask,
             Some(Arc::new(AlwaysDeny)),
         );
         let mut e = engine(

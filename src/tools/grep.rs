@@ -566,7 +566,7 @@ mod deny_rule_tests {
         let mut ctx = ToolContext::new(root.to_path_buf());
         ctx.permission_gate = Some(PermissionGate::new(
             PermissionState::new(false, &[], &deny).with_cwd(root),
-            false,
+            crate::permissions::Autonomy::Ask,
             None,
         ));
         (dir, ctx)
