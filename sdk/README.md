@@ -91,6 +91,7 @@ Your App                    OxideClaw
 | Type | When |
 |------|------|
 | `message/delta` | Text chunk from the model |
+| `thinking/delta` | The model's reasoning for one response, sent when `showThinkingSummaries` is on |
 | `tool/started` | Tool execution began |
 | `tool/approval_needed` | Tool needs host approval |
 | `tool/completed` | Tool finished |

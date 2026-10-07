@@ -344,6 +344,21 @@ impl SdkSession {
                 final_text = turn_text;
             }
 
+            // Same switch as the TUI's thinking display; ACP maps these to
+            // agent_thought_chunk.
+            if self.config.show_thinking_summaries {
+                for block in &response.content {
+                    if let ContentBlock::Thinking { thinking, .. } = block
+                        && !thinking.trim().is_empty()
+                    {
+                        self.send_notif(SdkNotification::ThinkingDelta {
+                            session_id: self.session_id.clone(),
+                            content: thinking.clone(),
+                        });
+                    }
+                }
+            }
+
             // Push assistant message to history (never empty: that is a 400
             // on the next request).
             if !response.content.is_empty() {
@@ -1825,6 +1840,40 @@ mod guard_tests {
             }
         }
         assert_eq!((budget_errors, completed), (2, 2));
+    }
+
+    /// thinking/delta (and ACP's agent_thought_chunk) was documented but
+    /// never sent: the reasoning arrived and was dropped.
+    #[tokio::test]
+    async fn thinking_is_sent_when_summaries_are_enabled() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let blocks = [
+            serde_json::json!({"type":"thinking","thinking":"weighing options"}),
+            serde_json::json!({"type":"text","text":"ok"}),
+        ];
+        for show in [true, false] {
+            let (url, _) = serve(vec![sse(&blocks, "end_turn")]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = cfg(dir.path());
+            c.show_thinking_summaries = show;
+            let (mut s, mut nrx) = session_with_notifs(c);
+            let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+            client.set_base_url_for_test(url);
+            s.client = ApiBackend::Anthropic(client);
+            s.execute_turn("hi".into()).await.unwrap();
+            let mut thoughts = Vec::new();
+            while let Ok(n) = nrx.try_recv() {
+                if let SdkNotification::ThinkingDelta { content, .. } = n {
+                    thoughts.push(content);
+                }
+            }
+            let want: Vec<String> = if show {
+                vec!["weighing options".into()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(thoughts, want, "show_thinking_summaries = {show}");
+        }
     }
 
     /// Sub-agent spend never reached the SDK's tracker, so CostUpdated,
