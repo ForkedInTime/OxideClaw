@@ -1248,9 +1248,10 @@ impl LspDiagnostics {
             self.pool
                 .client_for(command, &group.args, &self.root, &launch),
         );
-        // Esc and quit set `cancel`. Dropping the start releases the pool's
-        // lock (the LSP tool and the exit path's shutdown wait on it) and
-        // kills the half-started server; the next check starts it again.
+        // Esc and quit set `cancel`. Dropping the start kills the
+        // half-started server; the next check starts it again. The cap
+        // covers only this server's own start (and a start of the same
+        // server already under way): other servers start alongside it.
         let cancelled = async {
             while !cancel.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3026,6 +3027,42 @@ while True:
             "{:?}",
             quit.elapsed()
         );
+        assert!(!f.pool.gave_up(
+            "pyright-langserver",
+            &["--stdio".to_string()],
+            f.project.path()
+        ));
+    }
+
+    /// A server that hangs in `initialize` costs only itself: another
+    /// server in the same round used to wait behind its start for the pool
+    /// lock, hit the cap and be given up for the session too.
+    #[test]
+    fn a_hung_server_does_not_take_another_down_with_it() {
+        let f = fixture("ok");
+        let hung = tempfile::tempdir().unwrap();
+        fake_server(hung.path(), &hung.path().join("log"), "hang");
+        std::fs::copy(
+            hung.path().join("pyright-langserver"),
+            f.bin.path().join("gopls"),
+        )
+        .unwrap();
+        let go = f.file("main.go");
+        std::fs::write(&go, "package main\n").unwrap();
+        let py = f.file("app.py");
+        std::fs::write(&py, "y = ERR\n").unwrap();
+        let mut cfg = config();
+        cfg.lsp.timeout = Duration::from_secs(2);
+        let action = f.check(vec![(go, None), (py, None)], &cfg, &trusted());
+        let AutoFixAction::Retry { feedback, status } = &action else {
+            panic!("expected a retry: {action:?}");
+        };
+        assert!(feedback.contains("app.py:1:5 bad y = ERR"), "{feedback}");
+        assert!(
+            status.contains("gopls did not answer within 2s"),
+            "{status}"
+        );
+        assert!(!status.contains("pyright-langserver"), "{status}");
         assert!(!f.pool.gave_up(
             "pyright-langserver",
             &["--stdio".to_string()],

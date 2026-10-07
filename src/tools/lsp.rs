@@ -27,6 +27,14 @@ type ClientCache = Arc<Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>>;
 #[derive(Clone, Default)]
 pub struct LspPool {
     clients: ClientCache,
+    /// One start at a time per server + root, so two callers do not both
+    /// start it. Not the `clients` lock: one slow start (jdtls, a cold
+    /// rust-analyzer) held every other server's start behind it, and
+    /// auto-fix's shared deadline then gave those up.
+    starting: Arc<std::sync::Mutex<HashMap<(String, PathBuf), Arc<Mutex<()>>>>>,
+    /// Bumped by `shutdown`: a server whose start straddles it is stopped,
+    /// not cached, so it cannot outlive `/trust revoke`.
+    epoch: Arc<AtomicU64>,
     /// Servers the auto-fix check stopped using for this session: one that
     /// crashed, did not answer within the cap, or that the sandbox refused.
     given_up: Arc<std::sync::Mutex<HashSet<(String, PathBuf)>>>,
@@ -79,31 +87,60 @@ impl LspPool {
         launch: &Launch,
     ) -> Result<Arc<LspClient>> {
         let key = cache_key(command, args, root);
-        let mut cache = self.clients.lock().await;
-        if let Some(c) = cache.get(&key) {
-            // A sandboxed caller needs a server started under that exact
-            // sandbox line: one started before `/sandbox enable` (or before
-            // its network was turned off) runs project code unconfined.
-            // Unsandboxed callers take whatever runs.
-            let fits = match launch {
-                Launch::Shell(line) => c.sandbox_line.as_deref() == Some(line.as_str()),
-                Launch::Plain | Launch::Program(_) => true,
-            };
-            // A server that crashed or was killed would otherwise fail every
-            // later call (EPIPE) until OxideClaw restarts: start a new one.
-            if !c.dead.load(Ordering::SeqCst) && fits {
-                return Ok(Arc::clone(c));
-            }
-            if let Some(stale) = cache.remove(&key) {
-                stale.mark_dead();
-                tokio::spawn(async move { stale.shutdown().await });
-            }
+        if let Some(c) = self.cached(&key, launch).await {
+            return Ok(c);
         }
+        let start = Arc::clone(
+            self.starting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        let _starting = start.lock().await;
+        // Another caller may have started it while this one waited.
+        if let Some(c) = self.cached(&key, launch).await {
+            return Ok(c);
+        }
+        let epoch = self.epoch.load(Ordering::SeqCst);
         let client = LspClient::connect(command, args, root, launch).await?;
         client.initialize(command, root).await?;
         let client = Arc::new(client);
+        let mut cache = self.clients.lock().await;
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            drop(cache);
+            client.shutdown().await;
+            return Err(anyhow!(
+                "language servers were stopped while '{command}' started"
+            ));
+        }
         cache.insert(key, Arc::clone(&client));
         Ok(client)
+    }
+
+    /// The cached client for `key` if it is alive and fits `launch`. One
+    /// that does not is retired.
+    async fn cached(&self, key: &(String, PathBuf), launch: &Launch) -> Option<Arc<LspClient>> {
+        let mut cache = self.clients.lock().await;
+        let c = cache.get(key)?;
+        // A sandboxed caller needs a server started under that exact
+        // sandbox line: one started before `/sandbox enable` (or before
+        // its network was turned off) runs project code unconfined.
+        // Unsandboxed callers take whatever runs.
+        let fits = match launch {
+            Launch::Shell(line) => c.sandbox_line.as_deref() == Some(line.as_str()),
+            Launch::Plain | Launch::Program(_) => true,
+        };
+        // A server that crashed or was killed would otherwise fail every
+        // later call (EPIPE) until OxideClaw restarts: start a new one.
+        if !c.dead.load(Ordering::SeqCst) && fits {
+            return Some(Arc::clone(c));
+        }
+        if let Some(stale) = cache.remove(key) {
+            stale.mark_dead();
+            tokio::spawn(async move { stale.shutdown().await });
+        }
+        None
     }
 
     /// The running client for this server + root, without starting one.
@@ -135,6 +172,7 @@ impl LspPool {
     /// Ask every server to shut down (`shutdown`, then `exit`), killing any
     /// that has not gone within a second or two. For a clean exit.
     pub async fn shutdown(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         let clients: Vec<Arc<LspClient>> =
             self.clients.lock().await.drain().map(|(_, c)| c).collect();
         futures_util::future::join_all(clients.iter().map(|c| c.shutdown())).await;
@@ -1582,6 +1620,58 @@ mod cache_tests {
         assert!(Arc::ptr_eq(&rewrapped, &unboxed));
         let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(starts, 3, "server spawned {starts} times");
+    }
+
+    /// A server that answers `initialize` after `delay` (or never), and
+    /// stays up.
+    fn slow_server(delay: &str) -> Vec<String> {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        let script = format!(
+            "read -r _l; sleep {delay}; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; sleep 30",
+            body.len(),
+            body
+        );
+        vec!["-c".to_string(), script]
+    }
+
+    /// One server's slow start used to hold the pool's lock, so every other
+    /// server waited behind it (and auto-fix gave them up at its deadline).
+    #[tokio::test]
+    async fn a_slow_start_does_not_hold_up_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = LspPool::default();
+        let hung = {
+            let (pool, root) = (pool.clone(), dir.path().to_path_buf());
+            tokio::spawn(async move {
+                pool.client_for("sh", &slow_server("60"), &root, &Launch::Plain)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.client_for("sh", &slow_server("0"), dir.path(), &Launch::Plain),
+        )
+        .await;
+        assert!(matches!(other, Ok(Ok(_))), "waited on the other start");
+        hung.abort();
+    }
+
+    /// A server whose start straddles `shutdown` (`/trust revoke`) is
+    /// stopped rather than cached for later use.
+    #[tokio::test]
+    async fn a_start_during_shutdown_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = LspPool::default();
+        let args = slow_server("1");
+        let start = {
+            let (pool, root, args) = (pool.clone(), dir.path().to_path_buf(), args.clone());
+            tokio::spawn(async move { pool.client_for("sh", &args, &root, &Launch::Plain).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        pool.shutdown().await;
+        assert!(start.await.unwrap().is_err());
+        assert!(pool.running("sh", &args, dir.path()).await.is_none());
     }
 
     /// Two queries against the same root must reuse one server process.
