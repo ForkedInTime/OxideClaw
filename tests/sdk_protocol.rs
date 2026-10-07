@@ -210,5 +210,8 @@ fn test_protocol_doc_lists_exactly_the_sent_error_codes() {
         }
     }
 
-    assert_eq!(documented, sent, "sdk/protocol.md error codes drifted from src/sdk");
+    assert_eq!(
+        documented, sent,
+        "sdk/protocol.md error codes drifted from src/sdk"
+    );
 }
