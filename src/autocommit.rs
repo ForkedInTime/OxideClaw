@@ -333,8 +333,73 @@ fn temp_index_cmd(cwd: &Path, temp_index: &Path) -> Command {
         "core.untrackedCache=false",
         "-c",
         "index.sparse=false",
+        // The warm index carries the real one's stat data, and `.git/config`
+        // is writable from the sandbox: with ctime ignored, a same-size edit
+        // with its mtime restored would read as unchanged and never reach a
+        // snapshot (so /undo could neither save nor revert it).
+        "-c",
+        "core.trustctime=true",
+        "-c",
+        "core.checkStat=default",
+        "-c",
+        "core.ignoreStat=false",
     ]);
     cmd
+}
+
+/// Clear the flags the copied real index carries that make `add -A` skip a
+/// changed file: assume-unchanged, and skip-worktree on a file that is
+/// present (a sparse checkout's absent files keep theirs, or they would be
+/// recorded as deleted). Either can be set from a sandboxed Bash call.
+fn clear_stat_trust_flags(cwd: &Path, temp_index: &Path) -> anyhow::Result<()> {
+    let top = git_output(git_cmd(cwd).args(["rev-parse", "--show-toplevel"]))?;
+    let top = Path::new(&top);
+    let out = temp_index_cmd(top, temp_index)
+        .args(["ls-files", "-v", "-z"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("git ls-files -v failed");
+    }
+    let (mut assumed, mut skipped) = (Vec::new(), Vec::new());
+    for rec in out.stdout.split(|&b| b == 0).filter(|r| r.len() > 2) {
+        let (tag, path) = (rec[0], &rec[2..]);
+        if tag.is_ascii_lowercase() {
+            assumed.extend_from_slice(path);
+            assumed.push(0);
+        }
+        if tag.eq_ignore_ascii_case(&b'S')
+            && top
+                .join(String::from_utf8_lossy(path).as_ref())
+                .symlink_metadata()
+                .is_ok()
+        {
+            skipped.extend_from_slice(path);
+            skipped.push(0);
+        }
+    }
+    for (flag, paths) in [
+        ("--no-assume-unchanged", assumed),
+        ("--no-skip-worktree", skipped),
+    ] {
+        if paths.is_empty() {
+            continue;
+        }
+        let mut child = temp_index_cmd(top, temp_index)
+            .args(["update-index", flag, "-z", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            std::io::Write::write_all(&mut stdin, &paths)?;
+        }
+        if !child.wait()?.success() {
+            anyhow::bail!("git update-index {flag} failed");
+        }
+    }
+    Ok(())
 }
 
 /// Copy the user's index, mtime included. Git trusts an entry's stat data
@@ -367,7 +432,7 @@ fn seed_index(cwd: &Path, tree: &str, temp_index: &Path) -> anyhow::Result<()> {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
-    if warm {
+    if warm && clear_stat_trust_flags(cwd, temp_index).is_ok() {
         return Ok(());
     }
     // No index yet, or one mid-merge (`read-tree -m` refuses unmerged entries).
@@ -680,13 +745,25 @@ pub fn restore_to(
     }
 
     let target_files = list_tree_files(cwd, &tree_sha);
-    // Only files some snapshot recorded are ever removed; a file the user
-    // created after the last turn is not the undone turns' doing.
-    let snapshotted: std::collections::HashSet<String> = auto_commits
-        .last()
-        .and_then(|latest| tree_of_commit(cwd, latest))
-        .map(|tree| list_tree_files(cwd, &tree).into_iter().collect())
-        .unwrap_or_default();
+    // Only files some reachable state recorded are ever removed; a file the
+    // user created after the last turn is not the undone turns' doing. Every
+    // turn and the session base count, not just the newest turn: a file turn
+    // 1 created and turn 2 deleted is back after `/undo 1` and must go again
+    // on `/undo 0` (or `/redo 2`). The live tree is held by a snapshot or the
+    // recovery ref, so removing these stays recoverable.
+    let mut snapshotted = std::collections::HashSet::new();
+    let mut revs: Vec<String> = auto_commits
+        .iter()
+        .map(|c| format!("{c}^{{tree}}"))
+        .collect();
+    if let Some(first) = auto_commits.first() {
+        revs.push(format!("{first}^^{{tree}}")); // absent for a root first commit
+    }
+    for r in &revs {
+        if let Ok(tree) = git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", r])) {
+            snapshotted.extend(list_tree_files(cwd, &tree));
+        }
+    }
 
     let recovery = recovery_ref(session_id);
     let (saved_edits, live_tree) = save_unrecorded_worktree(cwd, &recovery, auto_commits)?;
@@ -1783,6 +1860,115 @@ mod restore_tests {
         assert_eq!(report.orphaned_files, vec![PathBuf::from("root_new.txt")]);
         assert!(!td.path().join("root_new.txt").exists());
         assert!(td.path().join("top.txt").exists());
+    }
+
+    /// The warm temp index trusted the real index's flags and the repo's
+    /// stat settings, so an edit hidden by assume-unchanged, skip-worktree
+    /// or `core.trustctime=false` never reached a snapshot.
+    #[test]
+    fn hidden_edits_still_reach_the_snapshot() {
+        let td = init_test_repo();
+        let past =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let set_mtime = |name: &str| {
+            std::fs::File::options()
+                .write(true)
+                .open(td.path().join(name))
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        };
+        for f in ["assumed.txt", "skipped.txt", "stat.txt"] {
+            write_file(td.path(), f, "old\n");
+            set_mtime(f);
+        }
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        for (flag, f) in [
+            ("--assume-unchanged", "assumed.txt"),
+            ("--skip-worktree", "skipped.txt"),
+        ] {
+            git_cmd(td.path())
+                .args(["update-index", flag, f])
+                .status()
+                .unwrap();
+        }
+        for (k, v) in [("core.trustctime", "false"), ("core.checkStat", "minimal")] {
+            git_cmd(td.path()).args(["config", k, v]).status().unwrap();
+        }
+        // Git compares whole seconds of ctime: the rewrite must land in a
+        // later second than the `git add` for a ctime check to see it.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for f in ["assumed.txt", "skipped.txt", "stat.txt"] {
+            write_file(td.path(), f, "new\n");
+            set_mtime(f);
+        }
+
+        let cfg = AutoCommitConfig::default();
+        let (mut commits, mut pos) = (Vec::new(), 0usize);
+        snapshot_turn(
+            td.path(),
+            &cfg,
+            "s",
+            "edit",
+            1,
+            &mut commits,
+            &mut pos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(commits.len(), 1, "the edits were not seen");
+        for f in ["assumed.txt", "skipped.txt", "stat.txt"] {
+            let blob =
+                git_output(git_cmd(td.path()).args(["show", &format!("{}:{f}", commits[0])]))
+                    .unwrap();
+            assert_eq!(blob, "new", "{f}");
+        }
+    }
+
+    /// Only the newest snapshot's files counted as removable, so a file an
+    /// earlier state recorded stayed on disk after /undo or /redo.
+    #[test]
+    fn undo_and_redo_remove_files_only_an_earlier_state_recorded() {
+        let td = init_test_repo();
+        write_file(td.path(), "a.txt", "a\n");
+        write_file(td.path(), "base.txt", "b\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        // Turn 1 creates x and deletes base.txt; turn 2 deletes x.
+        write_file(td.path(), "x.txt", "x\n");
+        std::fs::remove_file(td.path().join("base.txt")).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "t1", 1, &mut commits, &mut pos, None).unwrap();
+        std::fs::remove_file(td.path().join("x.txt")).unwrap();
+        snapshot_turn(td.path(), &cfg, "s", "t2", 2, &mut commits, &mut pos, None).unwrap();
+        assert_eq!(commits.len(), 2);
+        let x = td.path().join("x.txt");
+        let base = td.path().join("base.txt");
+
+        restore_to(td.path(), "s", &commits, 1).unwrap();
+        assert!(x.exists() && !base.exists());
+        restore_to(td.path(), "s", &commits, 0).unwrap();
+        assert!(!x.exists(), "/undo 0 left turn 1's file");
+        assert!(base.exists());
+
+        restore_to(td.path(), "s", &commits, 1).unwrap();
+        assert!(x.exists());
+        restore_to(td.path(), "s", &commits, 2).unwrap();
+        assert!(!x.exists(), "/redo 2 left the file turn 2 deleted");
+
+        restore_to(td.path(), "s", &commits, 0).unwrap();
+        assert!(base.exists());
+        restore_to(td.path(), "s", &commits, 1).unwrap();
+        assert!(!base.exists(), "/redo 1 left the base file turn 1 deleted");
     }
 
     /// A file the user wrote after the last turn is not an orphan of the
