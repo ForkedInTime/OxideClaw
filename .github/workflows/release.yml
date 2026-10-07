@@ -217,11 +217,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
+          # A hyphenated tag (v1.0.0-beta.1) must not become /releases/latest,
+          # which install.sh and /upgrade resolve for every stable user.
+          EXTRA=()
+          if [[ "$TAG" == *-* ]]; then EXTRA=(--prerelease --latest=false); fi
           # --verify-tag: never create a missing tag at the default branch tip.
           gh release create "$TAG" \
             --title "OxideClaw $TAG" \
             --generate-notes \
             --verify-tag \
+            "${EXTRA[@]}" \
             release/*
           # A release made with GITHUB_TOKEN triggers no workflows, so start
           # the image build explicitly; the Dockerfile downloads the musl
