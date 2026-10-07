@@ -9,37 +9,39 @@ pub(super) fn cmd_copy(ctx: &CommandContext) -> CommandAction {
     clipboard_write(text)
 }
 
+/// Clipboard tools in the order they are tried. Every one gets the text on
+/// stdin: as an argv element (how wl-copy used to be called) a reply starting
+/// with `-` is parsed as flags, one over 128 KiB fails with E2BIG, and the
+/// forked wl-copy server exposes it in /proc/<pid>/cmdline to other users.
+const CLIPBOARD_TOOLS: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),                        // Wayland
+    ("xclip", &["-selection", "clipboard"]), // X11
+    ("xsel", &["--clipboard", "--input"]),   // X11
+    ("pbcopy", &[]),                         // macOS
+    ("clip.exe", &[]),                       // WSL / Windows
+];
+
+/// Pipe `text` into `cmd`. `wait()` closes stdin first, so tools that read to
+/// EOF (wl-copy forks its selection server only then) see the end of input.
+fn pipe_to(cmd: &str, args: &[&str], text: &str) -> std::io::Result<std::process::ExitStatus> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin not available"))?
+        .write_all(text.as_bytes())?;
+    child.wait()
+}
+
 /// Write text to the system clipboard. Tries all known clipboard tools across platforms.
 pub fn clipboard_write(text: &str) -> CommandAction {
-    use std::io::Write;
-
-    // Helper: pipe text into a child process
-    let pipe_to = |cmd: &str, args: &[&str]| -> std::io::Result<std::process::ExitStatus> {
-        let mut child = std::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin not available")
-            })?
-            .write_all(text.as_bytes())?;
-        child.wait()
-    };
-
-    // Wayland
-    let ok = std::process::Command::new("wl-copy").arg(text).status()
-        .map(|s| s.success()).unwrap_or(false)
-    // X11 xclip
-    || pipe_to("xclip", &["-selection", "clipboard"]).map(|s| s.success()).unwrap_or(false)
-    // X11 xsel
-    || pipe_to("xsel", &["--clipboard", "--input"]).map(|s| s.success()).unwrap_or(false)
-    // macOS
-    || pipe_to("pbcopy", &[]).map(|s| s.success()).unwrap_or(false)
-    // WSL / Windows
-    || pipe_to("clip.exe", &[]).map(|s| s.success()).unwrap_or(false);
+    let ok = CLIPBOARD_TOOLS
+        .iter()
+        .any(|(cmd, args)| pipe_to(cmd, args, text).is_ok_and(|s| s.success()));
 
     if ok {
         CommandAction::Message("Copied to clipboard.".into())
@@ -217,7 +219,25 @@ pub(super) fn cmd_share(args: &str) -> CommandAction {
 
 #[cfg(test)]
 mod session_command_tests {
-    use super::{CommandAction, cmd_session};
+    use super::{CLIPBOARD_TOOLS, CommandAction, cmd_session, pipe_to};
+
+    /// /copy passed the reply to wl-copy as an argument, so a Markdown
+    /// bullet list ("- item") was parsed as an option and the copy failed.
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_text_goes_through_stdin_not_argv() {
+        let (wl_cmd, wl_args) = CLIPBOARD_TOOLS[0];
+        assert_eq!(wl_cmd, "wl-copy");
+        assert!(wl_args.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clip.txt");
+        let script = format!("cat > '{}'", out.display());
+        let text = "- first bullet\n--second\n";
+        let status = pipe_to("sh", &["-c", &script], text).unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), text);
+    }
 
     /// `/session clear` wiped every saved session at once, unasked.
     #[test]
