@@ -10,7 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -263,4 +263,33 @@ fn print_mode_reports_the_turn_cap() {
     let last: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
     assert_eq!(last["subtype"], "error_max_turns");
     assert_eq!(last["is_error"], true);
+}
+
+fn trusted(config_dir: &Path) -> Vec<String> {
+    let s: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_dir.join("settings.json")).unwrap())
+            .unwrap();
+    serde_json::from_value(s["trustedProjects"].clone()).unwrap()
+}
+
+/// The command cleared keys nothing reads; project MCP servers are gated by
+/// the global trustedProjects list, which it left alone.
+#[test]
+fn reset_project_choices_revokes_trust() {
+    let e = env();
+    let project = e.project.canonicalize().unwrap();
+    let project = project.to_str().unwrap();
+    std::fs::write(
+        e.config_dir.join("settings.json"),
+        serde_json::json!({ "trustedProjects": [project, "/elsewhere"] }).to_string(),
+    )
+    .unwrap();
+    let out = run(&e, &["mcp", "reset-project-choices"], &[], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(trusted(&e.config_dir), vec!["/elsewhere"]);
+
+    let out = run(&e, &["mcp", "reset-project-choices"], &[], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("not trusted"));
+    assert_eq!(trusted(&e.config_dir), vec!["/elsewhere"]);
 }

@@ -393,7 +393,8 @@ enum McpSubcommand {
         /// Server name
         name: String,
     },
-    /// Reset approved/rejected project-scoped (.mcp.json) server choices
+    /// Stop this project's .mcp.json and project-settings MCP servers from
+    /// starting by revoking its trust (same as /trust revoke)
     ResetProjectChoices,
 }
 
@@ -1626,18 +1627,35 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
             }
         }
         Some(McpSubcommand::ResetProjectChoices) => {
-            // Reset approvedMcpjsonServers / rejectedMcpjsonServers in project settings
-            let project_path = config.cwd.join(".claude").join("settings.json");
-            if project_path.exists() {
-                let mut json = config::read_json_object(&project_path)?;
-                if let Some(m) = json.as_object_mut() {
-                    m.remove("approvedMcpjsonServers");
-                    m.remove("rejectedMcpjsonServers");
-                }
-                std::fs::write(&project_path, serde_json::to_string_pretty(&json)?)?;
-                println!("Reset project MCP choices in {}", project_path.display());
+            // Project MCP servers (.mcp.json, .claude/settings.json) start
+            // only while the project is in the global trustedProjects list,
+            // so revoking that is the reset, as `/trust revoke` does.
+            let global = crate::settings::Settings::load_global();
+            if !global.load_errors.is_empty() {
+                anyhow::bail!(
+                    "{}",
+                    crate::settings::load_errors_notice(&global.load_errors)
+                );
+            }
+            let shown = config
+                .cwd
+                .canonicalize()
+                .unwrap_or_else(|_| config.cwd.clone());
+            let mut list = global.trusted_projects.unwrap_or_default();
+            if crate::settings::Settings::remove_trusted(&mut list, &config.cwd) {
+                Config::save_user_setting("trustedProjects", serde_json::json!(list))?;
+                println!(
+                    "Revoked trust for {}. Its .mcp.json and project MCP servers, settings \
+                     hooks and apiKeyHelper will be ignored from the next start; run /trust \
+                     to approve them again.",
+                    shown.display()
+                );
             } else {
-                println!("No project settings file found.");
+                println!(
+                    "{} is not trusted, so its .mcp.json and project MCP servers are \
+                     already ignored.",
+                    shown.display()
+                );
             }
         }
     }
