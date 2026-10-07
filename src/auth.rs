@@ -312,18 +312,105 @@ fn fetch_helper_key() -> Option<String> {
         .and_then(|k| non_empty(Some(k)))
 }
 
+/// How long an `apiKeyHelper` may run. It is re-run on a 401 mid-session,
+/// while the refresh lock is held, so a helper stuck on a prompt (an
+/// expired 1Password or vault session) must not wedge every API call.
+const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run an `apiKeyHelper` command: the key is its trimmed stdout. `Err`
 /// carries the message to warn with.
+///
+/// While the TUI owns the terminal (raw mode) the helper runs without a
+/// controlling terminal, so a prompt on /dev/tty fails at once instead of
+/// drawing over the TUI and fighting it for keystrokes. Before the TUI
+/// starts (and in `-p`), an interactive MFA prompt still works.
 pub fn run_api_key_helper(cmd: &str) -> Result<String, String> {
-    match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
-        Ok(out) if out.status.success() => {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let detach = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    run_api_key_helper_with(cmd, detach, HELPER_TIMEOUT)
+}
+
+fn run_api_key_helper_with(cmd: &str, detach: bool, timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut c = Command::new("sh");
+    c.arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if detach {
+        crate::tools::bash::new_session(&mut c);
+    }
+    #[cfg(not(unix))]
+    let _ = detach;
+    let mut child = c
+        .spawn()
+        .map_err(|e| format!("apiKeyHelper could not run: {e}"))?;
+
+    // Drained on threads: a full pipe must not stall the helper, and the
+    // deadline must hold even if it never closes them.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    };
+    let out_rx = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err_rx = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                // new_session made the child its group leader: take the
+                // whole group, not just `sh`.
+                #[cfg(unix)]
+                if detach {
+                    // SAFETY: kill has no memory-safety preconditions.
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "apiKeyHelper timed out after {}s",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return Err(format!("apiKeyHelper could not run: {e}")),
         }
-        Ok(out) => Err(format!(
+    };
+    // A background grandchild can hold the pipes open after `sh` exits.
+    let grace = Duration::from_secs(2);
+    let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    } else {
+        Err(format!(
             "apiKeyHelper failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-        Err(e) => Err(format!("apiKeyHelper could not run: {e}")),
+            String::from_utf8_lossy(&stderr).trim()
+        ))
     }
 }
 
@@ -526,6 +613,31 @@ mod profile_token_tests {
             run_api_key_helper("echo nope >&2; exit 3")
                 .unwrap_err()
                 .contains("nope")
+        );
+    }
+
+    /// A helper stuck on a prompt held the refresh lock forever, wedging
+    /// every later API call until restart.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_helper_times_out() {
+        use super::run_api_key_helper_with;
+        use std::time::{Duration, Instant};
+        for detach in [true, false] {
+            let started = Instant::now();
+            let err = run_api_key_helper_with("sleep 30", detach, Duration::from_millis(300))
+                .unwrap_err();
+            assert!(err.contains("timed out"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{detach}");
+        }
+        // Detached, a /dev/tty prompt fails instead of waiting for a key.
+        let started = Instant::now();
+        let r = run_api_key_helper_with("read k </dev/tty; echo $k", true, Duration::from_secs(10));
+        assert!(r.is_err() || r.as_deref() == Ok(""), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            run_api_key_helper_with("echo key", true, Duration::from_secs(10)).as_deref(),
+            Ok("key")
         );
     }
 }
