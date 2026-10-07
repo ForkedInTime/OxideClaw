@@ -144,28 +144,57 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     sanitize_buffer(f.buffer_mut());
 }
 
-/// Replace control characters in rendered cells with visible stand-ins.
-/// Paragraph writes every width-1 grapheme verbatim and unicode-width counts
-/// ESC/BEL/TAB as width 1, so tool output, file contents or a model-written
-/// command could otherwise emit raw escape sequences: redraw the permission
-/// dialog over the real command or set the clipboard via OSC 52. A control
-/// char is always its own grapheme, so a width-1 placeholder shifts nothing.
+/// Width-1 visible stand-in for a control character: a space for TAB/CR, the
+/// Unicode control picture for the rest of C0 and DEL, U+FFFD for C1.
+fn visible_char(c: char) -> char {
+    match c {
+        '\t' | '\r' => ' ',
+        '\u{7f}' => '\u{2421}',
+        c if (c as u32) < 0x20 => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+        c if c.is_control() => '\u{fffd}',
+        c => c,
+    }
+}
+
+/// `Paragraph::new` with control characters made visible first. ratatui
+/// silently drops them when it renders a span, which would delete tabs (code
+/// indentation, the line-number gutter in Read output) and hide an escape
+/// sequence smuggled into a command the user is asked to approve. Mapping
+/// before the Paragraph exists keeps `line_count` wrap math in step with what
+/// is drawn.
+fn paragraph<'a>(text: impl Into<Text<'a>>) -> Paragraph<'a> {
+    let mut text = text.into();
+    make_visible(&mut text.lines);
+    Paragraph::new(text)
+}
+
+/// Map control characters in `lines` the way `paragraph` does, for callers
+/// that build their `Paragraph`s from the same lines more than once.
+fn make_visible(lines: &mut [Line<'_>]) {
+    for span in lines.iter_mut().flat_map(|l| l.spans.iter_mut()) {
+        if span.content.contains(char::is_control) {
+            span.content = span
+                .content
+                .chars()
+                .map(visible_char)
+                .collect::<String>()
+                .into();
+        }
+    }
+}
+
+/// Backstop for anything that reaches a cell without going through
+/// `paragraph`: no raw control character may reach the terminal, where tool
+/// output, file contents or a model-written command could redraw the
+/// permission dialog over the real command or set the clipboard via OSC 52.
+/// A control char is always its own grapheme, so a width-1 stand-in shifts
+/// nothing.
 pub(crate) fn sanitize_buffer(buf: &mut ratatui::buffer::Buffer) {
     for cell in buf.content.iter_mut() {
         if !cell.symbol().chars().any(char::is_control) {
             continue;
         }
-        let clean: String = cell
-            .symbol()
-            .chars()
-            .map(|c| match c {
-                '\t' | '\r' => ' ',
-                '\u{7f}' => '\u{2421}',
-                c if (c as u32) < 0x20 => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
-                c if c.is_control() => '\u{fffd}',
-                c => c,
-            })
-            .collect();
+        let clean: String = cell.symbol().chars().map(visible_char).collect();
         cell.set_symbol(&clean);
     }
 }
@@ -269,7 +298,7 @@ fn draw_banner_left(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
             .add_modifier(Modifier::ITALIC),
     )));
 
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
+    f.render_widget(paragraph(Text::from(lines)), area);
 }
 
 fn draw_banner_right(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
@@ -283,7 +312,7 @@ fn draw_banner_right(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
     let div_lines: Vec<Line<'static>> = (0..area.height)
         .map(|_| Line::from(Span::styled("│", Style::default().fg(tc.accent))))
         .collect();
-    f.render_widget(Paragraph::new(Text::from(div_lines)), divider_area);
+    f.render_widget(paragraph(Text::from(div_lines)), divider_area);
 
     let content_area = Rect {
         x: area.x + 1,
@@ -361,7 +390,7 @@ fn draw_banner_right(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         )));
     }
 
-    f.render_widget(Paragraph::new(Text::from(lines)), content_area);
+    f.render_widget(paragraph(Text::from(lines)), content_area);
 }
 
 // ── Chat messages ─────────────────────────────────────────────────────────────
@@ -655,6 +684,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     }
 
     // Scroll math — use ratatui's own line_count() so wrap matches exactly
+    // ratatui 0.30 drops control characters (tabs included) from a span:
+    // map them first, so the wrap math below and the rendered rows agree.
+    make_visible(&mut lines);
     let total = Paragraph::new(borrowed_text(&lines))
         .wrap(Wrap { trim: false })
         .line_count(area.width);
@@ -706,7 +738,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                 height: 1,
             };
             f.render_widget(
-                Paragraph::new(badge).style(Style::default().fg(Color::Black).bg(Color::Yellow)),
+                paragraph(badge).style(Style::default().fg(Color::Black).bg(Color::Yellow)),
                 badge_area,
             );
         }
@@ -830,7 +862,7 @@ fn input_view(
         .collect();
 
     let wrapped =
-        |lines: Vec<Line<'static>>| Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        |lines: Vec<Line<'static>>| paragraph(Text::from(lines)).wrap(Wrap { trim: false });
     let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
     let scroll_to = match cursor_prefix {
         Some(prefix) => {
@@ -995,8 +1027,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         height: 1,
     };
 
-    f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
-    f.render_widget(Paragraph::new(right_line), right_area);
+    f.render_widget(paragraph(Line::from(left_spans)), left_area);
+    f.render_widget(paragraph(right_line), right_area);
 }
 
 // ── Browse approval dialog ────────────────────────────────────────────────────
@@ -1047,7 +1079,7 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         ),
         Span::styled("]eny", Style::default().fg(Color::DarkGray)),
     ]);
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    let para = paragraph(Text::from(lines)).wrap(Wrap { trim: true });
 
     let popup_w = (area.width * 6 / 10).max(50).min(area.width);
     // Sized to the wrapped text: a fixed height let a long target, URL or
@@ -1091,7 +1123,7 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
         ..inner
     };
     f.render_widget(para, body);
-    f.render_widget(Paragraph::new(legend), legend_area);
+    f.render_widget(paragraph(legend), legend_area);
 }
 
 // ── Permission dialog ─────────────────────────────────────────────────────────
@@ -1109,7 +1141,7 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
         )));
     }
     // trim: false keeps the command's own indentation when it wraps.
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let para = paragraph(Text::from(lines)).wrap(Wrap { trim: false });
 
     let popup_w = (area.width * 7 / 10).max(50).min(area.width);
     // Measure with the same Paragraph that is drawn: a character-count
@@ -1208,7 +1240,7 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
             )
         };
         f.render_widget(
-            Paragraph::new(Line::from(marker)),
+            paragraph(Line::from(marker)),
             Rect {
                 y: body.y + view_h,
                 height: body.height - view_h,
@@ -1216,7 +1248,7 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
             },
         );
     }
-    f.render_widget(Paragraph::new(legend), legend_area);
+    f.render_widget(paragraph(legend), legend_area);
 }
 
 // ── Overlay panel ─────────────────────────────────────────────────────────────
@@ -1292,7 +1324,7 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
             .rendered
             .iter()
             .map(|l| {
-                Paragraph::new(l.clone())
+                paragraph(l.clone())
                     .wrap(Wrap { trim: false })
                     .line_count(width)
                     .max(1)
@@ -1354,7 +1386,7 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     // Smaller than one line's row count, so it always fits in u16.
     let offset = u16::try_from(overlay.scroll - starts[first]).unwrap_or(u16::MAX);
     f.render_widget(
-        Paragraph::new(Text::from(display))
+        paragraph(Text::from(display))
             .wrap(Wrap { trim: false })
             .scroll((offset, 0)),
         inner,
@@ -1376,7 +1408,7 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
         )));
     }
     lines.push(Line::raw(""));
-    let question = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    let question = paragraph(Text::from(lines)).wrap(Wrap { trim: true });
 
     // Render the text input row with cursor
     let before: String = q.input[..q.cursor].iter().collect();
@@ -1388,7 +1420,7 @@ fn draw_ask_user(f: &mut Frame, area: Rect, app: &App) {
         Some(c) => c.to_string(),
     };
     let after_str: String = rest.iter().skip(1).collect();
-    let footer = Paragraph::new(Text::from(vec![
+    let footer = paragraph(Text::from(vec![
         Line::from(vec![
             Span::styled(
                 "  > ",
@@ -1749,7 +1781,36 @@ mod permission_popup_tests {
             .collect();
         assert!(bad.is_empty(), "control chars rendered: {bad:?}");
         let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(screen.contains("\u{241b}[2K"), "{screen}");
+        assert!(screen.contains("\u{241b}[2K\u{241b}[Gls"), "{screen}");
+        assert!(screen.contains("1 \u{241b}]52;c;"), "{screen}");
+    }
+
+    /// ratatui drops control characters while rendering a span, so without
+    /// `paragraph` a tab simply vanished: Read's `1\tfn main` gutter drew as
+    /// `1fn main`, tab-indented code lost its indent and a pasted tab in the
+    /// input box disappeared.
+    #[test]
+    fn tabs_render_as_spaces_in_chat_and_input() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.show_welcome = false;
+        app.entries
+            .push(crate::tui::app::ChatEntry::tool_result("1\tfn main() {}"));
+        app.entries.push(crate::tui::app::ChatEntry::assistant(
+            "```go\nfunc f() {\n\treturn\n}\n```",
+        ));
+        app.input = "a\tb".chars().collect();
+        app.cursor = 2;
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let rows = screen_rows(&term);
+        let screen = rows.join("\n");
+        assert!(screen.contains("1 fn main() {}"), "{screen}");
+        let col = |needle: &str| rows.iter().find_map(|r| r.find(needle)).unwrap();
+        assert!(col("return") > col("func f()"), "{screen}");
+        assert!(screen.contains("a b"), "{screen}");
+        let buf = term.backend().buffer();
+        let cur = buf.content.iter().find(|c| c.bg == Color::White).unwrap();
+        assert_eq!(cur.symbol(), "b");
     }
 
     fn screen_rows(term: &Terminal<TestBackend>) -> Vec<String> {

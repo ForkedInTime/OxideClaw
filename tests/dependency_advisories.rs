@@ -7,7 +7,10 @@
 //! copy of it in the lockfile.
 
 /// (crate, first patched version, advisories it closes)
-const FLOORS: &[(&str, (u64, u64, u64), &str)] = &[("rustls", (0, 23, 45), "RUSTSEC-2026-0285")];
+const FLOORS: &[(&str, (u64, u64, u64), &str)] = &[
+    ("rustls", (0, 23, 45), "RUSTSEC-2026-0285"),
+    ("lru", (0, 18, 2), "RUSTSEC-2026-0002, RUSTSEC-2026-0253"),
+];
 
 /// Every `version` of `name` recorded in a Cargo.lock.
 fn locked_versions(lock: &str, name: &str) -> Vec<String> {

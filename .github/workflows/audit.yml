@@ -5,7 +5,7 @@ name: Audit
 # sitting in the lockfile for five months. This job fails a PR that introduces
 # one, and the weekly schedule catches advisories published against an
 # unchanged lockfile. Unmaintained/unsound *warnings* do not fail the job —
-# the remaining ones are transitive (via ratatui 0.29, notify 7, image) and are
+# the remaining ones are transitive (via notify 7 and image) and are
 # tracked separately.
 on:
   push:
