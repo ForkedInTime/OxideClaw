@@ -36,6 +36,46 @@ pub struct SessionMeta {
     /// which case HEAD is the base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// The undo timeline: one mark per prompt of the conversation, oldest
+    /// first, saved before the prompt reaches the transcript. After a crash
+    /// it can run ahead of the transcript, never behind it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline: Vec<TurnMark>,
+    /// Turns /undo took off the conversation, the next one to /redo last.
+    /// Any new turn clears it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redo: Vec<UndoneTurn>,
+}
+
+/// A prompt on the undo timeline and where the files were when it started.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TurnMark {
+    /// [`prompt_fingerprint`] of the prompt this mark belongs to. A mark
+    /// only ever pairs with that prompt, so a transcript that changed
+    /// under the timeline (compaction, an import, a crash between saves)
+    /// can never make /undo restore another turn's files.
+    pub prompt: String,
+    /// `undo_position` when the turn started: what /undo of it restores.
+    pub before: usize,
+}
+
+/// A turn /undo removed: its messages, and the file positions to put back.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UndoneTurn {
+    pub mark: TurnMark,
+    /// `undo_position` after the turn: what /redo of it restores.
+    pub after: usize,
+    pub messages: Vec<Message>,
+}
+
+/// Stable identity of a prompt message, for [`TurnMark::prompt`].
+pub fn prompt_fingerprint(message: &Message) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(message).unwrap_or_default();
+    Sha256::digest(&bytes)[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 impl SessionMeta {
@@ -94,6 +134,8 @@ impl Session {
             auto_commits: Vec::new(),
             undo_position: 0,
             base_commit: None,
+            timeline: Vec::new(),
+            redo: Vec::new(),
         };
         meta.save_in(dir).await?;
         Ok(Self {
@@ -119,6 +161,8 @@ impl Session {
                 auto_commits: Vec::new(),
                 undo_position: 0,
                 base_commit: None,
+                timeline: Vec::new(),
+                redo: Vec::new(),
             },
             dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             path,
@@ -227,10 +271,13 @@ impl Session {
         self.meta.name = format!("fork-of-{origin}");
         self.meta.id = id.clone();
         self.meta.created_at = unix_now();
-        // Undo history lives on the original's shadow ref.
+        // Undo history lives on the original's shadow ref; the copied turns
+        // can still be undone, conversation only.
         self.meta.auto_commits.clear();
         self.meta.undo_position = 0;
         self.meta.base_commit = None;
+        self.meta.timeline.clear();
+        self.meta.redo.clear();
         self.path = Self::jsonl_path(&self.dir, &id);
         self.id = id;
         self.meta.save_in(&self.dir).await?;
@@ -419,8 +466,8 @@ impl Session {
         }
     }
 
-    /// Remove `<dir>/<id>/`, which holds the per-turn copies of edited files
-    /// that /rewind restores. Without this a deleted session kept them
+    /// Remove `<dir>/<id>/`, where older versions kept per-turn copies of
+    /// edited files for /rewind. Without this a deleted session kept them
     /// forever. The id comes from the .meta body, so anything but a plain id
     /// is refused rather than letting a tampered meta point remove_dir_all
     /// at sessions_dir, its parent, or (Windows `C:`) a drive's cwd.
@@ -1151,6 +1198,8 @@ mod continue_tests {
             auto_commits: Vec::new(),
             undo_position: 0,
             base_commit: None,
+            timeline: Vec::new(),
+            redo: Vec::new(),
         };
         std::fs::write(
             dir.join(format!("{id}.meta")),
@@ -1323,6 +1372,8 @@ mod resolve_tests {
             auto_commits: Vec::new(),
             undo_position: 0,
             base_commit: None,
+            timeline: Vec::new(),
+            redo: Vec::new(),
         };
         let body = serde_json::to_string(&meta).unwrap();
         atomic_write(&dir.join(format!("{id}.meta")), body.as_bytes())

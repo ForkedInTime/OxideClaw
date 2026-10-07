@@ -1978,7 +1978,7 @@ mod permission_popup_tests {
         let ids = vec!["a".to_string()];
         let sessions = overlay_hint(&Overlay::with_items("sessions", "x", ids.clone()));
         assert!(sessions.contains("d delete") && sessions.contains("resume"));
-        for title in ["models", "voices", "undo", "redo", "help"] {
+        for title in ["models", "voices", "rewind", "help"] {
             let hint = overlay_hint(&Overlay::with_items(title, "x", ids.clone()));
             assert!(
                 !hint.contains("delete") && !hint.contains("resume"),

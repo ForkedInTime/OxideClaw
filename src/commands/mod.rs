@@ -150,8 +150,9 @@ pub enum CommandAction {
     Compact,
     /// Send this text as a user prompt to Claude
     SendPrompt(String),
-    /// Remove last N user+assistant exchange pairs from history
-    Rewind(usize),
+    /// `/rewind [N]`: `None` opens a picker of turns to go back to;
+    /// `Some(n)` is `/undo n`.
+    Rewind(Option<usize>),
     /// Resume a session by ID
     ResumeSession(String),
     /// Rename current session
@@ -285,12 +286,12 @@ pub enum CommandAction {
     MemoryAutoToggle(bool),
     /// Show the current memory context (top 10 entries)
     MemoryInject,
-    /// `/undo [N]` — restore working tree to an earlier auto-commit.
-    /// `n == None` opens a picker; `n == Some(k)` rewinds k turns.
-    Undo { n: Option<u32> },
-    /// `/redo [N]` — restore working tree to a later auto-commit in the redo stack.
-    /// `n == None` opens a picker; `n == Some(k)` advances k turns.
-    Redo { n: Option<u32> },
+    /// `/undo [N]` — take the last N turns (default 1) off the conversation
+    /// and put their files back as they were before them.
+    Undo(usize),
+    /// `/redo [N]` — put back the last N turns /undo took off (default 1),
+    /// conversation and files.
+    Redo(usize),
     /// `/autocommit [status]` — print auto-commit state to the chat. v1 only supports `status`.
     AutoCommitStatus,
     /// `/trust` — add the current project to the global `trustedProjects`
@@ -409,7 +410,7 @@ pub fn dispatch(input: &str, ctx: &CommandContext) -> CommandAction {
         "review" => cmd_review(args),
         "tasks" => cmd_tasks(ctx),
         "copy" => cmd_copy(ctx),
-        "rewind" => CommandAction::Rewind(args.parse::<usize>().unwrap_or(1)),
+        "rewind" => CommandAction::Rewind(args.trim().parse::<usize>().ok().filter(|n| *n > 0)),
         "undo" => cmd_undo(args),
         "redo" => cmd_redo(args),
         "autocommit" => cmd_autocommit(args),

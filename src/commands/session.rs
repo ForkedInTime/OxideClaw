@@ -103,7 +103,7 @@ pub(super) fn cmd_session(args: &str) -> CommandAction {
                 let dir = crate::config::Config::sessions_dir();
                 let dir = dir.display().to_string().replace('\'', "'\\''");
                 CommandAction::Message(format!(
-                    "To delete session, run:\n  rm -rf '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta '{dir}'/{sub_args}*/\n\nThe directory holds the session's /rewind file snapshots. Use /session list to confirm the ID prefix."
+                    "To delete session, run:\n  rm -rf '{dir}'/{sub_args}*.jsonl '{dir}'/{sub_args}*.meta '{dir}'/{sub_args}*/\n\nThe directory holds file snapshots older versions kept for /rewind. Use /session list to confirm the ID prefix."
                 ))
             }
         }

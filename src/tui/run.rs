@@ -18,6 +18,7 @@ mod dispatch;
 mod input_helpers;
 mod keys;
 mod plugins;
+mod timeline;
 use api_task::*;
 use input_helpers::*;
 use keys::*;
@@ -105,8 +106,8 @@ fn merge_compaction(
     Some(replacement)
 }
 
-/// A user message that starts an exchange: typed text, not a tool result.
-/// /rewind cuts at these; resume counts them to realign the turn counter.
+/// A user message that starts a turn: typed text, not a tool result.
+/// The undo timeline has one turn per prompt.
 fn is_prompt(m: &Message) -> bool {
     m.role == Role::User
         && m.content
@@ -118,8 +119,8 @@ fn is_prompt(m: &Message) -> bool {
             .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
-/// Make the session file match a history that was cut short in place
-/// (/rewind). Done appends `messages[saved_count..]` only once history
+/// Make the session file match a history that was rewritten in place
+/// (/undo, /redo). Done appends `messages[saved_count..]` only once history
 /// outgrows `saved_count`, so a stale count left the next turns unsaved, or
 /// started the append mid-turn on a tool_result whose tool_use was rewound
 /// away, and the resumed session then 400'd on every request. The count
@@ -138,58 +139,26 @@ async fn rewrite_session_history(
     Ok(())
 }
 
-/// Turn counter for a session just resumed. `turn-N` snapshot dirs outlive
-/// the process, so a counter restarted at 0 sent the next turn into a
-/// previous run's `turn-1`, where `snapshot_file` keeps the stale copy and
-/// /rewind then reverted files to it. The result sits above every existing
-/// dir, and at least at the prompt count because turns without edits leave
-/// no dir and /rewind n must still line up with the last n prompts.
-fn resume_turn_counter(snap_base: &std::path::Path, messages: &[Message]) -> usize {
-    let max_dir = std::fs::read_dir(snap_base)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            e.file_name()
-                .to_str()?
-                .strip_prefix("turn-")?
-                .parse::<usize>()
-                .ok()
-        })
-        .max()
-        .unwrap_or(0);
-    max_dir.max(messages.iter().filter(|m| is_prompt(m)).count())
-}
-
-fn session_snapshot_base(session_id: &str) -> std::path::PathBuf {
-    Config::sessions_dir().join(session_id).join("snapshots")
-}
-
-/// Add a prompt to the history and give its turn a fresh `turn-N` snapshot
-/// dir. /rewind n cuts at the n-th last prompt and restores the last n turn
-/// dirs, so every prompt the agent runs (typed, slash command, skill,
-/// plugin) takes exactly one turn here, before its task is spawned. A
-/// command prompt that took none made /rewind 1 after /review restore the
-/// previous prompt's files; one pushed only by `Done` left a turn without a
-/// prompt when the request failed or was cancelled.
-fn push_prompt_turn(
+/// Add a prompt to the history and put its turn on the undo timeline.
+/// Every prompt the agent runs (typed, slash command, skill, plugin) goes
+/// through here before its task is spawned, so /undo n always takes off the
+/// last n prompts. The mark is saved now, before `Done` appends the prompt
+/// to the transcript, so it can run ahead of the transcript but never
+/// behind it.
+async fn push_prompt_turn(
     messages: &mut Vec<Message>,
     content: Vec<ContentBlock>,
-    turn_counter: &mut usize,
-    config: &mut Config,
-    snap_base: &std::path::Path,
+    session: &mut Session,
 ) {
-    messages.push(Message {
+    let prompt = Message {
         role: Role::User,
         content,
-    });
-    *turn_counter += 1;
-    let snap_dir = snap_base.join(format!("turn-{}", *turn_counter));
-    // snapshot_file keeps the first copy it finds, so leftovers from an
-    // earlier run or a partly failed /rewind would stand in for this turn's
-    // pre-edit state and /rewind would restore them.
-    let _ = std::fs::remove_dir_all(&snap_dir);
-    config.file_snapshot_dir = Some(snap_dir);
+    };
+    timeline::begin_turn(session, &prompt);
+    messages.push(prompt);
+    if let Err(e) = session.save_meta().await {
+        tracing::warn!("undo timeline: failed to save meta: {e}");
+    }
 }
 
 /// Record the session base before an agent turn can touch files. Needed
@@ -643,8 +612,6 @@ async fn run_loop(
     // A finished background compaction waiting for the running turn to end.
     let mut pending_compact: Option<AppEvent> = None;
     let mut saved_count: usize = 0;
-    // Turn counter for file history snapshots (increments on each user prompt sent to API)
-    let mut turn_counter: usize = 0;
 
     // Session cleanup: delete sessions idle longer than cleanupPeriodDays
     if let Some(days) = config.cleanup_period_days
@@ -682,7 +649,6 @@ async fn run_loop(
                     )));
                     app.session_name = s.meta.name.clone();
                     app.scroll_to_bottom();
-                    turn_counter = resume_turn_counter(&session_snapshot_base(&s.id), &messages);
                     s
                 }
                 Err(e) => {
@@ -830,7 +796,6 @@ async fn run_loop(
                 session: &mut session,
                 saved_count: &mut saved_count,
                 mcp_statuses: &mcp_statuses,
-                turn_counter: &mut turn_counter,
                 spawn_registry: &spawn_registry,
             })
             .await?;
@@ -978,8 +943,6 @@ async fn run_loop(
                     let resume_name = new_session.meta.name.clone();
                     let resume_count = saved_count;
                     app.session_name = resume_name.clone();
-                    turn_counter =
-                        resume_turn_counter(&session_snapshot_base(&new_session.id), &messages);
                     session = new_session;
                     app.overlay = Some(Overlay::new(
                         "resume",
@@ -1599,8 +1562,7 @@ async fn run_loop(
                             session: &mut session,
                             saved_count: &mut saved_count,
                             mcp_statuses: &mcp_statuses,
-                            turn_counter: &mut turn_counter,
-                            spawn_registry: &spawn_registry,
+                                        spawn_registry: &spawn_registry,
                         }).await?;
                     }
                     Event::Mouse(mouse) => {
@@ -2028,62 +1990,26 @@ mod short_id_tests {
 }
 
 #[cfg(test)]
-mod resume_turn_counter_tests {
+mod prompt_turn_tests {
     use super::*;
 
-    fn user_text(t: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text { text: t.into() }],
-        }
-    }
-
-    /// Run 1 left turn-1..turn-3 behind; the resumed run must start above
-    /// them, or its first turn reuses turn-1 and /rewind restores run 1's
-    /// pre-edit copies over everything done since.
-    #[test]
-    fn resumed_turns_never_reuse_a_previous_runs_snapshot_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        for n in [1, 3] {
-            std::fs::create_dir_all(tmp.path().join(format!("turn-{n}"))).unwrap();
-        }
-        std::fs::create_dir_all(tmp.path().join("not-a-turn")).unwrap();
-        let msgs = vec![user_text("a")];
-        assert_eq!(resume_turn_counter(tmp.path(), &msgs), 3);
-    }
-
-    /// Turns that edited nothing leave no dir; the counter still tracks the
-    /// prompt count so /rewind n restores the snapshots of the last n turns.
-    #[test]
-    fn prompt_count_wins_when_turns_left_no_snapshots() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("turn-1")).unwrap();
-        let tool_result = Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "t".into(),
-                content: vec![],
-                is_error: None,
-            }],
-        };
-        let msgs = vec![user_text("a"), tool_result, user_text("b"), user_text("c")];
-        assert_eq!(resume_turn_counter(tmp.path(), &msgs), 3);
-        assert_eq!(resume_turn_counter(&tmp.path().join("missing"), &[]), 0);
-    }
-
-    /// A typed prompt, then /review: the second prompt is in the history
-    /// before its task starts and snapshots into its own fresh turn-2, so
-    /// /rewind 1 restores only what /review's turn touched, not the typed
-    /// prompt's turn-1 copies.
-    #[test]
-    fn every_prompt_takes_its_own_snapshot_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let stale = tmp.path().join("turn-2");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(stale.join("a.rs"), "old run").unwrap();
+    /// A typed prompt, then /review: each is its own turn on the timeline,
+    /// saved before the task starts, so /undo 1 after /review takes off
+    /// only /review's turn. A new turn also ends what /redo could restore.
+    #[tokio::test]
+    async fn every_prompt_takes_its_own_timeline_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::at_path("s", dir.path().join("s.jsonl"));
+        session.meta.undo_position = 4;
+        session.meta.redo.push(crate::session::UndoneTurn {
+            mark: crate::session::TurnMark {
+                prompt: "old".into(),
+                before: 3,
+            },
+            after: 4,
+            messages: Vec::new(),
+        });
         let mut messages = Vec::new();
-        let mut turn_counter = 0;
-        let mut config = Config::default();
 
         for prompt in ["edit a.rs", "Review the changes"] {
             push_prompt_turn(
@@ -2091,16 +2017,29 @@ mod resume_turn_counter_tests {
                 vec![ContentBlock::Text {
                     text: prompt.into(),
                 }],
-                &mut turn_counter,
-                &mut config,
-                tmp.path(),
-            );
+                &mut session,
+            )
+            .await;
         }
 
         assert_eq!(messages.iter().filter(|m| is_prompt(m)).count(), 2);
-        assert_eq!(turn_counter, 2);
-        assert_eq!(config.file_snapshot_dir.as_deref(), Some(stale.as_path()));
-        assert!(!stale.exists(), "a leftover turn dir must not survive");
+        let fingerprints: Vec<String> = messages
+            .iter()
+            .map(crate::session::prompt_fingerprint)
+            .collect();
+        let marks: Vec<(String, usize)> = session
+            .meta
+            .timeline
+            .iter()
+            .map(|m| (m.prompt.clone(), m.before))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![(fingerprints[0].clone(), 4), (fingerprints[1].clone(), 4)]
+        );
+        assert!(session.meta.redo.is_empty(), "a new turn must clear redo");
+        let saved = std::fs::read_to_string(dir.path().join("s.meta")).unwrap();
+        assert!(saved.contains(&fingerprints[1]), "mark not saved: {saved}");
     }
 }
 
@@ -2237,7 +2176,7 @@ mod rewind_persistence_tests {
         }
     }
 
-    /// Two saved exchanges, /rewind 1, then a text-only turn and a tool
+    /// Two saved exchanges, /undo 1, then a text-only turn and a tool
     /// turn. The file must end up exactly the in-memory history: before,
     /// the first turn was never written and the second was appended from
     /// its tool_result on, after the rewound exchange.

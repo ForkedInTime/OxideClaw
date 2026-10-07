@@ -22,7 +22,6 @@ pub(super) struct KeyCtx<'a> {
     pub(super) session: &'a mut Session,
     pub(super) saved_count: &'a mut usize,
     pub(super) mcp_statuses: &'a [crate::mcp::types::McpServerStatus],
-    pub(super) turn_counter: &'a mut usize,
     pub(super) spawn_registry: &'a crate::spawn::SpawnRegistry,
 }
 
@@ -42,7 +41,6 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         session,
         saved_count,
         mcp_statuses,
-        turn_counter,
         spawn_registry,
     } = ctx;
     use KeyCode::*;
@@ -71,11 +69,10 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 app.overlay = None;
-                app.pending_undo_positions = None;
-                app.pending_redo_positions = None;
+                app.pending_rewind = None;
             }
             // A digit picks row N exactly as Enter picks the highlighted
-            // row; the separate digit arm sent undo/redo labels to /resume.
+            // row; the separate digit arm sent picker labels to /resume.
             KeyCode::Enter | KeyCode::Char('1'..='9') if is_interactive => {
                 let title = app
                     .overlay
@@ -91,80 +88,13 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     .as_ref()
                     .and_then(|o| o.selectable_ids.get(selected_index).cloned());
                 app.overlay = None;
-                if title == "undo" {
-                    let positions = app.pending_undo_positions.take();
-                    let target_pos = positions
-                        .as_ref()
-                        .and_then(|p| p.get(selected_index))
-                        .copied();
-                    if let Some(target_pos) =
-                        target_pos.filter(|&p| p != session.meta.undo_position)
-                    {
-                        match oxideclaw::autocommit::restore_to_blocking(
-                            config.cwd.clone(),
-                            session.id.clone(),
-                            session.meta.auto_commits.clone(),
-                            target_pos,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                session.meta.undo_position = target_pos;
-                                if let Err(e) = session.save_meta().await {
-                                    tracing::warn!("[undo] failed to save meta: {e}");
-                                }
-                                let label = if target_pos == 0 {
-                                    "session base".to_string()
-                                } else {
-                                    format!("turn {target_pos}")
-                                };
-                                app.entries.push(ChatEntry::system(format!(
-                                    "[undo] rewound to {label} ({} files restored{}){}",
-                                    report.files_restored,
-                                    report.removed_note(),
-                                    report.saved_edits_note()
-                                )));
-                            }
-                            Err(e) => {
-                                app.entries
-                                    .push(ChatEntry::system(format!("[undo] restore failed: {e}")));
-                            }
-                        }
-                    }
-                } else if title == "redo" {
-                    let positions = app.pending_redo_positions.take();
-                    let target_pos = positions
-                        .as_ref()
-                        .and_then(|p| p.get(selected_index))
-                        .copied();
-                    if let Some(target_pos) =
-                        target_pos.filter(|&p| p != session.meta.undo_position)
-                    {
-                        match oxideclaw::autocommit::restore_to_blocking(
-                            config.cwd.clone(),
-                            session.id.clone(),
-                            session.meta.auto_commits.clone(),
-                            target_pos,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                session.meta.undo_position = target_pos;
-                                if let Err(e) = session.save_meta().await {
-                                    tracing::warn!("[redo] failed to save meta: {e}");
-                                }
-                                app.entries.push(ChatEntry::system(format!(
-                                    "[redo] advanced to turn {target_pos} ({} files restored{}){}",
-                                    report.files_restored,
-                                    report.removed_note(),
-                                    report.saved_edits_note()
-                                )));
-                            }
-                            Err(e) => {
-                                app.entries
-                                    .push(ChatEntry::system(format!("[redo] restore failed: {e}")));
-                            }
-                        }
+                if title == "rewind" {
+                    let n = app
+                        .pending_rewind
+                        .take()
+                        .and_then(|counts| counts.get(selected_index).copied());
+                    if let Some(n) = n.filter(|&n| n > 0) {
+                        timeline::undo(app, messages, session, saved_count, config, n).await;
                     }
                 } else if let Some(val) = selected_val {
                     if title == "models" {
@@ -561,7 +491,6 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         session,
                         saved_count,
                         mcp_statuses,
-                        turn_counter,
                         spawn_registry,
                     },
                 )
@@ -640,13 +569,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 text: final_text.clone(),
             });
 
-            push_prompt_turn(
-                messages,
-                user_content,
-                turn_counter,
-                config,
-                &session_snapshot_base(&session.id),
-            );
+            push_prompt_turn(messages, user_content, session).await;
 
             // Background incremental re-index: pick up any files changed since last index.
             // Fire-and-forget — doesn't block the user's message from being sent.
@@ -1188,7 +1111,7 @@ mod overlay_delete_tests {
 
     #[test]
     fn delete_key_targets_only_the_sessions_picker() {
-        for title in ["models", "help", "help-commands", "voices", "undo", "redo"] {
+        for title in ["models", "help", "help-commands", "voices", "rewind"] {
             assert_eq!(
                 selected_session_to_delete(&app_with_picker(title)),
                 None,
@@ -1246,7 +1169,6 @@ mod overlay_key_tests {
             session: &mut session,
             saved_count: &mut 0,
             mcp_statuses: &[],
-            turn_counter: &mut 0,
             spawn_registry: &spawn_registry,
         })
         .await
@@ -1255,19 +1177,20 @@ mod overlay_key_tests {
     }
 
     /// `1` in the /undo picker sent the row label to /resume, which then
-    /// failed with "Could not resume session".
+    /// failed with "Could not resume session". The /rewind picker took over.
     #[tokio::test]
-    async fn digit_in_undo_picker_rewinds_instead_of_resuming() {
-        let labels = vec!["turn 2  ·  abc1234".to_string(), "session base".to_string()];
+    async fn digit_in_rewind_picker_undoes_instead_of_resuming() {
+        let labels = vec!["turn 1  ·  hi  ← current".to_string(), "start".to_string()];
         let (app, _dir) = press(
-            Overlay::with_items("undo", "x", labels),
-            KeyCode::Char('1'),
-            |app| app.pending_undo_positions = Some(vec![2, 0]),
+            Overlay::with_items("rewind", "x", labels),
+            KeyCode::Char('2'),
+            |app| app.pending_rewind = Some(vec![0, 1]),
         )
         .await;
         assert_eq!(app.pending_resume, None);
-        assert!(app.pending_undo_positions.is_none());
-        // Not a git repo, so the restore itself fails, but it was attempted.
+        assert!(app.pending_rewind.is_none());
+        // The conversation is empty, so the undo itself has nothing to take
+        // off, but it was attempted.
         let last = app
             .entries
             .last()

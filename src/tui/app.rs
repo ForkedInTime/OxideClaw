@@ -709,12 +709,9 @@ pub struct App {
     /// Voice clone tier — set when user starts a clone recording session.
     pub pending_clone_tier: Option<crate::voice::CloneTier>,
 
-    /// When the /undo picker is open, maps overlay row index → target
-    /// position in `session.meta.auto_commits`.
-    pub pending_undo_positions: Option<Vec<usize>>,
-    /// When the /redo picker is open, maps overlay row index → target
-    /// position in `session.meta.auto_commits`.
-    pub pending_redo_positions: Option<Vec<usize>>,
+    /// When the /rewind picker is open, maps overlay row index → how many
+    /// turns to undo.
+    pub pending_rewind: Option<Vec<usize>>,
 
     /// Smart model router configuration.
     pub router: crate::router::RouterConfig,
@@ -872,8 +869,7 @@ impl App {
             pending_help_command: None,
             pending_voice_model: None,
             pending_clone_tier: None,
-            pending_undo_positions: None,
-            pending_redo_positions: None,
+            pending_rewind: None,
             router: crate::router::RouterConfig::new(model),
             cost_tracker: crate::cost::CostTracker::new(),
             context_window: crate::api::context_window_for_model(model),

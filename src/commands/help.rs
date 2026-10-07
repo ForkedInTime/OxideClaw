@@ -190,7 +190,10 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/resume", "resume a saved session"),
             ("/rename", "rename current session"),
             ("/export", "export session to markdown"),
-            ("/rewind", "undo last n exchanges (default 1)"),
+            (
+                "/rewind",
+                "pick a turn to go back to (files + conversation; [N] = /undo N)",
+            ),
             ("/summary", "summarize conversation so far"),
             ("/copy", "copy last response to clipboard"),
             (
@@ -204,11 +207,11 @@ pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
             ("/thinkback", "per-turn token chart for this session"),
             (
                 "/undo",
-                "Rewind working tree to an earlier auto-commit turn ([N] or picker)",
+                "Take back the last N turns (default 1): files and conversation",
             ),
             (
                 "/redo",
-                "Advance working tree to a later auto-commit turn ([N] or picker)",
+                "Put back the last N undone turns (default 1): files and conversation",
             ),
             (
                 "/autocommit",

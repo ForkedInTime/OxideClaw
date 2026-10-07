@@ -493,14 +493,21 @@ pub(super) fn cmd_autocommit(_args: &str) -> CommandAction {
     CommandAction::AutoCommitStatus
 }
 
+/// The turn count of `/undo [N]` and `/redo [N]`: 1 when none is given.
+fn turn_count(args: &str) -> usize {
+    args.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
 pub(super) fn cmd_redo(args: &str) -> CommandAction {
-    let n = args.trim().parse::<u32>().ok().filter(|n| *n > 0);
-    CommandAction::Redo { n }
+    CommandAction::Redo(turn_count(args))
 }
 
 pub(super) fn cmd_undo(args: &str) -> CommandAction {
-    let n = args.trim().parse::<u32>().ok().filter(|n| *n > 0);
-    CommandAction::Undo { n }
+    CommandAction::Undo(turn_count(args))
 }
 
 pub(super) fn cmd_issue(args: &str) -> CommandAction {
@@ -575,6 +582,21 @@ mod prompt_command_tests {
             btw_note: None,
         };
         f(&ctx)
+    }
+
+    /// `/undo` and `/redo` take one turn by default; `/rewind` alone opens
+    /// the picker and `/rewind n` is `/undo n`.
+    #[test]
+    fn undo_and_redo_default_to_one_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |line: &str| with_ctx(dir.path(), |c| crate::commands::dispatch(line, c));
+        assert!(matches!(run("/undo"), CommandAction::Undo(1)));
+        assert!(matches!(run("/undo 3"), CommandAction::Undo(3)));
+        assert!(matches!(run("/undo 0"), CommandAction::Undo(1)));
+        assert!(matches!(run("/redo"), CommandAction::Redo(1)));
+        assert!(matches!(run("/redo 2"), CommandAction::Redo(2)));
+        assert!(matches!(run("/rewind 2"), CommandAction::Rewind(Some(2))));
+        assert!(matches!(run("/rewind"), CommandAction::Rewind(None)));
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

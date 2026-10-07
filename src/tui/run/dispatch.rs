@@ -36,7 +36,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         session,
         saved_count,
         mcp_statuses,
-        turn_counter,
         spawn_registry,
     } = k;
     let last_assistant = app
@@ -85,9 +84,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 && let Ok(fresh) = Session::new().await
             {
                 *session = fresh;
-                // Turn numbers restart only with a new id; the old one keeps
-                // its snapshot dirs for when it is resumed.
-                *turn_counter = 0;
+            } else {
+                // Same session, new conversation: /undo and /redo must not
+                // reach the cleared turns.
+                session.meta.timeline.clear();
+                session.meta.redo.clear();
             }
             *saved_count = 0;
             app.clear();
@@ -263,13 +264,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config).await;
-            push_prompt_turn(
-                messages,
-                vec![ContentBlock::Text { text: prompt }],
-                turn_counter,
-                config,
-                &session_snapshot_base(&session.id),
-            );
+            push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session).await;
             let snapshot = messages.clone();
             let c2 = client.clone();
             let tvec = tools.to_vec();
@@ -301,103 +296,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             });
             app.api_task = Some(handle.abort_handle());
         }
-        CommandAction::Rewind(n) => {
-            // An exchange is everything from one user prompt on: with tools
-            // that is many messages, so cut at the n-th last prompt rather
-            // than n*2 messages (which left a tool_use without its result).
-            let prompts: Vec<usize> = messages
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| is_prompt(m))
-                .map(|(i, _)| i)
-                .collect();
-            if prompts.is_empty() || n == 0 {
-                app.entries.push(ChatEntry::system("Nothing to rewind."));
+        CommandAction::Rewind(None) => {
+            if app.is_loading {
+                app.entries.push(ChatEntry::system(
+                    "[undo] cannot undo while an assistant turn is running",
+                ));
             } else {
-                let n = n.min(prompts.len());
-                messages.truncate(prompts[prompts.len() - n]);
-                messages.shrink_to_fit();
-                if let Err(e) = rewrite_session_history(
-                    session,
-                    messages,
-                    !config.no_session_persistence,
-                    saved_count,
-                )
-                .await
-                {
-                    tracing::warn!("rewind: session rewrite failed: {e}");
-                    app.entries.push(ChatEntry::error(format!(
-                        "Rewind: could not rewrite the session file ({e}); a resume may still show the rewound turns."
-                    )));
-                }
-                // Display: drop everything from the n-th last user entry on.
-                let user_entries: Vec<usize> = app
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| matches!(e.kind, crate::tui::app::EntryKind::User))
-                    .map(|(i, _)| i)
-                    .collect();
-                if user_entries.len() >= n {
-                    app.entries.truncate(user_entries[user_entries.len() - n]);
-                }
-
-                // Restore file snapshots. Oldest rewound turn first, first
-                // snapshot per file wins: that is the state before the
-                // earliest rewound edit. A turn's snapshots are deleted only
-                // once all of them were restored.
-                let restore_start = (*turn_counter).saturating_sub(n) + 1;
-                let snap_base = session_snapshot_base(&session.id);
-                let mut restored_files: Vec<String> = Vec::new();
-                let mut failed: Vec<String> = Vec::new();
-                for turn in restore_start..=*turn_counter {
-                    let snap_dir = snap_base.join(format!("turn-{}", turn));
-                    let mut turn_ok = true;
-                    if let Ok(entries) = std::fs::read_dir(&snap_dir) {
-                        for entry in entries.flatten() {
-                            let src = entry.path();
-                            let flat = src
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if restored_files.contains(&flat) {
-                                continue;
-                            }
-                            let real_path = crate::tools::snapshot_path(&flat);
-                            match std::fs::copy(&src, &real_path) {
-                                Ok(_) => restored_files.push(flat),
-                                Err(e) => {
-                                    turn_ok = false;
-                                    failed.push(format!("{}: {e}", real_path.display()));
-                                }
-                            }
-                        }
-                    }
-                    if turn_ok {
-                        let _ = std::fs::remove_dir_all(&snap_dir);
-                    }
-                }
-                *turn_counter = (*turn_counter).saturating_sub(n);
-
-                let mut file_note = if restored_files.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {} file(s) restored.", restored_files.len())
-                };
-                if !failed.is_empty() {
-                    file_note.push_str(&format!(
-                        "\nCould not restore (snapshots kept): {}",
-                        failed.join(", ")
-                    ));
-                }
-                app.entries.push(ChatEntry::system(format!(
-                    "Rewound {} exchange{}.{}",
-                    n,
-                    if n == 1 { "" } else { "s" },
-                    file_note
-                )));
+                timeline::open_rewind_picker(app, messages);
             }
+        }
+        CommandAction::Rewind(Some(n)) | CommandAction::Undo(n) => {
+            timeline::undo(app, messages, session, saved_count, config, n).await;
+        }
+        CommandAction::Redo(n) => {
+            timeline::redo(app, messages, session, saved_count, config, n).await;
         }
         CommandAction::ResumeSession(id_or_prefix) => {
             let full_id = match Session::resolve(&id_or_prefix).await {
@@ -421,8 +333,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let resume_name = new_session.meta.name.clone();
                         let resume_count = *saved_count;
                         app.session_name = resume_name.clone();
-                        *turn_counter =
-                            resume_turn_counter(&session_snapshot_base(&new_session.id), messages);
                         *session = new_session;
                         app.overlay = Some(Overlay::new(
                             "resume",
@@ -821,7 +731,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                  Tokens in:   {} total\n\
                  Tokens out:  {} total\n\n\
                  Per-turn tokens (in):\n{}",
-                turn_counter,
+                messages.iter().filter(|m| is_prompt(m)).count(),
                 &session.id[..8.min(session.id.len())],
                 app.model,
                 total_in,
@@ -837,7 +747,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 "session_name": session.meta.name,
                 "model": config.model,
                 "messages": messages,
-                "turn_count": turn_counter,
+                "turn_count": messages.iter().filter(|m| is_prompt(m)).count(),
             });
             match serde_json::to_string_pretty(&export_data) {
                 Ok(json_str) => match std::fs::write(&teleport_path, &json_str) {
@@ -910,7 +820,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                             && let Ok(fresh) = Session::new().await
                         {
                             *session = fresh;
-                            *turn_counter = 0;
+                        } else {
+                            session.meta.timeline.clear();
+                            session.meta.redo.clear();
                         }
                         *saved_count = 0;
                         app.entries = display;
@@ -1369,13 +1281,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.scroll_to_bottom();
                 app.start_loading();
                 begin_agent_turn(session, config).await;
-                push_prompt_turn(
-                    messages,
-                    vec![ContentBlock::Text { text: prompt }],
-                    turn_counter,
-                    config,
-                    &session_snapshot_base(&session.id),
-                );
+                push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session)
+                    .await;
                 let snapshot = messages.clone();
                 let c2 = client.clone();
                 let tvec = tools.to_vec();
@@ -2066,201 +1973,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries
                 .push(ChatEntry::system(format!("Discarding agent [{id}]...")));
         }
-        CommandAction::Undo { n } => {
-            if app.is_loading {
-                app.entries.push(ChatEntry::system(
-                    "[undo] cannot undo while an assistant turn is running",
-                ));
-            } else if !config.auto_commit.enabled {
-                app.entries.push(ChatEntry::system(
-                    "[undo] auto-commit is disabled in settings",
-                ));
-            } else if !oxideclaw::autocommit::is_git_repo(&config.cwd) {
-                app.entries.push(ChatEntry::system(
-                    "[undo] auto-commit disabled — not a git repo",
-                ));
-            } else if session.meta.auto_commits.is_empty() {
-                app.entries.push(ChatEntry::system(
-                    "[undo] nothing to undo (session has no auto-commits)",
-                ));
-            } else if session.meta.undo_position == 0 {
-                app.entries.push(ChatEntry::system(
-                    "[undo] at session start, nothing more to undo",
-                ));
-            } else {
-                match n {
-                    Some(k) => {
-                        let new_pos = session.meta.undo_position.saturating_sub(k as usize);
-                        match oxideclaw::autocommit::restore_to_blocking(
-                            config.cwd.clone(),
-                            session.id.clone(),
-                            session.meta.auto_commits.clone(),
-                            new_pos,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                session.meta.undo_position = new_pos;
-                                if let Err(e) = session.save_meta().await {
-                                    tracing::warn!("[undo] failed to save meta: {e}");
-                                }
-                                let label = if new_pos == 0 {
-                                    "session base".to_string()
-                                } else {
-                                    format!("turn {new_pos}")
-                                };
-                                app.entries.push(ChatEntry::system(format!(
-                                    "[undo] rewound to {label} ({} files restored{}){}",
-                                    report.files_restored,
-                                    report.removed_note(),
-                                    report.saved_edits_note()
-                                )));
-                            }
-                            Err(e) => {
-                                app.entries
-                                    .push(ChatEntry::system(format!("[undo] restore failed: {e}")));
-                            }
-                        }
-                    }
-                    None => {
-                        let mut labels: Vec<String> = Vec::new();
-                        let mut positions: Vec<usize> = Vec::new();
-                        let cur = session.meta.undo_position;
-                        for i in (0..cur).rev() {
-                            let target_pos = i + 1;
-                            let marker = if target_pos == cur {
-                                " ← current"
-                            } else {
-                                ""
-                            };
-                            labels.push(format!(
-                                "turn {target_pos}  ·  {}{marker}",
-                                session.meta.auto_commits[i]
-                                    .chars()
-                                    .take(7)
-                                    .collect::<String>()
-                            ));
-                            positions.push(target_pos);
-                        }
-                        labels.push("session base (pre-OxideClaw)".to_string());
-                        positions.push(0);
-                        // The body is what is drawn; the picker highlights
-                        // lines starting "N." (an empty body was a blank popup).
-                        let body = std::iter::once("Undo to (↑/↓ then Enter):\n".to_string())
-                            .chain(
-                                labels
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, l)| format!("  {}. {l}", i + 1)),
-                            )
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        app.overlay = Some(crate::tui::app::Overlay::with_items(
-                            "undo".to_string(),
-                            body,
-                            labels,
-                        ));
-                        app.pending_undo_positions = Some(positions);
-                    }
-                }
-            }
-        }
-        CommandAction::Redo { n } => {
-            if app.is_loading {
-                app.entries.push(ChatEntry::system(
-                    "[redo] cannot redo while an assistant turn is running",
-                ));
-            } else if !config.auto_commit.enabled {
-                app.entries.push(ChatEntry::system(
-                    "[redo] auto-commit is disabled in settings",
-                ));
-            } else if !oxideclaw::autocommit::is_git_repo(&config.cwd) {
-                app.entries.push(ChatEntry::system(
-                    "[redo] auto-commit disabled — not a git repo",
-                ));
-            } else if session.meta.undo_position == session.meta.auto_commits.len() {
-                app.entries
-                    .push(ChatEntry::system("[redo] nothing to redo (at latest turn)"));
-            } else {
-                match n {
-                    Some(k) => {
-                        let new_pos = (session.meta.undo_position + k as usize)
-                            .min(session.meta.auto_commits.len());
-                        match oxideclaw::autocommit::restore_to_blocking(
-                            config.cwd.clone(),
-                            session.id.clone(),
-                            session.meta.auto_commits.clone(),
-                            new_pos,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                session.meta.undo_position = new_pos;
-                                if let Err(e) = session.save_meta().await {
-                                    tracing::warn!("[redo] failed to save meta: {e}");
-                                }
-                                app.entries.push(ChatEntry::system(format!(
-                                    "[redo] advanced to turn {new_pos} ({} files restored{}){}",
-                                    report.files_restored,
-                                    report.removed_note(),
-                                    report.saved_edits_note()
-                                )));
-                            }
-                            Err(e) => {
-                                app.entries
-                                    .push(ChatEntry::system(format!("[redo] restore failed: {e}")));
-                            }
-                        }
-                    }
-                    None => {
-                        let mut labels: Vec<String> = Vec::new();
-                        let mut positions: Vec<usize> = Vec::new();
-                        let cur = session.meta.undo_position;
-                        let cur_label = if cur == 0 {
-                            "session base (pre-OxideClaw) ← current".to_string()
-                        } else {
-                            format!(
-                                "turn {cur}  ·  {} ← current",
-                                session.meta.auto_commits[cur - 1]
-                                    .chars()
-                                    .take(7)
-                                    .collect::<String>()
-                            )
-                        };
-                        labels.push(cur_label);
-                        positions.push(cur);
-                        for i in cur..session.meta.auto_commits.len() {
-                            labels.push(format!(
-                                "turn {}  ·  {}",
-                                i + 1,
-                                session.meta.auto_commits[i]
-                                    .chars()
-                                    .take(7)
-                                    .collect::<String>()
-                            ));
-                            positions.push(i + 1);
-                        }
-                        // The body is what is drawn; the picker highlights
-                        // lines starting "N." (an empty body was a blank popup).
-                        let body = std::iter::once("Redo to (↑/↓ then Enter):\n".to_string())
-                            .chain(
-                                labels
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, l)| format!("  {}. {l}", i + 1)),
-                            )
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        app.overlay = Some(crate::tui::app::Overlay::with_items(
-                            "redo".to_string(),
-                            body,
-                            labels,
-                        ));
-                        app.pending_redo_positions = Some(positions);
-                    }
-                }
-            }
-        }
         CommandAction::TrustProject { mode } => {
             use crate::commands::TrustMode;
             let global = crate::settings::Settings::load_global();
@@ -2445,13 +2157,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config).await;
-            push_prompt_turn(
-                messages,
-                vec![ContentBlock::Text { text: prompt }],
-                turn_counter,
-                config,
-                &session_snapshot_base(&session.id),
-            );
+            push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session).await;
             let snapshot = messages.clone();
             let c2 = client.clone();
             let tvec = tools.to_vec();
@@ -2489,13 +2195,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config).await;
-            push_prompt_turn(
-                messages,
-                vec![ContentBlock::Text { text: prompt }],
-                turn_counter,
-                config,
-                &session_snapshot_base(&session.id),
-            );
+            push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session).await;
             let snapshot = messages.clone();
             let c2 = client.clone();
             let tvec = tools.to_vec();
@@ -2713,13 +2413,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.scroll_to_bottom();
                 app.start_loading();
                 begin_agent_turn(session, config).await;
-                push_prompt_turn(
-                    messages,
-                    vec![ContentBlock::Text { text: prompt }],
-                    turn_counter,
-                    config,
-                    &session_snapshot_base(&session.id),
-                );
+                push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session)
+                    .await;
                 let snapshot = messages.clone();
                 let c2 = client.clone();
                 let tvec = skill_turn_tools(tools, config.disable_skill_shell_execution);

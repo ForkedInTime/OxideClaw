@@ -722,57 +722,119 @@ fn list_tree_files(cwd: &Path, tree: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The tree the chain holds at `position`: 0 is the session base (the
+/// first snapshot's parent; HEAD, or the empty tree, when there is none).
+fn position_tree(cwd: &Path, auto_commits: &[String], position: usize) -> anyhow::Result<String> {
+    if position > auto_commits.len() {
+        anyhow::bail!(
+            "target_position {position} out of range (max {})",
+            auto_commits.len()
+        );
+    }
+    let head_tree = || match resolve_head(cwd) {
+        Some(head) => tree_of_commit(cwd, &head).unwrap_or_default(),
+        None => EMPTY_TREE.to_string(),
+    };
+    let tree = match position.checked_sub(1) {
+        Some(i) => tree_of_commit(cwd, &auto_commits[i]).unwrap_or_default(),
+        // Session base = tree of first's parent. If first is a root commit
+        // (no parent), fall through to HEAD tree, else canonical empty tree.
+        None => match auto_commits.first() {
+            Some(first) => match git_output(git_cmd(cwd).args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("{first}^"),
+            ])) {
+                Ok(parent) => tree_of_commit(cwd, &parent).unwrap_or_default(),
+                Err(_) => head_tree(),
+            },
+            None => head_tree(),
+        },
+    };
+    if tree.is_empty() {
+        anyhow::bail!("could not resolve target tree");
+    }
+    Ok(tree)
+}
+
+/// NUL-separated paths that differ between two trees, optionally filtered
+/// (`--diff-filter`). The memory and RAG databases never count: a tree that
+/// holds them (a pre-exclusion snapshot, or a HEAD that tracks them) must
+/// not overwrite the live ones.
+fn diff_trees(cwd: &Path, from: &str, to: &str, filter: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let out = git_cmd(cwd)
+        .args(["diff-tree", "-r", "-z", "--name-only", "--no-renames"])
+        .args(filter)
+        .args([
+            from,
+            to,
+            "--",
+            ":(top)",
+            OWN_DB_EXCLUDES[0],
+            OWN_DB_EXCLUDES[1],
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git diff-tree failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
+fn nul_paths(raw: &[u8]) -> impl Iterator<Item = String> + '_ {
+    raw.split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+}
+
+/// Bring the working tree to `target_position` in the chain (0 = session
+/// base). Edits no snapshot holds are saved to the recovery ref first.
 pub fn restore_to(
     cwd: &Path,
     session_id: &str,
     auto_commits: &[String],
     target_position: usize,
 ) -> anyhow::Result<RestoreReport> {
+    restore(cwd, session_id, auto_commits, None, target_position)
+}
+
+/// [`restore_to`] for a step along the undo timeline from `from_position`,
+/// where the files are meant to be now. Refuses, before anything is
+/// written, when a file that changed since the `from_position` snapshot (a
+/// hand edit, or a turn whose snapshot failed) would be overwritten or
+/// removed: /undo must never clobber work it did not record.
+pub fn restore_from(
+    cwd: &Path,
+    session_id: &str,
+    auto_commits: &[String],
+    from_position: usize,
+    target_position: usize,
+) -> anyhow::Result<RestoreReport> {
+    restore(
+        cwd,
+        session_id,
+        auto_commits,
+        Some(from_position),
+        target_position,
+    )
+}
+
+fn restore(
+    cwd: &Path,
+    session_id: &str,
+    auto_commits: &[String],
+    from_position: Option<usize>,
+    target_position: usize,
+) -> anyhow::Result<RestoreReport> {
     if !is_git_repo(cwd) {
         anyhow::bail!("not a git repo");
     }
-    if target_position > auto_commits.len() {
-        anyhow::bail!(
-            "target_position {target_position} out of range (max {})",
-            auto_commits.len()
-        );
-    }
-
-    // Resolve target tree.
-    let tree_sha = if target_position == 0 {
-        if let Some(first) = auto_commits.first() {
-            // Session base = tree of first's parent. If first is a root commit
-            // (no parent), fall through to HEAD tree, else canonical empty tree.
-            let parent_commit = git_cmd(cwd)
-                .args(["rev-parse", &format!("{first}^")])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            if !parent_commit.is_empty() {
-                tree_of_commit(cwd, &parent_commit).unwrap_or_default()
-            } else if let Some(head) = resolve_head(cwd) {
-                tree_of_commit(cwd, &head).unwrap_or_default()
-            } else {
-                EMPTY_TREE.to_string()
-            }
-        } else if let Some(head) = resolve_head(cwd) {
-            tree_of_commit(cwd, &head).unwrap_or_default()
-        } else {
-            EMPTY_TREE.to_string()
-        }
-    } else {
-        let commit = &auto_commits[target_position - 1];
-        tree_of_commit(cwd, commit).unwrap_or_default()
-    };
-
-    if tree_sha.is_empty() {
-        anyhow::bail!("could not resolve target tree");
-    }
+    let tree_sha = position_tree(cwd, auto_commits, target_position)?;
 
     let target_files = list_tree_files(cwd, &tree_sha);
     // Only files some reachable state recorded are ever removed; a file the
@@ -795,51 +857,49 @@ pub fn restore_to(
         }
     }
 
-    let recovery = recovery_ref(session_id);
-    let (saved_edits, live_tree) = save_unrecorded_worktree(cwd, &recovery, auto_commits)?;
-
+    let live_tree = stage_live_tree(cwd, auto_commits)?;
     // Write only what differs from the live tree. `checkout-index -a` on a
     // fresh index rewrote every file (bumping every mtime, so builds redid
     // everything) and wrote out paths a sparse checkout had left out. Paths
     // absent from the target are skipped (`d`) here and removed below.
-    let diff_tree = |filter: &str| -> anyhow::Result<Vec<u8>> {
-        let out = git_cmd(cwd)
-            .args([
-                "diff-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                "--no-renames",
-                filter,
-                &live_tree,
-                &tree_sha,
-                // A target that holds the database (a pre-exclusion snapshot,
-                // or a HEAD that tracks it) must not overwrite the live one.
-                "--",
-                ":(top)",
-                OWN_DB_EXCLUDES[0],
-                OWN_DB_EXCLUDES[1],
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
-        if !out.status.success() {
+    let changed = diff_trees(cwd, &live_tree, &tree_sha, Some("--diff-filter=d"))?;
+    // Safe to delete: save_unrecorded_worktree below makes sure the live
+    // tree is held by a snapshot or the recovery ref.
+    let orphaned_files: Vec<String> = nul_paths(&diff_trees(
+        cwd,
+        &live_tree,
+        &tree_sha,
+        Some("--diff-filter=D"),
+    )?)
+    .filter(|p| snapshotted.contains(p))
+    .collect();
+
+    if let Some(from) = from_position {
+        let from_tree = position_tree(cwd, auto_commits, from)?;
+        let edited: std::collections::HashSet<String> =
+            nul_paths(&diff_trees(cwd, &from_tree, &live_tree, None)?).collect();
+        let mut clobbered: Vec<String> = nul_paths(&changed)
+            .chain(orphaned_files.iter().cloned())
+            .filter(|p| edited.contains(p))
+            .collect();
+        if !clobbered.is_empty() {
+            clobbered.sort();
+            const SHOWN: usize = 5;
+            let more = clobbered.len().saturating_sub(SHOWN);
+            clobbered.truncate(SHOWN);
+            if more > 0 {
+                clobbered.push(format!("+{more} more"));
+            }
             anyhow::bail!(
-                "git diff-tree failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "nothing was changed: {} changed since the last snapshot and would be \
+                 overwritten. Commit, stash or revert those edits, then try again.",
+                clobbered.join(", ")
             );
         }
-        Ok(out.stdout)
-    };
-    let changed = diff_tree("--diff-filter=d")?;
-    // Safe to delete: save_unrecorded_worktree just made sure the live tree
-    // is held by a snapshot or the recovery ref.
-    let orphaned_files: Vec<String> = diff_tree("--diff-filter=D")?
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .filter(|p| snapshotted.contains(p))
-        .collect();
+    }
+
+    let recovery = recovery_ref(session_id);
+    let saved_edits = save_unrecorded_worktree(cwd, &recovery, auto_commits, &live_tree)?;
 
     let td = tempfile::TempDir::new()?;
     let temp_index = td.path().join("restore.index");
@@ -911,37 +971,53 @@ pub fn restore_to(
     })
 }
 
-/// [`restore_to`] on a blocking thread. It stages the whole work tree through
-/// git subprocesses, which must not stall the async runtime the TUI runs on.
-pub async fn restore_to_blocking(
+/// [`restore_from`] on a blocking thread. It stages the whole work tree
+/// through git subprocesses, which must not stall the async runtime the TUI
+/// runs on.
+pub async fn restore_from_blocking(
     cwd: PathBuf,
     session_id: String,
     auto_commits: Vec<String>,
+    from_position: usize,
     target_position: usize,
 ) -> anyhow::Result<RestoreReport> {
     tokio::task::spawn_blocking(move || {
-        restore_to(&cwd, &session_id, &auto_commits, target_position)
+        restore_from(
+            &cwd,
+            &session_id,
+            &auto_commits,
+            from_position,
+            target_position,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("restore task failed: {e}"))?
 }
 
-/// Before `restore_to` overwrites the working tree, commit it under the
-/// session's `recovery` ref unless some snapshot already holds exactly this tree.
-/// Edits made after the last turn (or uncommitted work a legacy session base
-/// never captured) were otherwise overwritten with no way back. Errors abort
-/// the restore: better no undo than an undo that destroys work.
-/// Also returns the live tree it staged, which `restore_to` diffs against.
+/// The working tree as a tree object, staged on a temp index seeded from
+/// the newest snapshot (HEAD when there is none) so unchanged files are not
+/// re-hashed.
+fn stage_live_tree(cwd: &Path, auto_commits: &[String]) -> anyhow::Result<String> {
+    let latest = auto_commits.last().cloned().or_else(|| resolve_head(cwd));
+    let latest_tree = latest.as_deref().and_then(|c| tree_of_commit(cwd, c));
+    let td = tempfile::TempDir::new()?;
+    stage_worktree(cwd, latest_tree.as_deref(), &td.path().join("live.index"))
+}
+
+/// Before `restore_to` overwrites the working tree (`live_tree`), commit it
+/// under the session's `recovery` ref unless some snapshot already holds
+/// exactly this tree. Edits made after the last turn (or uncommitted work a
+/// legacy session base never captured) were otherwise overwritten with no
+/// way back. Errors abort the restore: better no undo than an undo that
+/// destroys work.
 fn save_unrecorded_worktree(
     cwd: &Path,
     recovery: &str,
     auto_commits: &[String],
-) -> anyhow::Result<(Option<String>, String)> {
+    live_tree: &str,
+) -> anyhow::Result<Option<String>> {
     let head = resolve_head(cwd);
     let latest = auto_commits.last().cloned().or_else(|| head.clone());
-    let latest_tree = latest.as_deref().and_then(|c| tree_of_commit(cwd, c));
-    let td = tempfile::TempDir::new()?;
-    let live_tree = stage_worktree(cwd, latest_tree.as_deref(), &td.path().join("live.index"))?;
 
     // Every state /undo and /redo can reach: each turn and the session base.
     let mut revs: Vec<String> = auto_commits
@@ -961,8 +1037,8 @@ fn save_unrecorded_worktree(
     if head.is_none() {
         known.push(EMPTY_TREE.to_string());
     }
-    if known.contains(&live_tree) {
-        return Ok((None, live_tree));
+    if known.iter().any(|t| t == live_tree) {
+        return Ok(None);
     }
 
     let previous = git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", recovery])).ok();
@@ -972,7 +1048,7 @@ fn save_unrecorded_worktree(
     }
     let sha = commit_tree(
         cwd,
-        &live_tree,
+        live_tree,
         &parents,
         "oxideclaw: working tree saved before /undo or /redo",
     )?;
@@ -986,7 +1062,7 @@ fn save_unrecorded_worktree(
             "could not save un-snapshotted edits to {recovery}; nothing was restored ({e})"
         );
     }
-    Ok((Some(sha), live_tree))
+    Ok(Some(sha))
 }
 
 // ── Prune pipeline ────────────────────────────────────────────────────────────
@@ -2781,5 +2857,106 @@ mod resume_and_restore_tests {
             runs <= 2,
             "clean filter ran {runs} times for one changed file"
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_from_tests {
+    use super::git_detection_tests::init_test_repo;
+    use super::snapshot_tests::write_file;
+    use super::*;
+
+    fn read(repo: &Path, rel: &str) -> String {
+        std::fs::read_to_string(repo.join(rel)).unwrap()
+    }
+
+    /// Base a=1, then three turns: a=2, b created, a=3.
+    fn three_turns(repo: &Path) -> Vec<String> {
+        write_file(repo, "a.txt", "1\n");
+        git_cmd(repo).args(["add", "-A"]).status().unwrap();
+        git_cmd(repo)
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .unwrap();
+        let cfg = AutoCommitConfig::default();
+        let (mut commits, mut pos) = (Vec::new(), 0usize);
+        for (i, (rel, body)) in [("a.txt", "2\n"), ("b.txt", "b\n"), ("a.txt", "3\n")]
+            .into_iter()
+            .enumerate()
+        {
+            write_file(repo, rel, body);
+            snapshot_turn(
+                repo,
+                &cfg,
+                "s",
+                "t",
+                i as u32 + 1,
+                &mut commits,
+                &mut pos,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(commits.len(), 3);
+        commits
+    }
+
+    /// A hand edit to a file a multi-step undo would rewrite is refused
+    /// before anything is written: no file moves, nothing is saved aside.
+    #[test]
+    fn multi_step_undo_refuses_to_overwrite_a_hand_edit() {
+        let td = init_test_repo();
+        let commits = three_turns(td.path());
+        write_file(td.path(), "b.txt", "mine\n");
+
+        let err = restore_from(td.path(), "s", &commits, 3, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("b.txt"), "{err}");
+        assert!(err.contains("nothing was changed"), "{err}");
+        assert_eq!(read(td.path(), "b.txt"), "mine\n");
+        assert_eq!(read(td.path(), "a.txt"), "3\n");
+        assert!(
+            git_output(git_cmd(td.path()).args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                &recovery_ref("s")
+            ]))
+            .is_err(),
+            "a refused undo must not save anything"
+        );
+    }
+
+    /// A hand edit to a file no undone turn touched is overwritten all the
+    /// same by a plain restore; the guard covers it too.
+    #[test]
+    fn undo_refuses_a_hand_edit_to_a_file_the_turns_did_not_touch() {
+        let td = init_test_repo();
+        write_file(td.path(), "keep.txt", "k\n");
+        let commits = three_turns(td.path());
+        write_file(td.path(), "keep.txt", "edited\n");
+        assert!(restore_from(td.path(), "s", &commits, 3, 2).is_err());
+        assert_eq!(read(td.path(), "keep.txt"), "edited\n");
+    }
+
+    /// Edits the restore does not overwrite (a new file no snapshot holds)
+    /// do not block it.
+    #[test]
+    fn undo_proceeds_when_no_edit_would_be_overwritten() {
+        let td = init_test_repo();
+        let commits = three_turns(td.path());
+        write_file(td.path(), "mine.txt", "m\n");
+
+        let report = restore_from(td.path(), "s", &commits, 3, 1).unwrap();
+        assert_eq!(read(td.path(), "a.txt"), "2\n");
+        assert!(!td.path().join("b.txt").exists());
+        assert_eq!(read(td.path(), "mine.txt"), "m\n");
+        assert_eq!(report.orphaned_files, vec![PathBuf::from("b.txt")]);
+
+        // And back, from where the files now are.
+        restore_from(td.path(), "s", &commits, 1, 3).unwrap();
+        assert_eq!(read(td.path(), "a.txt"), "3\n");
+        assert_eq!(read(td.path(), "b.txt"), "b\n");
     }
 }
