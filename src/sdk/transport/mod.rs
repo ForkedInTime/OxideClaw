@@ -16,6 +16,16 @@ pub struct BadRequest {
     pub message: String,
 }
 
+/// The `id` of a request object, as a host would match its reply ("" when
+/// there is none).
+pub(crate) fn request_id(v: &serde_json::Value) -> String {
+    match v.get("id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(n @ serde_json::Value::Number(_)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// `parse_error` for a line that is not JSON, `invalid_request` for JSON
 /// that is not a known request (unknown `type`, missing field, numeric `id`).
 pub fn parse_request(line: &str) -> Result<SdkRequest, BadRequest> {
@@ -25,11 +35,7 @@ pub fn parse_request(line: &str) -> Result<SdkRequest, BadRequest> {
 impl BadRequest {
     fn from_line(line: &str, err: &serde_json::Error) -> Self {
         let value = serde_json::from_str::<serde_json::Value>(line).ok();
-        let id = match value.as_ref().and_then(|v| v.get("id")) {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(v @ serde_json::Value::Number(_)) => v.to_string(),
-            _ => String::new(),
-        };
+        let id = value.as_ref().map(request_id).unwrap_or_default();
         Self {
             id,
             code: if value.is_some() {

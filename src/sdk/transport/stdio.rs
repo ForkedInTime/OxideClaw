@@ -42,30 +42,15 @@ impl Transport for StdioTransport {
             spawn_line_reader(BufReader::new(tokio::io::stdin()), MAX_LINE_SIZE)
         });
         loop {
-            let line = match lines.recv().await {
+            let read = match lines.recv().await {
                 None => return Ok(None),
-                Some(read) => match read.context("Failed to read from stdin")? {
-                    (LineRead::Eof, _) => return Ok(None), // EOF — host closed stdin
-                    (LineRead::TooLong, _) => {
-                        eprintln!("[sdk] Warning: line exceeds 4MB, skipping");
-                        continue;
-                    }
-                    (LineRead::InvalidUtf8, _) => {
-                        eprintln!("[sdk] Warning: line is not valid UTF-8, skipping");
-                        continue;
-                    }
-                    (LineRead::Line, line) => line,
-                },
+                Some(read) => read.context("Failed to read from stdin")?,
             };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue; // skip blank lines
+            match classify_line(read) {
+                Classified::Eof => return Ok(None),
+                Classified::Skip => continue,
+                Classified::Request(req) => return Ok(Some(req)),
             }
-            let req = parse_request(trimmed);
-            if req.is_err() {
-                eprintln!("[sdk] Invalid JSON request: {}", preview(trimmed, 200));
-            }
-            return Ok(Some(req));
         }
     }
 
@@ -88,6 +73,52 @@ impl Transport for StdioTransport {
     }
 }
 
+enum Classified {
+    Eof,
+    Skip,
+    Request(Result<SdkRequest, BadRequest>),
+}
+
+/// What one read line is to the server. Every line that is not blank gets
+/// a reply, so a host waiting on its id never hangs: a non-UTF-8 or
+/// over-long line is a `parse_error`, with the id recovered where possible.
+fn classify_line((read, line): (LineRead, String)) -> Classified {
+    let bad = |id: String, message: &str| {
+        Classified::Request(Err(BadRequest {
+            id,
+            code: "parse_error",
+            message: message.into(),
+        }))
+    };
+    match read {
+        LineRead::Eof => Classified::Eof, // EOF — host closed stdin
+        LineRead::TooLong => {
+            eprintln!("[sdk] Warning: line exceeds 4MB");
+            bad(String::new(), "line exceeds 4MB")
+        }
+        LineRead::InvalidUtf8 => {
+            eprintln!("[sdk] Warning: line is not valid UTF-8");
+            // The lossy text is used only to find the id: U+FFFD inside a
+            // JSON string can still parse, and must never be dispatched.
+            let id = serde_json::from_str::<serde_json::Value>(line.trim())
+                .map(|v| crate::sdk::transport::request_id(&v))
+                .unwrap_or_default();
+            bad(id, "line is not valid UTF-8")
+        }
+        LineRead::Line => {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return Classified::Skip; // skip blank lines
+            }
+            let req = parse_request(trimmed);
+            if req.is_err() {
+                eprintln!("[sdk] Invalid JSON request: {}", preview(trimmed, 200));
+            }
+            Classified::Request(req)
+        }
+    }
+}
+
 /// Result of one bounded line read.
 #[derive(Debug, PartialEq)]
 pub(crate) enum LineRead {
@@ -95,8 +126,9 @@ pub(crate) enum LineRead {
     Line,
     /// The line exceeded `max` bytes; it was drained and discarded.
     TooLong,
-    /// The line was not valid UTF-8; it was discarded. Not fatal: one bad
-    /// line from the host must not end the session.
+    /// The line was not valid UTF-8. Not fatal: one bad line from the host
+    /// must not end the session. Its lossy text is in the buffer, for
+    /// recovering the request id only.
     InvalidUtf8,
 }
 
@@ -157,7 +189,10 @@ pub(crate) async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
                 buf.push_str(&line);
                 LineRead::Line
             }
-            Err(_) => LineRead::InvalidUtf8,
+            Err(e) => {
+                buf.push_str(&String::from_utf8_lossy(e.as_bytes()));
+                LineRead::InvalidUtf8
+            }
         });
     }
     // No newline within the cap: drain the rest of the line in bounded
@@ -301,6 +336,33 @@ mod bounded_read_tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(lines.recv().await, Some(Ok((LineRead::Eof, _)))));
+    }
+
+    /// A non-UTF-8 line was skipped with no reply, so a host waiting on
+    /// that request's id hung forever.
+    #[tokio::test]
+    async fn an_invalid_utf8_request_gets_an_error_reply_with_its_id() {
+        let data =
+            b"{\"type\":\"session/start\",\"id\":\"r7\",\"cwd\":\"/tmp/\xff\"}\n\xff\xfe{}\n"
+                .to_vec();
+        let mut lines = spawn_line_reader(BufReader::new(std::io::Cursor::new(data)), 1024);
+        for want_id in ["r7", ""] {
+            match classify_line(lines.recv().await.unwrap().unwrap()) {
+                Classified::Request(Err(bad)) => {
+                    assert_eq!(bad.id, want_id);
+                    assert_eq!(bad.code, "parse_error");
+                }
+                _ => panic!("no error reply for a non-UTF-8 line"),
+            }
+        }
+        assert!(matches!(
+            classify_line((LineRead::TooLong, String::new())),
+            Classified::Request(Err(_))
+        ));
+        assert!(matches!(
+            classify_line((LineRead::Line, "  \n".into())),
+            Classified::Skip
+        ));
     }
 
     #[test]
