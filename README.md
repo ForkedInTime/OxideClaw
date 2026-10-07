@@ -141,7 +141,7 @@ How it compares with the agents people actually run. Competitor cells were check
 | Voice input | ✅ | ◐ realtime, cloud | ✅ local | — | ✅ `/voice` | **✅ Whisper** |
 | Ollama with native tool calling | ◐ via Ollama's Anthropic-compatible API | — | ✅ BYOK or offline | ✅ | ◐ edit formats, no tool calls | **✅ no shim, no login** |
 | OpenAI-compatible providers | ❌ | ◐ Responses API only | ✅ BYOK | ✅ 75+ providers | ✅ | **✅ 9 providers + any endpoint** |
-| MCP servers | ✅ | ✅ | ✅ | ✅ | ❌ | **✅ `2024-11-05` spec** |
+| MCP servers | ✅ | ✅ | ✅ | ✅ | ❌ | **✅ `2026-07-28`, legacy servers via `initialize`** |
 | Editor integration (Agent Client Protocol) | via adapter | — | ✅ | ✅ | — | **✅ `oxideclaw acp`** |
 | Sandboxed shell | ✅ Seatbelt / bwrap | ✅ every OS | — | — | — | **◐ Linux only (bwrap / firejail)** |
 | AGENTS.md | ✅ | ✅ | ✅ | ✅ | ◐ via `read:` config | **✅ plus CLAUDE.md, GEMINI.md, `/reload`** |

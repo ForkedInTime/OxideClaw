@@ -161,7 +161,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 
 | Command | Description |
 |---------|-------------|
-| `/mcp` | List connected MCP servers, their scope, and project servers waiting for `/trust` |
+| `/mcp` | List connected MCP servers, their scope and negotiated protocol revision, and project servers waiting for `/trust` |
 | `/mcp add [--scope local\|project\|user] <name> <command\|url> [args...]` | Add an MCP server (stdio command or HTTP URL), local scope by default |
 | `/mcp remove [--scope <s>] <name>` | Remove a server; `--scope` is needed when the name is in more than one scope |
 | `/mcp get <name>` | Show a server's config in every scope that defines it |
@@ -177,6 +177,8 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `user` | `mcpServers` in the config dir's `settings.json` | You, in every project | Always |
 
 A name in several scopes starts from the highest one that loads: local, then project, then user. `--scope project` refuses literal `-e` values (and `add-json` headers), since the file is shared and committed: keep the secret in the local scope, or write a reference such as `-e GITHUB_TOKEN='${GITHUB_TOKEN}'` (or `"Authorization": "Bearer ${TOKEN}"`) that each user's environment fills in at startup. `--force` writes a literal value anyway.
+
+**MCP protocol.** OxideClaw speaks the stateless `2026-07-28` revision: no `initialize` handshake and no session, every request carries the protocol version, client name and (empty) client capabilities in `_meta`, and over Streamable HTTP each POST also sends `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and the `Mcp-Param-*` headers a tool's `x-mcp-header` arguments ask for (a tool with an invalid `x-mcp-header` is left out, as the revision requires). Each server is probed once per connection with `server/discover`: a discovery result or one of the revision's own errors means a `2026-07-28` server; any other error, an HTTP 4xx without such an error, or no answer within 5 seconds means an older server, which gets the `initialize` handshake offering `2025-06-18` and keeps the version it answers (`2025-03-26` and `2024-11-05` servers work as before). A stdio server that exits on the probe is started again without it. Servers that ask for input mid-request (`input_required`) get their elicitations declined; a sampling or roots request ends that call with an error, since OxideClaw serves neither. `/mcp` and `oxideclaw mcp list` show each server's negotiated revision; `mcp list` starts the servers a session in the current directory would start (trusted, enabled) to find out, and reports the ones that fail to connect.
 
 ---
 
