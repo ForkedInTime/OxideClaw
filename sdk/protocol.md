@@ -73,7 +73,7 @@ Start a new conversation and execute the first prompt.
 | `id` | yes | | Request correlation ID |
 | `prompt` | yes | | The user's message |
 | `cwd` | no | server cwd | Project directory: tools run there, and its CLAUDE.md, AGENTS.md, GEMINI.md and project settings apply |
-| `model` | no | from config | Model name (e.g. `claude-sonnet-5`, `ollama:llama3`) |
+| `model` | no | from config | Model name (e.g. `claude-sonnet-5`, `ollama:llama3`). Naming one turns the user's model router off for the session |
 | `max_turns` | no | 50 | Max agentic loop iterations |
 | `max_budget_usd` | no | unlimited | Budget cap |
 | `record` | no | false | Reserved: accepted but currently ignored. SDK sessions are not saved, so they do not appear in `session/list`. |
@@ -279,6 +279,24 @@ A tool finished executing, or a call waiting on `tool/approval_needed` was denie
 
 ---
 
+### `model/routed`
+
+Sent when the user's [model router](../FEATURES.md#smart-model-router) is on and `session/start` named no `model`. It comes once before the turn's first API call, naming the tier's model. It comes again if a failure on that tier moved the rest of the turn one tier up. `complexity` is the tier (`low`, `medium`, `high` or `super-high`), and `reason` says how it was picked or why the turn moved.
+
+```json
+{
+  "type": "model/routed",
+  "session_id": "abc-123",
+  "model": "ollama:qwen3-coder",
+  "complexity": "low",
+  "reason": "heuristic"
+}
+```
+
+`turn/completed.model` is the model that finished the turn.
+
+---
+
 ### `cost/updated`
 
 Token usage and cost after each API call.
@@ -317,7 +335,7 @@ Context window usage after each API call.
 }
 ```
 
-`tokens_max` is the session model's context window (1,000,000 on Opus/Sonnet 4.6+, Claude 5 and Fable; 200,000 on Haiku 4.5 and older models). `compaction_imminent` is `true` when `used_pct >= 85`.
+`tokens_max` is the session model's context window (1,000,000 on Opus/Sonnet 4.6+, Claude 5 and Fable; 200,000 on Haiku 4.5 and older models). In a routed session it is the largest tier's window, since each turn goes to a tier whose window holds the history. `compaction_imminent` is `true` when `used_pct >= 85`.
 
 ---
 

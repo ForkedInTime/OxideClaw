@@ -20,7 +20,7 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 ### SHIPPED (1-5 + Phase 1 robustness)
 1. **OpenAI-compatible provider adapter** — Groq, OpenRouter, DeepSeek, Gemini, LM Studio, Together, Mistral, Venice.ai, OpenAI, plus a generic openai-compat escape hatch for any endpoint.
 2. **Local Codebase RAG Indexing** — tree-sitter AST parsing + SQLite FTS5 (BM25) full-text search over symbol chunks. No embeddings. Zero setup. 8 languages.
-3. **Smart Model Router + Cost Dashboard** — Opt-in router (`/router on`, off by default): a keyword/length heuristic picks a tier, and the default tiers are Claude models. Real-time cost tracking. `/budget $5` hard stop, settable mid-session, counts sub-agents.
+3. **Smart Model Router + Cost Dashboard** — Optional router, on once two tiers are configured (or `/router on`). Tiers can be on any provider. A keyword/length heuristic picks the tier by default; a low-tier classifier is opt-in. A failed cheap turn escalates once, within `/budget`, and tiers with no credential are skipped. Default tiers are Claude models. Real-time cost tracking. `/budget $5` hard stop, settable mid-session, counts sub-agents.
 4. **Background Parallel Agents in Git Worktrees** — `oxideclaw spawn "refactor auth"` runs an agent in an isolated worktree while you keep working. Table stakes (Claude Code, Codex, Copilot CLI have it).
 5. **Self-voice model** — XTTS v2 voice cloning. The only coding agent with a built-in record-your-voice flow that speaks every reply locally. Optional add-on: needs Python; the XTTS weights are non-commercial.
 

@@ -95,6 +95,7 @@ Your App                    OxideClaw
 | `tool/started` | Tool execution began |
 | `tool/approval_needed` | Tool needs host approval |
 | `tool/completed` | Tool finished |
+| `model/routed` | The model router picked (or escalated to) this model |
 | `cost/updated` | Token usage + cost after each API call |
 | `context/health` | Context window usage % |
 | `progress/updated` | Estimated progress through the task |

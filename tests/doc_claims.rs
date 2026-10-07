@@ -106,11 +106,22 @@ fn voice_docs_disclose_python_and_the_cpml_license() {
     );
 }
 
+/// Off unless two tiers are configured or it is switched on, and the
+/// docs say exactly that: heuristic by default, classifier opt-in.
 #[test]
 fn router_is_documented_as_off_by_default_and_is() {
-    assert!(!oxideclaw::router::RouterConfig::default().enabled);
-    assert!(README.contains("The smart router is optional and off by default."));
-    assert!(FEATURES.contains("## Smart Model Router\n\nOptional and off by default."));
+    use oxideclaw::router::{Classifier, RouterConfig, starts_enabled};
+    assert!(!RouterConfig::default().enabled);
+    assert_eq!(RouterConfig::default().classifier, Classifier::Heuristic);
+    assert!(!starts_enabled(None, 0) && !starts_enabled(None, 1));
+    assert!(starts_enabled(None, 2) && !starts_enabled(Some(false), 2));
+    assert!(README.contains("The model router is optional. Give two or more tiers a model"));
+    assert!(FEATURES.contains("## Smart Model Router\n\nOptional."));
+    assert!(FEATURES.contains(
+        "The router starts on once two or more tiers are set. `\"enabled\": false` keeps it off"
+    ));
+    assert!(FEATURES.contains("By default a keyword and length heuristic scores the prompt"));
+    assert!(FEATURES.contains("With `\"classifier\": \"model\"` the low tier is asked"));
 }
 
 /// The comparison is against the agents people actually run, and claims as
