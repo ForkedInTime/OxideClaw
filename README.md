@@ -237,6 +237,8 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 /undo                   # step back to any previous turn
 ```
 
+No API key yet? If Ollama is running locally (or at `OLLAMA_HOST`) and you have not picked a model, `oxideclaw` and `oxideclaw -p` start on one of your pulled Ollama models, preferring one that supports tools, and say which.
+
 `.env` files auto-load from `$CWD/.env`, `~/.env`, or `~/.config/oxideclaw/.env`. A project `.env` can set `OLLAMA_HOST` and `ANTHROPIC_MODEL` only after you `/trust` that folder.
 
 ---
