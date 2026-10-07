@@ -631,6 +631,7 @@ impl SdkSession {
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
+        ctx.live_thinking_budget = Some(self.config.thinking_budget_tokens);
         ctx.usage_sink = Some(self.child_usage_tx.clone());
         ctx.budget_remaining_usd = self.cost_tracker.remaining();
         // The host's policy and approval see only tool names, so the user's

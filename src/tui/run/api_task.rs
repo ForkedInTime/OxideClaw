@@ -649,6 +649,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 ctx.live_model = Some(config.model.clone());
                 ctx.live_api_key = Some(config.api_key.clone());
                 ctx.live_ollama_host = Some(config.ollama_host.clone());
+                ctx.live_thinking_budget = Some(config.thinking_budget_tokens);
                 ctx.usage_sink = Some(child_usage_tx.clone());
                 ctx.budget_remaining_usd = task_cost.remaining();
                 // Drain any pending plan_mode changes before building the gate
@@ -662,6 +663,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     let _ = tx.send(AppEvent::SystemMessage(msg.into()));
                     let _ = tx.send(AppEvent::SetPlanMode(enabled));
                 }
+                ctx.live_plan_mode = Some(effective_plan_mode);
 
                 // One gate per response (autonomy can change between turns
                 // via /autonomy), rebuilt when plan mode flips mid-response.
@@ -905,6 +907,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         if effective_plan_mode != was_plan_mode {
                             gate = build_gate(effective_plan_mode, skill_shell_blocked);
                             ctx.permission_gate = Some(gate.clone());
+                            ctx.live_plan_mode = Some(effective_plan_mode);
                         }
 
                         let same_call_streak =
@@ -1605,6 +1608,45 @@ mod loop_guard_tests {
         let (seen, errors) = run_with_probe(false, &["Planner", "Agent"]).await;
         assert_eq!(errors, Vec::<String>::new());
         assert_eq!(seen, vec![true]);
+    }
+
+    /// Config read plan mode from the registry's startup snapshot, so it
+    /// said `plan_mode: false` after EnterPlanMode (or `/plan`).
+    #[tokio::test]
+    async fn config_tool_reports_plan_mode_entered_mid_response() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let blocks: Vec<_> = ["Config", "Planner", "Config"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| serde_json::json!({"type":"tool_use","id":format!("t{i}"),"name":n,"input":{}}))
+            .collect();
+        let (url, _) = serve(vec![
+            sse(&blocks, "tool_use"),
+            sse(
+                &[serde_json::json!({"type":"text","text":"done"})],
+                "end_turn",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut t, mut rx) = task(url, dir.path(), None);
+        t.tools = vec![
+            std::sync::Arc::new(crate::tools::config_tool::ConfigTool {
+                config: t.config.clone(),
+            }),
+            std::sync::Arc::new(Planner),
+        ];
+        t.perm_state = PermissionState::new(false, &["Config".into(), "Planner".into()], &[]);
+        run_api_task(t).await;
+        let mut reports = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::ToolResult { text, .. } = ev
+                && let Some(line) = text.lines().find(|l| l.starts_with("plan_mode:"))
+            {
+                reports.push(line.to_string());
+            }
+        }
+        assert_eq!(reports, vec!["plan_mode: false", "plan_mode: true"]);
     }
 
     /// Stands in for Write: succeeds without touching the disk.

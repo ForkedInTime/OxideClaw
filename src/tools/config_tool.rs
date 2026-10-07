@@ -29,15 +29,19 @@ impl Tool for ConfigTool {
         // The registry snapshot goes stale after `/model`; the executor
         // publishes the live choice on the context.
         let model = ctx.live_model.as_deref().unwrap_or(&cfg.model);
+        let plan_mode = ctx.live_plan_mode.unwrap_or(cfg.plan_mode);
+        let thinking_budget = ctx
+            .live_thinking_budget
+            .unwrap_or(cfg.thinking_budget_tokens);
 
         let mut lines = vec![
             format!("model: {model}"),
             format!("max_tokens: {}", cfg.max_tokens_for(model)),
             format!("prompt_cache: {}", cfg.prompt_cache),
-            format!("plan_mode: {}", cfg.plan_mode),
+            format!("plan_mode: {plan_mode}"),
         ];
 
-        if let Some(budget) = cfg.thinking_budget_tokens {
+        if let Some(budget) = thinking_budget {
             lines.push(format!("thinking_budget_tokens: {budget}"));
         } else {
             lines.push("thinking_budget_tokens: disabled".to_string());
@@ -75,5 +79,29 @@ mod tests {
         let out = tool.execute(json!({}), &ctx).await.unwrap();
         let text = format!("{:?}", out.content);
         assert!(text.contains("model: claude-opus-5"), "{text}");
+    }
+
+    /// `/plan`, EnterPlanMode and `/reload` never reach the registry's
+    /// snapshot, so the tool said `plan_mode: false` while plan mode was on.
+    #[tokio::test]
+    async fn reports_live_plan_mode_and_thinking_budget() {
+        let cfg = crate::config::Config {
+            plan_mode: false,
+            thinking_budget_tokens: Some(4096),
+            ..crate::config::Config::default()
+        };
+        let tool = ConfigTool { config: cfg };
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.live_plan_mode = Some(true);
+        ctx.live_thinking_budget = Some(None);
+        let out = tool.execute(json!({}), &ctx).await.unwrap();
+        let text = format!("{:?}", out.content);
+        assert!(text.contains("plan_mode: true"), "{text}");
+        assert!(text.contains("thinking_budget_tokens: disabled"), "{text}");
+
+        ctx.live_thinking_budget = Some(Some(16000));
+        let out = tool.execute(json!({}), &ctx).await.unwrap();
+        let text = format!("{:?}", out.content);
+        assert!(text.contains("thinking_budget_tokens: 16000"), "{text}");
     }
 }

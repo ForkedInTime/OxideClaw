@@ -570,6 +570,7 @@ impl QueryEngine {
         ctx.live_model = Some(self.config.model.clone());
         ctx.live_api_key = Some(self.config.api_key.clone());
         ctx.live_ollama_host = Some(self.config.ollama_host.clone());
+        ctx.live_thinking_budget = Some(self.config.thinking_budget_tokens);
         ctx.middlewares = self.middlewares.clone();
         ctx.permission_gate = Some(gate.clone());
         ctx.agent_depth = self.agent_depth;

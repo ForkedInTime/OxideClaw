@@ -97,6 +97,11 @@ pub struct ToolContext {
     pub live_model: Option<String>,
     pub live_api_key: Option<String>,
     pub live_ollama_host: Option<String>,
+    /// Plan mode and thinking budget as the executor sees them now; `/plan`,
+    /// EnterPlanMode and `/reload` change these after the registry (and
+    /// `Config` tool's snapshot) was built.
+    pub live_plan_mode: Option<bool>,
+    pub live_thinking_budget: Option<Option<u32>>,
     /// The permission gate of the executor running this tool. A tool that
     /// launches a nested engine (`Agent`) must hand it on so every
     /// descendant prompts through the same human — or, headless, fails
@@ -148,6 +153,8 @@ impl ToolContext {
             live_model: None,
             live_api_key: None,
             live_ollama_host: None,
+            live_plan_mode: None,
+            live_thinking_budget: None,
             permission_gate: None,
             agent_depth: 0,
             usage_sink: None,
