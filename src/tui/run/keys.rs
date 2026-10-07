@@ -528,7 +528,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 .push(ChatEntry::system("TTS stopped.".to_string()));
             app.scroll_to_bottom();
         }
-        (Esc, _) if app.pending_clone_tier.is_some() && !app.voice_recording => {
+        (Esc, _) if esc_disarms_clone(app) => {
             app.pending_clone_tier = None;
             app.entries.push(ChatEntry::system(
                 "Voice clone cancelled. Ctrl+R records dictation again.".to_string(),
@@ -1008,6 +1008,12 @@ pub(super) fn budget_blocks(app: &mut App, unsent: &str) -> bool {
     true
 }
 
+/// Whether Esc disarms a pending /voice clone. Not while a turn runs: that
+/// Esc must cancel the turn first (clone mode stays armed for the next Esc).
+fn esc_disarms_clone(app: &App) -> bool {
+    app.pending_clone_tier.is_some() && !app.voice_recording && !app.is_loading
+}
+
 /// Whether vim mode gets this key before the main match. Esc while a turn or
 /// TTS is running and Ctrl+S must reach their cancel/stop arms: vim would eat
 /// them as a mode switch, and while loading every other key is blocked, so
@@ -1096,6 +1102,17 @@ mod vim_routing_tests {
         assert!(!vim_routes_key(&app, &esc));
         app.voice_recording = true;
         assert!(vim_routes_key(&app, &esc));
+    }
+
+    /// The clone-disarm arm came before the cancel arm, so the first Esc
+    /// during a turn only disarmed /voice clone and the turn kept running.
+    #[test]
+    fn esc_cancels_a_running_turn_before_disarming_clone() {
+        let mut app = vim_app(false);
+        app.pending_clone_tier = Some(crate::voice::CloneTier::Quick);
+        assert!(esc_disarms_clone(&app));
+        app.start_loading();
+        assert!(!esc_disarms_clone(&app));
     }
 
     #[test]

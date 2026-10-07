@@ -83,8 +83,6 @@ impl LoopGuard {
     }
 }
 
-/// Publish the turn's history so far: `messages` plus the results of the
-/// tool round in progress.
 /// The files an edit tool call wrote, for the auto-fix check. MultiEdit
 /// has no top-level `file_path` (each edit names its own), so turns that
 /// edited only through it never ran lint or tests. It also commits per
@@ -121,6 +119,8 @@ fn edited_paths(
     }
 }
 
+/// Publish the turn's history so far: `messages` plus the results of the
+/// tool round in progress.
 fn publish_history(history: &TurnHistory, messages: &[Message], results: &[ContentBlock]) {
     let mut h = messages.to_vec();
     if !results.is_empty() {

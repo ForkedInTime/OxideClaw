@@ -2683,10 +2683,12 @@ async fn uncommitted_diff(
         }
         cmd.output()
     };
-    let mut out = git(&["diff", "HEAD"]).await?;
+    // --no-ext-diff: /diff wants a parseable unified diff, not whatever a
+    // configured diff.external tool prints.
+    let mut out = git(&["diff", "--no-ext-diff", "HEAD"]).await?;
     if !out.status.success() {
         // No HEAD yet: everything is staged against the empty tree.
-        let cached = git(&["diff", "--cached"]).await?;
+        let cached = git(&["diff", "--no-ext-diff", "--cached"]).await?;
         if !cached.status.success() {
             anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -2914,6 +2916,11 @@ mod diff_tests {
         git(d, &["init", "-q"]);
         // The helper's own git calls lack the env isolation above.
         git(d, &["config", "core.fsmonitor", "false"]);
+        // Repo config overrides a global core.excludesFile (and the XDG
+        // default ignore file) that might match the untracked file.
+        git(d, &["config", "core.excludesFile", "/dev/null"]);
+        // An external diff tool must not replace the unified diff.
+        git(d, &["config", "diff.external", "false"]);
         std::fs::write(d.join("staged.txt"), "one\n").unwrap();
         git(d, &["add", "staged.txt"]);
 
@@ -2937,14 +2944,16 @@ mod diff_tests {
         );
         std::fs::write(d.join("staged.txt"), "two\n").unwrap();
         git(d, &["add", "staged.txt"]);
-        std::fs::write(d.join("new.txt"), "new\n").unwrap();
+        std::fs::write(d.join("new-untracked.oxideclaw-test"), "new\n").unwrap();
 
         let (diff, untracked) = uncommitted_diff(d, None).await.unwrap();
         assert!(diff.contains("+two"), "{diff}");
-        assert_eq!(untracked, ["new.txt"]);
+        assert_eq!(untracked, ["new-untracked.oxideclaw-test"]);
 
-        let (diff, untracked) = uncommitted_diff(d, Some("new.txt")).await.unwrap();
+        let (diff, untracked) = uncommitted_diff(d, Some("new-untracked.oxideclaw-test"))
+            .await
+            .unwrap();
         assert!(diff.is_empty(), "{diff}");
-        assert_eq!(untracked, ["new.txt"]);
+        assert_eq!(untracked, ["new-untracked.oxideclaw-test"]);
     }
 }
