@@ -186,7 +186,7 @@ OxideClaw includes 30+ built-in tools that the AI agent can use:
 | Tool | Description |
 |------|-------------|
 | `WebFetch` | Fetch URLs |
-| `WebSearch` | Search the web |
+| `WebSearch` | Search the web, with sources (Anthropic server-side search: needs an Anthropic key on any provider) |
 
 ### Advanced
 

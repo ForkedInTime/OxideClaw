@@ -42,6 +42,78 @@ impl WebSearchTool {
         h.push(("anthropic-beta", betas.join(",")));
         h
     }
+
+    /// The Claude model to run the search on. The search always goes to
+    /// api.anthropic.com, so an Ollama or OpenAI-compat id (the startup model,
+    /// or one picked with /model) would be a 400 on every call; the live
+    /// model wins over the startup snapshot when it is a Claude one.
+    fn search_model(&self, live: Option<&str>) -> String {
+        let foreign =
+            |m: &str| crate::api::is_ollama_model(m) || crate::api::is_openai_compat_model(m);
+        let model = [live, Some(self.model.as_str())]
+            .into_iter()
+            .flatten()
+            .find(|m| !m.is_empty() && !foreign(m))
+            .unwrap_or(crate::api::default_model());
+        crate::commands::resolve_model_alias(model)
+    }
+}
+
+/// The model's answer followed by the deduplicated sources it searched.
+/// Sources arrive inside `web_search_tool_result` blocks (and as citations
+/// on text blocks), never as top-level `web_search_result` blocks.
+fn render_response(resp: &serde_json::Value) -> Result<String, String> {
+    let mut answer = String::new();
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |title: Option<&str>, url: Option<&str>| {
+        if let Some(url) = url
+            && seen.insert(url.to_string())
+        {
+            sources.push((title.unwrap_or(url).to_string(), url.to_string()));
+        }
+    };
+    let mut error = None;
+    for block in resp["content"].as_array().into_iter().flatten() {
+        match block["type"].as_str() {
+            Some("text") => {
+                if let Some(text) = block["text"].as_str() {
+                    answer.push_str(text);
+                }
+                for c in block["citations"].as_array().into_iter().flatten() {
+                    add(c["title"].as_str(), c["url"].as_str());
+                }
+            }
+            Some("web_search_tool_result") => match &block["content"] {
+                serde_json::Value::Array(results) => {
+                    for r in results {
+                        if r["type"] == "web_search_result" {
+                            add(r["title"].as_str(), r["url"].as_str());
+                        }
+                    }
+                }
+                other => {
+                    if let Some(code) = other["error_code"].as_str() {
+                        error = Some(code.to_string());
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    if answer.trim().is_empty() && sources.is_empty() {
+        return Err(match error {
+            Some(code) => format!("Web search failed: {code}"),
+            None => "No search results returned".into(),
+        });
+    }
+    if !sources.is_empty() {
+        answer.push_str("\n\nSources:");
+        for (title, url) in &sources {
+            answer.push_str(&format!("\n- [{title}]({url})"));
+        }
+    }
+    Ok(answer)
 }
 
 #[derive(Deserialize)]
@@ -88,7 +160,7 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: WebSearchInput = serde_json::from_value(input)?;
 
         // Build the web_search tool definition for the Anthropic beta API
@@ -105,7 +177,7 @@ impl Tool for WebSearchTool {
         }
 
         let request_body = json!({
-            "model": self.model,
+            "model": self.search_model(ctx.live_model.as_deref()),
             "max_tokens": 4096,
             "messages": [{
                 "role": "user",
@@ -123,6 +195,12 @@ impl Tool for WebSearchTool {
             request.json(&request_body).send()
         };
         let secret = self.current_secret();
+        if secret.is_empty() {
+            return Ok(ToolOutput::error(
+                "WebSearch needs an Anthropic API key (ANTHROPIC_API_KEY or /login); \
+                 it runs on Anthropic's server-side search whatever the chat model.",
+            ));
+        }
         let mut response = send(secret.clone()).await?;
         // An expired profile token or helper key: refresh it once, as the
         // main client does.
@@ -144,38 +222,10 @@ impl Tool for WebSearchTool {
 
         let resp: serde_json::Value = response.json().await?;
 
-        // Extract text content from the response
-        let mut result = String::new();
-        if let Some(content) = resp["content"].as_array() {
-            for block in content {
-                match block["type"].as_str() {
-                    Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            result.push_str(text);
-                        }
-                    }
-                    Some("web_search_result") => {
-                        // Include source URLs
-                        if let Some(results) = block["results"].as_array() {
-                            for r in results {
-                                if let (Some(title), Some(url)) =
-                                    (r["title"].as_str(), r["url"].as_str())
-                                {
-                                    result.push_str(&format!("\n[{title}]({url})"));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if result.trim().is_empty() {
-            return Ok(ToolOutput::error("No search results returned"));
-        }
-
-        Ok(ToolOutput::success(result))
+        Ok(match render_response(&resp) {
+            Ok(text) => ToolOutput::success(text),
+            Err(e) => ToolOutput::error(e),
+        })
     }
 }
 
@@ -215,5 +265,71 @@ mod tests {
         let beta = header(&h, "anthropic-beta").unwrap();
         assert!(beta.contains("web-search-2025-03-05"), "{beta}");
         assert!(beta.contains(crate::auth::OAUTH_BETA), "{beta}");
+    }
+
+    fn tool(model: &str) -> WebSearchTool {
+        WebSearchTool {
+            api_key: "k".into(),
+            model: model.into(),
+            auth_is_oauth: false,
+        }
+    }
+
+    /// The startup model id went to api.anthropic.com even when it was an
+    /// Ollama/OpenAI-compat one, and a later /model switch never reached it.
+    #[test]
+    fn the_search_runs_on_a_claude_model() {
+        let t = tool("ollama:qwen3");
+        assert_eq!(t.search_model(None), crate::api::default_model());
+        assert_eq!(
+            t.search_model(Some("groq:llama-3.3-70b")),
+            crate::api::default_model()
+        );
+        assert_eq!(t.search_model(Some("claude-haiku-4-5")), "claude-haiku-4-5");
+
+        let t = tool("claude-sonnet-4-6");
+        assert_eq!(t.search_model(Some("claude-opus-4-6")), "claude-opus-4-6");
+        assert_eq!(t.search_model(Some("ollama:qwen3")), "claude-sonnet-4-6");
+        assert_eq!(t.search_model(Some("opus")), "claude-opus-5");
+    }
+
+    /// Sources live inside `web_search_tool_result` blocks and text
+    /// citations; the parser looked for a top-level block that never exists.
+    #[test]
+    fn sources_come_from_tool_result_blocks_and_citations() {
+        let resp = serde_json::json!({"content": [
+            {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [
+                {"type": "web_search_result", "url": "https://a.example/", "title": "A",
+                 "encrypted_content": "x"},
+                {"type": "web_search_result", "url": "https://b.example/", "title": "B",
+                 "encrypted_content": "y"}
+            ]},
+            {"type": "text", "text": "Answer.", "citations": [
+                {"type": "web_search_result_location", "url": "https://a.example/",
+                 "title": "A", "cited_text": "..."},
+                {"type": "web_search_result_location", "url": "https://c.example/",
+                 "title": "C", "cited_text": "..."}
+            ]}
+        ]});
+        let out = render_response(&resp).unwrap();
+        assert!(out.starts_with("Answer."), "{out}");
+        for src in [
+            "[A](https://a.example/)",
+            "[B](https://b.example/)",
+            "[C](https://c.example/)",
+        ] {
+            assert_eq!(out.matches(src).count(), 1, "{out}");
+        }
+
+        let err = serde_json::json!({"content": [
+            {"type": "web_search_tool_result", "tool_use_id": "s1",
+             "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}}
+        ]});
+        assert!(
+            render_response(&err)
+                .unwrap_err()
+                .contains("max_uses_exceeded")
+        );
     }
 }
