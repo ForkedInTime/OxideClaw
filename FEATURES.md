@@ -70,7 +70,7 @@ own environment variable (shell or `.env`):
 | OpenAI | `oai:` | `OPENAI_API_KEY` |
 | Generic | `openai-compat:` | `OPENAI_API_KEY` (optional: unset sends no `Authorization` header), plus `OPENAI_BASE_URL` (required) |
 
-Keys come from the environment, never from `settings.json`. Export the variable or put it in `~/.env` or `~/.config/oxideclaw/.env`, then pick the model. `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not read from `.env` files; export them in your shell.
+Keys come from the environment, never from `settings.json`. Export the variable or put it in `~/.env` or `.env` in the config dir (`~/.config/oxideclaw/.env`), then pick the model. `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not read from `.env` files; export them in your shell.
 
 ```bash
 echo 'GROQ_API_KEY=gsk_...' >> ~/.config/oxideclaw/.env
@@ -324,7 +324,7 @@ Sessions save automatically; resume, search, and export them.
 /export              # export the current session to markdown
 ```
 
-Sessions are stored in `~/.claude/sessions/` by default (the `sessions/` folder of the config directory), or in `$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set and either `$XDG_DATA_HOME/oxideclaw/` exists or the config directory has no `sessions/` folder. See [Where files live](#where-files-live).
+Sessions are stored in `~/.local/share/oxideclaw/sessions/` by default (`$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set). See [Where files live](#where-files-live).
 
 ---
 
@@ -448,7 +448,7 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 
 ### Settings File
 
-`~/.claude/settings.json` by default (see [Where files live](#where-files-live)), plus `<project>/.claude/settings.json` per project. `/status` prints the config directory in use:
+`~/.config/oxideclaw/settings.json` by default (see [Where files live](#where-files-live)), plus `<project>/.claude/settings.json` per project. `/status` prints the config directory in use:
 
 ```json
 {
@@ -477,14 +477,14 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 
 ### CLAUDE.md / AGENTS.md
 
-Drop a `CLAUDE.md` or `AGENTS.md` in your project root to give the agent project-specific context. These files are automatically injected into the system prompt.
+Drop a `CLAUDE.md` or `AGENTS.md` in your project root to give the agent project-specific context. These files are automatically injected into the system prompt. The global ones are read from the config dir (`~/.config/oxideclaw/CLAUDE.md`, `AGENTS.md`), falling back to Claude Code's `~/.claude/CLAUDE.md` / `AGENTS.md` when OxideClaw has none.
 
 ### .env Files
 
 Auto-loaded from (in order):
 1. `$CWD/.env`
 2. `~/.env`
-3. `~/.config/oxideclaw/.env`
+3. `.env` in the config dir (`~/.config/oxideclaw/.env`; also that path when `$XDG_CONFIG_HOME` moves the config dir)
 
 Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, ...) are read; `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not, so export those in your shell. `OLLAMA_HOST` and `ANTHROPIC_MODEL` decide where your prompts are sent, so `$CWD/.env` may set them only in a folder you have `/trust`ed; otherwise they are ignored with a note.
 
@@ -492,12 +492,14 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 
 | Purpose | Default | Override |
 |---------|---------|----------|
-| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md`) | `~/.claude/` (the same directory Claude Code uses) | `$CLAUDE_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` when `$XDG_CONFIG_HOME` is set and that directory exists or `~/.claude` does not |
-| Sessions | `<config dir>/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set and `$XDG_DATA_HOME/oxideclaw/` exists or `<config dir>/sessions/` does not |
+| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md`, skills, `memory.md`, plugins, `local-mcp/`) | `~/.config/oxideclaw/` | `$OXIDECLAW_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` (an absolute path). `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning, unless it names `~/.claude` |
+| Sessions | `~/.local/share/oxideclaw/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/`. With `$OXIDECLAW_CONFIG_DIR` (or `$CLAUDE_CONFIG_DIR`) and no `$XDG_DATA_HOME`, `<config dir>/sessions/` |
 | Cache: code index (`rag/`) and the update-check answer | `~/.cache/oxideclaw/` | `$XDG_CACHE_HOME/oxideclaw/` (an absolute path; a relative one is ignored) |
 | Project memories (`/memory`) | `<project>/.claude/memory.db`, created on first use | — |
 
-To move an existing `~/.claude/` setup to XDG paths, create `$XDG_CONFIG_HOME/oxideclaw/` (and `$XDG_DATA_HOME/oxideclaw/`) and copy your files in; `/status` shows which directories are in use.
+OxideClaw is XDG Base Directory compliant and never writes to Claude Code's `~/.claude`. It reads from it, as an import format, the global `CLAUDE.md` / `AGENTS.md` (when the config dir has none), skills, agents, output styles and workflows; OxideClaw's own copies win.
+
+**Upgrading from a version that used `~/.claude`.** On the first run, when the config dir does not exist yet (or holds only a `.env`), OxideClaw copies its own state out of `~/.claude` and prints what it did: sessions (only OxideClaw's `<id>.meta` / `.jsonl` files and snapshots), `memory.md`, `plugins.json`, `local-mcp/`, `bannerOrgDisplay` from `config.json`, and from `settings.json` the `model`, the `/trust` list, plain preferences (spinner, router, TTS, auto-commit, ...), `env` entries from the `.env` allowlist and the MCP servers of installed plugins. Hooks, permission rules, `apiKeyHelper` and other MCP servers run code or change permissions, so they are listed, not copied; `oxideclaw config import-claude` shows them and `--hooks`, `--permissions`, `--api-key-helper`, `--mcp` copy them (Claude Code's hook format is converted). Settings that pick commands or endpoints (`autoFixLoop`, `ollamaHost`, sandbox settings, ...) are named so you can set them again. `~/.claude` itself is never modified. Sessions older versions kept in `$XDG_CONFIG_HOME/oxideclaw/sessions/` move to the data dir. `/status` and `oxideclaw doctor` show the directories in use.
 
 ---
 
@@ -530,9 +532,10 @@ To move an existing `~/.claude/` setup to XDG paths, create `$XDG_CONFIG_HOME/ox
 | `LM_STUDIO_HOST` | LM Studio server URL (default: `http://localhost:1234/v1`; shell only, not `.env`) |
 | `OXIDECLAW_NO_UPDATE_CHECK` | `1` turns off the TUI's daily update check (same as `"updateCheck": false`). Shell only. |
 | `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |
-| `CLAUDE_CONFIG_DIR` | Config directory (default `~/.claude`) |
-| `XDG_CONFIG_HOME` | Config directory base, under the rule in [Where files live](#where-files-live) |
-| `XDG_DATA_HOME` | Sessions directory base, under the rule in [Where files live](#where-files-live) |
+| `OXIDECLAW_CONFIG_DIR` | Config directory (default `~/.config/oxideclaw`). Shell only, not `.env` |
+| `CLAUDE_CONFIG_DIR` | Deprecated alias for `OXIDECLAW_CONFIG_DIR`, honoured with a warning for one more release; ignored when it names `~/.claude` |
+| `XDG_CONFIG_HOME` | Config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
+| `XDG_DATA_HOME` | Sessions directory base (`$XDG_DATA_HOME/oxideclaw`), under the rule in [Where files live](#where-files-live) |
 | `XDG_CACHE_HOME` | Cache directory base (code index, update-check answer) |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | CA certificates to trust in place of the OS certificate store (e.g. a TLS-inspecting corporate proxy's root). HTTPS trusts the bundled Mozilla roots plus the OS store by default |
 

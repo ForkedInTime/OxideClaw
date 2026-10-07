@@ -7,18 +7,6 @@ const FEATURES: &str = include_str!("../FEATURES.md");
 
 /// (phrase, why it must not be claimed)
 const RETRACTED: &[(&str, &str)] = &[
-    (
-        "XDG Base Directory compliant",
-        "config defaults to ~/.claude, not $XDG_CONFIG_HOME",
-    ),
-    (
-        "~/.config/oxideclaw/settings.json",
-        "settings.json is read from Config::claude_dir(), ~/.claude by default",
-    ),
-    (
-        "~/.local/share/oxideclaw/sessions",
-        "sessions default to <config dir>/sessions without $XDG_DATA_HOME",
-    ),
     ("No Python", "the voice add-on needs Python + Coqui"),
     (
         "cannot talk to Ollama",
@@ -83,6 +71,22 @@ fn public_docs_make_no_retracted_claims() {
         for (phrase, why) in RETRACTED {
             assert!(!text.contains(phrase), "{doc} says {phrase:?}, but {why}");
         }
+    }
+}
+
+/// The config namespace change made these true; they must stay in sync
+/// with `Config::config_dir` / `data_dir` (unit-tested in src/config.rs).
+#[test]
+fn docs_name_oxideclaws_own_xdg_dirs() {
+    for (doc, text) in [("README.md", README), ("FEATURES.md", FEATURES)] {
+        assert!(text.contains("XDG Base Directory compliant"), "{doc}");
+        assert!(text.contains("`~/.config/oxideclaw/"), "{doc}");
+        assert!(text.contains("`~/.local/share/oxideclaw/sessions"), "{doc}");
+        assert!(text.contains("oxideclaw config import-claude"), "{doc}");
+        assert!(
+            !text.contains("Settings live in `~/.claude/settings.json`"),
+            "{doc} still says OxideClaw's settings are in ~/.claude"
+        );
     }
 }
 

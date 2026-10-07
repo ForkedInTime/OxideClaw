@@ -26,7 +26,7 @@ You are a 0.1% expert in computer science, systems programming, infrastructure, 
 
 ### PHASE 1 ROBUSTNESS (shipped 2026-04-08)
 - **AGENTS.md + CLAUDE.md (table stakes)** — Both read and merged into the system prompt.
-- **XDG directories (partial)** — Code index in `$XDG_CACHE_HOME/oxideclaw`, sessions in `$XDG_DATA_HOME/oxideclaw` when set. Config still defaults to `~/.claude` (shared with Claude Code) until the config namespace change lands; do not call it XDG-compliant before then.
+- **XDG Base Directory compliance** — Config in `$XDG_CONFIG_HOME/oxideclaw` (`~/.config/oxideclaw`, `$OXIDECLAW_CONFIG_DIR` overrides; `$CLAUDE_CONFIG_DIR` deprecated), sessions in `$XDG_DATA_HOME/oxideclaw` (`~/.local/share/oxideclaw`), code index in `$XDG_CACHE_HOME/oxideclaw`. Never writes to Claude Code's `~/.claude`: reads CLAUDE.md/AGENTS.md/skills/agents from it as an import format, migrates OxideClaw's old state out once (`src/claude_import.rs`), and `oxideclaw config import-claude` copies hooks/permissions/apiKeyHelper/MCP only on request. `Config::config_dir()` is OxideClaw's dir; `Config::claude_code_dir()` is the read-only `~/.claude`.
 - **Context usage % in status bar** — Real-time ctx % + color-coded warnings (yellow at 70%, red at 90%)
 - **Always-show-thinking** — Display model reasoning in TUI when enabled (`showThinkingSummaries: true`)
 - **Spinner style toggle** — `spinnerStyle: "themed" | "minimal" | "silent"` in settings.json
@@ -77,7 +77,8 @@ src/
 │   └── mod.rs        # Session::list() with preview backfill
 ├── voice.rs          # Recording + Whisper STT + XTTS v2 TTS + find_all_voices()
 ├── sandbox.rs        # bwrap / firejail / strict
-└── config.rs         # Settings, CLAUDE.md injection
+├── claude_import.rs  # One-time move off ~/.claude + `config import-claude`
+└── config.rs         # Settings, CLAUDE.md injection, config/data/cache dirs (XDG)
 ```
 
 ## Key Patterns

@@ -231,7 +231,7 @@ Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; s
 
 ### 📁 &nbsp; Config, CLAUDE.md and AGENTS.md
 
-Settings live in `~/.claude/settings.json` by default, the directory Claude Code also uses. `$CLAUDE_CONFIG_DIR` moves it; with `$XDG_CONFIG_HOME` set, `$XDG_CONFIG_HOME/oxideclaw` is used when it already exists or there is no `~/.claude`. Sessions go under `$XDG_DATA_HOME/oxideclaw` when that is set (sessions already in the config directory stay there), and the code index lives in `$XDG_CACHE_HOME/oxideclaw`. Reads **both** `CLAUDE.md` and `AGENTS.md`. Hot-reload with `/reload` — no restart.
+XDG Base Directory compliant, and OxideClaw's own: settings live in `~/.config/oxideclaw/settings.json` (`$XDG_CONFIG_HOME/oxideclaw`; `$OXIDECLAW_CONFIG_DIR` overrides), sessions in `~/.local/share/oxideclaw/sessions` (`$XDG_DATA_HOME/oxideclaw`), the code index in `~/.cache/oxideclaw` (`$XDG_CACHE_HOME/oxideclaw`). Claude Code's `~/.claude` is never written: OxideClaw reads its `CLAUDE.md`, `AGENTS.md`, skills and agents as an import format, copies its own old state out of it once on first run, and imports hooks, permission rules or MCP servers only when you run `oxideclaw config import-claude`. Reads **both** `CLAUDE.md` and `AGENTS.md`. Hot-reload with `/reload` — no restart.
 
 See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ slash commands, every config knob).
 
@@ -261,7 +261,7 @@ oxideclaw acp           # Agent Client Protocol over stdio (Zed, JetBrains, any 
 
 No API key yet? If Ollama is running locally (or at `OLLAMA_HOST`) and you have not picked a model, `oxideclaw` and `oxideclaw -p` start on one of your pulled Ollama models, preferring one that supports tools, and say which.
 
-`.env` files auto-load from `$CWD/.env`, `~/.env`, or `~/.config/oxideclaw/.env`. A project `.env` can set `OLLAMA_HOST` and `ANTHROPIC_MODEL` only after you `/trust` that folder.
+`.env` files auto-load from `$CWD/.env`, `~/.env`, or `.env` in the config dir (`~/.config/oxideclaw/.env`). A project `.env` can set `OLLAMA_HOST` and `ANTHROPIC_MODEL` only after you `/trust` that folder.
 
 ---
 
