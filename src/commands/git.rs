@@ -30,7 +30,7 @@ Read these key files if they exist:
 - manifest files: package.json, Cargo.toml, pyproject.toml, go.mod, pom.xml, etc.
 - README.md, Makefile, CI config (.github/workflows/, .circleci/, etc.)
 - Existing CLAUDE.md (if any)
-- .cursor/rules, .cursorrules, .github/copilot-instructions.md, AGENTS.md
+- .cursor/rules, .cursorrules, .github/copilot-instructions.md, AGENTS.md, GEMINI.md
 
 Detect:
 - Build, test, and lint commands (especially non-standard ones)

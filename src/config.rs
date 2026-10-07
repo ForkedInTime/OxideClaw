@@ -192,6 +192,12 @@ pub struct Config {
     #[serde(skip)]
     pub agentsmd: String,
 
+    /// Concatenated content of all GEMINI.md files (Gemini CLI's name for
+    /// the same thing), found by the same rules. Goes after CLAUDE.md and
+    /// AGENTS.md, so it is the lowest-priority instruction source.
+    #[serde(skip)]
+    pub geminimd: String,
+
     /// Ollama server base URL.  Overridable via OLLAMA_HOST env var or settings.json.
     pub ollama_host: String,
 
@@ -486,6 +492,7 @@ impl Default for Config {
             permissions_deny: Vec::new(),
             claudemd: String::new(),
             agentsmd: String::new(),
+            geminimd: String::new(),
             ollama_host: "http://localhost:11434".into(),
             thinking_budget_tokens: None,
             show_thinking_summaries: false,
@@ -796,6 +803,7 @@ impl Config {
             permissions_deny: new.permissions_deny,
             claudemd: new.claudemd,
             agentsmd: new.agentsmd,
+            geminimd: new.geminimd,
             show_thinking_summaries: new.show_thinking_summaries,
             prompt_cache: new.prompt_cache,
             hooks: new.hooks,
@@ -1212,11 +1220,12 @@ impl Config {
             }
         }
 
-        // ── CLAUDE.md + AGENTS.md files (global + project hierarchy) — skipped in bare mode
+        // ── CLAUDE.md + AGENTS.md + GEMINI.md files (global + project hierarchy) — skipped in bare mode
         if !self.bare_mode {
             let dirs = self.global_instruction_dirs();
             self.claudemd = Self::load_instruction_files(&dirs, &self.cwd, "CLAUDE.md");
             self.agentsmd = Self::load_instruction_files(&dirs, &self.cwd, "AGENTS.md");
+            self.geminimd = Self::load_instruction_files(&dirs, &self.cwd, "GEMINI.md");
         }
 
         // ── CLAUDE.md phase-routing directive override
@@ -1418,6 +1427,12 @@ impl Config {
     /// Industry-standard agent configuration — works across OxideClaw and other AGENTS.md-aware agents.
     pub fn load_agents_md(cwd: &Path) -> String {
         Self::load_instruction_files(&Self::default_instruction_dirs(), cwd, "AGENTS.md")
+    }
+
+    /// Load and merge all GEMINI.md files (same order as CLAUDE.md), so a
+    /// project set up for Gemini CLI keeps its instructions.
+    pub fn load_gemini_md(cwd: &Path) -> String {
+        Self::load_instruction_files(&Self::default_instruction_dirs(), cwd, "GEMINI.md")
     }
 
     /// The first `global_dirs[i]/name` that exists, then `name` in every
@@ -1895,6 +1910,13 @@ Use the `gh` CLI for all GitHub-related tasks. When creating a PR:
             base
         } else {
             format!("{base}\n\n<agents_md>\n{}</agents_md>", self.agentsmd)
+        };
+
+        // Append GEMINI.md content last: the lowest-priority source
+        let base = if self.geminimd.is_empty() {
+            base
+        } else {
+            format!("{base}\n\n<gemini_md>\n{}</gemini_md>", self.geminimd)
         };
 
         // Append persistent memory context (top 10 entries from MemoryStore)
@@ -3312,6 +3334,7 @@ mod flag_settings_retarget_tests {
         )
         .unwrap();
         std::fs::write(project.path().join("AGENTS.md"), "project agents").unwrap();
+        std::fs::write(project.path().join("GEMINI.md"), "project gemini").unwrap();
 
         // A temp config dir: the developer's own ~/.claude (or XDG dir) must
         // neither feed the result nor be touched by it.
@@ -3328,13 +3351,59 @@ mod flag_settings_retarget_tests {
         };
         let full = load(false);
         assert!(full.agentsmd.contains("project agents"));
+        assert!(full.geminimd.contains("project gemini"));
         assert_eq!(full.phase_router.research_model, "claude-bare-test-model");
 
         let bare = load(true);
         assert!(bare.bare_mode);
         assert!(bare.claudemd.is_empty());
         assert!(bare.agentsmd.is_empty());
+        assert!(bare.geminimd.is_empty());
         assert_ne!(bare.phase_router.research_model, "claude-bare-test-model");
+    }
+
+    /// GEMINI.md (Gemini CLI's instructions file) is found by the same rules
+    /// as CLAUDE.md and AGENTS.md, global then outermost to innermost, and
+    /// goes after both in the prompt. Without one, nothing is added.
+    #[test]
+    fn gemini_md_is_read_after_claude_and_agents_md() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let sub = project.path().join("crate");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(home.path().join("GEMINI.md"), "GLOBAL-GEMINI").unwrap();
+        std::fs::write(project.path().join("GEMINI.md"), "PROJECT-GEMINI").unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "CLAUDE-RULES").unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "AGENTS-RULES").unwrap();
+
+        let load = |home: &std::path::Path, cwd: &std::path::Path| {
+            let mut c = Config {
+                cwd: cwd.into(),
+                config_dir_override: Some(home.into()),
+                ..Config::default()
+            };
+            c.load_project();
+            c
+        };
+        let cfg = load(home.path(), &sub);
+        let global = cfg.geminimd.find("GLOBAL-GEMINI").unwrap();
+        assert!(global < cfg.geminimd.find("PROJECT-GEMINI").unwrap());
+
+        let prompt = cfg.build_system_prompt();
+        let pos = |marker: &str| {
+            prompt
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker}:\n{prompt}"))
+        };
+        assert!(pos("CLAUDE-RULES") < pos("AGENTS-RULES"));
+        assert!(pos("AGENTS-RULES") < pos("<gemini_md>"));
+        assert!(pos("<gemini_md>") < pos("GLOBAL-GEMINI"));
+
+        let (empty_home, plain) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(plain.path().join("CLAUDE.md"), "CLAUDE-RULES").unwrap();
+        let cfg = load(empty_home.path(), plain.path());
+        assert!(cfg.geminimd.is_empty(), "{}", cfg.geminimd);
+        assert!(!cfg.build_system_prompt().contains("<gemini_md>"));
     }
 
     /// Auto-fix reads trust from here; `--settings` must not drop it, and a

@@ -202,6 +202,9 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
     if ctx.config.cwd.join("AGENTS.md").exists() {
         checks.push("✓ AGENTS.md present".into());
     }
+    if ctx.config.cwd.join("GEMINI.md").exists() {
+        checks.push("✓ GEMINI.md present".into());
+    }
     checks.push(format!("✓ Model: {}", ctx.config.model));
 
     // .env

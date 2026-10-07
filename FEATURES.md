@@ -153,7 +153,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 
 | Command | Description |
 |---------|-------------|
-| `/reload` | Hot-reload settings, CLAUDE.md, AGENTS.md |
+| `/reload` | Hot-reload settings, CLAUDE.md, AGENTS.md, GEMINI.md |
 | `/config` | Show current configuration |
 | `/autonomy [mode]` | Show or switch the [autonomy mode](#autonomy-modes) for this session |
 
@@ -386,7 +386,7 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 |---------------------|---------------------|
 | `initialize` | Protocol version 1. Advertises `embeddedContext`; no image/audio prompts, no `loadSession`, no HTTP/SSE MCP. |
 | `authenticate` | No-op. Credentials come from the normal chain (`ANTHROPIC_API_KEY`, `ant` profile, settings). |
-| `session/new` | Requires an existing `cwd`; the session reads that directory's CLAUDE.md, AGENTS.md and project settings. Stdio `mcpServers` entries are recorded on the session config. |
+| `session/new` | Requires an existing `cwd`; the session reads that directory's CLAUDE.md, AGENTS.md, GEMINI.md and project settings. Stdio `mcpServers` entries are recorded on the session config. |
 | `session/prompt` | Text, `resource_link`, and embedded text resources are flattened into one prompt. Answers with `stopReason`: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` (budget exceeded), or `cancelled`. |
 | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call` (kind + title + raw input), `tool_call_update` (status + output summary). |
 | `session/request_permission` | Sent for every tool the SDK policy marks *ask* (the default for tools not on an allow list). Options: allow once / reject once. A `cancelled` outcome denies the tool. |
@@ -517,9 +517,9 @@ Earlier versions accepted `auto-edit` (then the default) and `full-auto` but pro
 | `updateCheck` | `true` / `false` | `true` | Once every 24 h the TUI looks up the latest GitHub release (the one `oxideclaw update` installs) in the background, with a 3 s timeout, and shows one dim line when it is newer than yours. `false` in any settings file turns it off; `-p`, `--headless`, `acp` and `browse` never check. The last answer is cached in `$XDG_CACHE_HOME/oxideclaw/update-check.json` (default `~/.cache/oxideclaw/`). Uses `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |
 
-### CLAUDE.md / AGENTS.md
+### CLAUDE.md / AGENTS.md / GEMINI.md
 
-Drop a `CLAUDE.md` or `AGENTS.md` in your project root to give the agent project-specific context. These files are automatically injected into the system prompt. The global ones are read from the config dir (`~/.config/oxideclaw/CLAUDE.md`, `AGENTS.md`), falling back to Claude Code's `~/.claude/CLAUDE.md` / `AGENTS.md` when OxideClaw has none.
+Drop a `CLAUDE.md` or `AGENTS.md` in your project root to give the agent project-specific context. These files are automatically injected into the system prompt. The global ones are read from the config dir (`~/.config/oxideclaw/CLAUDE.md`, `AGENTS.md`, `GEMINI.md`), falling back to Claude Code's `~/.claude/` copies when OxideClaw has none. A `GEMINI.md` (Gemini CLI's name for the same file) is read too, by the same rules: the global copy, then one in each directory from the filesystem root (or your home) down to the working directory. It goes after CLAUDE.md and AGENTS.md, as the lowest-priority source, and only when one exists. As with the other two, a symlinked file inside the project is ignored.
 
 ### Skills
 
@@ -568,7 +568,7 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 
 | Purpose | Default | Override |
 |---------|---------|----------|
-| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md`, skills, `memory.md`, plugins, `local-mcp/`) | `~/.config/oxideclaw/` | `$OXIDECLAW_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` (an absolute path). `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning, unless it names `~/.claude` |
+| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, skills, `memory.md`, plugins, `local-mcp/`) | `~/.config/oxideclaw/` | `$OXIDECLAW_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` (an absolute path). `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning, unless it names `~/.claude` |
 | Sessions | `~/.local/share/oxideclaw/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/`. With `$OXIDECLAW_CONFIG_DIR` (or `$CLAUDE_CONFIG_DIR`) and no `$XDG_DATA_HOME`, `<config dir>/sessions/` |
 | Cache: code index (`rag/`) and the update-check answer | `~/.cache/oxideclaw/` | `$XDG_CACHE_HOME/oxideclaw/` (an absolute path; a relative one is ignored) |
 | Skills | `<config dir>/skills/`, plus the project and `~/.claude/` directories in [Skills](#skills) | — |
@@ -637,7 +637,7 @@ src/
 ├── router.rs         # Optional model routing by a complexity heuristic
 ├── cost.rs           # Token/cost tracking + budget enforcement
 ├── sandbox.rs        # bwrap / firejail / strict
-└── config.rs         # Settings, CLAUDE.md/AGENTS.md injection
+└── config.rs         # Settings, CLAUDE.md/AGENTS.md/GEMINI.md injection
 ```
 
 Built with `tokio`, `ratatui`, `reqwest` (rustls), `clap`, `serde_json`, `tree-sitter`.

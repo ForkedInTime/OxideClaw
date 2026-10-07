@@ -72,7 +72,7 @@ Start a new conversation and execute the first prompt.
 |-------|----------|---------|-------------|
 | `id` | yes | | Request correlation ID |
 | `prompt` | yes | | The user's message |
-| `cwd` | no | server cwd | Project directory: tools run there, and its CLAUDE.md, AGENTS.md and project settings apply |
+| `cwd` | no | server cwd | Project directory: tools run there, and its CLAUDE.md, AGENTS.md, GEMINI.md and project settings apply |
 | `model` | no | from config | Model name (e.g. `claude-sonnet-5`, `ollama:llama3`) |
 | `max_turns` | no | 50 | Max agentic loop iterations |
 | `max_budget_usd` | no | unlimited | Budget cap |

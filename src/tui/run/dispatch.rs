@@ -1195,21 +1195,22 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
             let autonomy_fallback = config.fall_back_from_full_auto();
 
-            // Reload CLAUDE.md + AGENTS.md; --bare never loads them.
+            // Reload CLAUDE.md + AGENTS.md + GEMINI.md; --bare never loads them.
             if !config.bare_mode {
                 config.claudemd = crate::config::Config::load_claude_md(&config.cwd);
                 config.agentsmd = crate::config::Config::load_agents_md(&config.cwd);
+                config.geminimd = crate::config::Config::load_gemini_md(&config.cwd);
             }
             // Turns send this string, not config; without the rebuild the
             // refreshed files never reached the model until a restart.
             *system_prompt = config.build_system_prompt();
 
             let mut msg = if reloaded.is_empty() {
-                "Settings reloaded (no changes detected). CLAUDE.md + AGENTS.md refreshed."
+                "Settings reloaded (no changes detected). CLAUDE.md + AGENTS.md + GEMINI.md refreshed."
                     .to_string()
             } else {
                 format!(
-                    "Settings reloaded: {}. CLAUDE.md + AGENTS.md refreshed.",
+                    "Settings reloaded: {}. CLAUDE.md + AGENTS.md + GEMINI.md refreshed.",
                     reloaded.join(", ")
                 )
             };
