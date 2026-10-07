@@ -11,8 +11,10 @@
 ///   PostCompact     — after a compact/summarize cycle
 ///
 /// Hook JSON output (parsed from stdout):
-///   { "continue": false, "stopReason": "...", "decision": "approve"|"block",
+///   { "continue": false, "stopReason": "...", "decision": "block",
 ///     "systemMessage": "...", "reason": "..." }
+/// `"decision": "approve"` parses but grants nothing: hooks can only block,
+/// and an approved call still goes through the permission gate.
 ///
 /// Exit codes:
 ///   0   — success (allow, continue)
