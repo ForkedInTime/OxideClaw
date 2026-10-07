@@ -56,8 +56,10 @@ const PREFERENCE_KEYS: &[&str] = &[
 ];
 
 /// Settings OxideClaw understands that run commands, pick where prompts go
-/// or change what is allowed. Never copied; the first-run summary names the
-/// ones present so the user can set them again on purpose.
+/// or change what is allowed. A value that only tightens (see
+/// [`tightening_value`]) is copied, since dropping it would turn on what the
+/// user had turned off; any other value is left behind, and the first-run
+/// summary names it so the user can set it again on purpose.
 const LEFT_BEHIND_KEYS: &[&str] = &[
     "autoFixLoop",
     "autoRollback",
@@ -92,9 +94,10 @@ pub fn needs_migration(config_dir: &Path) -> bool {
 /// Copy OxideClaw's own state out of Claude Code's directory `claude` into
 /// `config` and `data`: sessions, memory, the plugin registry, the
 /// `/trust` list, the per-project MCP files, the banner label, and from
-/// `settings.json` only [`PREFERENCE_KEYS`], allow-listed `env` and the MCP
-/// servers of installed plugins. Hooks, permission rules, `apiKeyHelper`
-/// and other MCP servers are listed, not copied. Nothing already present
+/// `settings.json` only [`PREFERENCE_KEYS`], allow-listed `env`, the MCP
+/// servers of installed plugins, `permissions.deny` and the
+/// [`LEFT_BEHIND_KEYS`] whose values only tighten. Hooks, allow rules,
+/// `apiKeyHelper` and other MCP servers are listed, not copied. Nothing already present
 /// in `config` / `data` is overwritten, and `claude` is only read.
 ///
 /// Returns the summary lines (empty when there was nothing to report) and
@@ -102,7 +105,8 @@ pub fn needs_migration(config_dir: &Path) -> bool {
 pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
     let mut imported: Vec<String> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    let mut opt_in: Vec<String> = Vec::new();
+    // What was not copied, with the `config import-claude` flag that copies it.
+    let mut opt_in: Vec<(String, &str)> = Vec::new();
     let mut left_behind: Vec<String> = Vec::new();
 
     let plugins = read_json_object(&claude.join("plugins.json")).unwrap_or(Value::Null);
@@ -162,24 +166,51 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
                     );
                 }
                 if !other.is_empty() {
-                    opt_in.push(format!(
-                        "mcpServers ({})",
-                        join_keys(other.iter().map(|(n, _)| *n))
+                    opt_in.push((
+                        format!("mcpServers ({})", join_keys(other.iter().map(|(n, _)| *n))),
+                        "--mcp",
                     ));
                 }
             }
-            for (key, label) in [
-                ("hooks", "hooks"),
-                ("permissions", "permissions"),
-                ("apiKeyHelper", "apiKeyHelper"),
-            ] {
-                if theirs.get(key).is_some_and(is_set) {
-                    opt_in.push(label.to_string());
-                }
+            if theirs.get("hooks").is_some_and(is_set) {
+                opt_in.push(("hooks".into(), "--hooks"));
+            }
+            // Deny rules only restrict, so they come along; allow rules wait
+            // for `--permissions`.
+            let permissions = theirs.get("permissions").and_then(Value::as_object);
+            let rules = |kind: &str| -> Vec<Value> {
+                permissions
+                    .and_then(|p| p.get(kind))
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter(|r| r.is_string()).cloned().collect())
+                    .unwrap_or_default()
+            };
+            let deny = rules("deny");
+            if !deny.is_empty() {
+                names.push(format!("permissions.deny ({} rule(s))", deny.len()));
+                ours.insert("permissions".into(), serde_json::json!({ "deny": deny }));
+            }
+            if !rules("allow").is_empty() {
+                opt_in.push(("permissions.allow".into(), "--permissions"));
+            }
+            if theirs.get("apiKeyHelper").is_some_and(is_set) {
+                opt_in.push(("apiKeyHelper".into(), "--api-key-helper"));
             }
             for key in LEFT_BEHIND_KEYS {
-                if theirs.contains_key(*key) {
-                    left_behind.push(key.to_string());
+                let Some(v) = theirs.get(*key) else { continue };
+                // `autoRollback` is the old name of `autoFixLoop`.
+                let name = if *key == "autoRollback" {
+                    "autoFixLoop"
+                } else {
+                    key
+                };
+                match tightening_value(key, v, &theirs) {
+                    Some(v) if !ours.contains_key(name) => {
+                        ours.insert(name.to_string(), v);
+                        names.push(name.to_string());
+                    }
+                    Some(_) => {}
+                    None => left_behind.push(key.to_string()),
                 }
             }
             if !ours.is_empty() {
@@ -263,10 +294,13 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
         ));
     }
     if !opt_in.is_empty() {
+        let (what, flags): (Vec<String>, Vec<&str>) = opt_in.into_iter().unzip();
         lines.push(format!(
             "Not imported: {}. These run code or change permissions; review them, then run \
-             `oxideclaw config import-claude` to copy them.",
-            opt_in.join(", ")
+             `oxideclaw config import-claude {}` (or only the flags you want) to copy them. \
+             Without flags it only lists them.",
+            what.join(", "),
+            flags.join(" ")
         ));
     }
     if !left_behind.is_empty() {
@@ -343,15 +377,23 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
 /// `oxideclaw config import-claude`: merge the chosen executable settings
 /// from `claude/settings.json` into `config/settings.json`. Without any
 /// option, lists what could be imported and changes nothing. Existing
-/// OxideClaw entries win; `claude` is only read.
+/// OxideClaw entries win; `claude` is only read, so a config dir that is
+/// `claude` itself (an override, or a symlink to it) is refused.
 pub fn import_claude(
     claude: &Path,
     config: &Path,
     opts: ImportOptions,
 ) -> anyhow::Result<Vec<String>> {
     let src = claude.join("settings.json");
-    let theirs = read_json_object(&src)?;
     let dst = config.join("settings.json");
+    if crate::config::same_dir(claude, config) || crate::config::same_dir(&src, &dst) {
+        anyhow::bail!(
+            "the config dir {} is Claude Code's {}; nothing to import, and it is not changed",
+            config.display(),
+            claude.display()
+        );
+    }
+    let theirs = read_json_object(&src)?;
     let mut ours = read_json_object(&dst)?;
     let mut lines = Vec::new();
 
@@ -587,6 +629,51 @@ fn convert_hooks(hooks: &Value) -> Hooks {
     out
 }
 
+/// The part of a [`LEFT_BEHIND_KEYS`] setting that only tightens, by the
+/// rule `Settings::merge_with_trust` applies to untrusted project files, or
+/// `None` when the value loosens something or names an endpoint, binary or
+/// command. Dropping a tightening value on upgrade would turn on what the
+/// user had turned off.
+fn tightening_value(key: &str, v: &Value, all: &Map<String, Value>) -> Option<Value> {
+    let tightens = match key {
+        "sandboxEnabled" => *v == Value::Bool(true),
+        // The mode of a sandbox that is on; the modes are fixed names.
+        "sandboxMode" => v.is_string() && all.get("sandboxEnabled") == Some(&Value::Bool(true)),
+        "sandboxAllowNetwork" | "allowPrivateNetworkFetch" => *v == Value::Bool(false),
+        "autonomy" => v.as_str() == Some("suggest"),
+        "browseDefaultPolicy" => v
+            .as_str()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("ask")),
+        // Each pattern only adds an approval prompt.
+        "browseApprovalPatterns" => v.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
+        // Only the switch that turns the loop off: its lint / test commands
+        // stay behind.
+        "autoFixLoop" | "autoRollback" => {
+            let mut off = Map::new();
+            match v {
+                Value::Bool(false) => {
+                    off.insert("enabled".into(), Value::Bool(false));
+                }
+                Value::Object(o) => {
+                    if o.get("enabled") == Some(&Value::Bool(false)) {
+                        off.insert("enabled".into(), Value::Bool(false));
+                    }
+                    if o.get("trigger")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("off"))
+                    {
+                        off.insert("trigger".into(), "off".into());
+                    }
+                }
+                _ => {}
+            }
+            return (!off.is_empty()).then_some(Value::Object(off));
+        }
+        _ => false,
+    };
+    tightens.then(|| v.clone())
+}
+
 fn is_set(v: &Value) -> bool {
     match v {
         Value::Null => false,
@@ -764,13 +851,12 @@ mod tests {
             serde_json::json!({"ctx-plugin": {"command": "node", "args": ["/p/index.js"]}}),
             "only the MCP servers of OxideClaw's own plugins"
         );
-        for key in [
-            "hooks",
-            "permissions",
-            "apiKeyHelper",
-            "ollamaHost",
-            "statusLine",
-        ] {
+        assert_eq!(
+            settings["permissions"],
+            serde_json::json!({"deny": ["Read(./.env)"]}),
+            "deny rules only restrict; allow rules wait for --permissions"
+        );
+        for key in ["hooks", "apiKeyHelper", "ollamaHost", "statusLine"] {
             assert!(settings.get(key).is_none(), "{key} must not be imported");
         }
         assert_eq!(
@@ -800,9 +886,18 @@ mod tests {
 
         let text = lines.join("\n");
         assert!(text.contains("1 session(s)"), "{text}");
-        assert!(text.contains("hooks, permissions, apiKeyHelper"), "{text}");
+        assert!(
+            text.contains("hooks, permissions.allow, apiKeyHelper"),
+            "{text}"
+        );
         assert!(text.contains("mcpServers (github)"), "{text}");
-        assert!(text.contains("oxideclaw config import-claude"), "{text}");
+        // The command printed is one that copies them, not the bare listing.
+        assert!(
+            text.contains(
+                "`oxideclaw config import-claude --mcp --hooks --permissions --api-key-helper`"
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("ollamaHost") && text.contains("LD_PRELOAD"),
             "{text}"
@@ -812,6 +907,103 @@ mod tests {
         // Ran once: the marker stops a second run.
         assert!(config.join(MARKER).is_file());
         assert!(!needs_migration(&config));
+    }
+
+    /// Safety settings whose value only tightens survive the upgrade: the
+    /// defaults are looser, so dropping them would turn on what the user had
+    /// turned off. Values that loosen, or name a command, stay behind.
+    #[test]
+    fn migration_keeps_settings_that_only_tighten() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join(".claude");
+        write(
+            &claude.join("settings.json"),
+            r#"{
+                "trustedProjects": ["/work/repo"],
+                "sandboxEnabled": true,
+                "sandboxMode": "bwrap",
+                "sandboxAllowNetwork": false,
+                "allowPrivateNetworkFetch": false,
+                "autonomy": "suggest",
+                "autoFixLoop": false,
+                "browseDefaultPolicy": " Ask ",
+                "browseApprovalPatterns": ["checkout"],
+                "defaultShell": "/bin/zsh",
+                "permissions": {"deny": ["Bash(rm:*)"]}
+            }"#,
+        );
+        let config = td.path().join("config");
+        let before = snapshot(&claude);
+        let lines = migrate(&claude, &config, &td.path().join("data"));
+        assert_eq!(snapshot(&claude), before);
+
+        let path = config.join("settings.json");
+        let json = read(&path);
+        assert_eq!(json["sandboxEnabled"], true);
+        assert_eq!(json["sandboxMode"], "bwrap");
+        assert_eq!(json["sandboxAllowNetwork"], false);
+        assert_eq!(json["allowPrivateNetworkFetch"], false);
+        assert_eq!(json["autonomy"], "suggest");
+        assert_eq!(json["autoFixLoop"], serde_json::json!({"enabled": false}));
+        assert_eq!(json["browseApprovalPatterns"][0], "checkout");
+        assert_eq!(json["permissions"]["deny"][0], "Bash(rm:*)");
+        assert!(json.get("defaultShell").is_none());
+
+        // And they take effect once loaded.
+        let s = crate::settings::Settings::load_file(&path);
+        assert_eq!(s.sandbox_enabled, Some(true));
+        assert_eq!(s.autonomy.as_deref(), Some("suggest"));
+        assert_eq!(s.auto_fix.as_ref().and_then(|a| a.enabled), Some(false));
+        assert_eq!(s.permissions.deny, vec!["Bash(rm:*)".to_string()]);
+
+        let left = lines
+            .iter()
+            .find(|l| l.starts_with("Left behind"))
+            .expect("defaultShell is left behind");
+        assert!(left.contains("defaultShell"), "{left}");
+        for key in ["sandbox", "autonomy", "autoFixLoop", "browse", "Private"] {
+            assert!(!left.contains(key), "{key} was imported: {left}");
+        }
+    }
+
+    /// Values that loosen, and the commands in an auto-fix block, are left
+    /// behind; a loop turned off by `trigger` under the old `autoRollback`
+    /// name keeps only that switch.
+    #[test]
+    fn migration_leaves_loosening_values_behind() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join(".claude");
+        write(
+            &claude.join("settings.json"),
+            r#"{
+                "sandboxEnabled": false,
+                "sandboxMode": "firejail",
+                "sandboxAllowNetwork": true,
+                "allowPrivateNetworkFetch": true,
+                "autonomy": "full-auto",
+                "browseDefaultPolicy": "pattern",
+                "autoRollback": {"trigger": "OFF", "lintCommand": "make lint"}
+            }"#,
+        );
+        let config = td.path().join("config");
+        let lines = migrate(&claude, &config, &td.path().join("data"));
+        let json = read(&config.join("settings.json"));
+        assert_eq!(
+            json,
+            serde_json::json!({"autoFixLoop": {"trigger": "off"}}),
+            "only the switch that turns the loop off"
+        );
+        let text = lines.join("\n");
+        for key in [
+            "sandboxEnabled",
+            "sandboxMode",
+            "sandboxAllowNetwork",
+            "allowPrivateNetworkFetch",
+            "autonomy",
+            "browseDefaultPolicy",
+        ] {
+            assert!(text.contains(key), "{key} named as left behind: {text}");
+        }
     }
 
     #[test]
@@ -870,6 +1062,31 @@ mod tests {
         assert_eq!(read(&path)["model"], "sonnet");
         assert_eq!(read(&path)["trustedProjects"][0], "/work/repo");
         assert_eq!(snapshot(&claude), before);
+    }
+
+    /// A config dir that is ~/.claude itself (an override, or a symlink to
+    /// it) would mean rewriting Claude Code's own settings.json: refused.
+    #[test]
+    fn import_claude_refuses_when_the_config_dir_is_dot_claude() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = fake_claude(td.path());
+        let all = ImportOptions {
+            hooks: true,
+            permissions: true,
+            api_key_helper: true,
+            mcp: true,
+        };
+        let before = snapshot(&claude);
+        let err = import_claude(&claude, &claude, all).unwrap_err();
+        assert!(err.to_string().contains("nothing to import"), "{err}");
+        #[cfg(unix)]
+        {
+            let link = td.path().join("oxideclaw-link");
+            std::os::unix::fs::symlink(&claude, &link).unwrap();
+            assert!(import_claude(&claude, &link, all).is_err());
+            assert!(import_claude(&claude, &link, ImportOptions::default()).is_err());
+        }
+        assert_eq!(snapshot(&claude), before, "byte-identical");
     }
 
     #[test]

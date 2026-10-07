@@ -2031,8 +2031,9 @@ pub(crate) fn resolve_config_dir(
     }
 }
 
-/// Same directory, by name or (when both exist) after resolving symlinks.
-fn same_dir(a: &Path, b: &Path) -> bool {
+/// Same directory (or file), by name or (when both exist) after resolving
+/// symlinks.
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 

@@ -231,7 +231,7 @@ Shell commands can run under `bwrap` or `firejail` (Linux namespace isolation; s
 
 ### 📁 &nbsp; Config, CLAUDE.md and AGENTS.md
 
-XDG Base Directory compliant, and OxideClaw's own: settings live in `~/.config/oxideclaw/settings.json` (`$XDG_CONFIG_HOME/oxideclaw`; `$OXIDECLAW_CONFIG_DIR` overrides), sessions in `~/.local/share/oxideclaw/sessions` (`$XDG_DATA_HOME/oxideclaw`), the code index in `~/.cache/oxideclaw` (`$XDG_CACHE_HOME/oxideclaw`). Claude Code's `~/.claude` is never written: OxideClaw reads its `CLAUDE.md`, `AGENTS.md`, skills and agents as an import format, copies its own old state out of it once on first run, and imports hooks, permission rules or MCP servers only when you run `oxideclaw config import-claude`. Reads **both** `CLAUDE.md` and `AGENTS.md`. Hot-reload with `/reload` — no restart.
+XDG Base Directory compliant, and OxideClaw's own: settings live in `~/.config/oxideclaw/settings.json` (`$XDG_CONFIG_HOME/oxideclaw`; `$OXIDECLAW_CONFIG_DIR` overrides), sessions in `~/.local/share/oxideclaw/sessions` (`$XDG_DATA_HOME/oxideclaw`), the code index in `~/.cache/oxideclaw` (`$XDG_CACHE_HOME/oxideclaw`). Claude Code's `~/.claude` is never written: OxideClaw reads its `CLAUDE.md`, `AGENTS.md`, skills and agents as an import format, copies its own old state out of it once on first run, keeps the settings that only tighten (deny rules, `sandboxEnabled: true`, `autonomy: "suggest"`, a disabled auto-fix loop, ...), and imports hooks, allow rules or MCP servers only when you run `oxideclaw config import-claude`. Reads **both** `CLAUDE.md` and `AGENTS.md`. Hot-reload with `/reload` — no restart.
 
 See **[FEATURES.md](FEATURES.md)** for the complete reference (30+ tools, 60+ slash commands, every config knob).
 
