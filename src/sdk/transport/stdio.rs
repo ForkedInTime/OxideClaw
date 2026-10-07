@@ -73,6 +73,9 @@ impl Transport for StdioTransport {
     }
 }
 
+// Built and matched once per line, never stored: boxing would only add an
+// allocation per request.
+#[allow(clippy::large_enum_variant)]
 enum Classified {
     Eof,
     Skip,
