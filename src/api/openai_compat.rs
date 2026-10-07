@@ -425,10 +425,15 @@ pub(crate) fn translate_messages(
                     }
                 }
 
-                let content = if text_parts.is_empty() {
-                    None
-                } else {
+                // OpenAI and Groq require content unless tool_calls is set; a
+                // thinking-only turn (reasoning cut off by max_tokens) would
+                // otherwise go out bare and 400 every later request.
+                let content = if !text_parts.is_empty() {
                     Some(serde_json::Value::String(text_parts.join("\n")))
+                } else if tool_calls.is_empty() {
+                    Some(serde_json::Value::String(String::new()))
+                } else {
+                    None
                 };
 
                 let reasoning_content = if !echo_reasoning {
@@ -1001,6 +1006,24 @@ mod reasoning_echo_tests {
         let msgs = assistant(vec![ContentBlock::Text { text: "hi".into() }]);
         let v = assistant_json(&msgs, true);
         assert!(v.get("reasoning_content").is_none(), "{v}");
+    }
+
+    /// Reasoning cut off by max_tokens leaves a thinking-only turn; OpenAI
+    /// and Groq reject an assistant message with neither content nor
+    /// tool_calls, which wedged every later request.
+    #[test]
+    fn thinking_only_turn_still_has_content() {
+        for echo in [false, true] {
+            for sig in ["", "anthropic-sig"] {
+                let v = assistant_json(&assistant(vec![thinking(sig)]), echo);
+                assert_eq!(v["content"], "", "{v}");
+            }
+        }
+        let v = assistant_json(&assistant(vec![thinking("")]), true);
+        assert_eq!(v["reasoning_content"], "plan: read a.rs");
+        // A tool-call turn keeps omitting content, as before.
+        let v = assistant_json(&assistant(vec![tool_use()]), false);
+        assert!(v.get("content").is_none(), "{v}");
     }
 }
 
