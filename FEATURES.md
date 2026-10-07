@@ -519,6 +519,40 @@ Earlier versions accepted `auto-edit` (then the default) and `full-auto` but pro
 
 Drop a `CLAUDE.md` or `AGENTS.md` in your project root to give the agent project-specific context. These files are automatically injected into the system prompt. The global ones are read from the config dir (`~/.config/oxideclaw/CLAUDE.md`, `AGENTS.md`), falling back to Claude Code's `~/.claude/CLAUDE.md` / `AGENTS.md` when OxideClaw has none.
 
+### Skills
+
+A skill is a reusable prompt you run as `/<name> [args]`, or the agent runs with the `Skill` tool after finding it with `DiscoverSkills`. `/skills` lists what is loaded. OxideClaw reads the [Agent Skills](https://agentskills.io) layout, a folder per skill:
+
+```
+.agents/skills/release/
+├── SKILL.md          # YAML frontmatter + instructions
+└── scripts/bump.sh   # supporting files, referenced from SKILL.md
+```
+
+```markdown
+---
+name: release
+description: Cut a release, bump the version and tag it
+---
+Run scripts/bump.sh with the new version, then ...
+```
+
+`name` and `description` are required; other fields (`license`, `allowed-tools`, `metadata`, ...) are accepted and ignored. Only the name and description are loaded at startup. The body of `SKILL.md` is read when the skill runs, and the model is given the skill's folder so it reads the supporting files only when the instructions need them. A `SKILL.md` without frontmatter, `name` or `description` is skipped, and a startup notice (and the `DiscoverSkills` output) lists each skipped path with the reason.
+
+Skills are looked up in this order; on a name collision the first one wins, and the built-in skills (`commit`, `review`, `explain`, `fix`, `test`) only fill names nothing else uses:
+
+| # | Directory | Holds |
+|---|-----------|-------|
+| 1 | `<project>/.agents/skills/` | `<name>/SKILL.md` only (shared with other agents) |
+| 2 | `<project>/.oxideclaw/skills/` | `<name>/SKILL.md` and flat `<name>.md` |
+| 3 | `<project>/.claude/skills/` | both; read-only import from Claude Code |
+| 4 | `<config dir>/skills/` | both |
+| 5 | `~/.claude/skills/` | both; read-only import from Claude Code |
+
+Flat `<name>.md` skills from earlier versions still load: plain markdown, `# Title` / description / `---` / prompt, or YAML frontmatter with `params`. `{{ARGS}}` and `{{param}}` placeholders are filled from the arguments; arguments with no placeholder to go in are appended to the prompt.
+
+A skill is only a prompt: frontmatter grants no tools or permissions, so a cloned repository's skills go through the same permission prompts, sandbox and `/trust` rules as anything you type, and `disableSkillShellExecution` removes the shell tools from every skill turn.
+
 ### .env Files
 
 Auto-loaded from (in order):
@@ -535,6 +569,7 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 | Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md`, skills, `memory.md`, plugins, `local-mcp/`) | `~/.config/oxideclaw/` | `$OXIDECLAW_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` (an absolute path). `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning, unless it names `~/.claude` |
 | Sessions | `~/.local/share/oxideclaw/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/`. With `$OXIDECLAW_CONFIG_DIR` (or `$CLAUDE_CONFIG_DIR`) and no `$XDG_DATA_HOME`, `<config dir>/sessions/` |
 | Cache: code index (`rag/`) and the update-check answer | `~/.cache/oxideclaw/` | `$XDG_CACHE_HOME/oxideclaw/` (an absolute path; a relative one is ignored) |
+| Skills | `<config dir>/skills/`, plus the project and `~/.claude/` directories in [Skills](#skills) | — |
 | Project memories (`/memory`) | `<project>/.claude/memory.db`, created on first use | — |
 
 OxideClaw is XDG Base Directory compliant and never writes to Claude Code's `~/.claude`. It reads from it, as an import format, the global `CLAUDE.md` / `AGENTS.md` (when the config dir has none), skills, agents, output styles and workflows; OxideClaw's own copies win.
