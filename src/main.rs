@@ -5,6 +5,7 @@ mod api;
 mod auth;
 mod autofix;
 mod browser;
+mod claude_import;
 mod commands;
 mod compact;
 mod config;
@@ -323,6 +324,11 @@ enum Commands {
     },
     /// Check installation health
     Doctor,
+    /// Manage OxideClaw's configuration
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigSubcommand,
+    },
     /// Self-update to the latest release from GitHub
     Update,
     /// Run the autonomous browser agent
@@ -338,6 +344,27 @@ enum Commands {
         /// Maximum number of steps (default: 50)
         #[arg(long, default_value = "50", value_parser = clap::value_parser!(u32).range(1..))]
         max_steps: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigSubcommand {
+    /// Copy hooks, permission rules, apiKeyHelper or MCP servers from Claude
+    /// Code's ~/.claude/settings.json into OxideClaw's settings. With no
+    /// options, lists what is there and changes nothing. ~/.claude is only read.
+    ImportClaude {
+        /// Import hooks (Claude Code's format is converted)
+        #[arg(long)]
+        hooks: bool,
+        /// Import permissions.allow and permissions.deny rules
+        #[arg(long)]
+        permissions: bool,
+        /// Import apiKeyHelper (kept as is when OxideClaw already has one)
+        #[arg(long)]
+        api_key_helper: bool,
+        /// Import MCP servers OxideClaw does not have yet
+        #[arg(long)]
+        mcp: bool,
     },
 }
 
@@ -599,11 +626,29 @@ fn load_dotenv_auto() {
     }
 }
 
-/// Warns when a deprecated `$CLAUDE_CONFIG_DIR` picked (or tried to pick)
-/// the config dir.
+/// Says which config dir a deprecated `$CLAUDE_CONFIG_DIR` picked, and on
+/// the first run of a version with its own config dir, copies OxideClaw's
+/// state out of Claude Code's `~/.claude` (which it never changes). Runs
+/// before anything reads or writes the config dir.
 fn prepare_config_dirs() {
-    if let Some(notice) = Config::config_dir_choice().notice() {
+    let choice = Config::config_dir_choice();
+    if let Some(notice) = choice.notice() {
         eprintln!("{notice}");
+    }
+    // A directory the user named is theirs to fill.
+    if choice.source.is_explicit() {
+        return;
+    }
+    let data = Config::data_dir();
+    if let Some(claude) = Config::claude_code_dir().filter(|d| d.is_dir())
+        && claude_import::needs_migration(&choice.dir)
+    {
+        for line in claude_import::migrate(&claude, &choice.dir, &data) {
+            eprintln!("{line}");
+        }
+    }
+    if let Some(line) = claude_import::move_sessions_to_data_dir(&choice.dir, &data) {
+        eprintln!("{line}");
     }
 }
 
@@ -842,6 +887,29 @@ async fn run() -> Result<()> {
             }
             Commands::Update => {
                 return self_update().await;
+            }
+            Commands::Config {
+                subcommand:
+                    ConfigSubcommand::ImportClaude {
+                        hooks,
+                        permissions,
+                        api_key_helper,
+                        mcp,
+                    },
+            } => {
+                let Some(claude) = Config::claude_code_dir() else {
+                    anyhow::bail!("no home directory, so no ~/.claude to import from");
+                };
+                let opts = claude_import::ImportOptions {
+                    hooks: *hooks,
+                    permissions: *permissions,
+                    api_key_helper: *api_key_helper,
+                    mcp: *mcp,
+                };
+                for line in claude_import::import_claude(&claude, &Config::config_dir(), opts)? {
+                    println!("{line}");
+                }
+                return Ok(());
             }
             // Needs the full config so --model, --settings and the other
             // global flags apply; handled below.

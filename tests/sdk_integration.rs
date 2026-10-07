@@ -9,8 +9,17 @@ use tokio::process::Command;
 async fn test_health_check_via_headless() {
     // Cargo builds the binary for integration tests and exposes its path;
     // shelling out to `cargo run` deadlocks on the build lock under `cargo test`.
+    // A temp home: never read or migrate the real ~/.claude or config dir.
+    let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxideclaw"))
         .arg("--headless")
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env_remove("OXIDECLAW_CONFIG_DIR")
+        .env_remove("RUSTYCLAW_CONFIG_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
