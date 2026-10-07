@@ -198,7 +198,7 @@ impl StdioTransport {
 /// Windows process creation only tries `<name>.exe`, but `npx` (the usual
 /// MCP launcher) and most Node and Python shims are `.cmd` files, so
 /// `"command": "npx"` failed to spawn. Std quotes arguments safely when it
-/// runs a `.cmd`/`.bat` by full path.
+/// runs a `.cmd`/`.bat` by full path. The LSP tool spawns the same way.
 #[cfg(any(windows, test))]
 pub(crate) fn resolve_on_path(
     command: &str,
