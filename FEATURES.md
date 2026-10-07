@@ -142,6 +142,8 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `/cost` | Show session cost breakdown |
 | `/budget <amount>` | Set budget limit (e.g., `/budget $5`) |
 | `/budget clear` | Remove budget limit |
+| `/router [on\|off\|status]` | Enable, disable or inspect the [smart model router](#smart-model-router) (off by default) |
+| `/router <low\|medium\|high\|super-high> <model>` | Set the model for a router tier |
 
 ### Settings
 
@@ -257,15 +259,25 @@ The index auto-updates when files change between queries. It lives in `.claude/r
 
 ## Smart Model Router
 
-Automatically routes tasks to the most cost-effective model based on complexity analysis.
+Routes each interactive (TUI) turn to the most cost-effective model based on complexity analysis. The router is **off by default**: until you enable it, every turn uses your configured model. Enable it with `/router on` for the session, or `"routerEnabled": true` in settings.json.
 
-| Complexity | Routed To | Example |
+| Complexity | Routed To (default) | Example |
 |-----------|-----------|---------|
-| Low | Haiku / Ollama | "What does this function do?" |
-| Medium | Sonnet | "Refactor this module" |
-| High | Opus | "Debug this race condition" |
+| Low | `claude-haiku-4-5` | "What does this function do?" |
+| Medium | `claude-sonnet-5` | "Refactor this module" |
+| High | your configured model | "Debug this race condition" |
+| Super-high | `claude-opus-5` | "Audit the entire codebase" |
 
-The router analyzes prompt length, keyword signals (debug, refactor, audit), and context to classify complexity. Cost savings are tracked and shown in `/cost`.
+```
+/router              # show status and tier models (also /router status)
+/router on | off     # enable / disable routing for this session
+/router low ollama:llama3      # set the model for a tier
+/router medium <model>
+/router high <model>
+/router super-high <model>
+```
+
+The router analyzes prompt length, keyword signals (debug, refactor, audit), and context to classify complexity. Cost savings are tracked and shown in `/cost`. The `router*` keys in the [settings table](#settings-file) set the same options at startup.
 
 ---
 
@@ -429,6 +441,12 @@ The project directory stays writable inside the sandbox, `.git/` included, so Ox
 | `thinkingBudgetTokens` | `0` or ≥ `1024` | unset | Extended thinking. Sent as `{"type":"adaptive"}` on Claude 4.6+ / Claude 5 and as `budget_tokens` on older models; `0` disables (sent as `{"type":"between_tools"}` on Sonnet 5.5; ignored on Fable and Opus 5.5, where the API does not allow thinking to be turned off, and on Opus 5 and Sonnet 5.5 at `xhigh`/`max` effort, where it only allows it at `high` or below). CLI: `--thinking enabled\|disabled`, `--max-thinking-tokens N` |
 | `effort` | `low` / `medium` / `high` / `xhigh` / `max` | unset | Sent as `output_config.effort` on Claude 4.6+ / Claude 5 (`xhigh` becomes `high` on Opus/Sonnet 4.6, which lack it); older and non-Claude models get a prompt nudge. Set with `/effort` |
 | `spinnerStyle` | `themed` / `minimal` / `silent` | `themed` | Spinner animation style |
+| `routerEnabled` | `true` / `false` | `false` | Start with the [smart model router](#smart-model-router) on (same as `/router on`) |
+| `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`) |
+| `routerLowModel` | any model name | `claude-haiku-4-5` | Model for low-complexity turns |
+| `routerMediumModel` | any model name | `claude-sonnet-5` | Model for medium-complexity turns |
+| `routerHighModel` | any model name | your `model` | Model for high-complexity turns |
+| `routerSuperHighModel` | any model name | `claude-opus-5` | Model for super-high-complexity turns |
 | `env` | `{ "NAME": "value" }` | `{}` | Environment variables set on every Bash and PowerShell tool command. A project's `.claude/settings.json` may set them only in a folder you have `/trust`ed |
 
 ### CLAUDE.md / AGENTS.md

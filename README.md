@@ -149,7 +149,7 @@ RAG search: 'TOCTOU' — 1 results
 
 ### 💰 &nbsp; Smart model router + live cost dashboard
 
-Simple edits go to Haiku or Ollama. Architecture questions go to Opus. Every token is priced in real time. Cap the bill with `/budget $5` — OxideClaw warns at 80% and stops the loop when the budget is exceeded.
+Turn on the router with `/router on` (or `"routerEnabled": true` in settings.json) and simple edits go to Haiku or Ollama while architecture questions go to Opus; it is off by default, so every turn uses your configured model until you enable it. Every token is priced in real time. Cap the bill with `/budget $5` — OxideClaw warns at 80% and stops the loop when the budget is exceeded.
 
 ### 🎭 &nbsp; Parallel agents in git worktrees
 
