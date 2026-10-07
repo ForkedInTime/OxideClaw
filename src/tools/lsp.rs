@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
@@ -38,7 +38,12 @@ impl LSPTool {
         let key = (format!("{command} {}", args.join(" ")), root.to_path_buf());
         let mut cache = self.cache.lock().await;
         if let Some(c) = cache.get(&key) {
-            return Ok(Arc::clone(c));
+            // A server that crashed or was killed would otherwise fail every
+            // later call (EPIPE) until OxideClaw restarts: start a new one.
+            if !c.dead.load(Ordering::SeqCst) {
+                return Ok(Arc::clone(c));
+            }
+            cache.remove(&key);
         }
         let client = LspClient::connect(command, args, root).await?;
         client.initialize(root).await?;
@@ -343,6 +348,9 @@ struct LspClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     id_counter: Arc<AtomicU64>,
+    /// Set once the server's stdout closes or a write to it fails. Writing to
+    /// a dead server's stdin raises SIGPIPE, which kills `-p` runs outright.
+    dead: Arc<AtomicBool>,
     /// Owns the language server. `kill_on_drop` means the server lives
     /// exactly as long as this client — previously the handle was dropped at
     /// the end of `connect`, which killed the server before `initialize`.
@@ -369,6 +377,8 @@ impl LspClient {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_clone = pending.clone();
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_clone = dead.clone();
 
         // Spawn reader task
         tokio::spawn(async move {
@@ -379,6 +389,7 @@ impl LspClient {
                 if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
                     // Server gone: fail every in-flight request now rather
                     // than letting each sit out the full request timeout.
+                    dead_clone.store(true, Ordering::SeqCst);
                     pending_clone.lock().await.clear();
                     break;
                 }
@@ -405,6 +416,8 @@ impl LspClient {
                 // Read the body
                 let mut body = vec![0u8; content_length];
                 if reader.read_exact(&mut body).await.is_err() {
+                    dead_clone.store(true, Ordering::SeqCst);
+                    pending_clone.lock().await.clear();
                     break;
                 }
 
@@ -437,6 +450,7 @@ impl LspClient {
             stdin: Arc::new(Mutex::new(stdin)),
             pending,
             id_counter: Arc::new(AtomicU64::new(1)),
+            dead,
             _child: child,
         })
     }
@@ -444,10 +458,19 @@ impl LspClient {
     async fn send_raw(&self, msg: Value) -> Result<()> {
         let body = serde_json::to_string(&msg)?;
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(anyhow!("language server exited"));
+        }
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(frame.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        let written = async {
+            stdin.write_all(frame.as_bytes()).await?;
+            stdin.flush().await
+        }
+        .await;
+        if written.is_err() {
+            self.dead.store(true, Ordering::SeqCst);
+        }
+        Ok(written?)
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -459,13 +482,18 @@ impl LspClient {
             pending.insert(id, tx);
         }
 
-        self.send_raw(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        }))
-        .await?;
+        if let Err(e) = self
+            .send_raw(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
 
         // Wait up to 15 seconds
         tokio::time::timeout(tokio::time::Duration::from_secs(15), rx)
@@ -760,6 +788,39 @@ mod uri_tests {
 #[cfg(all(test, unix))]
 mod cache_tests {
     use super::*;
+
+    /// A server that exits must be replaced on the next call, not handed out
+    /// from the cache to fail with EPIPE for the rest of the session.
+    #[tokio::test]
+    async fn a_dead_cached_server_is_respawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("starts");
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        // Answers initialize, then exits shortly after (a crash mid-session).
+        let script = format!(
+            "echo x >> '{}'; read -r _l; printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; sleep 0.5",
+            counter.display(),
+            body.len(),
+            body
+        );
+        let tool = LSPTool::default();
+        let args = vec!["-c".to_string(), script];
+        let a = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !a.dead.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "exit never noticed");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(a.notify("initialized", json!({})).await.is_err());
+        assert!(a.pending.lock().await.is_empty());
+        let b = tool.client_for("sh", &args, dir.path()).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "the dead server came back from the cache"
+        );
+        let starts = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(starts, 2, "server spawned {starts} times");
+    }
 
     /// Two queries against the same root must reuse one server process.
     #[tokio::test]
