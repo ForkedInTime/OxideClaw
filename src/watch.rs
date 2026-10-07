@@ -4,7 +4,8 @@
 //! Integrates with the TUI event loop via AppEvent.
 
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -86,6 +87,45 @@ pub enum WatchEvent {
     MarkerFound { marker: Marker },
 }
 
+/// The paths of one notify event worth reporting: files outside `.git` that
+/// match `pattern_exts` (`*.EXT` patterns; empty passes all), each at most
+/// once per `rate_limit`.
+///
+/// The limit is per path and applied after filtering. A single global window
+/// taken before filtering let an editor's swap or write-probe file (vim's
+/// `4913`, `.swp`), a `.git/index.lock` or a build under `target/` use it up,
+/// so the source-file save that followed was silently dropped.
+fn paths_to_report(
+    paths: &[PathBuf],
+    pattern_exts: &[String],
+    rate_limit: Duration,
+    last_trigger: &mut HashMap<PathBuf, Instant>,
+    now: Instant,
+) -> Vec<PathBuf> {
+    last_trigger.retain(|_, t| now.duration_since(*t) < rate_limit);
+    let mut out = Vec::new();
+    for path in paths {
+        if !path.is_file() || path.components().any(|c| c.as_os_str() == ".git") {
+            continue;
+        }
+        if !pattern_exts.is_empty() && !has_ext(path, pattern_exts) {
+            continue;
+        }
+        if last_trigger.contains_key(path) {
+            continue;
+        }
+        last_trigger.insert(path.clone(), now);
+        out.push(path.clone());
+    }
+    out
+}
+
+fn has_ext(path: &Path, exts: &[String]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| exts.iter().any(|p| p == ext))
+}
+
 /// Start a file watcher. Returns a receiver for watch events.
 /// The watcher handle must be kept alive (dropping it stops watching).
 pub fn start_watcher(
@@ -103,11 +143,7 @@ pub fn start_watcher(
         .filter_map(|p| p.strip_prefix("*.").map(|s| s.to_string()))
         .collect();
 
-    // `None` means "never triggered" — allows the first event through without
-    // relying on `Instant::now() - rate_limit`, which can underflow on
-    // short-uptime systems where `Duration::from_millis(rate_limit_ms)` is
-    // greater than the time since boot.
-    let mut last_trigger: Option<Instant> = None;
+    let mut last_trigger: HashMap<PathBuf, Instant> = HashMap::new();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<NotifyEvent>| {
         let Ok(event) = res else { return };
@@ -117,43 +153,18 @@ pub fn start_watcher(
             return;
         }
 
-        // Rate limit. Update `last_trigger` unconditionally once we decide
-        // to handle this event — otherwise a burst where every path is
-        // filtered out (e.g., all under `.git/`) would never suppress the
-        // following burst.
         let now = Instant::now();
-        if last_trigger.is_some_and(|t| now.duration_since(t) < rate_limit) {
-            return;
-        }
-        last_trigger = Some(now);
-
-        for path in &event.paths {
-            // Skip non-files and gitignored files
-            if !path.is_file() {
-                continue;
-            }
-            if path.components().any(|c| c.as_os_str() == ".git") {
-                continue;
-            }
-
-            // Extension filter. Patterns like `*.rs` only — anything else
-            // (or an empty list) passes through. Keeps the implementation
-            // tight; globbing can come later.
-            if !pattern_exts.is_empty() {
-                let matches = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|ext| pattern_exts.iter().any(|p| p == ext))
-                    .unwrap_or(false);
-                if !matches {
-                    continue;
-                }
-            }
-
+        for path in paths_to_report(
+            &event.paths,
+            &pattern_exts,
+            rate_limit,
+            &mut last_trigger,
+            now,
+        ) {
             let _ = tx.send(WatchEvent::FileChanged { path: path.clone() });
 
             // Scan for markers
-            if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
                 let pattern_refs: Vec<&str> = marker_patterns.iter().map(|s| s.as_str()).collect();
                 let mut markers = scan_markers(&content, &pattern_refs);
                 for m in &mut markers {
@@ -171,4 +182,52 @@ pub fn start_watcher(
     }
 
     Ok(watcher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_to_report;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// A vim save: write probe, swap file, then the real file, all within
+    /// the rate-limit window. The source file must still be reported.
+    #[test]
+    fn editor_scratch_files_do_not_use_up_the_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("4913");
+        let swap = dir.path().join(".lib.rs.swp");
+        let src = dir.path().join("lib.rs");
+        let other = dir.path().join("main.rs");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        let lock = git.join("index.rs");
+        for p in [&probe, &swap, &src, &other, &lock] {
+            std::fs::write(p, "// AI: x").unwrap();
+        }
+        let exts = vec!["rs".to_string()];
+        let limit = Duration::from_secs(10);
+        let mut last = HashMap::new();
+        let t0 = Instant::now();
+        let mut report = |paths: &[&std::path::PathBuf], secs| {
+            let paths: Vec<_> = paths.iter().map(|p| (*p).clone()).collect();
+            paths_to_report(
+                &paths,
+                &exts,
+                limit,
+                &mut last,
+                t0 + Duration::from_secs(secs),
+            )
+        };
+
+        assert!(report(&[&probe], 0).is_empty());
+        assert!(report(&[&swap], 0).is_empty());
+        assert!(report(&[&lock], 0).is_empty());
+        assert_eq!(report(&[&src], 0), vec![src.clone()]);
+        // The same file again inside the window is suppressed; another isn't.
+        assert!(report(&[&src], 1).is_empty());
+        assert_eq!(report(&[&other], 1), vec![other.clone()]);
+        // After the window the file reports again.
+        assert_eq!(report(&[&src], 11), vec![src.clone()]);
+    }
 }
