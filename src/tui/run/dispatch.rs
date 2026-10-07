@@ -629,6 +629,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::SetVoiceEnabled(enabled) => {
             config.voice_enabled = enabled;
+            if !enabled {
+                app.pending_clone_tier = None;
+            }
             let _ = crate::config::Config::save_user_setting(
                 "voiceEnabled",
                 serde_json::Value::Bool(enabled),
@@ -1888,7 +1891,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             } else if let Some(tier) = crate::voice::CloneTier::parse(&tier_arg) {
                 // Show recording instructions for the chosen tier
                 let instructions = crate::voice::recording_instructions(tier);
-                app.entries.push(ChatEntry::system(instructions));
+                app.entries.push(ChatEntry::system(format!(
+                    "{instructions}\n\nUntil then, Ctrl+R records the clone sample, not \
+                     dictation. Esc cancels clone mode."
+                )));
                 app.pending_clone_tier = Some(tier);
                 // Enable voice mode so Ctrl+R works
                 config.voice_enabled = true;
@@ -1965,6 +1971,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             });
         }
         CommandAction::VoiceCloneRemove => {
+            app.pending_clone_tier = None;
             let tx2 = tx.clone();
             tokio::spawn(async move {
                 match crate::voice::remove_voice_clone().await {

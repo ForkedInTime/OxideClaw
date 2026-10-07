@@ -1554,6 +1554,9 @@ impl App {
         self.follow_bottom = true;
         self.show_welcome = true;
         self.turn_costs = Vec::new();
+        // An armed /voice clone would turn the next dictation after /clear
+        // into the clone sample.
+        self.pending_clone_tier = None;
     }
 }
 
@@ -1853,6 +1856,14 @@ mod background_event_tests {
         });
         assert!(!app.is_loading && app.side_task.is_none());
         task.abort();
+    }
+
+    #[test]
+    fn clear_disarms_a_pending_voice_clone() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.pending_clone_tier = Some(crate::voice::CloneTier::Premium);
+        app.clear();
+        assert!(app.pending_clone_tier.is_none());
     }
 
     /// Ctrl+R stop → transcription A runs → Ctrl+R starts recording B → A

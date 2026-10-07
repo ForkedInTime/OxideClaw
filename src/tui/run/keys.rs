@@ -462,9 +462,18 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     }
                     Some(backend) => {
                         app.voice_recording = true;
-                        app.entries.push(ChatEntry::system(
-                            "Recording… press Ctrl+R again to stop.".to_string(),
-                        ));
+                        // This recording replaces the clone sample instead of
+                        // being transcribed; say so, since /voice clone may
+                        // have been typed long ago.
+                        let msg = match app.pending_clone_tier {
+                            Some(tier) => format!(
+                                "Recording voice-clone sample ({} tier)… press Ctrl+R again to stop. \
+                                 (Esc before recording cancels clone mode.)",
+                                tier.label()
+                            ),
+                            None => "Recording… press Ctrl+R again to stop.".to_string(),
+                        };
+                        app.entries.push(ChatEntry::system(msg));
                         app.scroll_to_bottom();
                         let tx2 = tx.clone();
                         let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -517,6 +526,13 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             }
             app.entries
                 .push(ChatEntry::system("TTS stopped.".to_string()));
+            app.scroll_to_bottom();
+        }
+        (Esc, _) if app.pending_clone_tier.is_some() && !app.voice_recording => {
+            app.pending_clone_tier = None;
+            app.entries.push(ChatEntry::system(
+                "Voice clone cancelled. Ctrl+R records dictation again.".to_string(),
+            ));
             app.scroll_to_bottom();
         }
         (Esc, _) if app.is_loading => {
@@ -1000,7 +1016,9 @@ fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
     if !app.vim_enabled {
         return false;
     }
-    let cancels_work = key.code == KeyCode::Esc && (app.is_loading || app.tts_stop_tx.is_some());
+    let clone_armed = app.pending_clone_tier.is_some() && !app.voice_recording;
+    let cancels_work =
+        key.code == KeyCode::Esc && (app.is_loading || app.tts_stop_tx.is_some() || clone_armed);
     let stops_tts = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
     !(cancels_work || stops_tts)
 }
@@ -1066,6 +1084,18 @@ mod vim_routing_tests {
             app.start_loading();
             assert!(!vim_routes_key(&app, &esc), "Esc could not cancel the turn");
         }
+    }
+
+    /// Vim would eat the Esc that disarms /voice clone, leaving the next
+    /// dictation to overwrite the clone sample.
+    #[test]
+    fn esc_reaches_clone_cancel_in_vim_mode() {
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let mut app = vim_app(true);
+        app.pending_clone_tier = Some(crate::voice::CloneTier::Quick);
+        assert!(!vim_routes_key(&app, &esc));
+        app.voice_recording = true;
+        assert!(vim_routes_key(&app, &esc));
     }
 
     #[test]

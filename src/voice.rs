@@ -1396,24 +1396,49 @@ pub async fn save_voice_clone(tier: CloneTier) -> Result<String> {
     }
 
     let dest_dir = voice_clone_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
-    tokio::fs::create_dir_all(&dest_dir).await?;
-
-    let dest = dest_dir.join("my-voice.wav");
-    tokio::fs::copy(&src, &dest).await?;
-
-    // Also save the tier info
-    let meta = dest_dir.join("meta.txt");
-    tokio::fs::write(&meta, format!("tier={}\nsize={}\n", tier.label(), size)).await?;
+    let (dest, backup) = install_clone_sample(&src, &dest_dir, tier, size).await?;
+    let backup_note = backup
+        .map(|b| format!("Previous sample kept at {}\n", b.display()))
+        .unwrap_or_default();
 
     Ok(format!(
         "Voice clone saved ({} tier, ~{}s).\n\
-         Location: {}\n\n\
+         Location: {}\n{}\n\
          TTS will now use XTTS v2 with your voice.\n\
          Use /voice clone remove to revert to the default XTTS v2 speaker.",
         tier.label(),
         est_secs,
         dest.display(),
+        backup_note,
     ))
+}
+
+/// Copy `src` in as the active sample. A sample that is already there moves
+/// to `my-voice.prev.wav` first: a recording that was meant as dictation (or
+/// a worse take) must not silently destroy a long premium recording.
+/// Returns the new sample path and the backup path, if one was made.
+async fn install_clone_sample(
+    src: &std::path::Path,
+    dest_dir: &std::path::Path,
+    tier: CloneTier,
+    size: u64,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    tokio::fs::create_dir_all(dest_dir).await?;
+
+    let dest = dest_dir.join("my-voice.wav");
+    let meta = dest_dir.join("meta.txt");
+    let mut backup = None;
+    if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        let prev = dest_dir.join("my-voice.prev.wav");
+        tokio::fs::rename(&dest, &prev).await?;
+        let _ = tokio::fs::rename(&meta, dest_dir.join("meta.prev.txt")).await;
+        backup = Some(prev);
+    }
+    tokio::fs::copy(src, &dest).await?;
+
+    // Also save the tier info
+    tokio::fs::write(&meta, format!("tier={}\nsize={}\n", tier.label(), size)).await?;
+    Ok((dest, backup))
 }
 
 /// Remove the voice clone sample, reverting to XTTS v2 default speaker.
@@ -1730,5 +1755,36 @@ mod voice_api_key_tests {
             Some(("OPENAI_API_KEY", "sk-openai".to_string()))
         );
         assert_eq!(pick_voice_api_key(env(&[])), None);
+    }
+}
+
+#[cfg(test)]
+mod clone_sample_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn new_sample_keeps_the_previous_one_as_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone_dir = dir.path().join("voice-clone");
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        std::fs::write(&first, b"premium take").unwrap();
+        std::fs::write(&second, b"stray dictation").unwrap();
+
+        let (_, backup) = install_clone_sample(&first, &clone_dir, CloneTier::Premium, 12)
+            .await
+            .unwrap();
+        assert!(backup.is_none());
+
+        let (dest, backup) = install_clone_sample(&second, &clone_dir, CloneTier::Quick, 15)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stray dictation");
+        let backup = backup.expect("old sample was overwritten without a backup");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"premium take");
+        let prev_meta = std::fs::read_to_string(clone_dir.join("meta.prev.txt")).unwrap();
+        assert!(prev_meta.contains(CloneTier::Premium.label()));
+        let meta = std::fs::read_to_string(clone_dir.join("meta.txt")).unwrap();
+        assert!(meta.contains(CloneTier::Quick.label()));
     }
 }
