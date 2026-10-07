@@ -95,18 +95,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // and reappears after /clear (which empties entries).
     let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
 
-    // Collect input to String once — reused in both height calc and draw_input.
     let full_input: String = app.input.iter().collect();
-    // ">" + space prefix; max(1) keeps a 1-2 column pane from dividing by 0.
-    let usable_w = (area.width.saturating_sub(2) as usize).max(1);
-    let visual_lines: u16 = full_input
-        .split('\n')
-        .map(|line| {
-            let n = line.chars().count();
-            n.div_ceil(usable_w).max(1) as u16
-        })
-        .sum();
-    let input_height = visual_lines.clamp(1, 8);
+    let (input, input_height) = input_view(app, &full_input, tc, area.width);
 
     // Banner height — must match viewport_height() in run.rs exactly.
     // border top+bottom = 2; left col = logo + 4 header/model/cwd lines;
@@ -135,7 +125,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_banner(f, outer[0], app, tc);
     }
     draw_chat(f, outer[1], app, tc);
-    draw_input(f, outer[2], app, &full_input, tc);
+    f.render_widget(input, outer[2]);
     draw_status(f, outer[3], app, tc);
 
     // Same precedence as handle_key, so the dialog on screen is always the
@@ -681,7 +671,25 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
 
 // ── Input line (no border — matches oxideclaw's plain "> " prompt) ────────────
 
-fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeColors) {
+/// Rows the input box takes at `width`. viewport_height() sizes the inline
+/// viewport with this, so it must be the same measure draw() lays out with.
+pub fn input_height(app: &App, width: u16) -> u16 {
+    let full_input: String = app.input.iter().collect();
+    input_view(app, &full_input, theme_colors(&app.theme), width).1
+}
+
+/// The input box at `width` and its height (1..=8 rows), scrolled so the
+/// cursor row is inside it.
+///
+/// The height comes from the paragraph's own wrap: a char-count estimate
+/// ignores double-width CJK/emoji, word wrap and the trailing cursor cell,
+/// and every row it undercounts (the cursor's row, usually) was clipped.
+fn input_view(
+    app: &App,
+    full_input: &str,
+    tc: ThemeColors,
+    width: u16,
+) -> (Paragraph<'static>, u16) {
     let text_style = Style::default().fg(Color::White);
     let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
     let suggestion_style = Style::default().fg(Color::Rgb(80, 80, 80)); // dim gray
@@ -693,16 +701,16 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeC
             .add_modifier(Modifier::BOLD)
     };
 
-    // full_input already computed in draw() — reuse it, collect before_cursor only
     let full = full_input;
-    let before_cursor: String = app.input[..app.cursor].iter().collect();
+    let before_cursor = &app.input[..app.cursor];
     let input_lines: Vec<&str> = full.split('\n').collect();
-    let lines_before = before_cursor.split('\n').count();
-    let cursor_line_idx = lines_before - 1;
+    let cursor_line_idx = before_cursor.iter().filter(|&&c| c == '\n').count();
+    // In chars, like `src.chars()` below: a byte count put the cursor past
+    // the end of any line with non-ASCII text before it.
     let cursor_col = before_cursor
-        .rfind('\n')
-        .map(|p| before_cursor.len() - p - 1)
-        .unwrap_or(before_cursor.len());
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(before_cursor.len(), |p| before_cursor.len() - p - 1);
 
     // Disabled/loading: dim the prompt
     let (prompt_char, effective_prompt_style) = if app.is_loading {
@@ -720,6 +728,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeC
     // Show placeholder when input is completely empty
     let show_placeholder = full.is_empty() && !app.is_loading;
 
+    // The cursor line cut after the word holding the cursor: wrapping it
+    // gives the row the cursor lands on in the full paragraph.
+    let mut cursor_prefix: Option<Line<'static>> = None;
     let render_lines: Vec<Line<'static>> = input_lines
         .iter()
         .enumerate()
@@ -733,16 +744,25 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeC
                 let chars: Vec<char> = src.chars().collect();
                 let col = cursor_col.min(chars.len());
                 let before: String = chars[..col].iter().collect();
-                let cur_ch: String = if col < chars.len() {
-                    chars[col].to_string()
-                } else {
-                    " ".to_string()
+                // A plain space cursor cell is whitespace to the word wrapper,
+                // which drops it where a row breaks: the cursor vanished at the
+                // end of a full row. NBSP draws the same but wraps as text.
+                let cur_ch: String = match chars.get(col) {
+                    Some(' ') | None => "\u{a0}".to_string(),
+                    Some(c) => c.to_string(),
                 };
                 let after: String = if col < chars.len() {
                     chars[col + 1..].iter().collect()
                 } else {
                     String::new()
                 };
+                let word_rest: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+                cursor_prefix = Some(Line::from(vec![
+                    Span::raw(prompt.clone()),
+                    Span::raw(before.clone()),
+                    Span::raw(cur_ch.clone()),
+                    Span::raw(word_rest),
+                ]));
                 // Append dim suggestion or placeholder after cursor (cursor line only)
                 let mut spans = vec![
                     Span::styled(prompt, effective_prompt_style),
@@ -765,10 +785,20 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, full_input: &str, tc: ThemeC
         })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(Text::from(render_lines)).wrap(Wrap { trim: false }),
-        area,
-    );
+    let wrapped =
+        |lines: Vec<Line<'static>>| Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let scroll_to = match cursor_prefix {
+        Some(prefix) => {
+            let mut upto = render_lines[..cursor_line_idx].to_vec();
+            upto.push(prefix);
+            rows(wrapped(upto).line_count(width))
+        }
+        None => 0,
+    };
+    let para = wrapped(render_lines);
+    let height = rows(para.line_count(width)).clamp(1, 8);
+    (para.scroll((scroll_to.saturating_sub(height), 0)), height)
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -1489,6 +1519,48 @@ mod permission_popup_tests {
         assert!(screen.contains("err-line-5"), "{screen}");
         assert!(!screen.contains("err-line-6"), "{screen}");
         assert!(screen.contains("[▸ 494 more lines]"), "{screen}");
+    }
+
+    /// The input box was sized by char count, so wide CJK text, a line
+    /// that exactly filled the row (pushing the cursor cell down) and word
+    /// wrap all got too few rows and the cursor's row was clipped.
+    #[test]
+    fn input_box_fits_its_wrapped_rows_and_shows_the_cursor() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.show_welcome = false;
+        let cursor_drawn = |app: &mut crate::tui::app::App, w: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, 20)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            buf.content.iter().any(|c| c.bg == Color::White)
+        };
+        let words = "abcdefghijklmn ".repeat(26);
+        // The old char-count estimate gave 1, 1 and 5 rows.
+        let cases = [
+            ("中".repeat(40), 3),         // one 80-col word, then the cursor
+            ("x".repeat(78), 2),          // 2 + 78 + cursor = 81 cols
+            (words.trim_end().into(), 6), // 389 chars, 5 words a row
+        ];
+        for (text, want) in cases {
+            app.input = text.chars().collect();
+            app.cursor = app.input.len();
+            assert_eq!(input_height(&app, 80), want, "{text}");
+            assert!(cursor_drawn(&mut app, 80), "{text}");
+        }
+
+        // Taller than the 8-row cap: the box scrolls to the cursor.
+        app.input = "line\n".repeat(20).chars().collect();
+        app.cursor = app.input.len();
+        assert_eq!(input_height(&app, 80), 8);
+        assert!(cursor_drawn(&mut app, 80));
+        // Cursor after CJK text sits on the next char, not at the line end.
+        app.input = "中文字".chars().collect();
+        app.cursor = 1;
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let cur = buf.content.iter().find(|c| c.bg == Color::White).unwrap();
+        assert_eq!(cur.symbol(), "文");
     }
 
     /// Raw ESC/BEL in the dialog or in chat must never reach the terminal:

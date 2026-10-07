@@ -363,16 +363,7 @@ fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
     let show_banner = app.show_welcome && app.entries.is_empty() && app.streaming.is_empty();
     let status_h = 1u16;
 
-    let usable_w = term_cols.saturating_sub(2) as usize;
-    let full_input: String = app.input.iter().collect();
-    let input_h: u16 = full_input
-        .split('\n')
-        .map(|line| {
-            let n = line.chars().count();
-            (n.saturating_add(usable_w).saturating_sub(1) / usable_w.max(1)).max(1) as u16
-        })
-        .sum::<u16>()
-        .clamp(1, 8);
+    let input_h = super::render::input_height(app, term_cols);
 
     if show_banner {
         // Must mirror the banner_h formula in render::draw() exactly.
