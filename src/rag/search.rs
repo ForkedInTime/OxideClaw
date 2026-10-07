@@ -185,7 +185,7 @@ mod tests {
 
     fn seeded_db() -> (TempDir, RagDb) {
         let tmp = TempDir::new().unwrap();
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = RagDb::open_at(&tmp.path().join("rag.db")).unwrap();
         let chunks = vec![
             (
                 "src/auth.rs",

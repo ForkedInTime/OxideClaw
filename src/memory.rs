@@ -1,18 +1,23 @@
 /// Persistent project memory — stores decisions, preferences, patterns, and
-/// contextual notes in the same SQLite database used by the RAG indexer.
+/// contextual notes in a per-project SQLite database.
 ///
 /// Each memory is a keyed (key, value) pair with a category and source.
 /// FTS5 full-text search allows fuzzy retrieval; `build_context()` formats
 /// the top-N items for injection into the system prompt.
 ///
-/// Database location: `<cwd>/.claude/rag.db` (shared with RAG).
+/// Database location: `<cwd>/.claude/memory.db`. Memories used to share
+/// `.claude/rag.db` with the code index; that index is regenerable and now
+/// lives in the cache dir, so memories moved out on first open.
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
-use crate::rag::RagDb;
+/// Where `project`'s memories live.
+pub fn memory_db_path(project: &Path) -> PathBuf {
+    project.join(".claude").join("memory.db")
+}
 
 // ── Category ──────────────────────────────────────────────────────────────────
 
@@ -77,21 +82,108 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
-    /// Open (or create) the memory store backed by the shared RAG database.
+    /// Open (or create) the memory store for a project, first carrying over
+    /// the memories of a pre-cache-dir `.claude/rag.db`.
     pub fn open(cwd: &Path) -> Result<Self> {
-        // RagDb::open ensures the schema (including memory tables) is created.
-        let rag = RagDb::open(cwd)?;
-        // Transfer ownership of the connection out of RagDb.
-        // We own the Connection; RagDb drops cleanly.
-        let conn = rag.conn;
-        debug!("MemoryStore opened (shared rag.db)");
+        crate::rag::retire_legacy_db(cwd);
+        let store = Self::open_at(&memory_db_path(cwd))?;
+        crate::rag::ensure_git_excluded_once(cwd);
+        Ok(store)
+    }
+
+    /// Open (or create) the memory database at `path`.
+    pub(crate) fn open_at(path: &Path) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create {}", dir.display()))?;
+        }
+        let conn = Connection::open(path).context("Failed to open memory database")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+
+            CREATE TABLE IF NOT EXISTS memory (
+                id          INTEGER PRIMARY KEY,
+                key         TEXT NOT NULL UNIQUE,
+                value       TEXT NOT NULL,
+                category    TEXT NOT NULL DEFAULT 'context',
+                source      TEXT NOT NULL DEFAULT 'user',
+                created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_category ON memory(category);
+            CREATE INDEX IF NOT EXISTS idx_memory_updated  ON memory(updated_at DESC);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                key,
+                value,
+                content=memory,
+                content_rowid=id,
+                tokenize='porter unicode61'
+            );
+
+            -- Triggers to keep memory_fts in sync with the memory table
+            CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
+                INSERT INTO memory_fts(rowid, key, value)
+                VALUES (new.id, new.key, new.value);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, key, value)
+                VALUES ('delete', old.id, old.key, old.value);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, key, value)
+                VALUES ('delete', old.id, old.key, old.value);
+                INSERT INTO memory_fts(rowid, key, value)
+                VALUES (new.id, new.key, new.value);
+            END;",
+        )?;
+        debug!("MemoryStore opened at {}", path.display());
         Ok(Self { conn })
     }
 
-    /// Open the store only if rag.db already exists; for read-only callers
-    /// that must not create it (see [`RagDb::open_existing`]).
+    /// Open the project's memory store only if it has one (or a
+    /// pre-cache-dir `.claude/rag.db` whose memories move into one), so
+    /// read-only callers (the system prompt every -p/SDK/browse engine
+    /// builds) never add `.claude/memory.db` to a project that has none.
     pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
-        Ok(RagDb::open_existing(cwd)?.map(|rag| Self { conn: rag.conn }))
+        let legacy = cwd.join(".claude").join("rag.db");
+        if memory_db_path(cwd).is_file() || legacy.is_file() {
+            Self::open(cwd).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Copy every memory from another database's `memory` table, keeping
+    /// timestamps. A key already present here wins.
+    pub(crate) fn import_from(&self, other: &Connection) -> Result<()> {
+        let mut stmt = other.prepare(
+            "SELECT id, key, value, category, source, created_at, updated_at FROM memory",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_memory)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let tx = self.conn.unchecked_transaction()?;
+        for m in rows {
+            tx.execute(
+                "INSERT INTO memory (key, value, category, source, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(key) DO NOTHING",
+                rusqlite::params![
+                    m.key,
+                    m.value,
+                    m.category.as_str(),
+                    m.source,
+                    m.created_at,
+                    m.updated_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────

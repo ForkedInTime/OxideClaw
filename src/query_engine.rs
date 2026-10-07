@@ -11,7 +11,6 @@ use crate::rag;
 use crate::tools::{DynTool, ToolContext};
 use anyhow::{Context, Result};
 use colored::Colorize;
-use tracing::debug;
 
 // System prompt is built dynamically from Config::build_system_prompt().
 
@@ -59,6 +58,9 @@ pub struct QueryEngine {
     /// children's spend counts toward this engine's budget.
     child_usage_tx: crate::tools::UsageSink,
     child_usage_rx: tokio::sync::mpsc::UnboundedReceiver<(String, crate::api::types::Usage)>,
+    /// Where the code index is looked up: None is the user's cache dir;
+    /// tests point it at a temp dir.
+    rag_index_dir: Option<std::path::PathBuf>,
 }
 
 impl QueryEngine {
@@ -121,6 +123,7 @@ impl QueryEngine {
             usage_sink: None,
             child_usage_tx,
             child_usage_rx,
+            rag_index_dir: None,
         })
     }
 
@@ -341,7 +344,8 @@ impl QueryEngine {
         let rag_context = {
             let cwd = self.config.cwd.clone();
             let q = user_input.clone();
-            tokio::task::spawn_blocking(move || Self::retrieve_rag_context(&cwd, &q))
+            let index_dir = self.rag_index_dir.clone();
+            tokio::task::spawn_blocking(move || rag::auto_context(index_dir.as_deref(), &cwd, &q))
                 .await
                 .unwrap_or_default()
         };
@@ -1020,70 +1024,6 @@ impl QueryEngine {
     fn replay_user_messages(&self) -> bool {
         self.config.replay_user_messages
     }
-
-    /// Retrieve relevant code context from the local RAG index.
-    /// Returns a formatted context block, or empty string if RAG is unavailable.
-    fn retrieve_rag_context(cwd: &std::path::Path, user_input: &str) -> String {
-        // Only inject RAG if the index exists; opening would create it.
-        let db = match rag::RagDb::open_existing(cwd) {
-            Ok(Some(db)) => db,
-            _ => return String::new(),
-        };
-
-        // Skip if the index is empty (not yet built)
-        if db.chunk_count().unwrap_or(0) == 0 {
-            return String::new();
-        }
-
-        // Only the TUI indexes on its own; without this, print/SDK/ACP turns
-        // inject whatever a past TUI run stored, including deleted files and
-        // code this session already edited. Incremental, so cheap when idle.
-        if let Err(e) = rag::indexer::index_project(&db, cwd, false) {
-            debug!("RAG refresh failed: {e}");
-        }
-
-        // Fetch more candidates, then filter by relevance threshold
-        let results = match rag::search::search(&db, user_input, 20) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("RAG search failed: {e}");
-                return String::new();
-            }
-        };
-
-        if results.is_empty() {
-            return String::new();
-        }
-
-        // Filter: only keep results with a decent relevance score.
-        // FTS5 rank is negative (closer to 0 = more relevant); discard weak matches.
-        let top_rank = results[0].rank;
-        let threshold = if top_rank < -5.0 {
-            top_rank * 0.3
-        } else {
-            top_rank * 0.5
-        };
-        let filtered: Vec<_> = results
-            .into_iter()
-            .filter(|r| r.rank <= threshold || r.rank <= top_rank * 0.8)
-            .take(10) // cap at 10 injected chunks
-            .collect();
-
-        if filtered.is_empty() {
-            return String::new();
-        }
-
-        // Context budget: ~12KB for rich models, keeps well within token limits
-        let context = rag::search::build_context(&filtered, 12288);
-        if !context.is_empty() {
-            debug!(
-                "RAG injected {} results ({} chars)",
-                filtered.len(),
-                context.len()
-            );
-        }
-        context
-    }
 }
 
 /// Per-call cost in USD, from the same price table as `/cost`.
@@ -1179,8 +1119,10 @@ pub(crate) mod scripted_api_tests {
     #[test]
     fn rag_context_sees_files_added_after_the_index_was_built() {
         let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join("old.rs"), "fn unrelated_helper() {}\n").unwrap();
-        let db = rag::RagDb::open(dir.path()).unwrap();
+        let db = rag::RagDb::open_in(index.path(), dir.path()).unwrap();
         rag::indexer::index_project(&db, dir.path(), true).unwrap();
         drop(db);
 
@@ -1189,15 +1131,20 @@ pub(crate) mod scripted_api_tests {
             "/// Compute the invoice total.\nfn compute_invoice_total() -> u32 { 0 }\n",
         )
         .unwrap();
-        let ctx = QueryEngine::retrieve_rag_context(dir.path(), "compute invoice total");
+        let ctx = rag::auto_context(Some(index.path()), dir.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
     }
 
     #[test]
     fn rag_context_does_not_create_an_index_in_an_unindexed_project() {
         let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        // A work tree, so auto-indexing is allowed and only "no index yet"
+        // keeps the context empty.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn compute() {}\n").unwrap();
-        assert!(QueryEngine::retrieve_rag_context(dir.path(), "compute").is_empty());
+        assert!(rag::auto_context(Some(index.path()), dir.path(), "compute").is_empty());
+        assert_eq!(std::fs::read_dir(index.path()).unwrap().count(), 0);
         assert!(!dir.path().join(".claude").exists());
     }
 
@@ -1500,12 +1447,14 @@ pub(crate) mod scripted_api_tests {
     #[tokio::test]
     async fn rag_context_keeps_the_system_prompt_stable_across_tool_turns() {
         let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(
             dir.path().join("auth.rs"),
             "/// Validate the session token expiry.\nfn validate_session_token() -> bool { true }\n",
         )
         .unwrap();
-        let db = rag::RagDb::open(dir.path()).unwrap();
+        let db = rag::RagDb::open_in(index.path(), dir.path()).unwrap();
         rag::indexer::index_project(&db, dir.path(), true).unwrap();
         drop(db);
 
@@ -1528,6 +1477,7 @@ pub(crate) mod scripted_api_tests {
         };
         let mut e = QueryEngine::new(config, Vec::new()).unwrap();
         e.quiet = true;
+        e.rag_index_dir = Some(index.path().to_path_buf());
         let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
         c.set_base_url_for_test(url);
         e.client = ApiBackend::Anthropic(c);

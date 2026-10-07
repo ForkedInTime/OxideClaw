@@ -456,7 +456,7 @@ fn stage_worktree(
     // index has other staging.
     if let Some(tree) = seed_tree {
         seed_index(cwd, tree, temp_index)?;
-        // The exclude below only stops `add` from touching the database; a
+        // The exclude below only stops `add` from touching the databases; a
         // copy already in the seed (a snapshot from before the exclusion, or
         // a HEAD that tracks it) would ride along into every later snapshot
         // and make /undo delete the live file. `-f`: that stale copy matches
@@ -469,23 +469,39 @@ fn stage_worktree(
             "-q",
             "--ignore-unmatch",
             "--",
-            RAG_DB_PATHSPEC,
+            OWN_DB_PATHSPECS[0],
+            OWN_DB_PATHSPECS[1],
         ]))
-        .map_err(|e| anyhow::anyhow!("git rm --cached {RAG_DB_PATHSPEC} failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("git rm --cached of OxideClaw's databases failed: {e}"))?;
     }
     // Whole tree from any subdirectory, minus OxideClaw's own SQLite
-    // index/memory store: snapshotting it stored a binary blob per turn, and
-    // /undo overwrote the live database (rolling back memories).
+    // memory store: snapshotting it stored a binary blob per turn, and /undo
+    // overwrote the live database (rolling back memories). The `rag.db`
+    // pattern covers the pre-cache-dir index that held them.
     // Captured, like every git call here: this runs under the raw-mode TUI,
     // and warnings such as "adding embedded git repository" landed on it.
-    git_output(temp_index_cmd(cwd, temp_index).args(["add", "-A", "--", ":(top)", RAG_DB_EXCLUDE]))
-        .map_err(|e| anyhow::anyhow!("git add -A failed: {e}"))?;
+    git_output(temp_index_cmd(cwd, temp_index).args([
+        "add",
+        "-A",
+        "--",
+        ":(top)",
+        OWN_DB_EXCLUDES[0],
+        OWN_DB_EXCLUDES[1],
+    ]))
+    .map_err(|e| anyhow::anyhow!("git add -A failed: {e}"))?;
     git_output(temp_index_cmd(cwd, temp_index).args(["write-tree"]))
 }
 
-/// OxideClaw's own SQLite index/memory store, wherever a `.claude/` sits.
-const RAG_DB_PATHSPEC: &str = ":(top,glob)**/.claude/rag.db*";
-const RAG_DB_EXCLUDE: &str = ":(top,exclude,glob)**/.claude/rag.db*";
+/// OxideClaw's own SQLite stores, wherever a `.claude/` sits: the memory
+/// database and the pre-cache-dir index (which also held memories).
+const OWN_DB_PATHSPECS: [&str; 2] = [
+    ":(top,glob)**/.claude/memory.db*",
+    ":(top,glob)**/.claude/rag.db*",
+];
+const OWN_DB_EXCLUDES: [&str; 2] = [
+    ":(top,exclude,glob)**/.claude/memory.db*",
+    ":(top,exclude,glob)**/.claude/rag.db*",
+];
 
 /// `git commit-tree` with OxideClaw as author, so shadow commits never carry
 /// the user's identity or depend on it being configured.
@@ -801,7 +817,8 @@ pub fn restore_to(
                 // or a HEAD that tracks it) must not overwrite the live one.
                 "--",
                 ":(top)",
-                RAG_DB_EXCLUDE,
+                OWN_DB_EXCLUDES[0],
+                OWN_DB_EXCLUDES[1],
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1708,11 +1725,13 @@ mod restore_tests {
     }
 
     #[test]
-    fn snapshots_leave_out_the_rag_database() {
+    fn snapshots_leave_out_the_memory_and_rag_databases() {
         let td = init_test_repo();
         write_file(td.path(), "app.txt", "v1\n");
         write_file(td.path(), ".claude/rag.db", "sqlite");
         write_file(td.path(), ".claude/rag.db-wal", "wal");
+        write_file(td.path(), ".claude/memory.db", "sqlite");
+        write_file(td.path(), "pkg/.claude/memory.db-wal", "wal");
         let mut commits = Vec::new();
         let mut pos = 0usize;
         snapshot_turn(
@@ -1730,6 +1749,7 @@ mod restore_tests {
         let files = list_tree_files(td.path(), &tree);
         assert!(files.iter().any(|f| f == "app.txt"), "{files:?}");
         assert!(!files.iter().any(|f| f.contains("rag.db")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("memory.db")), "{files:?}");
     }
 
     /// A chain recorded before the exclusion carries a rag.db blob. Seeding

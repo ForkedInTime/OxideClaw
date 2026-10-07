@@ -1,10 +1,14 @@
 /// Local codebase RAG — tree-sitter AST indexing + SQLite FTS5 search.
 ///
 /// Indexes the project's source code into per-symbol chunks, stored in a local
-/// SQLite database.  When the agent needs context, FTS5 retrieves the most
-/// relevant code spans — so the LLM sees surgical context instead of whole files.
+/// SQLite database.  When the agent needs context, FTS5 (BM25) retrieves the
+/// most relevant code spans — so the LLM sees surgical context instead of
+/// whole files.
 ///
-/// Index location: `<project>/.claude/rag.db`
+/// Index location: `$XDG_CACHE_HOME/oxideclaw/rag/<project hash>.db`
+/// (fallback `~/.cache/oxideclaw/rag/`), never inside the project. The walk
+/// honours `.gitignore`, `.git/info/exclude`, the global excludes file and
+/// `.ignore`, and only a git work tree below `$HOME` is indexed on its own.
 ///
 /// Paid tools charge for this; we do it locally, for free, in a single binary
 /// with zero external dependencies.
@@ -12,17 +16,20 @@ pub mod indexer;
 pub mod search;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-/// Ignore pattern covering the database and its WAL/SHM side files at any depth.
-const GIT_EXCLUDE_PATTERN: &str = "**/.claude/rag.db*";
+/// Ignore pattern covering the memory database and its WAL/SHM side files
+/// at any depth.
+const GIT_EXCLUDE_PATTERN: &str = "**/.claude/memory.db*";
 
-/// The index and memory rows live inside the user's repo; `/checkpoint`,
-/// `/commit` and `/spawn merge` all `git add -A`, which would commit them.
-/// Once per cwd per process, so a turn does not fork git every time.
-fn ensure_git_excluded_once(cwd: &Path) {
+/// The memory rows live inside the user's repo (`.claude/memory.db`);
+/// `/checkpoint`, `/commit` and `/spawn merge` all `git add -A`, which would
+/// commit them. Once per cwd per process, so a turn does not fork git every
+/// time. The code index itself lives in the cache dir, outside the repo.
+pub(crate) fn ensure_git_excluded_once(cwd: &Path) {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
     let first = SEEN
@@ -75,7 +82,7 @@ fn ensure_git_excluded(cwd: &Path) {
         .open(&path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     if let Err(e) = res {
-        debug!("could not add rag.db to {}: {e}", path.display());
+        debug!("could not add memory.db to {}: {e}", path.display());
     }
 }
 
@@ -86,8 +93,204 @@ fn ensure_git_excluded(cwd: &Path) {
 /// migration step in `apply_migrations` for the new version.
 ///
 /// Version history:
-///   1 — Baseline: code_chunks, chunks_fts, memory, memory_fts, rag_meta.
+///   1 — Baseline: code_chunks, chunks_fts, rag_meta. (Indexes that lived in
+///       `<project>/.claude/rag.db` also held the memory tables; memory now
+///       has its own database, see `crate::memory`.)
 pub(crate) const RAG_SCHEMA_VERSION: i64 = 1;
+
+/// Where code indexes live: `$XDG_CACHE_HOME/oxideclaw/rag`, falling back
+/// to `~/.cache/oxideclaw/rag`.
+pub fn cache_index_dir() -> PathBuf {
+    crate::config::Config::cache_dir().join("rag")
+}
+
+/// `<index_dir>/<first 16 hex digits of sha256(canonical project root)>.db`.
+///
+/// Keyed by the canonical path so `./x`, a symlink to it and `x/../x` share
+/// one index, and two checkouts of the same repo never do.
+pub fn db_path_in(index_dir: &Path, project: &Path) -> PathBuf {
+    let root = canonical(project);
+    let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    index_dir.join(format!("{name}.db"))
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Why `dir` may never be indexed, even on request: the filesystem root and
+/// the home directory (or anything above it) hold far more than a project,
+/// including credentials. `home` is passed in so tests never depend on the
+/// real one.
+pub fn index_refusal(dir: &Path, home: Option<&Path>) -> Option<&'static str> {
+    let dir = canonical(dir);
+    if dir.parent().is_none() {
+        return Some("the filesystem root is never indexed");
+    }
+    if home.is_some_and(|h| canonical(h).starts_with(&dir)) {
+        return Some("the home directory is never indexed");
+    }
+    None
+}
+
+/// Why `dir` is not indexed automatically (startup, before each prompt):
+/// on top of `index_refusal`, it must sit inside a git work tree, and that
+/// work tree must not be the home directory itself (a dotfiles repo).
+pub fn auto_index_refusal(dir: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if let Some(why) = index_refusal(dir, home) {
+        return Some(why);
+    }
+    match git_work_tree_root(&canonical(dir)) {
+        None => Some("not inside a git repository"),
+        Some(root) if index_refusal(&root, home).is_some() => {
+            Some("the enclosing git repository is the home directory")
+        }
+        Some(_) => None,
+    }
+}
+
+/// The nearest ancestor (or `dir` itself) holding `.git`: a directory in a
+/// normal checkout, a file in a linked worktree or submodule.
+fn git_work_tree_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|a| a.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Code context for a prompt from the project's index, refreshed first.
+///
+/// Used by every non-TUI turn (print, SDK, ACP). It never builds an index:
+/// it stays empty until the TUI or `/index` has created one, and is off
+/// wherever `auto_index_refusal` says auto-indexing is. `index_dir` is the
+/// cache dir in production and a temp dir in tests.
+pub fn auto_context(index_dir: Option<&Path>, cwd: &Path, user_input: &str) -> String {
+    if let Some(why) = auto_index_refusal(cwd, dirs::home_dir().as_deref()) {
+        debug!("RAG context off: {why}");
+        return String::new();
+    }
+    let db_path = db_path_in(
+        &index_dir.map_or_else(cache_index_dir, Path::to_path_buf),
+        cwd,
+    );
+    if !db_path.exists() {
+        return String::new();
+    }
+    let db = match RagDb::open_at(&db_path) {
+        Ok(db) => db,
+        Err(_) => return String::new(),
+    };
+
+    // Skip if the index is empty (not yet built)
+    if db.chunk_count().unwrap_or(0) == 0 {
+        return String::new();
+    }
+
+    // Only the TUI indexes on its own; without this, print/SDK/ACP turns
+    // inject whatever a past TUI run stored, including deleted files and
+    // code this session already edited. Incremental, so cheap when idle.
+    if let Err(e) = indexer::index_project(&db, cwd, false) {
+        debug!("RAG refresh failed: {e}");
+    }
+
+    // Fetch more candidates, then filter by relevance threshold
+    let results = match search::search(&db, user_input, 20) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("RAG search failed: {e}");
+            return String::new();
+        }
+    };
+
+    if results.is_empty() {
+        return String::new();
+    }
+
+    // Filter: only keep results with a decent relevance score.
+    // FTS5 rank is negative (closer to 0 = more relevant); discard weak matches.
+    let top_rank = results[0].rank;
+    let threshold = if top_rank < -5.0 {
+        top_rank * 0.3
+    } else {
+        top_rank * 0.5
+    };
+    let filtered: Vec<_> = results
+        .into_iter()
+        .filter(|r| r.rank <= threshold || r.rank <= top_rank * 0.8)
+        .take(10) // cap at 10 injected chunks
+        .collect();
+
+    if filtered.is_empty() {
+        return String::new();
+    }
+
+    // Context budget: ~12KB for rich models, keeps well within token limits
+    let context = search::build_context(&filtered, 12288);
+    if !context.is_empty() {
+        debug!(
+            "RAG injected {} results ({} chars)",
+            filtered.len(),
+            context.len()
+        );
+    }
+    context
+}
+
+/// Retire `<project>/.claude/rag.db`, where the index (and `/memory`) lived
+/// before the index moved to the cache dir. Its chunks may hold files that
+/// are gitignored now, so it is never searched again. It is deleted only when
+/// its tables show it is OxideClaw's, after its memories are copied to
+/// `.claude/memory.db`; anything else at that path is left alone.
+pub(crate) fn retire_legacy_db(project: &Path) {
+    let legacy = project.join(".claude").join("rag.db");
+    if !legacy.is_file() {
+        return;
+    }
+    match retire_legacy_db_at(&legacy, &crate::memory::memory_db_path(project)) {
+        Ok(true) => info!("removed the old code index {}", legacy.display()),
+        Ok(false) => debug!("left {} alone: not an OxideClaw index", legacy.display()),
+        Err(e) => warn!("could not retire {}: {e}", legacy.display()),
+    }
+}
+
+/// `Ok(false)` when `legacy` is not an OxideClaw index (or cannot be read
+/// as SQLite at all) and was left untouched.
+fn retire_legacy_db_at(legacy: &Path, memory_db: &Path) -> Result<bool> {
+    {
+        // Read-write (never create) so a crash-left WAL can be recovered;
+        // only `sqlite_master` and `memory` are read.
+        let flags = OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE);
+        let conn = Connection::open_with_flags(legacy, flags)?;
+        let tables: Vec<String> = match conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()
+            }) {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        let has = |name: &str| tables.iter().any(|t| t == name);
+        if !(has("code_chunks") && has("rag_meta")) {
+            return Ok(false);
+        }
+        // Memories are the user's own words, not regenerable like chunks.
+        if has("memory") {
+            crate::memory::MemoryStore::open_at(memory_db)?.import_from(&conn)?;
+        }
+    }
+    let name = legacy.as_os_str();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = name.to_os_string();
+        p.push(suffix);
+        if let Err(e) = std::fs::remove_file(&p)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
+        }
+    }
+    Ok(true)
+}
 
 /// The RAG database — owns a SQLite connection with FTS5 tables.
 pub struct RagDb {
@@ -96,16 +299,26 @@ pub struct RagDb {
 }
 
 impl RagDb {
-    /// Open (or create) the RAG database for a project.
-    /// Stored at `<cwd>/.claude/rag.db`.
-    pub fn open(cwd: &Path) -> Result<Self> {
-        let claude_dir = cwd.join(".claude");
-        std::fs::create_dir_all(&claude_dir)
-            .context("Failed to create .claude directory for RAG index")?;
+    /// Open (or create) the index for `project` in the user's cache dir.
+    pub fn open(project: &Path) -> Result<Self> {
+        Self::open_in(&cache_index_dir(), project)
+    }
 
-        let db_path = claude_dir.join("rag.db");
+    /// Open (or create) the index for `project` under `index_dir`, retiring
+    /// a pre-cache-dir `<project>/.claude/rag.db` on the way.
+    pub fn open_in(index_dir: &Path, project: &Path) -> Result<Self> {
+        retire_legacy_db(project);
+        Self::open_at(&db_path_in(index_dir, project))
+    }
+
+    /// Open (or create) the index database at `db_path`.
+    pub fn open_at(db_path: &Path) -> Result<Self> {
+        if let Some(dir) = db_path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create {}", dir.display()))?;
+        }
+        let db_path = db_path.to_path_buf();
         let conn = Connection::open(&db_path).context("Failed to open RAG database")?;
-        ensure_git_excluded_once(cwd);
 
         // Performance: WAL mode + relaxed sync for indexing speed
         conn.execute_batch(
@@ -161,47 +374,7 @@ impl RagDb {
             CREATE TABLE IF NOT EXISTS rag_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-
-            -- ── Memory tables ──────────────────────────────────────────────────
-            CREATE TABLE IF NOT EXISTS memory (
-                id          INTEGER PRIMARY KEY,
-                key         TEXT NOT NULL UNIQUE,
-                value       TEXT NOT NULL,
-                category    TEXT NOT NULL DEFAULT 'context',
-                source      TEXT NOT NULL DEFAULT 'user',
-                created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_memory_category ON memory(category);
-            CREATE INDEX IF NOT EXISTS idx_memory_updated  ON memory(updated_at DESC);
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-                key,
-                value,
-                content=memory,
-                content_rowid=id,
-                tokenize='porter unicode61'
-            );
-
-            -- Triggers to keep memory_fts in sync with the memory table
-            CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
-                INSERT INTO memory_fts(rowid, key, value)
-                VALUES (new.id, new.key, new.value);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
-                INSERT INTO memory_fts(memory_fts, rowid, key, value)
-                VALUES ('delete', old.id, old.key, old.value);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
-                INSERT INTO memory_fts(memory_fts, rowid, key, value)
-                VALUES ('delete', old.id, old.key, old.value);
-                INSERT INTO memory_fts(rowid, key, value)
-                VALUES (new.id, new.key, new.value);
-            END;",
+            );",
         )?;
 
         // Run migrations if the persisted schema version is behind the
@@ -212,14 +385,20 @@ impl RagDb {
         Ok(Self { conn, db_path })
     }
 
-    /// Open the database only if a previous run already created it. Read-only
-    /// consumers (print/SDK/ACP turns, the memory block of the system prompt)
-    /// use this so a one-shot query does not leave `.claude/rag.db` behind.
+    /// Open the index only if a previous run already created it. Read-only
+    /// consumers (SDK `rag/search`) use this so a one-shot query does not
+    /// leave an empty index behind.
     pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
-        if !cwd.join(".claude").join("rag.db").exists() {
+        Self::open_existing_in(&cache_index_dir(), cwd)
+    }
+
+    /// `open_existing` with the index directory given.
+    pub fn open_existing_in(index_dir: &Path, cwd: &Path) -> Result<Option<Self>> {
+        let path = db_path_in(index_dir, cwd);
+        if !path.is_file() {
             return Ok(None);
         }
-        Self::open(cwd).map(Some)
+        Self::open_at(&path).map(Some)
     }
 
     /// Total number of indexed chunks.
@@ -332,7 +511,7 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
         match version {
             0 => {
                 // Baseline: the v1 tables are already present via the
-                // CREATE ... IF NOT EXISTS block in RagDb::open. Nothing to
+                // CREATE ... IF NOT EXISTS block in RagDb::open_at. Nothing to
                 // ALTER — just record the version.
                 conn.execute(
                     "INSERT INTO rag_meta (key, value) VALUES ('schema_version', ?1) \
@@ -371,17 +550,27 @@ mod tests {
 
     fn test_db() -> (TempDir, RagDb) {
         let tmp = TempDir::new().unwrap();
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = RagDb::open_at(&tmp.path().join("rag.db")).unwrap();
         (tmp, db)
     }
 
     #[test]
     fn open_existing_does_not_create_the_database() {
         let tmp = TempDir::new().unwrap();
-        assert!(RagDb::open_existing(tmp.path()).unwrap().is_none());
+        let idx = TempDir::new().unwrap();
+        assert!(
+            RagDb::open_existing_in(idx.path(), tmp.path())
+                .unwrap()
+                .is_none()
+        );
         assert!(!tmp.path().join(".claude").exists());
-        RagDb::open(tmp.path()).unwrap();
-        assert!(RagDb::open_existing(tmp.path()).unwrap().is_some());
+        assert_eq!(std::fs::read_dir(idx.path()).unwrap().count(), 0);
+        RagDb::open_in(idx.path(), tmp.path()).unwrap();
+        assert!(
+            RagDb::open_existing_in(idx.path(), tmp.path())
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -407,14 +596,14 @@ mod tests {
         // pattern glued onto its last line.
         std::fs::write(repo.join(".git/info/exclude"), "*.log").unwrap();
 
-        drop(RagDb::open(&sub).unwrap());
-        drop(RagDb::open(repo).unwrap());
+        drop(crate::memory::MemoryStore::open(&sub).unwrap());
+        drop(crate::memory::MemoryStore::open(repo).unwrap());
         ensure_git_excluded(&sub);
 
         let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert_eq!(exclude, format!("*.log\n{GIT_EXCLUDE_PATTERN}\n"));
         let status = git(repo, &["status", "--porcelain", "--untracked-files=all"]);
-        assert!(!status.contains("rag.db"), "{status}");
+        assert!(!status.contains("memory.db"), "{status}");
         assert!(status.contains(".claude/settings.json"), "{status}");
     }
 
@@ -490,8 +679,7 @@ mod tests {
     #[test]
     fn pre_versioning_db_is_migrated_to_current() {
         let tmp = TempDir::new().unwrap();
-        let db_path = tmp.path().join(".claude").join("rag.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let db_path = tmp.path().join("rag.db");
 
         // Simulate a pre-migration DB: create just the v1 tables and
         // rag_meta, but do NOT write a schema_version row.
@@ -518,9 +706,9 @@ mod tests {
             assert_eq!(read_schema_version(&conn).unwrap(), 0);
         }
 
-        // Re-open through RagDb::open — this should detect v0, migrate
+        // Re-open through RagDb::open_at — this should detect v0, migrate
         // to the current version, and preserve the existing row.
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = RagDb::open_at(&db_path).unwrap();
         assert_eq!(
             read_schema_version(&db.conn).unwrap(),
             RAG_SCHEMA_VERSION,
@@ -538,11 +726,12 @@ mod tests {
     #[test]
     fn migration_is_idempotent() {
         let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rag.db");
         // Open twice.
         {
-            let _db = RagDb::open(tmp.path()).unwrap();
+            let _db = RagDb::open_at(&path).unwrap();
         }
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = RagDb::open_at(&path).unwrap();
 
         // Exactly one row in rag_meta for schema_version.
         let count: i64 = db
@@ -563,13 +752,14 @@ mod tests {
     #[test]
     fn future_version_opens_without_error() {
         let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rag.db");
         // First open normally.
         {
-            let _db = RagDb::open(tmp.path()).unwrap();
+            let _db = RagDb::open_at(&path).unwrap();
         }
         // Now simulate a newer build by forcibly bumping the version.
         {
-            let conn = Connection::open(tmp.path().join(".claude").join("rag.db")).unwrap();
+            let conn = Connection::open(&path).unwrap();
             conn.execute(
                 "UPDATE rag_meta SET value = '9999' WHERE key = 'schema_version'",
                 [],
@@ -578,7 +768,7 @@ mod tests {
         }
         // Re-open should succeed (not panic, not error) and leave the
         // persisted version alone.
-        let db = RagDb::open(tmp.path()).unwrap();
+        let db = RagDb::open_at(&path).unwrap();
         assert_eq!(read_schema_version(&db.conn).unwrap(), 9999);
     }
 
@@ -595,5 +785,220 @@ mod tests {
         assert_eq!(db.chunk_count().unwrap(), 5);
         db.clear().unwrap();
         assert_eq!(db.chunk_count().unwrap(), 0);
+    }
+
+    // ── Location, scope and the pre-cache-dir index ─────────────────────────
+
+    /// The index lives at `<index dir>/<16 hex of sha256(canonical root)>.db`:
+    /// never inside the project, the same file for every spelling of one
+    /// directory, and a different file per project.
+    #[test]
+    fn db_path_is_the_hash_of_the_canonical_project_root() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("idx");
+        let proj = tmp.path().join("proj");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let path = db_path_in(&idx, &proj);
+        let canon = std::fs::canonicalize(&proj).unwrap();
+        let digest = Sha256::digest(canon.as_os_str().as_encoded_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(path, idx.join(format!("{}.db", &hex[..16])));
+
+        assert_eq!(db_path_in(&idx, &proj.join("sub").join("..")), path);
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&proj, &link).unwrap();
+            assert_eq!(db_path_in(&idx, &link), path);
+        }
+        assert_ne!(db_path_in(&idx, &other), path);
+
+        let db = RagDb::open_in(&idx, &proj).unwrap();
+        assert_eq!(db.db_path, path);
+        assert!(path.is_file());
+        assert!(
+            !proj.join(".claude").exists(),
+            "nothing is written into the project"
+        );
+    }
+
+    /// `/`, `$HOME` and anything above `$HOME` are refused even on request;
+    /// a directory below home is fine.
+    #[test]
+    fn root_and_home_are_never_indexed() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home").join("u");
+        let proj = home.join("code").join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        assert!(index_refusal(Path::new("/"), None).is_some());
+        assert!(index_refusal(Path::new("/"), Some(&home)).is_some());
+        assert_eq!(
+            index_refusal(&home, Some(&home)),
+            Some("the home directory is never indexed")
+        );
+        assert!(index_refusal(&home.join("code").join(".."), Some(&home)).is_some());
+        assert!(index_refusal(home.parent().unwrap(), Some(&home)).is_some());
+        assert_eq!(index_refusal(&proj, Some(&home)), None);
+        assert_eq!(index_refusal(&proj, None), None);
+
+        // A git repository at home (dotfiles) does not make home, or a
+        // plain directory under it, a project.
+        std::fs::create_dir(home.join(".git")).unwrap();
+        assert!(auto_index_refusal(&home, Some(&home)).is_some());
+        assert_eq!(
+            auto_index_refusal(&proj, Some(&home)),
+            Some("the enclosing git repository is the home directory")
+        );
+    }
+
+    /// Auto-indexing (TUI startup, every prompt, print/SDK refresh) needs a
+    /// git work tree; a subdirectory of one, or a linked worktree whose
+    /// `.git` is a file, counts.
+    #[test]
+    fn auto_index_needs_a_git_work_tree() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let plain = home.join("downloads");
+        let repo = home.join("repo");
+        let worktree = home.join("wt");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+
+        assert_eq!(
+            auto_index_refusal(&plain, Some(&home)),
+            Some("not inside a git repository")
+        );
+        assert_eq!(auto_index_refusal(&repo, Some(&home)), None);
+        assert_eq!(auto_index_refusal(&repo.join("src"), Some(&home)), None);
+        assert_eq!(auto_index_refusal(&worktree, Some(&home)), None);
+        // Explicit /index still works outside a repository.
+        assert_eq!(index_refusal(&plain, Some(&home)), None);
+    }
+
+    /// Print/SDK turns never index a directory outside a git repository,
+    /// and never search one even when an explicit /index built it.
+    #[test]
+    fn non_git_directories_get_no_automatic_context() {
+        let proj = TempDir::new().unwrap();
+        let idx = TempDir::new().unwrap();
+        std::fs::write(
+            proj.path().join("billing.rs"),
+            "fn compute_invoice_total() -> u32 { 0 }\n",
+        )
+        .unwrap();
+        assert!(auto_context(Some(idx.path()), proj.path(), "compute invoice total").is_empty());
+        assert_eq!(
+            std::fs::read_dir(idx.path()).unwrap().count(),
+            0,
+            "no index may be created"
+        );
+
+        let db = RagDb::open_in(idx.path(), proj.path()).unwrap();
+        indexer::index_project(&db, proj.path(), true).unwrap();
+        assert!(db.chunk_count().unwrap() > 0);
+        assert!(auto_context(Some(idx.path()), proj.path(), "compute invoice total").is_empty());
+
+        // The same project inside a work tree does get context.
+        std::fs::create_dir(proj.path().join(".git")).unwrap();
+        let ctx = auto_context(Some(idx.path()), proj.path(), "compute invoice total");
+        assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
+
+    /// An old-layout `<project>/.claude/rag.db`: index tables and memories
+    /// in one WAL-mode database, as OxideClaw wrote it before the move.
+    fn write_legacy_db(project: &Path) -> PathBuf {
+        let legacy = project.join(".claude").join("rag.db");
+        let db = RagDb::open_at(&legacy).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO code_chunks (file_path, symbol_name, symbol_kind, language, start_line, end_line, content, mtime)
+                 VALUES ('config.local.js', 'apiKey', 'lexical_declaration', 'javascript', 1, 1, 'const apiKey = \"sk-live\"', 1)",
+                [],
+            )
+            .unwrap();
+        let mem = crate::memory::MemoryStore::open_at(&legacy).unwrap();
+        mem.add(
+            "auth_lib",
+            "We use JWT for auth",
+            crate::memory::Category::Decision,
+            "user",
+        )
+        .unwrap();
+        legacy
+    }
+
+    /// The old in-project index is never searched: opening the new one
+    /// deletes it, after carrying its memories over to `.claude/memory.db`.
+    #[test]
+    fn legacy_oxideclaw_index_is_deleted_and_its_memories_kept() {
+        let proj = TempDir::new().unwrap();
+        let idx = TempDir::new().unwrap();
+        let legacy = write_legacy_db(proj.path());
+        std::fs::write(proj.path().join(".claude").join("rag.db-shm"), "stale").unwrap();
+
+        let db = RagDb::open_in(idx.path(), proj.path()).unwrap();
+        assert!(!legacy.exists(), "old index must be deleted");
+        for leftover in ["rag.db-wal", "rag.db-shm"] {
+            assert!(
+                !proj.path().join(".claude").join(leftover).exists(),
+                "{leftover}"
+            );
+        }
+        assert_eq!(db.chunk_count().unwrap(), 0, "old chunks must not be read");
+
+        let mem = crate::memory::MemoryStore::open(proj.path()).unwrap();
+        let all = mem.list(None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].value, "We use JWT for auth");
+        assert_eq!(all[0].category, crate::memory::Category::Decision);
+        assert_eq!(
+            mem.search("JWT", 5).unwrap().len(),
+            1,
+            "FTS must cover imports"
+        );
+    }
+
+    /// Memory is usually what touches the old file first (the system prompt
+    /// opens it every session): it retires it the same way.
+    #[test]
+    fn memory_store_retires_the_legacy_index_too() {
+        let proj = TempDir::new().unwrap();
+        let legacy = write_legacy_db(proj.path());
+        let mem = crate::memory::MemoryStore::open(proj.path()).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(mem.count().unwrap(), 1);
+        assert!(crate::memory::memory_db_path(proj.path()).is_file());
+    }
+
+    /// A `.claude/rag.db` that is not OxideClaw's (another tool's SQLite
+    /// file, or not SQLite at all) is left exactly as it is.
+    #[test]
+    fn foreign_rag_db_is_left_alone() {
+        let foreign_sqlite = TempDir::new().unwrap();
+        let path = foreign_sqlite.path().join(".claude").join("rag.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE documents (id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+        let not_sqlite = TempDir::new().unwrap();
+        let text = not_sqlite.path().join(".claude").join("rag.db");
+        std::fs::create_dir_all(text.parent().unwrap()).unwrap();
+        std::fs::write(&text, "my notes, not a database\n").unwrap();
+
+        for (project, file) in [(foreign_sqlite.path(), &path), (not_sqlite.path(), &text)] {
+            let before = std::fs::read(file).unwrap();
+            let idx = TempDir::new().unwrap();
+            RagDb::open_in(idx.path(), project).unwrap();
+            crate::memory::MemoryStore::open(project).unwrap();
+            assert_eq!(std::fs::read(file).unwrap(), before, "{}", file.display());
+        }
     }
 }

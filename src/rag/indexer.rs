@@ -591,8 +591,9 @@ mod tests {
     use crate::rag::RagDb;
     use tempfile::TempDir;
 
+    /// Index database for a test project, kept out of the real cache dir.
     fn test_db(project: &Path) -> RagDb {
-        RagDb::open(project).unwrap()
+        RagDb::open_at(&project.join(".rag-test.db")).unwrap()
     }
 
     fn setup_project(files: &[(&str, &str)]) -> TempDir {

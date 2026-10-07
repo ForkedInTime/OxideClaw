@@ -1397,6 +1397,14 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::IndexProject { force } => {
             let cwd = config.cwd.clone();
+            if let Some(why) = crate::rag::index_refusal(&cwd, dirs::home_dir().as_deref()) {
+                app.entries.push(ChatEntry::system(format!(
+                    "Not indexing {}: {why}.",
+                    cwd.display()
+                )));
+                app.scroll_to_bottom();
+                return Ok(());
+            }
             let label = if force {
                 "Full re-index"
             } else {

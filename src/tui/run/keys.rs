@@ -648,7 +648,8 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 
             // Background incremental re-index: pick up any files changed since last index.
             // Fire-and-forget — doesn't block the user's message from being sent.
-            {
+            // Off where startup said so (outside a git repo, $HOME, /).
+            if crate::rag::auto_index_refusal(&config.cwd, dirs::home_dir().as_deref()).is_none() {
                 let cwd = config.cwd.clone();
                 tokio::spawn(async move {
                     let _ = tokio::task::spawn_blocking(move || {

@@ -761,7 +761,12 @@ async fn run_loop(
     }
 
     // ── Background RAG indexing (incremental, non-blocking) ────────────────
-    {
+    // Only inside a git work tree, never $HOME or /: gitignore is what keeps
+    // local secrets out of the index, and a home directory is not a project.
+    if let Some(why) = crate::rag::auto_index_refusal(&config.cwd, dirs::home_dir().as_deref()) {
+        app.entries
+            .push(ChatEntry::system(format!("Code index off: {why}")));
+    } else {
         let cwd = config.cwd.clone();
         let tx2 = tx.clone();
         tokio::spawn(async move {

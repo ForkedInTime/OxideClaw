@@ -1366,16 +1366,14 @@ impl Config {
         )
     }
 
-    /// Path to the cache directory: `$XDG_CACHE_HOME/oxideclaw`, else
-    /// `~/.cache/oxideclaw`.
+    /// Path to the cache directory (XDG-aware): `$XDG_CACHE_HOME/oxideclaw`,
+    /// else `~/.cache/oxideclaw`. Only regenerable data (code indexes, the
+    /// update-check answer).
     pub fn cache_dir() -> PathBuf {
-        let base = match std::env::var_os("XDG_CACHE_HOME") {
-            Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
-            _ => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".cache"),
-        };
-        app_dir(&base)
+        cache_dir_in(
+            std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+            dirs::home_dir().as_deref(),
+        )
     }
 
     /// Path to the sessions directory
@@ -1813,6 +1811,15 @@ pub fn app_dir(base: &Path) -> PathBuf {
     new
 }
 
+/// `Config::cache_dir` for a given `$XDG_CACHE_HOME` and home directory. A
+/// relative or empty `$XDG_CACHE_HOME` is ignored, as the XDG spec requires.
+fn cache_dir_in(xdg: Option<&str>, home: Option<&Path>) -> PathBuf {
+    match xdg.map(Path::new).filter(|x| x.is_absolute()) {
+        Some(xdg) => app_dir(xdg),
+        None => app_dir(&home.unwrap_or(Path::new(".")).join(".cache")),
+    }
+}
+
 /// `OXIDECLAW_<suffix>`, or `RUSTYCLAW_<suffix>` if only the old name is set.
 pub fn app_env(suffix: &str) -> Option<String> {
     ENV_PREFIXES
@@ -1909,8 +1916,26 @@ fn compute_data_dir(
 
 #[cfg(test)]
 mod data_dir_tests {
-    use super::compute_data_dir;
+    use super::{cache_dir_in, compute_data_dir};
     use std::path::{Path, PathBuf};
+
+    /// The code index lives under `$XDG_CACHE_HOME/oxideclaw`, else
+    /// `~/.cache/oxideclaw`; a relative `$XDG_CACHE_HOME` is not honoured.
+    #[test]
+    fn cache_dir_is_xdg_cache_home_else_dot_cache() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            cache_dir_in(Some("/xdg/cache"), Some(home)),
+            PathBuf::from("/xdg/cache/oxideclaw")
+        );
+        for unset in [None, Some(""), Some("rel/cache")] {
+            assert_eq!(
+                cache_dir_in(unset, Some(home)),
+                PathBuf::from("/home/u/.cache/oxideclaw"),
+                "{unset:?}"
+            );
+        }
+    }
 
     /// No XDG set → always return the legacy claude_dir, even when it
     /// doesn't physically exist yet. This is the pre-XDG baseline and

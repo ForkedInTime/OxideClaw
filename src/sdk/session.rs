@@ -197,7 +197,7 @@ impl SdkSession {
         let rag_context = {
             let cwd = self.config.cwd.clone();
             let q = prompt.clone();
-            tokio::task::spawn_blocking(move || Self::retrieve_rag_context(&cwd, &q))
+            tokio::task::spawn_blocking(move || rag::auto_context(None, &cwd, &q))
                 .await
                 .unwrap_or_default()
         };
@@ -975,66 +975,6 @@ impl SdkSession {
         }
     }
 
-    /// Retrieve relevant code context from the local RAG index.
-    /// Returns a formatted context block, or empty string on any failure.
-    fn retrieve_rag_context(cwd: &std::path::Path, user_input: &str) -> String {
-        // Opening would create the index; only a TUI run or /index builds it.
-        let db = match rag::RagDb::open_existing(cwd) {
-            Ok(Some(db)) => db,
-            _ => return String::new(),
-        };
-
-        if db.chunk_count().unwrap_or(0) == 0 {
-            return String::new();
-        }
-
-        // Only the TUI indexes on its own; without this, print/SDK/ACP turns
-        // inject whatever a past TUI run stored, including deleted files and
-        // code this session already edited. Incremental, so cheap when idle.
-        if let Err(e) = rag::indexer::index_project(&db, cwd, false) {
-            debug!("RAG refresh failed: {e}");
-        }
-
-        let results = match rag::search::search(&db, user_input, 20) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("RAG search failed: {e}");
-                return String::new();
-            }
-        };
-
-        if results.is_empty() {
-            return String::new();
-        }
-
-        // Filter by relevance threshold (FTS5 rank is negative; closer to 0 = more relevant)
-        let top_rank = results[0].rank;
-        let threshold = if top_rank < -5.0 {
-            top_rank * 0.3
-        } else {
-            top_rank * 0.5
-        };
-        let filtered: Vec<_> = results
-            .into_iter()
-            .filter(|r| r.rank <= threshold || r.rank <= top_rank * 0.8)
-            .take(10)
-            .collect();
-
-        if filtered.is_empty() {
-            return String::new();
-        }
-
-        let context = rag::search::build_context(&filtered, 12288);
-        if !context.is_empty() {
-            debug!(
-                "RAG injected {} results ({} chars)",
-                filtered.len(),
-                context.len()
-            );
-        }
-        context
-    }
-
     /// Send a notification, ignoring channel errors (host may have disconnected).
     /// The user's hooks, unless `disableAllHooks` / `--bare` turned them off.
     fn hooks(&self) -> Option<&crate::settings::HooksConfig> {
@@ -1155,8 +1095,10 @@ mod cancel_tests {
     #[test]
     fn rag_context_sees_files_added_after_the_index_was_built() {
         let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join("old.rs"), "fn unrelated_helper() {}\n").unwrap();
-        let db = rag::RagDb::open(dir.path()).unwrap();
+        let db = rag::RagDb::open_in(index.path(), dir.path()).unwrap();
         rag::indexer::index_project(&db, dir.path(), true).unwrap();
         drop(db);
 
@@ -1165,15 +1107,20 @@ mod cancel_tests {
             "/// Compute the invoice total.\nfn compute_invoice_total() -> u32 { 0 }\n",
         )
         .unwrap();
-        let ctx = SdkSession::retrieve_rag_context(dir.path(), "compute invoice total");
+        let ctx = rag::auto_context(Some(index.path()), dir.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
     }
 
     #[test]
     fn rag_context_does_not_create_an_index_in_an_unindexed_project() {
         let dir = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        // A work tree, so auto-indexing is allowed and only "no index yet"
+        // keeps the context empty.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn compute() {}\n").unwrap();
-        assert!(SdkSession::retrieve_rag_context(dir.path(), "compute").is_empty());
+        assert!(rag::auto_context(Some(index.path()), dir.path(), "compute").is_empty());
+        assert_eq!(std::fs::read_dir(index.path()).unwrap().count(), 0);
         assert!(!dir.path().join(".claude").exists());
     }
 
