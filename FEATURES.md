@@ -163,7 +163,7 @@ Each provider reads only its own variable, so your OpenAI key is never sent to G
 | `/mcp add [--scope local\|project\|user] <name> <command\|url> [args...]` | Add an MCP server (stdio command or HTTP URL), local scope by default |
 | `/mcp remove [--scope <s>] <name>` | Remove a server; `--scope` is needed when the name is in more than one scope |
 | `/mcp get <name>` | Show a server's config in every scope that defines it |
-| `/mcp enable\|disable <name>` | Toggle the entry that starts |
+| `/mcp enable\|disable <name>` | Toggle the entry that starts; a project entry is refused, since `.mcp.json` is shared (override it with a local one) |
 | `/mcp tools` | List tools per MCP server |
 
 **MCP scopes.** `oxideclaw mcp add` and `/mcp add` keep a server in one of three scopes; `mcp list`, `mcp get` and `mcp remove` show and take the scope.

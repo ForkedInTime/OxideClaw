@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before them, end the list with `--` or write `--allowed-tools=<list>`.
   Bare `--allowed-tools` names beside `--tools` are an error, and
   `oxideclaw browse` now honours both flags.
+- **MCP scopes.** `/mcp add`, like `oxideclaw mcp add`, now defaults to the
+  private local scope (a file under the config dir for this project only)
+  instead of the global `settings.json`, so a server added in one project no
+  longer appears in the others; `--scope user` keeps it in every project.
+  `--scope project` writes the repo's `.mcp.json` instead of
+  `.claude/settings.json` and refuses literal `-e` values or headers unless
+  `--force` (`${VAR}` references pass). `mcp list` and `mcp get` show each
+  server's scope; `mcp remove` asks for `--scope` when a name is in more
+  than one scope instead of deleting every copy. `/mcp enable|disable`
+  refuses a project-scope server rather than editing the shared
+  `.mcp.json`.
 - **Auto-fix runs only in trusted projects.** Lint and test commands run the
   project's own code (`build.rs`, `conftest.py`, npm scripts), so a folder
   you have not `/trust`ed now runs none of them and says so once. In a

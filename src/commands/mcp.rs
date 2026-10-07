@@ -288,7 +288,7 @@ pub(super) fn mcp_set_disabled(
             if disabled { "disabled" } else { "enabled" }
         )),
         Ok(None) => CommandAction::Message(format!("MCP server '{name}' not found.")),
-        Err(e) => CommandAction::Message(format!("Failed to write settings: {e}")),
+        Err(e) => CommandAction::Message(format!("{e:#}")),
     }
 }
 

@@ -14,7 +14,7 @@
 use crate::config::{read_json_object, write_json_atomic};
 use crate::mcp::types::McpServerConfig;
 use crate::settings::Settings;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,23 +215,23 @@ pub fn add(
     Ok(path)
 }
 
-/// Scopes whose files define `name`.
-fn scopes_defining(name: &str, cwd: &Path, config_dir: &Path) -> Result<Vec<Scope>> {
-    let mut found = Vec::new();
-    for scope in Scope::ALL {
-        for path in scope.files(cwd, config_dir) {
-            if path.exists()
-                && read_json_object(&path)?
-                    .get("mcpServers")
-                    .and_then(|m| m.get(name))
-                    .is_some()
-            {
-                found.push(scope);
-                break;
-            }
-        }
-    }
-    Ok(found)
+/// The files that define `name`, with their scope, in `Scope::ALL` order. A
+/// file that cannot be read or parsed is skipped, as `list` skips it, so a
+/// broken (or hostile) `.mcp.json` does not block removing a local server.
+fn files_defining(name: &str, cwd: &Path, config_dir: &Path) -> Vec<(Scope, PathBuf)> {
+    Scope::ALL
+        .into_iter()
+        .flat_map(|scope| {
+            scope
+                .files(cwd, config_dir)
+                .into_iter()
+                .map(move |p| (scope, p))
+        })
+        .filter(|(_, path)| {
+            read_json_object(path)
+                .is_ok_and(|json| json.get("mcpServers").and_then(|m| m.get(name)).is_some())
+        })
+        .collect()
 }
 
 /// Remove `name` from `scope`, or with no scope from the one scope that
@@ -244,22 +244,27 @@ pub fn remove(
     cwd: &Path,
     config_dir: &Path,
 ) -> Result<Option<Scope>> {
-    let scope = match scope {
-        Some(s) => s,
-        None => match scopes_defining(name, cwd, config_dir)?.as_slice() {
-            [] => return Ok(None),
-            [one] => *one,
-            many => anyhow::bail!(
-                "'{name}' is defined in the {} scopes; pass --scope to pick one",
-                many.iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" and ")
-            ),
-        },
+    let (scope, paths) = match scope {
+        Some(s) => (s, s.files(cwd, config_dir)),
+        None => {
+            let found = files_defining(name, cwd, config_dir);
+            let mut scopes: Vec<Scope> = found.iter().map(|(s, _)| *s).collect();
+            scopes.dedup();
+            match scopes.as_slice() {
+                [] => return Ok(None),
+                [one] => (*one, found.into_iter().map(|(_, p)| p).collect()),
+                many => anyhow::bail!(
+                    "'{name}' is defined in the {} scopes; pass --scope to pick one",
+                    many.iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ),
+            }
+        }
     };
     let mut removed = false;
-    for path in scope.files(cwd, config_dir) {
+    for path in paths {
         if !path.exists() {
             continue;
         }
@@ -276,7 +281,9 @@ pub fn remove(
 
 /// Set or clear `disabled` on the entry of `name` that startup uses (the
 /// highest-precedence one that loads, else the highest of any). Returns the
-/// scope and file changed; `None` if no scope defines it.
+/// scope and file changed; `None` if no scope defines it. A project-scope
+/// entry is refused: `.mcp.json` is shared, so the flag would switch the
+/// server off (or on) for everyone with the repo.
 pub fn set_disabled(
     name: &str,
     disabled: bool,
@@ -294,6 +301,14 @@ pub fn set_disabled(
     else {
         return Ok(None);
     };
+    if target.scope == Scope::Project {
+        anyhow::bail!(
+            "'{name}' is in the shared {}, so this would change it for everyone with \
+             the repo. Edit that file, or add a local server named '{name}' to \
+             override it for yourself.",
+            target.path.display()
+        );
+    }
     let mut json = read_json_object(&target.path)?;
     let Some(entry) = json
         .get_mut("mcpServers")
@@ -307,7 +322,8 @@ pub fn set_disabled(
     } else {
         entry.remove("disabled");
     }
-    write_json_atomic(&target.path, &serde_json::to_string_pretty(&json)?)?;
+    write_json_atomic(&target.path, &serde_json::to_string_pretty(&json)?)
+        .with_context(|| format!("failed to write {}", target.path.display()))?;
     Ok(Some((target.scope, target.path.clone())))
 }
 
@@ -577,6 +593,75 @@ mod tests {
         assert!(list(r, h).is_empty());
         let left = read_json_object(&r.join(".claude/settings.json")).unwrap();
         assert_eq!(left["model"], "m");
+    }
+
+    /// Without --scope, `remove` looks through every scope's files. A repo's
+    /// `.mcp.json` linked to /dev/zero used to be read until memory ran out,
+    /// and an unparseable one failed the removal of a local-only server.
+    #[cfg(unix)]
+    #[test]
+    fn remove_without_scope_skips_a_hostile_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (r, h) = (repo.path(), home.path());
+        let mcp_json = r.join(".mcp.json");
+        add("gh", stdio(&[]), Scope::Local, r, h, false).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &mcp_json).unwrap();
+        assert_eq!(remove("gh", None, r, h).unwrap(), Some(Scope::Local));
+        assert!(list(r, h).is_empty());
+
+        // Named explicitly, the file is refused rather than read.
+        let err = remove("gh", Some(Scope::Project), r, h)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(mcp_json.is_symlink());
+    }
+
+    #[test]
+    fn remove_without_scope_skips_an_invalid_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (r, h) = (repo.path(), home.path());
+        add("gh", stdio(&[]), Scope::Local, r, h, false).unwrap();
+        std::fs::write(r.join(".mcp.json"), "{ not json").unwrap();
+        assert_eq!(remove("gh", None, r, h).unwrap(), Some(Scope::Local));
+        assert_eq!(
+            std::fs::read_to_string(r.join(".mcp.json")).unwrap(),
+            "{ not json"
+        );
+    }
+
+    /// `.mcp.json` is shared: a `disabled` flag written there would turn a
+    /// team server off for everyone with the repo.
+    #[test]
+    fn disable_leaves_the_shared_project_file_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (r, h) = (repo.path(), home.path());
+        add("team", stdio(&[]), Scope::Project, r, h, false).unwrap();
+        let mcp_json = r.join(".mcp.json");
+        let before = std::fs::read(&mcp_json).unwrap();
+
+        // Untrusted, project only: the project entry is the only target.
+        let err = set_disabled("team", true, r, h).unwrap_err().to_string();
+        assert!(
+            err.contains("shared") && err.contains("local server"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&mcp_json).unwrap(), before);
+
+        // Trusted, the project entry wins over a user one: still refused.
+        trust(h, r);
+        add("team", stdio(&[]), Scope::User, r, h, false).unwrap();
+        assert!(set_disabled("team", true, r, h).is_err());
+        assert_eq!(std::fs::read(&mcp_json).unwrap(), before);
+
+        // A local entry of the same name wins, and is the user's own.
+        add("team", stdio(&[]), Scope::Local, r, h, false).unwrap();
+        let (scope, _) = set_disabled("team", true, r, h).unwrap().unwrap();
+        assert_eq!(scope, Scope::Local);
+        assert_eq!(std::fs::read(&mcp_json).unwrap(), before);
     }
 
     #[test]

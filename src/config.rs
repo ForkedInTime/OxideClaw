@@ -2062,17 +2062,18 @@ fn legacy_autonomy_notice(value: &str, source: &str) -> Option<String> {
 /// writing back `{}` plus one key would silently delete the user's config.
 /// A leading BOM (Notepad, PowerShell 5.1) is skipped, as the settings
 /// loader skips it; the file is written back without one.
+///
+/// Read with the loader's limits (a regular file of at most 1 MiB): callers
+/// such as `mcp remove` read a repo's `.mcp.json` and `.claude/settings.json`,
+/// which a hostile repo can link to `/dev/zero` or `/dev/tty`.
 pub fn read_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let text = crate::settings::read_config_file(path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}; not overwriting it", path.display()))?
+        .unwrap_or_default();
     if text.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    match serde_json::from_str::<serde_json::Value>(text) {
+    match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) if v.is_object() => Ok(v),
         Ok(_) => anyhow::bail!(
             "{} is not a JSON object; not overwriting it",
