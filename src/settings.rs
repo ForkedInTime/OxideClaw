@@ -236,6 +236,11 @@ pub struct Settings {
     #[serde(rename = "spinnerStyle")]
     pub spinner_style: Option<String>,
 
+    /// Check GitHub for a newer release once a day and say so in the TUI
+    /// (default true).
+    #[serde(rename = "updateCheck")]
+    pub update_check: Option<bool>,
+
     /// Whether bwrap sandbox allows outbound network (default true).
     #[serde(rename = "sandboxAllowNetwork")]
     pub sandbox_allow_network: Option<bool>,
@@ -977,6 +982,12 @@ impl Settings {
             tts_voice_model: other.tts_voice_model.or(self.tts_voice_model),
             notifications_enabled: other.notifications_enabled.or(self.notifications_enabled),
             spinner_style: other.spinner_style.or(self.spinner_style),
+            // An opt-out in any layer holds: a cloned repo's settings must
+            // not turn back on the network call the user switched off.
+            update_check: match (self.update_check, other.update_check) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (a, b) => b.or(a),
+            },
             sandbox_allow_network: other.sandbox_allow_network.or(self.sandbox_allow_network),
             disable_skill_shell_execution: other
                 .disable_skill_shell_execution
@@ -1527,6 +1538,27 @@ mod project_trust_tests {
         assert!(!Settings::is_trusted(&global, &canonical));
         assert!(!Settings::remove_trusted(&mut list, &canonical));
         assert_eq!(list, vec![other]);
+    }
+
+    /// `"updateCheck": false` in any layer turns the network call off; a
+    /// project cannot turn back on what the user switched off.
+    #[test]
+    fn an_update_check_opt_out_in_any_layer_holds() {
+        let off: Settings = serde_json::from_value(serde_json::json!({ "updateCheck": false }))
+            .expect("updateCheck parses");
+        let on: Settings = serde_json::from_value(serde_json::json!({ "updateCheck": true }))
+            .expect("updateCheck parses");
+        for trusted in [true, false] {
+            let user_off = Settings::merge_with_trust(off.clone(), on.clone(), None, trusted);
+            assert_eq!(user_off.update_check, Some(false), "trusted={trusted}");
+            let project_off = Settings::merge_with_trust(on.clone(), off.clone(), None, trusted);
+            assert_eq!(project_off.update_check, Some(false), "trusted={trusted}");
+        }
+        let neither = Settings::merge_with_trust(Settings::default(), on, None, false);
+        assert_eq!(neither.update_check, Some(true));
+        let unset =
+            Settings::merge_with_trust(Settings::default(), Settings::default(), None, true);
+        assert_eq!(unset.update_check, None, "unset means the default (on)");
     }
 }
 

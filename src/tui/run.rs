@@ -748,6 +748,9 @@ async fn run_loop(
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut term_events = EventStream::new();
 
+    // Daily update notice. Runs detached; the first frame never waits on it.
+    crate::update_check::spawn(&config, tx.clone());
+
     // ttsEnabled persists across launches but /quit stops the server, so a
     // new session must start it like `/voice speak on` does.
     if config.tts_enabled

@@ -27,6 +27,7 @@ mod skills;
 mod spawn;
 mod tools;
 mod tui;
+mod update_check;
 mod voice;
 mod watch;
 
@@ -1361,6 +1362,32 @@ fn interactive_prompt(words: &[String]) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// The GitHub releases `oxideclaw update` installs from. The TUI's daily
+/// update notice reads the same source.
+fn release_updater() -> self_update::backends::github::UpdateBuilder {
+    let mut builder = self_update::backends::github::Update::configure();
+    builder
+        .repo_owner("ForkedInTime")
+        .repo_name("OxideClaw")
+        .bin_name("oxideclaw")
+        .current_version(VERSION);
+    builder
+}
+
+/// The newest published release's version (`0.4.1`, no `v`). Blocking; the
+/// whole request, DNS included, gives up after `timeout`. Proxies come from
+/// `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`, as for `oxideclaw update`.
+fn latest_release_version(timeout: std::time::Duration) -> Result<String> {
+    let releases = release_updater()
+        .timeout(timeout)
+        .build()?
+        .get_latest_release()?;
+    let latest = releases
+        .latest()
+        .ok_or_else(|| anyhow::anyhow!("no release published"))?;
+    Ok(latest.version().to_string())
+}
+
 /// Self-update: download the latest release from GitHub and replace the running binary.
 async fn self_update() -> Result<()> {
     println!("Checking for updates…");
@@ -1369,11 +1396,7 @@ async fn self_update() -> Result<()> {
     let target = self_update_target();
     println!("Platform: {target}");
 
-    let status = self_update::backends::github::Update::configure()
-        .repo_owner("ForkedInTime")
-        .repo_name("OxideClaw")
-        .bin_name("oxideclaw")
-        .current_version(VERSION)
+    let status = release_updater()
         .target(&target)
         .asset_matcher(move |assets| pick_release_asset(assets, &target))
         .show_download_progress(true)

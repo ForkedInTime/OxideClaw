@@ -395,6 +395,9 @@ pub struct Config {
     /// Spinner style: "themed" (default), "minimal", or "silent".
     pub spinner_style: String,
 
+    /// The TUI checks for a newer release once a day (`updateCheck`).
+    pub update_check: bool,
+
     /// Whether bwrap sandbox allows outbound network access.
     pub sandbox_allow_network: bool,
 
@@ -530,6 +533,7 @@ impl Default for Config {
             watch_markers: vec!["AI:".into(), "AGENT:".into()],
             notifications_enabled: false,
             spinner_style: "themed".to_string(),
+            update_check: true,
             sandbox_allow_network: true,
             disable_skill_shell_execution: false,
             router_enabled: false,
@@ -803,6 +807,7 @@ impl Config {
             browse_default_policy: new.browse_default_policy,
             notifications_enabled: new.notifications_enabled,
             spinner_style: new.spinner_style,
+            update_check: new.update_check,
             sandbox_allow_network: new.sandbox_allow_network,
             disable_skill_shell_execution: new.disable_skill_shell_execution,
             router_enabled: new.router_enabled,
@@ -973,6 +978,7 @@ impl Config {
         if let Some(style) = settings.spinner_style {
             self.spinner_style = style;
         }
+        self.update_check = settings.update_check.unwrap_or(true);
         self.sandbox_allow_network = settings.sandbox_allow_network.unwrap_or(true);
         self.disable_skill_shell_execution =
             settings.disable_skill_shell_execution.unwrap_or(false);
@@ -1360,13 +1366,16 @@ impl Config {
         )
     }
 
-    /// Path to the cache directory (XDG-aware).
-    #[allow(dead_code)] // available for RAG cache, session cache, etc.
+    /// Path to the cache directory: `$XDG_CACHE_HOME/oxideclaw`, else
+    /// `~/.cache/oxideclaw`.
     pub fn cache_dir() -> PathBuf {
-        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-            return app_dir(Path::new(&xdg));
-        }
-        Self::claude_dir().join("cache")
+        let base = match std::env::var_os("XDG_CACHE_HOME") {
+            Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+            _ => dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache"),
+        };
+        app_dir(&base)
     }
 
     /// Path to the sessions directory
