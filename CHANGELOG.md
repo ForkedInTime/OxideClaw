@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `browse` never check.
 - **Verifiable releases.** Every release carries a `SHA256SUMS` file and
   Sigstore build-provenance attestations (`gh attestation verify`). Releases
-  stay drafts until the Linux binaries have started on Debian 10 and Rocky
-  Linux 8 (glibc 2.28), Ubuntu 22.04, Debian 12, Rocky Linux 9 and Alpine.
+  stay drafts until the Linux x86_64 binaries (gnu and musl) have started on
+  Debian 10 and Rocky Linux 8 (glibc 2.28), Ubuntu 22.04, Debian 12, Rocky
+  Linux 9 and Alpine.
 
 ### Changed
 

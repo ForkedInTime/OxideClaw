@@ -26,12 +26,16 @@ jobs:
 
       - name: Resolve version
         id: v
+        # Through env, never `${{ }}` in the script: the input is text the
+        # shell would otherwise run, and a comma would inject extra tags.
+        env:
+          VERSION: ${{ github.event.inputs.version }}
         run: |
-          v="${{ github.event.inputs.version }}"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          tags="ghcr.io/forkedintime/oxideclaw:$v"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::bad version: $VERSION"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          tags="ghcr.io/forkedintime/oxideclaw:$VERSION"
           # A pre-release must not move :latest under stable users.
-          [[ "$v" == *-* ]] || tags="$tags,ghcr.io/forkedintime/oxideclaw:latest"
+          [[ "$VERSION" == *-* ]] || tags="$tags,ghcr.io/forkedintime/oxideclaw:latest"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR

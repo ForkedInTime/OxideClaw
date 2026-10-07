@@ -1094,9 +1094,6 @@ mod tests {
         assert!(err.contains("/spawn kill"), "{err}");
     }
 
-    /// A conflicting merge must not leave the user's checkout mid-merge, and
-    /// must not throw away the worktree, branch and registry entry the user
-    /// would need to resolve it by hand.
     /// main repo with one commit, plus a worktree on `branch` holding an
     /// uncommitted new file.
     async fn repo_with_agent_worktree(tmp: &std::path::Path, branch: &str) -> (PathBuf, PathBuf) {
@@ -1157,6 +1154,9 @@ mod tests {
         );
     }
 
+    /// A conflicting merge must not leave the user's checkout mid-merge, and
+    /// must not throw away the worktree, branch and registry entry the user
+    /// would need to resolve it by hand.
     #[tokio::test]
     async fn a_failed_merge_aborts_cleanly_and_keeps_the_agents_work() {
         let tmp = tempfile::tempdir().unwrap();

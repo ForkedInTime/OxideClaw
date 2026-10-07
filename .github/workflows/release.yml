@@ -25,7 +25,7 @@ concurrency:
 
 # Flow: build -> release (draft, SHA256SUMS, provenance attestations) ->
 # smoke (run the draft's Linux x64 assets on old and new distros) -> publish.
-# Users and docker.yml only ever see a release whose binaries started.
+# Users and docker.yml only ever see a release whose Linux x64 binaries started.
 jobs:
   build:
     strategy:

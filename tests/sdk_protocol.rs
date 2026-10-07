@@ -183,7 +183,13 @@ fn test_health_check_response_serialize() {
 #[test]
 fn test_protocol_doc_lists_exactly_the_sent_error_codes() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let doc = std::fs::read_to_string(root.join("sdk/protocol.md")).unwrap();
+    // Cargo.toml excludes sdk/ from the crates.io package; a source checkout
+    // (which has .git) must still have the doc.
+    let doc = match std::fs::read_to_string(root.join("sdk/protocol.md")) {
+        Ok(doc) => doc,
+        Err(e) if root.join(".git").exists() => panic!("sdk/protocol.md: {e}"),
+        Err(_) => return,
+    };
     let mut documented = std::collections::BTreeSet::new();
     let mut in_codes = false;
     for line in doc.lines() {

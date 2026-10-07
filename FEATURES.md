@@ -494,7 +494,6 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 |---------|---------|----------|
 | Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md`) | `~/.claude/` (the same directory Claude Code uses) | `$CLAUDE_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` when `$XDG_CONFIG_HOME` is set and that directory exists or `~/.claude` does not |
 | Sessions | `<config dir>/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/` when `$XDG_DATA_HOME` is set and `$XDG_DATA_HOME/oxideclaw/` exists or `<config dir>/sessions/` does not |
-| Code index (cache) | `~/.cache/oxideclaw/rag/` | `$XDG_CACHE_HOME/oxideclaw/rag/` |
 | Cache: code index (`rag/`) and the update-check answer | `~/.cache/oxideclaw/` | `$XDG_CACHE_HOME/oxideclaw/` (an absolute path; a relative one is ignored) |
 | Project memories (`/memory`) | `<project>/.claude/memory.db`, created on first use | — |
 
