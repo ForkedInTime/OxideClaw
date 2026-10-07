@@ -466,7 +466,7 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         // `target_text` is what we match against `button_patterns`. For refs,
         // resolve to the element's accessible name via the browser session's
         // ref-name map; otherwise fall back to the identifier.
-        let (mut target_text, visible_prices, client) =
+        let (mut target_text, cached_text, client) =
             if let Some(session_arc) = &self.browser_session {
                 let session = session_arc.lock().await;
                 let name = session
@@ -475,20 +475,42 @@ impl ToolMiddleware for ApprovalGateMiddleware {
                     .unwrap_or_else(|| ref_or_selector.clone());
                 (
                     name,
-                    self.gate.visible_prices_in(&session.last_page_text),
+                    session.last_page_text.clone(),
                     session.client().ok().cloned(),
                 )
             } else {
-                (ref_or_selector.clone(), Vec::new(), None)
+                (ref_or_selector.clone(), String::new(), None)
             };
+        // Prices come from the page's DOM as it is now, not from the last
+        // snapshot: a fill, key press or script may have changed it since
+        // (a total appearing, a redirect to checkout). Bounded like
+        // live_url; on failure the last snapshot's text is used.
+        let page_text = match &client {
+            Some(c) => match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::browser::snapshot::read_page_text(c),
+            )
+            .await
+            {
+                Ok(Ok(text)) => {
+                    if let Some(s) = &self.browser_session {
+                        s.lock().await.last_page_text = text.clone();
+                    }
+                    text
+                }
+                _ => cached_text,
+            },
+            None => cached_text,
+        };
+        let visible_prices = self.gate.visible_prices_in(&page_text);
         // Enter/Space press whatever has focus, which the input does not
         // name. Ask the page, bounded like live_url; on failure keep the old
         // behaviour rather than wedge the loop.
         if is_activating_key
-            && let Some(c) = client
+            && let Some(c) = &client
             && let Ok(Some(label)) = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                crate::browser::actions::active_element_label(&c, is_submit_key),
+                crate::browser::actions::active_element_label(c, is_submit_key),
             )
             .await
         {
@@ -970,6 +992,122 @@ mod price_signal_tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    /// As `fake_cdp`, with `nodes` as the page's accessibility tree.
+    async fn fake_cdp_page(href: &'static str, nodes: serde_json::Value) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let cmd: serde_json::Value = serde_json::from_str(&t).unwrap();
+                let result = match cmd["method"].as_str() {
+                    Some("Runtime.evaluate") => {
+                        json!({"result": {"type": "string", "value": href}})
+                    }
+                    Some("Accessibility.getFullAXTree") => json!({ "nodes": nodes }),
+                    _ => json!({}),
+                };
+                let reply = json!({"id": cmd["id"], "result": result}).to_string();
+                if ws.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Prompts a pattern-policy gate on a live (fake) page raises for one
+    /// call, the cached page text being `cached`.
+    async fn prompts_on_page(
+        nodes: serde_json::Value,
+        cached: &str,
+        tool: &str,
+        input: serde_json::Value,
+        name: &str,
+    ) -> Vec<String> {
+        let session = Arc::new(tokio::sync::Mutex::new(
+            crate::browser::BrowserSession::default(),
+        ));
+        {
+            let mut s = session.lock().await;
+            s.connect(&fake_cdp_page("https://shop.example/cart", nodes).await)
+                .await
+                .unwrap();
+            s.last_page_text = cached.into();
+            s.set_refs_with_names(
+                std::collections::HashMap::from([("@e1".to_string(), 1i64)]),
+                std::collections::HashMap::from([("@e1".to_string(), name.to_string())]),
+            );
+        }
+        let (tx, mut rx) = mpsc::channel::<ApprovalPrompt>(8);
+        let mw = ApprovalGateMiddleware::new(
+            ApprovalGate::default(),
+            BrowsePolicy::Pattern,
+            Arc::new(tokio::sync::Mutex::new("https://shop.example/cart".into())),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            false,
+        )
+        .with_browser_session(Some(session));
+        let host = tokio::spawn(async move {
+            let mut reasons = Vec::new();
+            while let Some(p) = rx.recv().await {
+                reasons.push(p.reason.clone());
+                let _ = p.reply.send(true);
+            }
+            reasons
+        });
+        mw.before_tool(tool, &input).await;
+        drop(mw);
+        host.await.unwrap()
+    }
+
+    /// The price signal read the last snapshot's text, which held no page
+    /// text at all and goes stale as soon as a fill or script changes the
+    /// page. It reads the DOM's text nodes at decision time.
+    #[tokio::test]
+    async fn the_price_signal_reads_the_pages_text_nodes() {
+        let nodes = json!([
+            {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": "Cart"}},
+            {"nodeId": "2", "parentId": "1", "role": {"value": "StaticText"},
+             "name": {"value": "Total due today: $49.99"}},
+            {"nodeId": "3", "parentId": "1", "backendDOMNodeId": 1,
+             "role": {"value": "button"}, "name": {"value": "Continue"}},
+        ]);
+        let reasons = prompts_on_page(
+            nodes,
+            "Your cart is empty",
+            "browser_click",
+            json!({"ref": "@e1"}),
+            "Continue",
+        )
+        .await;
+        assert_eq!(reasons, vec!["visible_price: $49.99".to_string()]);
+    }
+
+    /// Only the page's own text counts: a price the model types into a
+    /// search box is not a price on the page.
+    #[tokio::test]
+    async fn a_price_the_model_types_is_not_a_page_price() {
+        let nodes = json!([
+            {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": "Shop"}},
+            {"nodeId": "2", "parentId": "1", "backendDOMNodeId": 1,
+             "role": {"value": "searchbox"}, "name": {"value": "Search"}},
+        ]);
+        let reasons = prompts_on_page(
+            nodes,
+            "",
+            "browser_fill",
+            json!({"ref": "@e1", "value": "headphones under $12.99"}),
+            "Search",
+        )
+        .await;
+        assert!(reasons.is_empty(), "{reasons:?}");
     }
 
     /// browser_navigate recorded the requested URL, so after a redirect to

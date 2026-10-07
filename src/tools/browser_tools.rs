@@ -112,7 +112,8 @@ impl Tool for BrowserNavigateTool {
     }
     fn description(&self) -> &str {
         "Navigate the browser to a URL. Launches the browser if not already running. \
-         Returns the page title and an accessibility snapshot."
+         Returns the page title and an accessibility snapshot with the page's text, \
+         fenced as untrusted page content."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
@@ -147,14 +148,14 @@ impl Tool for BrowserNavigateTool {
         // Snapshot afterwards. This also uses the client, not the session,
         // so still no session lock held.
         let tree = match browser::snapshot::take_snapshot(&client).await {
-            Ok((tree, refs, names)) => {
+            Ok(snap) => {
                 // Brief re-lock to publish the post-navigation state.
                 let mut session = self.session.lock().await;
                 session.current_url = final_url.clone();
                 session.current_title = title.clone();
-                session.set_refs_with_names(refs, names);
-                session.last_page_text = tree.clone();
-                tree
+                session.set_refs_with_names(snap.refs, snap.names);
+                session.last_page_text = snap.page_text;
+                snap.tree
             }
             Err(e) => {
                 // Snapshot failed (e.g. page still settling). Still publish
@@ -162,6 +163,7 @@ impl Tool for BrowserNavigateTool {
                 let mut session = self.session.lock().await;
                 session.current_url = final_url.clone();
                 session.current_title = title.clone();
+                session.last_page_text.clear();
                 format!("(snapshot unavailable: {e})")
             }
         };
@@ -171,8 +173,13 @@ impl Tool for BrowserNavigateTool {
             Some(code) => format!("\nStatus: {code}"),
             None => String::new(),
         };
+        // The title is the page's too, so it goes inside the fence.
+        let page = browser::snapshot::wrap_untrusted(&format!(
+            "Title: {}\n\nAccessibility snapshot:\n{tree}",
+            title.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
         Ok(ToolOutput::success(format!(
-            "Navigated to: {final_url}\nTitle: {title}{status}{dialogs}\n\nAccessibility snapshot:\n{tree}"
+            "Navigated to: {final_url}{status}{dialogs}\n\n{page}"
         )))
     }
 }
@@ -190,7 +197,8 @@ impl Tool for BrowserSnapshotTool {
     }
     fn description(&self) -> &str {
         "Capture a fresh accessibility snapshot of the current page. \
-         Returns a text tree with @eN refs you can pass to browser_click/browser_fill/etc."
+         Returns a text tree with @eN refs you can pass to browser_click/browser_fill/etc., \
+         plus the page's text, fenced as untrusted page content."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
@@ -202,19 +210,21 @@ impl Tool for BrowserSnapshotTool {
     async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         let client = clone_client(&self.session).await?;
         browser::actions::ensure_page_allowed(&client).await?;
-        let (tree, refs, names) = browser::snapshot::take_snapshot(&client).await?;
+        let snap = browser::snapshot::take_snapshot(&client).await?;
         // A redirect or JS navigation may have moved the page since the last
         // tool recorded its URL.
         let live_url = browser::actions::current_url(&client).await;
         {
             let mut s = self.session.lock().await;
-            s.set_refs_with_names(refs, names);
-            s.last_page_text = tree.clone();
+            s.set_refs_with_names(snap.refs, snap.names);
+            s.last_page_text = snap.page_text;
             if let Some(u) = live_url {
                 s.current_url = u;
             }
         }
-        Ok(ToolOutput::success(tree))
+        Ok(ToolOutput::success(browser::snapshot::wrap_untrusted(
+            &snap.tree,
+        )))
     }
 }
 
@@ -266,13 +276,16 @@ impl Tool for BrowserClickTool {
         // away mid-click), report that as a soft warning rather than
         // losing the successful click result.
         let trailer = match browser::snapshot::take_snapshot(&client).await {
-            Ok((tree, refs, names)) => {
+            Ok(snap) => {
                 {
                     let mut s = self.session.lock().await;
-                    s.set_refs_with_names(refs, names);
-                    s.last_page_text = tree.clone();
+                    s.set_refs_with_names(snap.refs, snap.names);
+                    s.last_page_text = snap.page_text;
                 }
-                format!("\n\nUpdated snapshot:\n{tree}")
+                format!(
+                    "\n\nUpdated snapshot:\n{}",
+                    browser::snapshot::wrap_untrusted(&snap.tree)
+                )
             }
             Err(e) => format!("\n\n(snapshot unavailable: {e})"),
         };
@@ -402,7 +415,8 @@ impl Tool for BrowserGetTextTool {
         "browser_get_text"
     }
     fn description(&self) -> &str {
-        "Read the inner text / textContent of an element identified by an @eN ref."
+        "Read the inner text / textContent of an element identified by an @eN ref. \
+         The text is fenced as untrusted page content."
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({
@@ -419,7 +433,9 @@ impl Tool for BrowserGetTextTool {
         browser::actions::ensure_page_allowed(&client).await?;
         let mut session = self.session.lock().await;
         let text = browser::actions::get_text(&mut session, element_ref).await?;
-        Ok(ToolOutput::success(text))
+        Ok(ToolOutput::success(browser::snapshot::wrap_untrusted(
+            &text,
+        )))
     }
 }
 

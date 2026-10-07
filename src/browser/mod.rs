@@ -40,8 +40,8 @@ pub struct BrowserSession {
     ref_names: HashMap<String, String>,
     /// Current page URL
     pub current_url: String,
-    /// Text of the last snapshot / get_text, for the approval gate's
-    /// visible-price signal.
+    /// The page's text and element names from the last snapshot (DOM facts,
+    /// not the model's view), for the approval gate's visible-price signal.
     pub last_page_text: String,
     /// Current page title
     pub current_title: String,
@@ -189,6 +189,7 @@ impl BrowserSession {
         self.ref_names.clear();
         self.current_url.clear();
         self.current_title.clear();
+        self.last_page_text.clear();
     }
 
     /// Drain and return all console messages captured since the last call.

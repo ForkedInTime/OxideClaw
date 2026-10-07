@@ -50,6 +50,10 @@ WebFetch and WebBrowser run without an approval prompt, so a prompt-injected tur
 
 A name that does not resolve locally (split-horizon DNS where only the proxy can resolve it) can only be judged by its shape. It goes to the proxy only if it looks public: cloud metadata names (`metadata.google.internal`, `metadata`, `instance-data`, and `metadata.` or `instance-data.` under a local-network domain such as `instance-data.eu-west-1.compute.internal`) are always refused, and local-network names (single-label names, `localhost`, `.local`, `.internal`, `.lan`, `.corp`, `.home.arpa`, ...) only pass with `allowPrivateNetworkFetch: true`. For such names, and for what a public name resolves to at the proxy, **the proxy is treated as trusted egress**: if it can reach your internal network or a metadata service, restrict it there.
 
+### The `browser_*` tools (CDP browser)
+
+Snapshot and `browser_get_text` results put the page's text inside a fence labelled as untrusted page data, so instructions printed on a page are presented to the model as content, not commands. The approval gate's visible-price check reads the page's own text nodes at the moment it decides, never text the model supplies.
+
 ## Sandboxing
 
 OxideClaw supports multiple sandbox backends to limit tool execution:
