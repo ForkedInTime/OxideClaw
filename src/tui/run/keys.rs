@@ -284,27 +284,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     // Browse approval dialog takes priority after permission dialog
     if app.browse_approval.is_some() {
         match key.code {
-            Char('a') | Char('A') => {
-                if let Some(prompt) = app.browse_approval.take() {
-                    let _ = prompt.reply.send(true);
-                    app.entries.push(ChatEntry::system("  ✓ Approved"));
-                    app.scroll_to_bottom();
-                }
-            }
-            Char('d') | Char('D') => {
-                if let Some(prompt) = app.browse_approval.take() {
-                    let _ = prompt.reply.send(false);
-                    app.entries.push(ChatEntry::system("  ✗ Denied"));
-                    app.scroll_to_bottom();
-                }
-            }
-            KeyCode::Esc => {
-                if let Some(prompt) = app.browse_approval.take() {
-                    let _ = prompt.reply.send(false);
-                    app.entries.push(ChatEntry::system("  ✗ Cancelled"));
-                    app.scroll_to_bottom();
-                }
-            }
+            Char('a') | Char('A') => answer_browse_approval(app, true, "  ✓ Approved"),
+            Char('d') | Char('D') => answer_browse_approval(app, false, "  ✗ Denied"),
+            KeyCode::Esc => answer_browse_approval(app, false, "  ✗ Cancelled"),
             _ => {} // ignore other keys while prompt is active
         }
         return Ok(());
@@ -989,6 +971,23 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Send the user's answer to the pending browse approval. The gate stops
+/// listening after its 60 s window (denying the action) or once voice answered,
+/// so a failed send means this key changed nothing and must not say otherwise.
+fn answer_browse_approval(app: &mut App, approved: bool, label: &str) {
+    let Some(prompt) = app.browse_approval.take() else {
+        return;
+    };
+    if prompt.reply.send(approved).is_ok() {
+        app.entries.push(ChatEntry::system(label));
+    } else {
+        app.entries.push(ChatEntry::system(
+            "  ⚠ Approval prompt expired (timed out or answered by voice) — your key was not applied",
+        ));
+    }
+    app.scroll_to_bottom();
+}
+
 // ── Vim normal-mode key handler ───────────────────────────────────────────────
 
 /// Refuse a model call once /budget is spent, putting `unsent` back in the
@@ -1128,5 +1127,57 @@ mod vim_routing_tests {
             &app,
             &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
         ));
+    }
+}
+
+#[cfg(test)]
+mod browse_approval_key_tests {
+    use super::*;
+
+    fn prompt() -> (
+        crate::browser::approval_gate::ApprovalPrompt,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let prompt = crate::browser::approval_gate::ApprovalPrompt {
+            id: 1,
+            step: 1,
+            tool_name: "browser_click".into(),
+            target_text: "Buy".into(),
+            url: "https://example.com".into(),
+            reason: "submit".into(),
+            reply,
+        };
+        (prompt, rx)
+    }
+
+    fn last_entry(app: &App) -> String {
+        app.entries.last().unwrap().text.clone()
+    }
+
+    #[test]
+    fn approving_a_live_prompt_reports_approved() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (p, mut rx) = prompt();
+        app.browse_approval = Some(p);
+        answer_browse_approval(&mut app, true, "  ✓ Approved");
+        assert!(app.browse_approval.is_none());
+        assert!(rx.try_recv().unwrap());
+        assert!(last_entry(&app).contains("Approved"));
+    }
+
+    /// The gate timed out and dropped its receiver: the action was already
+    /// denied, so "Approved" would be a lie.
+    #[test]
+    fn approving_an_expired_prompt_does_not_claim_approval() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (p, rx) = prompt();
+        drop(rx);
+        app.browse_approval = Some(p);
+        answer_browse_approval(&mut app, true, "  ✓ Approved");
+        assert!(app.browse_approval.is_none());
+        let last = last_entry(&app);
+        assert!(!last.contains("✓ Approved"), "{last}");
+        assert!(last.contains("expired"), "{last}");
     }
 }

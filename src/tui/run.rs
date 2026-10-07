@@ -61,6 +61,23 @@ fn short_id(id: &str, n: usize) -> &str {
     }
 }
 
+/// Drop a browse approval prompt the gate no longer listens to. Kept, it
+/// stayed on screen and swallowed every key until a/d/Esc, then reported an
+/// answer that never reached the gate.
+fn expire_closed_browse_approval(app: &mut App) {
+    if app
+        .browse_approval
+        .as_ref()
+        .is_some_and(|p| p.reply.is_closed())
+    {
+        app.browse_approval = None;
+        app.entries.push(ChatEntry::system(
+            "  ⚠ Approval prompt expired (timed out or answered by voice)",
+        ));
+        app.scroll_to_bottom();
+    }
+}
+
 /// History after a background compaction of `base` finishes. The user may
 /// have sent turns meanwhile (kept after the summary) or switched, cleared,
 /// rewound or resumed the conversation (`None`: the summary would replace
@@ -1011,6 +1028,7 @@ async fn run_loop(
                         app.scroll_to_bottom();
                         app.finish_loading();
                         app.browse_approval_rx = None;
+                        app.browse_approval = None;
                         app.browse_cancel = None;
                         done = true;
                         break;
@@ -1041,8 +1059,10 @@ async fn run_loop(
                         )));
                         app.scroll_to_bottom();
                         app.finish_loading();
-                        // Clean up approval channel too
+                        // Clean up approval channel and any prompt the run
+                        // stopped waiting on.
                         app.browse_approval_rx = None;
+                        app.browse_approval = None;
                         done = true;
                         break;
                     }
@@ -1053,6 +1073,8 @@ async fn run_loop(
                 app.browse_progress_rx = Some(rx);
             }
         }
+
+        expire_closed_browse_approval(&mut app);
 
         // Poll browse approval prompts
         if let Some(mut rx) = app.browse_approval_rx.take() {
@@ -1849,6 +1871,43 @@ mod tty_handoff_tests {
         let back = String::from_utf8(back).unwrap();
         assert!(back.contains("\x1b[?2004h"), "{back:?}");
         assert!(back.contains("\x1b[?1003h"), "{back:?}");
+    }
+}
+
+#[cfg(test)]
+mod browse_approval_expiry_tests {
+    use super::*;
+
+    fn prompt() -> (
+        crate::browser::approval_gate::ApprovalPrompt,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let prompt = crate::browser::approval_gate::ApprovalPrompt {
+            id: 1,
+            step: 1,
+            tool_name: "browser_click".into(),
+            target_text: "Buy".into(),
+            url: "https://example.com".into(),
+            reason: "submit".into(),
+            reply,
+        };
+        (prompt, rx)
+    }
+
+    #[test]
+    fn prompt_is_dropped_once_the_gate_stops_waiting() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (p, rx) = prompt();
+        app.browse_approval = Some(p);
+        expire_closed_browse_approval(&mut app);
+        assert!(app.browse_approval.is_some(), "live prompt must stay");
+
+        drop(rx);
+        expire_closed_browse_approval(&mut app);
+        assert!(app.browse_approval.is_none());
+        let last = app.entries.last().unwrap().text.clone();
+        assert!(last.contains("expired"), "{last}");
     }
 }
 
