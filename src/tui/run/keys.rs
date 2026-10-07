@@ -74,17 +74,22 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 app.pending_undo_positions = None;
                 app.pending_redo_positions = None;
             }
-            KeyCode::Enter if is_interactive => {
+            // A digit picks row N exactly as Enter picks the highlighted
+            // row; the separate digit arm sent undo/redo labels to /resume.
+            KeyCode::Enter | KeyCode::Char('1'..='9') if is_interactive => {
                 let title = app
                     .overlay
                     .as_ref()
                     .map(|o| o.title.clone())
                     .unwrap_or_default();
-                let selected_index = app.overlay.as_ref().map(|o| o.selected).unwrap_or(0);
+                let selected_index = match key.code {
+                    KeyCode::Char(c) => (c as usize) - ('1' as usize),
+                    _ => app.overlay.as_ref().map(|o| o.selected).unwrap_or(0),
+                };
                 let selected_val = app
                     .overlay
                     .as_ref()
-                    .and_then(|o| o.selectable_ids.get(o.selected).cloned());
+                    .and_then(|o| o.selectable_ids.get(selected_index).cloned());
                 app.overlay = None;
                 if title == "undo" {
                     let positions = app.pending_undo_positions.take();
@@ -172,7 +177,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.pending_help_command = Some(val);
                     } else if title == "voices" {
                         app.pending_voice_model = Some(val);
-                    } else {
+                    } else if title == "sessions" {
                         app.pending_resume = Some(val);
                     }
                 }
@@ -180,35 +185,12 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             KeyCode::Enter => {
                 app.overlay = None;
             }
-            KeyCode::Char(c @ '1'..='9') if is_interactive => {
-                let idx = (c as usize) - ('1' as usize);
-                let title = app
-                    .overlay
-                    .as_ref()
-                    .map(|o| o.title.clone())
-                    .unwrap_or_default();
-                let selected_val = app
-                    .overlay
-                    .as_ref()
-                    .and_then(|o| o.selectable_ids.get(idx).cloned());
-                app.overlay = None;
-                if let Some(val) = selected_val {
-                    if title == "models" {
-                        app.pending_model = Some(val);
-                    } else if title == "help" {
-                        if let Ok(cat_idx) = val.parse::<usize>() {
-                            app.pending_help_category = Some(cat_idx);
-                        }
-                    } else if title == "help-commands" {
-                        app.pending_help_command = Some(val);
-                    } else if title == "voices" {
-                        app.pending_voice_model = Some(val);
-                    } else {
-                        app.pending_resume = Some(val);
-                    }
-                }
-            }
-            KeyCode::Char('d') | KeyCode::Delete if is_interactive => {
+            // Only session ids are deletable; elsewhere the id is a model,
+            // command or voice path and "Deleted session" was a lie.
+            KeyCode::Char('d') | KeyCode::Delete
+                if is_interactive
+                    && app.overlay.as_ref().is_some_and(|o| o.title == "sessions") =>
+            {
                 if let Some(id) = selected_session_to_delete(app) {
                     // Don't allow deleting the current session
                     if id == session.id {
@@ -1215,5 +1197,102 @@ mod overlay_delete_tests {
             selected_session_to_delete(&app_with_picker("sessions")).as_deref(),
             Some("claude-opus-4-6")
         );
+    }
+}
+
+#[cfg(test)]
+mod overlay_key_tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    /// Press `code` with `overlay` open; returns the app afterwards.
+    async fn press(
+        overlay: Overlay,
+        code: KeyCode,
+        setup: impl FnOnce(&mut App),
+    ) -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        app.overlay = Some(overlay);
+        setup(&mut app);
+        let mut messages = Vec::new();
+        let mut client =
+            ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
+        let mut config = Config {
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let perm_state = PermissionState::new(false, &[], &[]);
+        let skills = std::collections::HashMap::new();
+        let mut system_prompt = String::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let todo_state = TodoState::default();
+        let mut session = Session::at_path("current", dir.path().join("current.jsonl"));
+        let spawn_registry = crate::spawn::new_registry();
+        handle_key(KeyCtx {
+            key: KeyEvent::new(code, KeyModifiers::NONE),
+            app: &mut app,
+            messages: &mut messages,
+            client: &mut client,
+            tools: &[],
+            config: &mut config,
+            perm_state: &perm_state,
+            skills: &skills,
+            system_prompt: &mut system_prompt,
+            tx: &tx,
+            todo_state: &todo_state,
+            session: &mut session,
+            saved_count: &mut 0,
+            mcp_statuses: &[],
+            turn_counter: &mut 0,
+            spawn_registry: &spawn_registry,
+        })
+        .await
+        .unwrap();
+        (app, dir)
+    }
+
+    /// `1` in the /undo picker sent the row label to /resume, which then
+    /// failed with "Could not resume session".
+    #[tokio::test]
+    async fn digit_in_undo_picker_rewinds_instead_of_resuming() {
+        let labels = vec!["turn 2  ·  abc1234".to_string(), "session base".to_string()];
+        let (app, _dir) = press(
+            Overlay::with_items("undo", "x", labels),
+            KeyCode::Char('1'),
+            |app| app.pending_undo_positions = Some(vec![2, 0]),
+        )
+        .await;
+        assert_eq!(app.pending_resume, None);
+        assert!(app.pending_undo_positions.is_none());
+        // Not a git repo, so the restore itself fails, but it was attempted.
+        let last = app
+            .entries
+            .last()
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        assert!(last.starts_with("[undo]"), "{last}");
+    }
+
+    /// `d` in the model picker queued a "session delete" of a model name.
+    #[tokio::test]
+    async fn d_only_deletes_in_the_session_picker() {
+        let ids = vec!["claude-opus-4-7".to_string()];
+        let (app, _dir) = press(
+            Overlay::with_items("models", "x", ids.clone()),
+            KeyCode::Char('d'),
+            |_| {},
+        )
+        .await;
+        assert_eq!(app.pending_delete, None);
+        assert!(app.overlay.is_some(), "picker stays open");
+
+        let (app, _dir) = press(
+            Overlay::with_items("sessions", "x", vec!["old-session".into()]),
+            KeyCode::Char('d'),
+            |_| {},
+        )
+        .await;
+        assert_eq!(app.pending_delete.as_deref(), Some("old-session"));
     }
 }

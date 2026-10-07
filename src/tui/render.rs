@@ -1221,6 +1221,18 @@ fn draw_permission(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
 
 // ── Overlay panel ─────────────────────────────────────────────────────────────
 
+/// Bottom-border key hint. Only the session picker resumes and deletes;
+/// advertising that on every picker invited `d` on a model or voice.
+fn overlay_hint(overlay: &crate::tui::app::Overlay) -> &'static str {
+    if !overlay.is_interactive() {
+        " Esc / Enter / q to close  ↑↓ to scroll "
+    } else if overlay.title == "sessions" {
+        " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close "
+    } else {
+        " ↑↓ select · Enter choose · 1-9 quick · Esc close "
+    }
+}
+
 fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     let Some(overlay) = &mut app.overlay else {
         return;
@@ -1240,11 +1252,7 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
     f.render_widget(Clear, popup);
 
     let title = format!(" {} ", overlay.title);
-    let hint = if overlay.is_interactive() {
-        " ↑↓ select · Enter resume · d delete · 1-9 quick · Esc close "
-    } else {
-        " Esc / Enter / q to close  ↑↓ to scroll "
-    };
+    let hint = overlay_hint(overlay);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.accent))
@@ -1875,5 +1883,22 @@ mod permission_popup_tests {
         // 14 words a row: row 5 starts at w070.
         assert!(!screen.contains("w069 "), "{screen}");
         assert!(screen.contains("│w070 "), "{screen}");
+    }
+
+    /// Every picker advertised "Enter resume · d delete".
+    #[test]
+    fn only_the_session_picker_advertises_resume_and_delete() {
+        use crate::tui::app::Overlay;
+        let ids = vec!["a".to_string()];
+        let sessions = overlay_hint(&Overlay::with_items("sessions", "x", ids.clone()));
+        assert!(sessions.contains("d delete") && sessions.contains("resume"));
+        for title in ["models", "voices", "undo", "redo", "help"] {
+            let hint = overlay_hint(&Overlay::with_items(title, "x", ids.clone()));
+            assert!(
+                !hint.contains("delete") && !hint.contains("resume"),
+                "{title}: {hint}"
+            );
+            assert!(hint.contains("1-9"), "{title}: {hint}");
+        }
     }
 }
