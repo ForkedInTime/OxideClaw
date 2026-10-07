@@ -1556,8 +1556,10 @@ mod tool_search_snapshot_tests {
     /// filters ran: MCP tools never matched and removed tools still did.
     #[tokio::test]
     async fn tool_search_sees_mcp_tools_and_not_filtered_ones() {
-        let mut cfg = crate::config::Config::default();
-        cfg.disallowed_tools = vec!["NotebookEdit".into()];
+        let cfg = crate::config::Config {
+            disallowed_tools: vec!["NotebookEdit".into()],
+            ..Default::default()
+        };
         let (mut tools, _) = all_tools_with_state_and_mcp(&cfg, vec![Arc::new(FakeMcp)], vec![]);
         assert!(
             search(&tools, "jira")
