@@ -189,28 +189,31 @@ pub(super) fn cmd_spawn(args: &str) -> CommandAction {
     }
 
     let (sub, rest) = split_first_word(args);
-    // A subcommand only when its argument looks like one: spawn ids are
-    // 8-hex-char UUID prefixes, so "review the auth module" or "list all
-    // TODOs" is a task, not a subcommand with a bogus id.
-    let is_id = !rest.is_empty() && rest.len() <= 8 && rest.chars().all(|c| c.is_ascii_hexdigit());
+    // Decided by word count, not by the shape of the id: one bare token
+    // after a subcommand word is an id (a typo or unknown one is a cheap
+    // "No agent found"), a multi-word remainder is a task. Checking for hex
+    // made `/spawn kill a1b2c3dz` launch a paid bypass-permissions agent.
+    let one_token = !rest.is_empty() && !rest.contains(char::is_whitespace);
+    // A pasted branch name `spawn-<slug>-<id>` names its trailing id.
+    let id = rest.rsplit('-').next().unwrap_or(rest).to_string();
     match sub {
-        "list" | "ls" if rest.is_empty() => CommandAction::ListSpawns,
+        "list" | "ls" if rest.is_empty() || one_token => CommandAction::ListSpawns,
         "review" | "diff" if rest.is_empty() => {
             CommandAction::Message("Usage: /spawn review <agent-id>".into())
         }
-        "review" | "diff" if is_id => CommandAction::ReviewSpawn(rest.to_string()),
+        "review" | "diff" if one_token => CommandAction::ReviewSpawn(id),
         "merge" if rest.is_empty() => {
             CommandAction::Message("Usage: /spawn merge <agent-id>".into())
         }
-        "merge" if is_id => CommandAction::MergeSpawn(rest.to_string()),
+        "merge" if one_token => CommandAction::MergeSpawn(id),
         "kill" | "cancel" if rest.is_empty() => {
             CommandAction::Message("Usage: /spawn kill <agent-id>".into())
         }
-        "kill" | "cancel" if is_id => CommandAction::KillSpawn(rest.to_string()),
+        "kill" | "cancel" if one_token => CommandAction::KillSpawn(id),
         "discard" | "drop" if rest.is_empty() => {
             CommandAction::Message("Usage: /spawn discard <agent-id>".into())
         }
-        "discard" | "drop" if is_id => CommandAction::DiscardSpawn(rest.to_string()),
+        "discard" | "drop" if one_token => CommandAction::DiscardSpawn(id),
         // Everything else is the task description
         _ => CommandAction::SpawnAgent(args.to_string()),
     }
@@ -283,5 +286,29 @@ mod spawn_parse_tests {
             CommandAction::DiscardSpawn(_)
         ));
         assert!(matches!(cmd_spawn("merge"), CommandAction::Message(_)));
+    }
+
+    /// A mistyped or non-hex id fell through to SpawnAgent and launched a
+    /// paid background agent instead of reporting "No agent found".
+    #[test]
+    fn a_single_token_after_a_subcommand_is_always_an_id() {
+        assert!(
+            matches!(cmd_spawn("kill a1b2c3dz"), CommandAction::KillSpawn(id) if id == "a1b2c3dz")
+        );
+        assert!(
+            matches!(cmd_spawn("review a1b2c3d4e"), CommandAction::ReviewSpawn(id) if id == "a1b2c3d4e")
+        );
+        assert!(matches!(
+            cmd_spawn("merge spawn-refactor-auth-a1b2c3d4"),
+            CommandAction::MergeSpawn(id) if id == "a1b2c3d4"
+        ));
+        assert!(matches!(
+            cmd_spawn("list running"),
+            CommandAction::ListSpawns
+        ));
+        assert!(matches!(
+            cmd_spawn("discard dead"),
+            CommandAction::DiscardSpawn(_)
+        ));
     }
 }
