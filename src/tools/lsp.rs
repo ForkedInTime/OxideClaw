@@ -85,7 +85,10 @@ impl Tool for LSPTool {
         goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls. \
         Automatically selects the appropriate language server based on file extension; \
         workspaceSymbol without file_path picks it from the project's build files \
-        (Cargo.toml, package.json, pyproject.toml, go.mod, ...)."
+        (Cargo.toml, package.json, pyproject.toml, go.mod, ...). \
+        Results print locations 1-based as path:line:col, like Read and grep; \
+        the line and character inputs are 0-based, so subtract 1 from a result \
+        before passing it back."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -108,11 +111,11 @@ impl Tool for LSPTool {
                 },
                 "line": {
                     "type": "integer",
-                    "description": "0-based line number (required for position operations)"
+                    "description": "0-based line number (required for position operations); results print 1-based lines"
                 },
                 "character": {
                     "type": "integer",
-                    "description": "0-based character offset (required for position operations)"
+                    "description": "0-based character offset (required for position operations); results print 1-based columns"
                 },
                 "query": {
                     "type": "string",
@@ -377,7 +380,20 @@ impl LspClient {
     async fn connect(command: &str, args: &[String], cwd: &Path) -> Result<Self> {
         use tokio::process::Command;
 
-        let mut child = Command::new(command)
+        // npm's typescript-language-server and pyright-langserver (and the
+        // gem/jdtls launchers) are `.cmd`/`.bat` shims on Windows, which
+        // spawning the bare name never finds.
+        #[cfg(windows)]
+        let program = crate::mcp::client::resolve_on_path(
+            command,
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("PATHEXT").as_deref(),
+        )
+        .unwrap_or_else(|| command.into());
+        #[cfg(not(windows))]
+        let program = command;
+
+        let mut child = Command::new(program)
             .args(args)
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
@@ -661,8 +677,8 @@ fn format_lsp_result(operation: &str, result: &Value) -> String {
                         match start {
                             Some(start) => format!(
                                 "{kind_str} {name} — {}:{}",
-                                start.get("line").and_then(|v| v.as_u64()).unwrap_or(0),
-                                start.get("character").and_then(|v| v.as_u64()).unwrap_or(0)
+                                start.get("line").and_then(|v| v.as_u64()).unwrap_or(0) + 1,
+                                start.get("character").and_then(|v| v.as_u64()).unwrap_or(0) + 1
                             ),
                             None => format!("{kind_str} {name}"),
                         }
@@ -697,7 +713,14 @@ fn format_location(loc: &Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("?");
 
-    let path = uri.trim_start_matches("file://");
+    // Servers return percent-encoded URIs (`my%20proj`, `/C:/...`), which
+    // Read and Edit cannot open; non-file schemes (`jdt://`) stay as given.
+    let path = url::Url::parse(uri)
+        .ok()
+        .filter(|u| u.scheme() == "file")
+        .and_then(|u| u.to_file_path().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| uri.to_string());
 
     let range = loc
         .get("range")
@@ -714,9 +737,9 @@ fn format_location(loc: &Value) -> String {
             .and_then(|s| s.get("character"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        format!("{path}:{line}:{character}")
+        format!("{path}:{}:{}", line + 1, character + 1)
     } else {
-        path.to_string()
+        path
     }
 }
 
@@ -867,17 +890,20 @@ mod symbol_tests {
 
     #[test]
     fn symbol_results_say_where_each_symbol_is() {
+        // A real absolute path, so the URI round-trips on Windows too.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
         let workspace = json!([{
             "name": "parse",
             "kind": 12,
             "location": {
-                "uri": "file:///p/src/lib.rs",
+                "uri": url::Url::from_file_path(&file).unwrap().to_string(),
                 "range": {"start": {"line": 41, "character": 7}, "end": {"line": 41, "character": 12}}
             }
         }]);
         assert_eq!(
             format_lsp_result("workspaceSymbol", &workspace),
-            "Function parse — /p/src/lib.rs:41:7"
+            format!("Function parse — {}:42:8", file.display())
         );
         let document = json!([{
             "name": "Config",
@@ -887,7 +913,30 @@ mod symbol_tests {
         }]);
         assert_eq!(
             format_lsp_result("documentSymbol", &document),
-            "Struct Config — 4:11"
+            "Struct Config — 5:12"
+        );
+    }
+
+    /// Locations came back as `/p/my%20proj/lib.rs:41:7`: an encoded path
+    /// Read cannot open and a 0-based line that reads as one line too early.
+    #[test]
+    fn locations_print_decoded_paths_and_one_based_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("my proj #1").join("lib.rs");
+        let uri = url::Url::from_file_path(&file).unwrap().to_string();
+        assert!(uri.contains("my%20proj%20%231"), "{uri}");
+        let defs = json!([{
+            "uri": uri,
+            "range": {"start": {"line": 41, "character": 7}, "end": {"line": 41, "character": 12}}
+        }]);
+        assert_eq!(
+            format_lsp_result("goToDefinition", &defs),
+            format!("{}:42:8", file.display())
+        );
+        let jdt = json!({"uri": "jdt://contents/rt.jar/String.class"});
+        assert_eq!(
+            format_lsp_result("goToDefinition", &jdt),
+            "jdt://contents/rt.jar/String.class"
         );
     }
 }
