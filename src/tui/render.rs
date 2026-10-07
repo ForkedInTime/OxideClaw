@@ -454,12 +454,11 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
             }
 
             EntryKind::ToolStream => {
-                // Collapsed by default — just show the line count.
-                // User can scroll up to see full output in history.
-                let total = entry.text.lines().count();
-                if total > 0 {
+                // Collapsed: only the running line count is shown (the entry's
+                // text); the tool's result follows in its own entry.
+                if !entry.text.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        format!("  │ [▸ {} lines]", total),
+                        format!("  │ [▸ {} lines]", entry.text),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }

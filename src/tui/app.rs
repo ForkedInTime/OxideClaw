@@ -367,7 +367,7 @@ pub enum EntryKind {
     Assistant,
     Thinking, // Model's extended thinking/reasoning (shown when show_thinking_summaries=true)
     ToolCall,
-    ToolStream, // Live streaming output from a running tool
+    ToolStream, // Live output line count of a running tool (text is the count)
     ToolResult,
     /// A failed tool's output: collapsed like ToolResult, since a broken
     /// build can be ~1 MB.
@@ -645,8 +645,9 @@ pub struct App {
     pub vim_normal: bool,
     /// Pending first char of a two-char vim command (e.g. 'd' waiting for 'd')
     pub vim_pending: Option<char>,
-    /// Accumulates live bash output lines for the current tool call
-    pub tool_stream_buf: String,
+    /// Live output lines streamed by the current tool call. Only the count
+    /// is shown, so the lines themselves are not kept.
+    pub tool_stream_lines: usize,
     /// Handle to the current API task — used to abort it on Escape
     pub api_task: Option<tokio::task::AbortHandle>,
     /// The running /plugin install or /upgrade check, which also shows the
@@ -843,7 +844,7 @@ impl App {
             vim_enabled: false,
             vim_normal: false,
             vim_pending: None,
-            tool_stream_buf: String::new(),
+            tool_stream_lines: 0,
             api_task: None,
             side_task: None,
             turn_history: None,
@@ -1398,44 +1399,24 @@ impl App {
                 let preview = format_tool_preview(&name, &args);
                 self.entries
                     .push(ChatEntry::tool_call(format!("{name}  {preview}")));
-                self.tool_stream_buf = String::new(); // drop old capacity
+                self.tool_stream_lines = 0;
                 self.scroll_to_bottom();
             }
             AppEvent::ToolOutputStream(line) => {
-                // Accumulate live output lines (capped at 4KB — we only display the last 500 chars)
-                self.tool_stream_buf.push_str(&line);
-                self.tool_stream_buf.push('\n');
-                if self.tool_stream_buf.len() > 4096 {
-                    let start = self.tool_stream_buf.len() - 2048;
-                    // Find a safe char boundary
-                    let mut start = start;
-                    while start < self.tool_stream_buf.len()
-                        && !self.tool_stream_buf.is_char_boundary(start)
-                    {
-                        start += 1;
-                    }
-                    self.tool_stream_buf = self.tool_stream_buf[start..].to_string();
-                }
-                // Update or create the live output entry (last entry if it's a tool_stream kind)
-                let display = if self.tool_stream_buf.len() > 500 {
-                    let mut cut = self.tool_stream_buf.len() - 500;
-                    while !self.tool_stream_buf.is_char_boundary(cut) {
-                        cut += 1;
-                    }
-                    format!("…{}", &self.tool_stream_buf[cut..])
-                } else {
-                    self.tool_stream_buf.clone()
-                };
+                // Count every line: counting a kept tail of the text capped
+                // the shown total near 500 bytes / line length.
+                self.tool_stream_lines += line.lines().count().max(1);
+                let count = self.tool_stream_lines.to_string();
                 if let Some(last) = self.entries.last_mut()
                     && matches!(last.kind, EntryKind::ToolStream)
                 {
-                    last.text = display;
+                    last.text = count;
                     self.scroll_to_bottom();
                     return;
                 }
                 self.entries.push(ChatEntry {
                     kind: EntryKind::ToolStream,
-                    text: display,
+                    text: count,
                 });
                 self.scroll_to_bottom();
             }
@@ -1562,7 +1543,7 @@ impl App {
     pub fn clear(&mut self) {
         self.entries = Vec::new();
         self.streaming = String::new();
-        self.tool_stream_buf = String::new();
+        self.tool_stream_lines = 0;
         self.tokens_in = 0;
         self.tokens_out = 0;
         self.cache_read_tokens = 0;
@@ -1849,6 +1830,34 @@ mod trim_entries_tests {
 #[cfg(test)]
 mod background_event_tests {
     use super::*;
+
+    /// The count came from a 500-byte tail of the output, so 5,000 lines
+    /// showed as about 17.
+    #[test]
+    fn tool_stream_entry_counts_every_streamed_line() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.apply(AppEvent::ToolCall {
+            name: "Bash".into(),
+            args: "{}".into(),
+        });
+        for i in 0..5_000 {
+            app.apply(AppEvent::ToolOutputStream(format!(
+                "compiling crate number {i:05}"
+            )));
+        }
+        app.apply(AppEvent::ToolOutputStream("two\nlines".into()));
+        let entry = app.entries.last().unwrap();
+        assert!(matches!(entry.kind, EntryKind::ToolStream));
+        assert_eq!(entry.text, "5002");
+
+        // A new tool call starts a fresh count.
+        app.apply(AppEvent::ToolCall {
+            name: "Bash".into(),
+            args: "{}".into(),
+        });
+        app.apply(AppEvent::ToolOutputStream("x".into()));
+        assert_eq!(app.entries.last().unwrap().text, "1");
+    }
 
     /// The status-bar ctx % kept the pre-/clear or pre-compaction size
     /// (often red) until the next API call.
