@@ -244,7 +244,7 @@ pub struct Config {
     /// Disable all hooks globally.
     pub disable_all_hooks: bool,
 
-    /// Auto-delete sessions older than this many days (0 = disabled).
+    /// Auto-delete sessions idle for more than this many days (0 = disabled).
     pub cleanup_period_days: Option<u32>,
 
     /// Default shell for the Bash tool ("bash" or "powershell").

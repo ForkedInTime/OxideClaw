@@ -505,21 +505,11 @@ async fn run_loop(
     // Turn counter for file history snapshots (increments on each user prompt sent to API)
     let mut turn_counter: usize = 0;
 
-    // Session cleanup — delete sessions older than cleanupPeriodDays
+    // Session cleanup: delete sessions idle longer than cleanupPeriodDays
     if let Some(days) = config.cleanup_period_days
         && days > 0
-        && let Ok(list) = crate::session::Session::list().await
     {
-        let cutoff_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            .saturating_sub(days as u64 * 86400);
-        for meta in &list {
-            if meta.created_at < cutoff_secs {
-                let _ = crate::session::Session::delete(&meta.id).await;
-            }
-        }
+        crate::session::Session::prune_inactive(days, resume_id.as_deref()).await;
     }
 
     // Session — create new or resume existing

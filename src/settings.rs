@@ -164,7 +164,7 @@ pub struct Settings {
     #[serde(rename = "disableAllHooks")]
     pub disable_all_hooks: Option<bool>,
 
-    /// Auto-delete sessions older than this many days (0 = never).
+    /// Auto-delete sessions idle for more than this many days (0 = never).
     #[serde(rename = "cleanupPeriodDays")]
     pub cleanup_period_days: Option<u32>,
 

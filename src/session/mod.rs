@@ -308,6 +308,17 @@ impl Session {
     }
 
     async fn list_in(dir: &std::path::Path) -> Result<Vec<SessionMeta>> {
+        Ok(Self::list_with_activity_in(dir)
+            .await?
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect())
+    }
+
+    /// Like `list_in`, paired with each session's last-activity time:
+    /// max(created_at, mtime of its .jsonl). The .meta mtime is left out on
+    /// purpose: the preview backfill below rewrites it on every listing.
+    async fn list_with_activity_in(dir: &std::path::Path) -> Result<Vec<(u64, SessionMeta)>> {
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -358,7 +369,29 @@ impl Session {
         }
 
         sessions.sort_by_key(|e| std::cmp::Reverse(e.0));
-        Ok(sessions.into_iter().map(|(_, m)| m).collect())
+        Ok(sessions)
+    }
+
+    /// `cleanupPeriodDays`: delete sessions idle for more than `days`, never
+    /// `keep` (the session about to be resumed). Judged by last activity, not
+    /// created_at, or a long-lived session used daily is deleted, right
+    /// before `--continue` would reopen it.
+    pub async fn prune_inactive(days: u32, keep: Option<&str>) {
+        let cutoff = unix_now().saturating_sub(u64::from(days) * 86400);
+        Self::prune_inactive_in(&crate::config::Config::sessions_dir(), cutoff, keep).await;
+    }
+
+    async fn prune_inactive_in(dir: &std::path::Path, cutoff: u64, keep: Option<&str>) {
+        let Ok(list) = Self::list_with_activity_in(dir).await else {
+            return;
+        };
+        for (last_active, meta) in list {
+            if last_active >= cutoff || keep == Some(meta.id.as_str()) {
+                continue;
+            }
+            let _ = fs::remove_file(dir.join(format!("{}.jsonl", meta.id))).await;
+            let _ = fs::remove_file(dir.join(format!("{}.meta", meta.id))).await;
+        }
     }
 
     /// The session `--continue` / `--resume` reopens: the most recently
@@ -1169,6 +1202,33 @@ mod continue_tests {
             Session::most_recent_in(d).await.as_deref(),
             Some("worked-today")
         );
+    }
+
+    /// cleanupPeriodDays compared created_at, so a month-old session used
+    /// yesterday was deleted, as was the one `--resume` was about to open.
+    #[tokio::test]
+    async fn cleanup_keeps_recently_active_and_resumed_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        meta(d, "old-but-active", 1_000);
+        jsonl(d, "old-but-active", 9_000);
+        meta(d, "idle", 1_000);
+        jsonl(d, "idle", 2_000);
+        meta(d, "idle-resumed", 1_000);
+        jsonl(d, "idle-resumed", 2_000);
+
+        Session::prune_inactive_in(d, 5_000, Some("idle-resumed")).await;
+
+        let mut left: Vec<String> = Session::list_in(d)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["idle-resumed", "old-but-active"]);
+        assert!(!d.join("idle.jsonl").exists());
+        assert!(!d.join("idle.meta").exists());
     }
 
     #[tokio::test]
