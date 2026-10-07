@@ -400,6 +400,24 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    // rename(2) replaces the directory entry, so renaming onto a symlink
+    // (CLAUDE.md -> AGENTS.md, stow-managed dotfiles) would swap the link for
+    // a regular file and leave its target stale. Write the target instead.
+    let target = resolve_symlink_target(path).await;
+    let path = target.as_path();
+
+    // rename only needs a writable directory, so without this a 0444 file
+    // that fs::write would have refused gets silently replaced.
+    if tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|m| m.permissions().readonly())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is read-only", path.display()),
+        ));
+    }
+
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = parent.join(format!(
@@ -442,6 +460,74 @@ pub async fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Res
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     write_result
+}
+
+#[cfg(all(test, unix))]
+mod atomic_write_tests {
+    use super::atomic_write;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    /// Writing CLAUDE.md -> AGENTS.md replaced the link with a regular file
+    /// and left AGENTS.md stale.
+    #[tokio::test]
+    async fn a_symlink_survives_and_its_target_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("CLAUDE.md");
+        std::fs::write(dir.path().join("AGENTS.md"), "orig").unwrap();
+        symlink("AGENTS.md", &link).unwrap();
+
+        atomic_write(&link, "new").await.unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "new"
+        );
+    }
+
+    /// A dangling link is not followed: its target is never created.
+    #[tokio::test]
+    async fn a_dangling_symlink_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("notes");
+        symlink("elsewhere", &link).unwrap();
+
+        atomic_write(&link, "x").await.unwrap();
+
+        assert!(!dir.path().join("elsewhere").exists());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "x");
+    }
+
+    /// rename only needs a writable directory, so a 0444 file was replaced.
+    #[tokio::test]
+    async fn a_read_only_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("locked.txt");
+        std::fs::write(&f, "orig").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let err = atomic_write(&f, "new").await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "orig");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+/// The file a write to `path` should land on: `path` itself unless it is a
+/// symlink to an existing file, then that file.
+///
+/// A dangling link is left to be replaced, not followed: the sensitive-path
+/// guard can only see where a link points once the target exists, so creating
+/// it here would let `notes -> ~/.ssh/authorized_keys` through.
+async fn resolve_symlink_target(path: &std::path::Path) -> std::path::PathBuf {
+    let is_link = tokio::fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|m| m.file_type().is_symlink());
+    if is_link && let Ok(real) = tokio::fs::canonicalize(path).await {
+        return real;
+    }
+    path.to_path_buf()
 }
 
 /// CRLF forms of an Edit's `old`/`new` strings, when the raw `old` cannot match
