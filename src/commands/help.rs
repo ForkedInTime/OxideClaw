@@ -118,6 +118,28 @@ pub(super) fn cmd_keybindings() -> CommandAction {
 
 // ─── RAG codebase indexing ────────────────────────────────────────────────────
 
+/// What picking `cmd` in the help picker puts in the input line: the
+/// command up to its first placeholder (`<description>`, `[status|revoke]`,
+/// `N`), with a trailing space when one was cut. Copying `/issue
+/// <description>` verbatim meant Enter filed an issue titled "<description>"
+/// (and `/spawn <task>` spawned an agent on "<task>").
+pub fn help_picker_input(cmd: &str) -> String {
+    let is_placeholder = |w: &str| {
+        w.starts_with(['<', '[']) || (w.len() == 1 && w.chars().all(|c| c.is_ascii_uppercase()))
+    };
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let kept: Vec<&str> = words
+        .iter()
+        .copied()
+        .take_while(|w| !is_placeholder(w))
+        .collect();
+    let mut out = kept.join(" ");
+    if kept.len() < words.len() {
+        out.push(' ');
+    }
+    out
+}
+
 /// Help categories — each entry is (category_name, short_description, commands).
 /// Used by both the interactive picker and `/help <category>`.
 pub const HELP_CATEGORIES: &[(&str, &str, &[HelpCommand])] = &[
@@ -657,6 +679,27 @@ mod stale_text_tests {
             );
         }
         assert_eq!(taught, 3);
+    }
+
+    /// The picker copied the help key verbatim, so Enter on `/issue
+    /// <description>` filed an issue titled "<description>".
+    #[test]
+    fn help_picker_drops_placeholders() {
+        assert_eq!(help_picker_input("/issue <description>"), "/issue ");
+        assert_eq!(help_picker_input("/spawn <task>"), "/spawn ");
+        assert_eq!(help_picker_input("/spawn list"), "/spawn list");
+        assert_eq!(help_picker_input("/spawn review <id>"), "/spawn review ");
+        assert_eq!(help_picker_input("/trust [status|revoke]"), "/trust ");
+        assert_eq!(
+            help_picker_input("/browse --max-steps N <goal>"),
+            "/browse --max-steps "
+        );
+        assert_eq!(help_picker_input("/help"), "/help");
+        // `/issue ` is empty after trimming, so Enter shows the usage.
+        for (cmd, _) in HELP_CATEGORIES.iter().flat_map(|(_, _, c)| c.iter()) {
+            let input = help_picker_input(cmd);
+            assert!(!input.contains(['<', '[']), "{cmd} -> {input}");
+        }
     }
 
     /// /branch only prints status (it takes no arguments) and /issue files a

@@ -244,7 +244,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let mut ids = Vec::new();
                 for (i, (cmd, desc)) in commands.iter().enumerate() {
                     lines.push(format!("  {}. {:16} {}", i + 1, cmd, desc));
-                    ids.push(cmd.to_string());
+                    ids.push(crate::commands::help_picker_input(cmd));
                 }
                 lines.push(String::new());
                 lines.push("  ↑↓ select · Enter run · 1-9 quick pick · Esc close".into());
@@ -1016,6 +1016,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             suspend_tty();
             let status = editor_process(&editor, &claude_md).status().await;
             resume_tty();
+            // The child (sh's "not found", an editor failing before its alt
+            // screen) may have written to the TTY; ratatui only repaints
+            // changed cells, so clear and recreate before the next draw.
+            app.pending_screen_clear = true;
             match status {
                 Ok(s) if s.success() => {}
                 // sh's "command not found": the editor never ran.

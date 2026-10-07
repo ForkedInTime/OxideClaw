@@ -524,6 +524,9 @@ async fn run_loop(
     };
     let mut terminal = make_terminal(init_h)?;
     let mut current_vp_h = init_h;
+    // Whether the current viewport holds a drawn frame worth keeping in
+    // scrollback; the never-drawn startup viewport is blank.
+    let mut frame_drawn = false;
     let mut last_term_cols = init_cols;
     let mut last_term_rows = init_rows; // cached — updated only on Resize events
     let mut system_prompt = config.build_system_prompt();
@@ -765,9 +768,9 @@ async fn run_loop(
     // local secrets out of the index, and a home directory is not a project.
     // The index covers the whole work tree, wherever in it we started.
     match crate::rag::IndexTarget::for_cwd(&config.cwd, true) {
-        Err(why) => app
-            .entries
-            .push(ChatEntry::system(format!("Code index off: {why}"))),
+        // Logged, not shown: an entry here would replace the welcome banner
+        // on every launch outside a project. /index and /rag explain it.
+        Err(why) => tracing::info!("Code index off: {why}"),
         Ok(target) => {
             let tx2 = tx.clone();
             tokio::spawn(async move {
@@ -859,6 +862,7 @@ async fn run_loop(
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
             current_vp_h = needed;
+            frame_drawn = false;
 
             let msg = if success {
                 "Install complete — run /doctor to verify.".to_string()
@@ -880,6 +884,7 @@ async fn run_loop(
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
             current_vp_h = needed;
+            frame_drawn = false;
         }
 
         // Handle pending session delete from interactive session picker
@@ -1010,7 +1015,7 @@ async fn run_loop(
                 let mut ids = Vec::new();
                 for (i, (cmd, desc)) in commands.iter().enumerate() {
                     lines.push(format!("  {}. {:16} {}", i + 1, cmd, desc));
-                    ids.push(cmd.to_string());
+                    ids.push(crate::commands::help_picker_input(cmd));
                 }
                 lines.push(String::new());
                 lines.push("  ↑↓ select · Enter run · 1-9 quick pick · Esc close".into());
@@ -1149,12 +1154,15 @@ async fn run_loop(
             if needed != current_vp_h {
                 let old_bottom = terminal.get_frame().area().bottom();
                 drop(terminal);
-                scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom)?;
+                if frame_drawn {
+                    scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom)?;
+                }
                 terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
                 current_vp_h = needed;
             }
         }
         terminal.draw(|f| draw(f, &mut app))?;
+        frame_drawn = true;
 
         // ── Wait for next activity: API event, keyboard, or 50 ms heartbeat ──
         tokio::select! {
@@ -1624,6 +1632,7 @@ async fn run_loop(
                         let needed = viewport_height(&app, cols, rows);
                         terminal = make_top_terminal(cols, rows, needed)?;
                         current_vp_h = needed;
+                        frame_drawn = false;
                     }
                     _ => {}
                 }
