@@ -975,9 +975,6 @@ async fn run() -> Result<()> {
                         list,
                     },
             } => {
-                let Some(claude) = Config::claude_code_dir() else {
-                    anyhow::bail!("no home directory, so no ~/.claude to import from");
-                };
                 let opts = claude_import::ImportOptions {
                     hooks: *hooks,
                     permissions: *permissions,
@@ -986,12 +983,21 @@ async fn run() -> Result<()> {
                 };
                 // Settings are listed when nothing else was asked for.
                 if *hooks || *permissions || *api_key_helper || *mcp || sessions.is_none() {
+                    let Some(claude) = Config::claude_code_dir() else {
+                        anyhow::bail!("no home directory, so no ~/.claude to import from");
+                    };
                     for line in claude_import::import_claude(&claude, &Config::config_dir(), opts)?
                     {
                         println!("{line}");
                     }
                 }
                 if let Some(only) = sessions {
+                    // Transcripts live under $CLAUDE_CONFIG_DIR when it is set.
+                    let Some(claude) = session::claude_code::claude_code_home() else {
+                        anyhow::bail!(
+                            "no home directory and no CLAUDE_CONFIG_DIR, so no Claude Code sessions to import"
+                        );
+                    };
                     let cwd = std::env::current_dir()?;
                     let lines = if *list {
                         anyhow::ensure!(only.is_none(), "--list takes no session id");

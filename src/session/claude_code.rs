@@ -7,11 +7,15 @@
 //! turned into `-`. Each line is a record. `user` and `assistant` records
 //! carry an API `message` (one assistant reply is spread over one record per
 //! content block); the rest is bookkeeping: titles (`custom-title`,
-//! `ai-title`, `summary`), `system` notes, attachments, queue state. Records
-//! flagged `isSidechain` (subagents), `isMeta` (injected context),
-//! `isCompactSummary`, `isVisibleInTranscriptOnly` or `isApiErrorMessage`,
-//! and assistant records from the `<synthetic>` model, are not part of the
-//! conversation and are skipped. Subagent transcripts in subdirectories and
+//! `ai-title`, `summary`), `system` notes, attachments, queue state. The
+//! records form a tree by `parentUuid`: the conversation is the path from
+//! the last message back to the root or to the latest `compact_boundary`,
+//! plus the parallel tool results chained beside it ([`conversation`]).
+//! Records flagged `isSidechain` (subagents), `isMeta` (injected context),
+//! `isVisibleInTranscriptOnly` (except the compaction summary the model is
+//! given), `queueTranscriptOnly` or `isApiErrorMessage`, and assistant
+//! records from the `<synthetic>` model, are not part of the conversation
+//! and are skipped. Subagent transcripts in subdirectories and
 //! `agent-*.jsonl` files are not sessions and are not read. Messages keep
 //! the file's order, except that tool results are paired with their calls
 //! by id ([`tidy`]).
@@ -22,7 +26,7 @@ use super::{Session, SessionMeta, unix_now};
 use crate::api::types::{ContentBlock, Message, Role, ToolResultContent};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +40,8 @@ const MAX_PROJECT_NAME: usize = 200;
 struct Transcript {
     /// Claude Code's session id (the file name).
     id: String,
+    /// The transcript file.
+    path: PathBuf,
     /// The working directory of the first record that names one.
     cwd: Option<String>,
     /// The session's title: the last `custom-title`, `ai-title` or
@@ -50,6 +56,9 @@ struct Transcript {
     /// Unix seconds of the earliest and latest record timestamps.
     created_at: Option<u64>,
     updated_at: Option<u64>,
+    /// How many messages the conversation has; kept when `messages` is
+    /// dropped ([`read_project`]).
+    message_count: usize,
     messages: Vec<Message>,
     skipped: Skipped,
 }
@@ -132,9 +141,16 @@ fn project_dirs(claude: &Path, cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Every Claude Code session recorded for `cwd` that has a conversation,
-/// oldest first, plus warnings for the transcripts that could not be read.
-fn read_project(claude: &Path, cwd: &Path) -> (Vec<Transcript>, Vec<String>) {
+/// Every Claude Code session recorded for `cwd` that has a conversation and
+/// whose id `wanted` accepts, oldest first, plus warnings for the
+/// transcripts that could not be read. Their messages are dropped (only the
+/// count is kept), so one transcript is held in memory at a time; [`load`]
+/// reads one in full.
+fn read_project(
+    claude: &Path,
+    cwd: &Path,
+    wanted: &dyn Fn(&str) -> bool,
+) -> (Vec<Transcript>, Vec<String>) {
     let mut found = Vec::new();
     let mut warnings = Vec::new();
     let cwd_text = cwd.to_string_lossy();
@@ -153,20 +169,29 @@ fn read_project(claude: &Path, cwd: &Path) -> (Vec<Transcript>, Vec<String>) {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".jsonl"))
-                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok() && wanted(id))
             else {
                 continue;
             };
-            match read_transcript(&path, id) {
+            match load(&path, id, &cwd_text) {
                 Err(e) => warnings.push(format!("skipped {}: {e:#}", path.display())),
-                Ok(t) if t.messages.is_empty() => {}
-                Ok(t) if t.cwd.as_deref().is_some_and(|c| c != cwd_text) => {}
-                Ok(t) => found.push(t),
+                Ok(None) => {}
+                Ok(Some(mut t)) => {
+                    t.messages = Vec::new();
+                    found.push(t);
+                }
             }
         }
     }
     found.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
     (found, warnings)
+}
+
+/// The transcript at `path`, when it has a conversation and was not
+/// recorded in another directory than `cwd`.
+fn load(path: &Path, id: &str, cwd: &str) -> Result<Option<Transcript>> {
+    let t = read_transcript(path, id)?;
+    Ok((!t.messages.is_empty() && t.cwd.as_deref().is_none_or(|c| c == cwd)).then_some(t))
 }
 
 fn read_transcript(path: &Path, id: &str) -> Result<Transcript> {
@@ -182,7 +207,9 @@ fn read_transcript(path: &Path, id: &str) -> Result<Transcript> {
     if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
         return Err(too_big());
     }
-    Ok(parse_transcript(id, &bytes))
+    let mut t = parse_transcript(id, &bytes);
+    t.path = path.to_path_buf();
+    Ok(t)
 }
 
 /// Convert one transcript's bytes. Never fails: a line that is not a JSON
@@ -190,6 +217,7 @@ fn read_transcript(path: &Path, id: &str) -> Result<Transcript> {
 fn parse_transcript(id: &str, bytes: &[u8]) -> Transcript {
     let mut t = Transcript {
         id: id.to_string(),
+        path: PathBuf::new(),
         cwd: None,
         title: None,
         first_prompt: String::new(),
@@ -197,10 +225,12 @@ fn parse_transcript(id: &str, bytes: &[u8]) -> Transcript {
         started: None,
         created_at: None,
         updated_at: None,
+        message_count: 0,
         messages: Vec::new(),
         skipped: Skipped::default(),
     };
     let (mut custom_title, mut ai_title, mut summary) = (None, None, None);
+    let mut records: Vec<Record> = Vec::new();
     for line in bytes.split(|b| *b == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
@@ -210,7 +240,6 @@ fn parse_transcript(id: &str, bytes: &[u8]) -> Transcript {
             continue;
         };
         let text = |key: &str| r.get(key).and_then(Value::as_str);
-        let flag = |key: &str| r.get(key).and_then(Value::as_bool) == Some(true);
         if let Some(ts) = text("timestamp")
             && let Some(secs) = parse_timestamp(ts)
         {
@@ -223,31 +252,38 @@ fn parse_transcript(id: &str, bytes: &[u8]) -> Transcript {
         if t.cwd.is_none() {
             t.cwd = text("cwd").map(str::to_string);
         }
-        let role = match text("type") {
+        match text("type") {
             Some("custom-title") => {
                 custom_title = text("customTitle").map(str::to_string).or(custom_title);
-                continue;
             }
             Some("ai-title") => {
                 ai_title = text("aiTitle").map(str::to_string).or(ai_title);
-                continue;
             }
             Some("summary") => {
                 summary = text("summary").map(str::to_string).or(summary);
-                continue;
             }
-            Some("user") => Role::User,
-            Some("assistant") => Role::Assistant,
-            _ => continue,
-        };
-        if flag("isSidechain")
-            || flag("isMeta")
-            || flag("isCompactSummary")
-            || flag("isVisibleInTranscriptOnly")
-            || flag("isApiErrorMessage")
+            _ => {}
+        }
+        if t.first_prompt.is_empty()
+            && is_conversation(&r)
+            && text("type") == Some("user")
+            && !skipped_record(&r)
+            && !flag(&r, "isCompactSummary")
+            && let Some(typed) = r.get("message").and_then(|m| typed_text(&m["content"]))
         {
+            t.first_prompt = one_line(typed, 60);
+        }
+        records.push(r);
+    }
+    for i in conversation(&records) {
+        let r = &records[i];
+        if skipped_record(r) {
             continue;
         }
+        let role = match r.get("type").and_then(Value::as_str) {
+            Some("assistant") => Role::Assistant,
+            _ => Role::User,
+        };
         let message = r.get("message").unwrap_or(&Value::Null);
         if role == Role::Assistant {
             match message.get("model").and_then(Value::as_str) {
@@ -258,15 +294,6 @@ fn parse_transcript(id: &str, bytes: &[u8]) -> Transcript {
             }
         }
         let content = convert_content(&message["content"], &mut t.skipped);
-        if role == Role::User && t.first_prompt.is_empty() {
-            let typed = content.iter().find_map(|b| match b {
-                ContentBlock::Text { text } if !is_command_echo(text) => Some(text),
-                _ => None,
-            });
-            if let Some(text) = typed {
-                t.first_prompt = one_line(text, 60);
-            }
-        }
         if !content.is_empty() {
             t.messages.push(Message { role, content });
         }
@@ -277,7 +304,156 @@ fn parse_transcript(id: &str, bytes: &[u8]) -> Transcript {
         .map(|s| one_line(&s, 80))
         .filter(|s| !s.is_empty());
     t.skipped.orphaned_tool_blocks = tidy(&mut t.messages);
+    t.message_count = t.messages.len();
     t
+}
+
+type Record = serde_json::Map<String, Value>;
+
+fn flag(r: &Record, key: &str) -> bool {
+    r.get(key).and_then(Value::as_bool) == Some(true)
+}
+
+fn record_type(r: &Record) -> Option<&str> {
+    r.get("type").and_then(Value::as_str)
+}
+
+/// A `user` or `assistant` record of the main conversation (subagent
+/// records are flagged `isSidechain`).
+fn is_conversation(r: &Record) -> bool {
+    matches!(record_type(r), Some("user" | "assistant")) && !flag(r, "isSidechain")
+}
+
+/// A conversation record the model was not sent: injected context, records
+/// only the transcript view shows, queue bookkeeping and API error
+/// stand-ins. The summary that opens a compacted conversation is shown
+/// only in the transcript view too, but the model gets it.
+fn skipped_record(r: &Record) -> bool {
+    flag(r, "isMeta")
+        || (flag(r, "isVisibleInTranscriptOnly") && !flag(r, "isCompactSummary"))
+        || flag(r, "queueTranscriptOnly")
+        || flag(r, "isApiErrorMessage")
+}
+
+fn is_compact_boundary(r: &Record) -> bool {
+    record_type(r) == Some("system")
+        && r.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+}
+
+/// The first text the user typed in a message's content, slash-command
+/// bookkeeping left out.
+fn typed_text(content: &Value) -> Option<&str> {
+    let usable = |s: &&str| !s.trim().is_empty() && !is_command_echo(s);
+    match content {
+        Value::String(s) => Some(s.as_str()).filter(usable),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .find(usable),
+        _ => None,
+    }
+}
+
+/// The records of the conversation as the model last saw it, as indices
+/// into `records` in file order. A transcript is a tree: each record names
+/// its `parentUuid`, a rewind starts a new branch from an earlier record,
+/// and a compaction writes a `compact_boundary` with no parent, after which
+/// the model sees only the summary and what follows. So, like Claude Code,
+/// this walks back from the last conversation record to the root or the
+/// boundary. Claude Code chains each result of parallel tool calls to its
+/// own call, which leaves all but one beside that path: records holding
+/// only results for calls on it are kept, as are the other blocks of a
+/// reply on it (one record per block, sharing the API message id).
+/// Transcripts without record ids (old Claude Code) are taken in file
+/// order from the last boundary.
+fn conversation(records: &[Record]) -> Vec<usize> {
+    let Some(leaf) = records.iter().rposition(is_conversation) else {
+        return Vec::new();
+    };
+    if uuid(&records[leaf]).is_none() {
+        let start = records
+            .iter()
+            .rposition(is_compact_boundary)
+            .map_or(0, |b| b + 1);
+        return (start..records.len())
+            .filter(|&i| is_conversation(&records[i]))
+            .collect();
+    }
+    // A repeated id (a record written twice) resolves to its last copy.
+    let by_uuid: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| uuid(r).map(|u| (u, i)))
+        .collect();
+    let mut on_path = BTreeSet::new();
+    let mut at = Some(leaf);
+    while let Some(i) = at {
+        // A cycle (a corrupt file) ends the walk too.
+        if !on_path.insert(i) || is_compact_boundary(&records[i]) {
+            break;
+        }
+        at = records[i]
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .and_then(|p| by_uuid.get(p))
+            .copied();
+    }
+    let start = on_path.first().copied().unwrap_or(leaf);
+    let replies: HashSet<&str> = on_path
+        .iter()
+        .filter_map(|&i| reply_id(&records[i]))
+        .collect();
+    let mut keep: Vec<bool> = (0..records.len())
+        .map(|i| {
+            i >= start
+                && is_conversation(&records[i])
+                && (on_path.contains(&i)
+                    || reply_id(&records[i]).is_some_and(|m| replies.contains(m)))
+        })
+        .collect();
+    let calls: HashSet<&str> = (0..records.len())
+        .filter(|&i| keep[i])
+        .flat_map(|i| blocks(&records[i]))
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|b| b.get("id").and_then(Value::as_str))
+        .collect();
+    for i in start..records.len() {
+        let r = &records[i];
+        let results = blocks(r);
+        keep[i] = keep[i]
+            || (is_conversation(r)
+                && record_type(r) == Some("user")
+                && !results.is_empty()
+                && results.iter().all(|b| {
+                    b.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && b.get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| calls.contains(id))
+                }));
+    }
+    (0..records.len()).filter(|&i| keep[i]).collect()
+}
+
+fn uuid(r: &Record) -> Option<&str> {
+    r.get("uuid").and_then(Value::as_str)
+}
+
+/// The API message id of an assistant record: the records of one reply,
+/// one per content block, share it.
+fn reply_id(r: &Record) -> Option<&str> {
+    if record_type(r) != Some("assistant") {
+        return None;
+    }
+    r.get("message")?.get("id")?.as_str()
+}
+
+/// The content blocks of a record's message (none when it is a string).
+fn blocks(r: &Record) -> &[Value] {
+    r.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
 }
 
 /// Slash-command bookkeeping Claude Code records as user text: not what
@@ -556,6 +732,48 @@ fn is_within(path: &Path, root: &Path) -> bool {
         || matches!((resolve(path), resolve(root)), (Some(p), Some(r)) if p.starts_with(&r))
 }
 
+/// The directory Claude Code keeps `projects/` in: `$CLAUDE_CONFIG_DIR`
+/// when it is set to an absolute path, as Claude Code itself does, otherwise
+/// `~/.claude`.
+pub fn claude_code_home() -> Option<PathBuf> {
+    home_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        crate::config::Config::claude_code_dir(),
+    )
+}
+
+fn home_from(env: Option<std::ffi::OsString>, default: Option<PathBuf>) -> Option<PathBuf> {
+    env.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or(default)
+}
+
+/// The directories an import must not write into: `~/.claude`, and
+/// `claude` (which may be `$CLAUDE_CONFIG_DIR`) unless it is also
+/// OxideClaw's own config dir, through the deprecated `$CLAUDE_CONFIG_DIR`
+/// profile whose sessions live in it already.
+fn never_written(claude: &Path) -> Vec<PathBuf> {
+    use crate::config::Config;
+    never_written_with(
+        claude,
+        &Config::config_dir_choice(),
+        Config::claude_code_dir(),
+    )
+}
+
+fn never_written_with(
+    claude: &Path,
+    own: &crate::config::ConfigDirChoice,
+    dot_claude: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let shared = own.source == crate::config::ConfigDirSource::ClaudeConfigDir && own.dir == claude;
+    (!shared)
+        .then(|| claude.to_path_buf())
+        .into_iter()
+        .chain(dot_claude)
+        .collect()
+}
+
 /// Claude Code session id → OxideClaw session id, for the sessions in `dir`
 /// imported before. Reads the `.meta` files only and writes nothing.
 fn imported_ids(dir: &Path) -> HashMap<String, String> {
@@ -588,7 +806,7 @@ fn no_sessions(claude: &Path, cwd: &Path, warnings: Vec<String>) -> Vec<String> 
 /// `config import-claude --sessions --list`: this project's Claude Code
 /// sessions, and which are imported. Changes nothing.
 pub async fn list(claude: &Path, cwd: &Path, sessions_dir: &Path) -> Result<Vec<String>> {
-    let (found, warnings) = read_project(claude, cwd);
+    let (found, warnings) = read_project(claude, cwd, &|_| true);
     if found.is_empty() {
         return Ok(no_sessions(claude, cwd, warnings));
     }
@@ -610,9 +828,7 @@ pub async fn list(claude: &Path, cwd: &Path, sessions_dir: &Path) -> Result<Vec<
             .unwrap_or_default();
         lines.push(format!(
             "  {}  {date}  {:>4} msgs  {}{imported}",
-            t.id,
-            t.messages.len(),
-            t.first_prompt
+            t.id, t.message_count, t.first_prompt
         ));
     }
     lines.extend(warnings);
@@ -633,23 +849,24 @@ pub async fn import(
     sessions_dir: &Path,
     only: Option<&str>,
 ) -> Result<Vec<String>> {
-    if is_within(sessions_dir, claude) {
-        anyhow::bail!(
-            "the sessions dir {} is inside Claude Code's {}, which is never written",
-            sessions_dir.display(),
-            claude.display()
-        );
+    for root in never_written(claude) {
+        if is_within(sessions_dir, &root) {
+            anyhow::bail!(
+                "the sessions dir {} is inside Claude Code's {}, which is never written",
+                sessions_dir.display(),
+                root.display()
+            );
+        }
     }
-    let (found, warnings) = read_project(claude, cwd);
-    let chosen: Vec<&Transcript> = match only {
+    let q = only.map(str::trim);
+    // Only the transcripts `only` names are read.
+    let wanted = |id: &str| q.is_none_or(|q| id == q || (!q.is_empty() && id.starts_with(q)));
+    let (found, mut warnings) = read_project(claude, cwd, &wanted);
+    let chosen: Vec<&Transcript> = match q {
         None if found.is_empty() => return Ok(no_sessions(claude, cwd, warnings)),
         None => found.iter().collect(),
         Some(q) => {
-            let q = q.trim();
-            let hits: Vec<&Transcript> = found
-                .iter()
-                .filter(|t| t.id == q || (!q.is_empty() && t.id.starts_with(q)))
-                .collect();
+            let hits: Vec<&Transcript> = found.iter().collect();
             match hits.as_slice() {
                 [t] => vec![*t],
                 [] => {
@@ -676,7 +893,16 @@ pub async fn import(
             }
             continue;
         }
-        let id = write_session(sessions_dir, t)
+        // Read again, in full, one at a time.
+        let t = match load(&t.path, &t.id, &cwd.to_string_lossy()) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(e) => {
+                warnings.push(format!("skipped {}: {e:#}", t.path.display()));
+                continue;
+            }
+        };
+        let id = write_session(sessions_dir, &t)
             .await
             .with_context(|| format!("importing Claude Code session {}", t.id))?;
         imported += 1;
@@ -713,7 +939,9 @@ pub async fn import(
 /// Save `t` as a new OxideClaw session in `dir` and return its id. The
 /// transcript is written before the `.meta` that lists it and marks it
 /// imported, and its modification time is set to the last activity, so the
-/// session list and `--continue` see the session's real age.
+/// session list and `--continue` see the session's real age. `imported_at`
+/// counts as activity for `cleanupPeriodDays`, or an old session would be
+/// deleted on the next start and imported again by the next run.
 async fn write_session(dir: &Path, t: &Transcript) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = t.created_at.unwrap_or_else(unix_now);
@@ -736,6 +964,7 @@ async fn write_session(dir: &Path, t: &Transcript) -> Result<String> {
             cwd: t.cwd.clone(),
             model: t.model.clone(),
             claude_code_session: Some(t.id.clone()),
+            imported_at: Some(unix_now()),
             redo: Vec::new(),
         },
         dir: dir.to_path_buf(),
@@ -801,10 +1030,34 @@ mod tests {
         )
     }
 
+    /// Link records as Claude Code does: each one that has a `uuid` and no
+    /// `parentUuid` yet gets the previous main-chain record as its parent.
+    /// Sidechain records hang off the chain without extending it; lines
+    /// that are not records pass through.
+    fn chain(lines: &[String]) -> String {
+        let mut prev: Option<String> = None;
+        let mut out = String::new();
+        for line in lines {
+            match serde_json::from_str::<Value>(line) {
+                Ok(Value::Object(mut r)) if r.contains_key("uuid") => {
+                    r.entry("parentUuid")
+                        .or_insert_with(|| prev.clone().map_or(Value::Null, Value::String));
+                    if r.get("isSidechain") != Some(&Value::Bool(true)) {
+                        prev = r["uuid"].as_str().map(str::to_string);
+                    }
+                    out.push_str(&Value::Object(r).to_string());
+                }
+                _ => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// A synthetic Claude Code transcript covering text, a tool call and
-    /// its result, an orphaned tool call, a sidechain record, meta and
-    /// compact-summary records, a block OxideClaw has no type for and a
-    /// malformed line.
+    /// its result, an orphaned tool call, a sidechain record, meta,
+    /// queue-only and API error records, bookkeeping records on the chain,
+    /// a block OxideClaw has no type for and a malformed line.
     fn fixture() -> String {
         let lines = [
             r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-03-01T09:59:59.000Z","sessionId":"x"}"#.to_string(),
@@ -843,9 +1096,16 @@ mod tests {
             ])),
             // The run was cut off: toolu_edit never got a result.
             user("2026-03-01T10:05:00.000Z", "never mind, thanks".into()),
+            // Bookkeeping on the chain, which the walk goes through.
+            record("system", "2026-03-01T10:05:01.000Z", serde_json::json!({
+                "subtype": "stop_hook_summary", "content": "hooks ran"
+            })),
+            record("attachment", "2026-03-01T10:05:02.000Z", serde_json::json!({
+                "attachment": {"type": "todo"}
+            })),
             record("user", "2026-03-01T10:06:00.000Z", serde_json::json!({
-                "isCompactSummary": true, "isVisibleInTranscriptOnly": true,
-                "message": {"role": "user", "content": "This session is being continued..."}
+                "queueTranscriptOnly": true,
+                "message": {"role": "user", "content": "QUEUED for later"}
             })),
             record("assistant", "2026-03-01T10:06:30.000Z", serde_json::json!({
                 "isApiErrorMessage": true,
@@ -859,7 +1119,7 @@ mod tests {
             r#"{"type":"ai-title","aiTitle":"Login bug fix","sessionId":"x"}"#.to_string(),
             r#"["not", "a", "record"]"#.to_string(),
         ];
-        lines.join("\n") + "\n"
+        chain(&lines)
     }
 
     fn claude_home(root: &Path) -> PathBuf {
@@ -994,7 +1254,7 @@ mod tests {
         assert_eq!(text(&t.messages[5]), ["You're welcome."]);
 
         let all: Vec<&str> = t.messages.iter().flat_map(text).collect();
-        for skipped in ["SIDECHAIN", "injected", "continued", "API Error", "torn"] {
+        for skipped in ["SIDECHAIN", "injected", "QUEUED", "API Error", "torn"] {
             assert!(
                 !all.iter().any(|s| s.contains(skipped)),
                 "{skipped} leaked: {all:?}"
@@ -1123,14 +1383,13 @@ mod tests {
         // file; and a session of another project sharing the dir name.
         write(
             &project.join(format!("{S2}.jsonl")),
-            &[
+            &chain(&[
                 user("2026-04-01T08:00:00Z", "second session".into()),
                 assistant(
                     "2026-04-01T08:00:05Z",
                     serde_json::json!([{"type": "text", "text": "ok"}]),
                 ),
-            ]
-            .join("\n"),
+            ]),
         );
         write(
             &project.join("33333333-3333-4333-8333-333333333333.jsonl"),
@@ -1270,12 +1529,40 @@ mod tests {
             .join(project_dir_name(Path::new(PROJECT)));
         let big = std::fs::File::create(project.join(format!("{S2}.jsonl"))).unwrap();
         big.set_len(MAX_TRANSCRIPT_BYTES + 1).unwrap();
-        let (found, warnings) = read_project(&claude, Path::new(PROJECT));
+        let (found, warnings) = read_project(&claude, Path::new(PROJECT), &|_| true);
         assert_eq!(found.len(), 1);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].contains(S2) && warnings[0].contains("50 MiB"),
             "{warnings:?}"
+        );
+    }
+
+    /// Listing keeps no messages in memory, only their count, and a
+    /// transcript the id filter leaves out is never opened.
+    #[tokio::test]
+    async fn listing_holds_no_messages_and_reads_only_wanted_ids() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = claude_home(td.path());
+        let project = claude
+            .join("projects")
+            .join(project_dir_name(Path::new(PROJECT)));
+        let big = std::fs::File::create(project.join(format!("{S2}.jsonl"))).unwrap();
+        big.set_len(MAX_TRANSCRIPT_BYTES + 1).unwrap();
+        let (found, warnings) = read_project(&claude, Path::new(PROJECT), &|id| id == S1);
+        assert!(warnings.is_empty(), "{S2} was read: {warnings:?}");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].messages.is_empty());
+        assert_eq!(found[0].message_count, 6);
+        // Importing one by id does not read the other either.
+        let sessions = td.path().join("sessions");
+        let out = import(&claude, Path::new(PROJECT), &sessions, Some(&S1[..8]))
+            .await
+            .unwrap()
+            .join("\n");
+        assert!(
+            out.contains("(6 messages)") && !out.contains("50 MiB"),
+            "{out}"
         );
     }
 
@@ -1302,5 +1589,282 @@ mod tests {
             );
         }
         assert_eq!(snapshot(&claude), before);
+    }
+
+    /// Claude Code compacts in place: the old records stay, a
+    /// `compact_boundary` with no parent starts the chain again, and the
+    /// model sees the summary and what follows. A rewind leaves the
+    /// abandoned branch in the file. Neither old history nor the abandoned
+    /// branch may reach the model; the results of parallel calls, chained
+    /// beside the path, must.
+    #[test]
+    fn compacted_and_rewound_transcripts_keep_only_the_live_branch() {
+        let id = |n: u8| format!("00000000-0000-4000-8000-0000000000{n:02}");
+        let at = |r: String, uuid: &str, parent: Option<&str>| {
+            let mut v: Value = serde_json::from_str(&r).unwrap();
+            v["uuid"] = uuid.into();
+            v["parentUuid"] = parent.map_or(Value::Null, Value::from);
+            v.to_string()
+        };
+        let reply = |ts: &str, msg_id: &str, content: Value| {
+            let mut v: Value = serde_json::from_str(&assistant(ts, content)).unwrap();
+            v["message"]["id"] = msg_id.into();
+            v.to_string()
+        };
+        let text_of = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+        let tool = |call: &str| serde_json::json!([{"type": "tool_use", "id": call, "name": "Bash", "input": {}}]);
+        let result = |call: &str| serde_json::json!([{"type": "tool_result", "tool_use_id": call, "content": call}]);
+        let ts = "2026-06-01T10:00:00Z";
+        let (u1, a1, b, s, u2, a2a, a2b, r1, r2, a3) = (
+            id(1),
+            id(2),
+            id(3),
+            id(4),
+            id(5),
+            id(6),
+            id(7),
+            id(8),
+            id(9),
+            id(10),
+        );
+        let (u3, a4, r9, u4, a5) = (id(11), id(12), id(13), id(14), id(15));
+        let lines = [
+            at(user(ts, "OLD prompt".into()), &u1, None),
+            at(reply(ts, "msg_a1", text_of("OLD reply")), &a1, Some(&u1)),
+            at(
+                record(
+                    "system",
+                    ts,
+                    serde_json::json!({
+                        "subtype": "compact_boundary", "logicalParentUuid": a1,
+                        "compactMetadata": {"trigger": "auto"}
+                    }),
+                ),
+                &b,
+                None,
+            ),
+            at(
+                record(
+                    "user",
+                    ts,
+                    serde_json::json!({
+                        "isCompactSummary": true, "isVisibleInTranscriptOnly": true,
+                        "message": {"role": "user", "content": "Summary of the earlier work."}
+                    }),
+                ),
+                &s,
+                Some(&b),
+            ),
+            at(user(ts, "second prompt".into()), &u2, Some(&s)),
+            // Two parallel calls in one reply, one record per block; the
+            // first call's result hangs off its own record.
+            at(reply(ts, "msg_a2", tool("t1")), &a2a, Some(&u2)),
+            at(reply(ts, "msg_a2", tool("t2")), &a2b, Some(&a2a)),
+            at(user(ts, result("t1")), &r1, Some(&a2a)),
+            at(user(ts, result("t2")), &r2, Some(&a2b)),
+            at(reply(ts, "msg_a3", text_of("both done")), &a3, Some(&r2)),
+            // Rewound: this branch was abandoned.
+            at(user(ts, "ABANDONED prompt".into()), &u3, Some(&a3)),
+            at(reply(ts, "msg_a4", tool("t9")), &a4, Some(&u3)),
+            at(user(ts, result("t9")), &r9, Some(&a4)),
+            at(user(ts, "retyped prompt".into()), &u4, Some(&a3)),
+            at(reply(ts, "msg_a5", text_of("final")), &a5, Some(&u4)),
+        ];
+        let t = parse_transcript(S1, (lines.join("\n") + "\n").as_bytes());
+        let all: Vec<&str> = t.messages.iter().flat_map(text).collect();
+        assert_eq!(
+            all,
+            [
+                "Summary of the earlier work.",
+                "second prompt",
+                "both done",
+                "retyped prompt",
+                "final"
+            ]
+        );
+        let roles: Vec<Role> = t.messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            [
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::Assistant
+            ]
+        );
+        let ids = |m: &Message| -> Vec<String> {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(ids(&t.messages[1]), ["t1", "t2"]);
+        assert_eq!(ids(&t.messages[2]), ["t1", "t2"]);
+        assert_eq!(t.skipped, Skipped::default(), "nothing orphaned");
+        // The listing still shows the prompt the session began with.
+        assert_eq!(t.first_prompt, "OLD prompt");
+    }
+
+    /// Transcripts from before record ids are taken in file order, from
+    /// the last compaction on.
+    #[test]
+    fn transcripts_without_ids_start_after_the_last_compaction() {
+        let strip = |r: String| {
+            let mut v: Value = serde_json::from_str(&r).unwrap();
+            v.as_object_mut().unwrap().remove("uuid");
+            v.to_string()
+        };
+        let ts = "2026-06-01T10:00:00Z";
+        let lines = [
+            strip(user(ts, "OLD".into())),
+            strip(assistant(
+                ts,
+                serde_json::json!([{"type": "text", "text": "OLD reply"}]),
+            )),
+            strip(record(
+                "system",
+                ts,
+                serde_json::json!({"subtype": "compact_boundary"}),
+            )),
+            strip(record(
+                "user",
+                ts,
+                serde_json::json!({
+                    "isCompactSummary": true, "isVisibleInTranscriptOnly": true,
+                    "message": {"role": "user", "content": "Summary."}
+                }),
+            )),
+            strip(user(ts, "new".into())),
+            strip(assistant(
+                ts,
+                serde_json::json!([{"type": "text", "text": "reply"}]),
+            )),
+        ];
+        let t = parse_transcript(S1, lines.join("\n").as_bytes());
+        let all: Vec<&str> = t.messages.iter().flat_map(text).collect();
+        assert_eq!(all, ["Summary.", "new", "reply"]);
+    }
+
+    /// An import keeps the original session's age for the list, but counts
+    /// as activity for `cleanupPeriodDays`: the next start must not delete
+    /// it (and the next import bring it back under a new id).
+    #[tokio::test]
+    async fn imported_sessions_survive_cleanup_of_old_sessions() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = claude_home(td.path());
+        let sessions = td.path().join("sessions");
+        import(&claude, Path::new(PROJECT), &sessions, None)
+            .await
+            .unwrap();
+        let before = Session::list_in(&sessions).await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].imported_at.is_some());
+        // A 30-day cutoff: the session itself is from months before.
+        let cutoff = unix_now() - 30 * 86_400;
+        assert!(before[0].created_at < cutoff);
+        Session::prune_inactive_in(&sessions, cutoff, None).await;
+        let ids = |metas: Vec<SessionMeta>| metas.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(Session::list_in(&sessions).await.unwrap()), ids(before));
+        // Once the import itself is older than the cutoff, it goes.
+        Session::prune_inactive_in(&sessions, unix_now() + 10, None).await;
+        assert!(Session::list_in(&sessions).await.unwrap().is_empty());
+    }
+
+    /// Claude Code keeps its transcripts owner-only; an import must not
+    /// make them readable by others.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn imported_sessions_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let claude = claude_home(td.path());
+        let sessions = td.path().join("data/sessions");
+        import(&claude, Path::new(PROJECT), &sessions, None)
+            .await
+            .unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&sessions), 0o700);
+        let files: Vec<PathBuf> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        for f in files {
+            assert_eq!(mode(&f), 0o600, "{}", f.display());
+        }
+    }
+
+    #[test]
+    fn claude_config_dir_is_used_when_absolute() {
+        let home = Some(PathBuf::from("/home/u/.claude"));
+        assert_eq!(
+            home_from(Some("/srv/claude".into()), home.clone()),
+            Some(PathBuf::from("/srv/claude"))
+        );
+        assert_eq!(home_from(Some("relative".into()), home.clone()), home);
+        assert_eq!(home_from(None, home.clone()), home);
+    }
+
+    /// `$CLAUDE_CONFIG_DIR` is guarded unless OxideClaw's own deprecated
+    /// profile is that directory (its sessions live there already);
+    /// `~/.claude` always is.
+    #[test]
+    fn the_guard_spares_only_oxideclaws_own_claude_config_dir_profile() {
+        use crate::config::{ConfigDirChoice, ConfigDirSource};
+        let (cc, dot) = (PathBuf::from("/cc"), PathBuf::from("/home/u/.claude"));
+        let own = |dir: &str, source| ConfigDirChoice {
+            dir: dir.into(),
+            source,
+        };
+        assert_eq!(
+            never_written_with(&cc, &own("/x", ConfigDirSource::Xdg), Some(dot.clone())),
+            [cc.clone(), dot.clone()]
+        );
+        assert_eq!(
+            never_written_with(
+                &cc,
+                &own("/cc", ConfigDirSource::ClaudeConfigDir),
+                Some(dot.clone())
+            ),
+            vec![dot.clone()]
+        );
+        assert_eq!(
+            never_written_with(&dot, &own("/x", ConfigDirSource::Xdg), Some(dot.clone())),
+            [dot.clone(), dot]
+        );
+    }
+
+    /// With `$CLAUDE_CONFIG_DIR` in use, a sessions dir inside it is
+    /// refused like one inside `~/.claude`.
+    #[tokio::test]
+    async fn never_writes_under_claude_config_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = claude_home(td.path());
+        let err = import(
+            &claude,
+            Path::new(PROJECT),
+            &claude.join("x/sessions"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("never written"), "{err}");
+        if let Some(dot_claude) = crate::config::Config::claude_code_dir() {
+            let err = import(
+                &claude,
+                Path::new(PROJECT),
+                &dot_claude.join("sessions"),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("never written"), "{err}");
+        }
     }
 }

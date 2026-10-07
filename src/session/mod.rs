@@ -53,6 +53,11 @@ pub struct SessionMeta {
     /// (`config import-claude --sessions`), so a re-run skips it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_session: Option<String>,
+    /// When the session was imported (unix seconds). Imports keep the
+    /// original session's age for display, so this is what keeps
+    /// `cleanupPeriodDays` from deleting one right after the import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<u64>,
     /// Turns /undo took off the conversation, the next one to /redo last.
     /// Any new turn clears it. Never part of the `.meta`: it holds whole
     /// messages (tool output, file contents), which `Session::list` would
@@ -153,7 +158,7 @@ impl Session {
 
     /// `new_with_id` in the sessions directory `dir`.
     pub async fn create_in(dir: &Path, id: String) -> Result<Self> {
-        fs::create_dir_all(dir).await?;
+        create_private_dir(dir).await?;
         let meta = SessionMeta {
             id: id.clone(),
             name: human_session_name(),
@@ -167,6 +172,7 @@ impl Session {
             cwd: None,
             model: None,
             claude_code_session: None,
+            imported_at: None,
             redo: Vec::new(),
         };
         meta.save_in(dir).await?;
@@ -197,6 +203,7 @@ impl Session {
                 cwd: None,
                 model: None,
                 claude_code_session: None,
+                imported_at: None,
                 redo: Vec::new(),
             },
             dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -331,11 +338,11 @@ impl Session {
             batch.push(b'\n');
         }
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&self.path).await?;
         let original_len = file.metadata().await?.len();
         // A failed write (ENOSPC, EIO) can leave part of the batch behind;
         // cut it off so the caller can retry the whole batch and the next
@@ -504,7 +511,7 @@ impl Session {
             return;
         };
         for (last_active, meta) in list {
-            if last_active >= cutoff
+            if last_active.max(meta.imported_at.unwrap_or(0)) >= cutoff
                 || keep == Some(meta.id.as_str())
                 || !is_safe_session_id(&meta.id)
             {
@@ -863,15 +870,26 @@ fn repair_loaded(id: &str, messages: &mut Vec<Message>) {
     }
 }
 
+/// Create `dir` and its missing parents. Session files hold tool output,
+/// file contents and often secrets, so on unix the directories created here
+/// are the owner's only (0700), like Claude Code's `~/.claude/projects`.
+async fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).await
+}
+
 /// Atomic file write: write to a sibling temp file, fsync, then rename over
 /// the target. Survives mid-write crashes — the target is either the old
-/// content or the new content, never a truncated splice. Falls back to a
-/// direct write only if the temp-file path can't be constructed.
+/// content or the new content, never a truncated splice. On unix the file is
+/// the owner's only (0600), as Claude Code keeps its transcripts.
 async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("session path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).await?;
+    create_private_dir(parent).await?;
 
     let file_name = path
         .file_name()
@@ -883,11 +901,11 @@ async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     ));
 
     {
-        let mut f = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)
-            .await?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut f = options.open(&tmp).await?;
         f.write_all(bytes).await?;
         f.sync_all().await?;
     }
@@ -1254,6 +1272,7 @@ mod continue_tests {
             cwd: None,
             model: None,
             claude_code_session: None,
+            imported_at: None,
             redo: Vec::new(),
         };
         std::fs::write(
@@ -1431,6 +1450,7 @@ mod resolve_tests {
             cwd: None,
             model: None,
             claude_code_session: None,
+            imported_at: None,
             redo: Vec::new(),
         };
         let body = serde_json::to_string(&meta).unwrap();
