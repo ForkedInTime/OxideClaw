@@ -172,7 +172,17 @@ pub(super) fn cmd_branch(ctx: &CommandContext) -> CommandAction {
         lines.push(String::new());
     }
 
-    if let Some(status) = run(&["status", "--short"]) {
+    // Not through `run`: its trim() ate the leading space of the first
+    // XY code (" M" read as staged "M"), and its empty filter hid the
+    // clean-tree line.
+    let status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(&ctx.config.cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string());
+    if let Some(status) = status {
         if !status.is_empty() {
             lines.push("Working tree changes:".into());
             for l in status.lines().take(15) {
@@ -533,6 +543,77 @@ mod prompt_command_tests {
             assert!(c.ends_with("2>&1"), "{c}");
         }
         assert!(checks.contains(&"npm test 2>&1"));
+    }
+
+    fn with_ctx<R>(cwd: &std::path::Path, f: impl FnOnce(&CommandContext) -> R) -> R {
+        let config = Config {
+            cwd: cwd.to_path_buf(),
+            ..Config::default()
+        };
+        let skills = HashMap::new();
+        let todo = TodoState::default();
+        let ctx = CommandContext {
+            config: &config,
+            tokens_in: 0,
+            context_window: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cost_summary: String::new(),
+            cache_write_tokens: 0,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: &[],
+            brief_mode: false,
+            btw_note: None,
+        };
+        f(&ctx)
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// trim() turned the first entry's " M" (unstaged) into "M" (staged),
+    /// and a clean tree printed nothing at all.
+    #[test]
+    fn branch_keeps_status_columns_and_reports_a_clean_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("a"), "1").unwrap();
+        git(d, &["add", "a"]);
+        git(d, &["commit", "-q", "-m", "init"]);
+
+        let msg = |d: &std::path::Path| match with_ctx(d, cmd_branch) {
+            CommandAction::Message(m) => m,
+            _ => panic!("expected a message"),
+        };
+        assert!(msg(d).contains("Working tree: clean"));
+
+        std::fs::write(d.join("a"), "2").unwrap();
+        let out = msg(d);
+        assert!(out.contains("\n   M a"), "{out}");
     }
 
     /// The bare form promised to target the current branch's PR but only
