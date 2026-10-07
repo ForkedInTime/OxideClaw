@@ -12,10 +12,13 @@ pub(crate) struct ModelPrice {
     /// Cache-read price as a fraction of `input`. Writes (5-minute TTL) are
     /// always 1.25× input.
     cache_read_mult: f64,
-    /// True when this is a guess for an unrecognised model rather than a known
-    /// published rate. Surfaced in `/cost` so a wrong number is never presented
-    /// as an authoritative one.
+    /// True when this is an approximation (a rough third-party rate or the
+    /// unknown-model fallback) rather than a known published rate. Surfaced in
+    /// `/cost` so a wrong number is never presented as an authoritative one.
     estimated: bool,
+    /// True only for the unknown-model Sonnet-tier fallback, so `/cost` does
+    /// not tell a DeepSeek or Groq user their model was not recognised.
+    fallback: bool,
 }
 
 /// Cache writes with the default 5-minute TTL bill at 1.25× the input rate.
@@ -40,12 +43,14 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         output,
         cache_read_mult: 0.1,
         estimated: false,
+        fallback: false,
     };
     let rough = |input: f64, output: f64| ModelPrice {
         input,
         output,
         cache_read_mult: 0.1,
         estimated: true,
+        fallback: false,
     };
     // OpenRouter spells versions with dots (`anthropic/claude-opus-4.1`);
     // the generation checks below are written against Anthropic's dashes.
@@ -113,7 +118,10 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         // functions, but flag it: an unrecognised model may be an order of
         // magnitude cheaper or dearer, and silently reporting a guess as fact
         // is how a /budget cap gets trusted when it should not be.
-        rough(3.0, 15.0)
+        ModelPrice {
+            fallback: true,
+            ..rough(3.0, 15.0)
+        }
     }
 }
 
@@ -147,8 +155,10 @@ pub struct ModelUsage {
     pub output_tokens: u64,
     pub turns: u32,
     pub cost_usd: f64,
-    /// Cost for this model is based on fallback rates, not published ones.
+    /// Cost for this model is based on approximate rates, not published ones.
     pub estimated: bool,
+    /// The model was not recognised and is priced at Sonnet-tier rates.
+    pub fallback: bool,
 }
 
 /// Session-wide cost tracker.
@@ -212,10 +222,18 @@ impl CostTracker {
         let entry = self.by_model.entry(model.to_string()).or_default();
         if price.estimated && !entry.estimated {
             entry.estimated = true;
-            tracing::warn!(
-                "cost: '{model}' is not a recognised model — pricing it at Sonnet-tier \
-                 rates. Reported cost and any /budget cap are estimates for this model."
-            );
+            entry.fallback = price.fallback;
+            if price.fallback {
+                tracing::warn!(
+                    "cost: '{model}' is not a recognised model — pricing it at Sonnet-tier \
+                     rates. Reported cost and any /budget cap are estimates for this model."
+                );
+            } else {
+                tracing::warn!(
+                    "cost: '{model}' is priced at an approximate third-party rate. \
+                     Reported cost and any /budget cap are estimates for this model."
+                );
+            }
         }
         entry.input_tokens += input_tokens;
         entry.output_tokens += output_tokens;
@@ -274,11 +292,13 @@ impl CostTracker {
             // order costs nothing and removes the failure mode permanently.
             models.sort_by(|a, b| b.1.cost_usd.total_cmp(&a.1.cost_usd));
 
-            let mut any_estimated = false;
+            let (mut any_rough, mut any_fallback) = (false, false);
             for (model, usage) in models {
                 let short = short_model_name(model);
-                if usage.estimated {
-                    any_estimated = true;
+                if usage.fallback {
+                    any_fallback = true;
+                } else if usage.estimated {
+                    any_rough = true;
                 }
                 lines.push(format!(
                     "  {short}: {turns} turns, {in_tok} in / {out_tok} out, {approx}${cost:.4}",
@@ -289,8 +309,13 @@ impl CostTracker {
                     cost = usage.cost_usd,
                 ));
             }
-            if any_estimated {
+            if any_rough || any_fallback {
                 lines.push(String::new());
+            }
+            if any_rough {
+                lines.push("  ~ estimated — approximate third-party rates.".into());
+            }
+            if any_fallback {
                 lines.push(
                     "  ~ estimated — model not recognised, priced at Sonnet-tier rates.".into(),
                 );
@@ -414,6 +439,7 @@ mod tests {
                     turns: 1,
                     cost_usd: cost,
                     estimated: false,
+                    fallback: false,
                 },
             );
         }
@@ -443,6 +469,25 @@ mod tests {
             "estimate must be marked in the report: {s}"
         );
         assert!(s.contains("not recognised"), "and explained: {s}");
+    }
+
+    /// DeepSeek/Groq rows are known approximate rates, not the Sonnet-tier
+    /// fallback; the footnote used to claim they were not recognised.
+    #[test]
+    fn rough_third_party_rates_are_not_reported_as_unrecognised() {
+        let mut t = CostTracker::new();
+        t.record("deepseek:deepseek-chat", 1_000_000, 0);
+        t.record("groq:llama-3.3-70b", 1_000_000, 0);
+        assert!(t.by_model["deepseek:deepseek-chat"].estimated);
+        assert!(!t.by_model["deepseek:deepseek-chat"].fallback);
+        let s = t.summary();
+        assert!(s.contains("approximate third-party rates"), "{s}");
+        assert!(!s.contains("not recognised"), "{s}");
+
+        t.record("some-new-provider:mystery-model", 1_000_000, 0);
+        let s = t.summary();
+        assert!(s.contains("approximate third-party rates"), "{s}");
+        assert!(s.contains("not recognised"), "{s}");
     }
 
     #[test]
