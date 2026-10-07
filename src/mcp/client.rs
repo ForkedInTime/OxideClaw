@@ -3,6 +3,7 @@
 /// Implements the Model Context Protocol (MCP) JSON-RPC 2.0 protocol.
 /// Stdio transport: spawns the server process and communicates via stdin/stdout.
 /// HTTP transport:  POSTs JSON-RPC requests to a URL (streamable HTTP).
+/// SSE transport:   the legacy HTTP+SSE pair (an event stream plus POSTs).
 use crate::mcp::types::{JsonRpcRequest, JsonRpcResponse, McpCallResult, McpResource, McpToolDef};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -292,27 +293,30 @@ impl HttpTransport {
     // user replaces it and restarts. No OAuth discovery/PKCE/refresh flow is
     // planned — documented in SECURITY.md.
     pub fn new(url: &str, headers: &HashMap<String, String>) -> Result<Self> {
-        let mut builder = reqwest::Client::builder();
-
-        if !headers.is_empty() {
-            let mut header_map = reqwest::header::HeaderMap::new();
-            for (k, v) in headers {
-                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
-                    .map_err(|e| anyhow!("Invalid MCP header name '{}': {}", k, e))?;
-                let value = reqwest::header::HeaderValue::from_str(v)
-                    .map_err(|e| anyhow!("Invalid MCP header value: {}", e))?;
-                header_map.insert(name, value);
-            }
-            builder = builder.default_headers(header_map);
-        }
-
         Ok(Self {
             url: url.to_string(),
-            client: builder.build()?,
+            client: client_with_headers(headers)?,
             session_id: std::sync::Mutex::new(None),
             timeout: REQUEST_TIMEOUT,
         })
     }
+}
+
+/// An HTTP client that sends `headers` (static auth) on every request.
+fn client_with_headers(headers: &HashMap<String, String>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if !headers.is_empty() {
+        let mut header_map = reqwest::header::HeaderMap::new();
+        for (k, v) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| anyhow!("Invalid MCP header name '{}': {}", k, e))?;
+            let value = reqwest::header::HeaderValue::from_str(v)
+                .map_err(|e| anyhow!("Invalid MCP header value: {}", e))?;
+            header_map.insert(name, value);
+        }
+        builder = builder.default_headers(header_map);
+    }
+    Ok(builder.build()?)
 }
 
 /// Largest HTTP MCP response body we will buffer. Resources and tool
@@ -423,20 +427,35 @@ fn sse_event_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// The JSON-RPC response for `id` carried by one SSE event, if that is
-/// what the event holds (not a notification or a server-to-client request).
-fn sse_event_response(event: &[u8], id: u64) -> Option<JsonRpcResponse> {
+/// One SSE event's type (`message` when it names none) and its `data`
+/// lines joined, or `None` for an event without data (a comment, a retry).
+fn sse_event_fields(event: &[u8]) -> Option<(String, String)> {
     let text = String::from_utf8_lossy(event);
-    let data: Vec<&str> = text
-        .split('\n')
-        .map(|l| l.trim_end_matches('\r'))
-        .filter_map(|l| l.strip_prefix("data:"))
-        .map(|d| d.strip_prefix(' ').unwrap_or(d))
-        .collect();
+    let field = |l: &str, name: &str| {
+        l.strip_prefix(name)
+            .and_then(|r| r.strip_prefix(':'))
+            .map(|v| v.strip_prefix(' ').unwrap_or(v).to_string())
+    };
+    let mut kind = None;
+    let mut data: Vec<String> = Vec::new();
+    for l in text.split('\n').map(|l| l.trim_end_matches('\r')) {
+        if let Some(d) = field(l, "data") {
+            data.push(d);
+        } else if let Some(e) = field(l, "event") {
+            kind = Some(e);
+        }
+    }
     if data.is_empty() {
         return None;
     }
-    let v: Value = serde_json::from_str(&data.join("\n")).ok()?;
+    Some((kind.unwrap_or_else(|| "message".into()), data.join("\n")))
+}
+
+/// The JSON-RPC response for `id` carried by one SSE event, if that is
+/// what the event holds (not a notification or a server-to-client request).
+fn sse_event_response(event: &[u8], id: u64) -> Option<JsonRpcResponse> {
+    let (_, data) = sse_event_fields(event)?;
+    let v: Value = serde_json::from_str(&data).ok()?;
     let is_response = v.get("result").is_some() || v.get("error").is_some();
     if !is_response || v.get("id").and_then(Value::as_u64) != Some(id) {
         return None;
@@ -512,12 +531,235 @@ impl McpTransport for HttpTransport {
     }
 }
 
+// ── Legacy HTTP+SSE transport ─────────────────────────────────────────────────
+
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+/// MCP's HTTP+SSE transport (protocol 2024-11-05, since replaced by
+/// Streamable HTTP), which ACP hosts may still pass as `type: "sse"`. A GET
+/// opens an event stream whose first `endpoint` event names the URL to POST
+/// messages to; the answers come back on that stream, not in the POST's
+/// reply.
+pub(crate) struct SseTransport {
+    endpoint: reqwest::Url,
+    client: reqwest::Client,
+    pending: Pending,
+    /// Set by the reader, under the `pending` lock, once the stream ends.
+    closed: Arc<AtomicBool>,
+    reader: tokio::task::JoinHandle<()>,
+    timeout: Duration,
+}
+
+impl Drop for SseTransport {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+impl SseTransport {
+    pub async fn connect(url: &str, headers: &HashMap<String, String>) -> Result<Self> {
+        Self::connect_with_timeout(url, headers, REQUEST_TIMEOUT).await
+    }
+
+    async fn connect_with_timeout(
+        url: &str,
+        headers: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        use tokio_stream::StreamExt;
+        let base = reqwest::Url::parse(url).map_err(|e| anyhow!("bad SSE MCP url {url}: {e}"))?;
+        let client = client_with_headers(headers)?;
+        let open = async {
+            let resp = client
+                .get(base.clone())
+                .header("Accept", "text/event-stream")
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("SSE MCP stream failed: {}", resp.status()));
+            }
+            let mut stream = Box::pin(resp.bytes_stream());
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                while let Some((end, sep)) = sse_event_end(&buf, 0) {
+                    let event: Vec<u8> = buf.drain(..end + sep).collect();
+                    if let Some((kind, data)) = sse_event_fields(&event[..end])
+                        && kind == "endpoint"
+                    {
+                        return Ok((data, stream, buf));
+                    }
+                }
+                match stream.next().await {
+                    Some(chunk) => {
+                        buf.extend_from_slice(&chunk?);
+                        if buf.len() > MAX_HTTP_BODY_BYTES {
+                            return Err(anyhow!("SSE MCP stream sent no endpoint event"));
+                        }
+                    }
+                    None => return Err(anyhow!("SSE MCP stream ended before its endpoint event")),
+                }
+            }
+        };
+        let (data, mut stream, mut buf) = tokio::time::timeout(timeout, open)
+            .await
+            .map_err(|_| anyhow!("SSE MCP server sent no endpoint event"))??;
+        let endpoint = base
+            .join(data.trim())
+            .map_err(|e| anyhow!("SSE MCP endpoint {data:?}: {e}"))?;
+        // The headers (often a bearer token) go to every POST: never to a
+        // host other than the one the user named.
+        if endpoint.origin() != base.origin() {
+            return Err(anyhow!(
+                "SSE MCP endpoint {endpoint} is not on the server's origin {}",
+                base.origin().ascii_serialization()
+            ));
+        }
+
+        let pending: Pending = Arc::default();
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (pending, closed) = (pending.clone(), closed.clone());
+            let (client, endpoint) = (client.clone(), endpoint.clone());
+            tokio::spawn(async move {
+                loop {
+                    while let Some((end, sep)) = sse_event_end(&buf, 0) {
+                        let event: Vec<u8> = buf.drain(..end + sep).collect();
+                        let Some((kind, data)) = sse_event_fields(&event[..end]) else {
+                            continue;
+                        };
+                        if kind != "message" {
+                            continue;
+                        }
+                        let Ok(msg) = serde_json::from_str::<Value>(&data) else {
+                            continue;
+                        };
+                        Self::dispatch(msg, &pending, &client, &endpoint).await;
+                    }
+                    match stream.next().await {
+                        Some(Ok(chunk)) if buf.len() + chunk.len() <= MAX_HTTP_BODY_BYTES => {
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Some(Ok(_)) => {
+                            tracing::warn!("SSE MCP: event over {MAX_HTTP_BODY_BYTES} bytes");
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                // Dropping the senders fails every waiting call at once.
+                let mut p = pending.lock().await;
+                closed.store(true, Ordering::SeqCst);
+                p.clear();
+            })
+        };
+        Ok(Self {
+            endpoint,
+            client,
+            pending,
+            closed,
+            reader,
+            timeout,
+        })
+    }
+
+    /// Route one message from the stream: a response to its caller, a
+    /// server request to our fixed answer; notifications are dropped.
+    async fn dispatch(
+        msg: Value,
+        pending: &Pending,
+        client: &reqwest::Client,
+        endpoint: &reqwest::Url,
+    ) {
+        if let Some(method) = msg.get("method").and_then(Value::as_str) {
+            if let Some(id) = msg.get("id") {
+                let reply = server_request_reply(id, method);
+                let (client, endpoint) = (client.clone(), endpoint.clone());
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        REQUEST_TIMEOUT,
+                        client.post(endpoint).json(&reply).send(),
+                    )
+                    .await;
+                });
+            }
+            return;
+        }
+        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let Some(tx) = pending.lock().await.remove(&id) else {
+            return;
+        };
+        let reply = match serde_json::from_value::<JsonRpcResponse>(msg) {
+            Ok(r) => match r.error {
+                Some(err) => Err(anyhow!("MCP error {}: {}", err.code, err.message)),
+                None => Ok(r.result.unwrap_or(Value::Null)),
+            },
+            Err(e) => Err(anyhow!("malformed MCP response: {e}")),
+        };
+        let _ = tx.send(reply);
+    }
+
+    async fn post(&self, body: &JsonRpcRequest, method: &str) -> Result<()> {
+        let resp = self
+            .client
+            .post(self.endpoint.clone())
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = HttpTransport::bounded_body(resp, method)
+                .await
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "SSE MCP {method} failed: {status} — {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for SseTransport {
+    async fn call(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(anyhow!("SSE MCP stream closed"));
+            }
+            pending.insert(id, tx);
+        }
+        let req = JsonRpcRequest::new(id, method, params);
+        let exchange = async {
+            self.post(&req, method).await?;
+            rx.await
+                .map_err(|_| anyhow!("SSE MCP stream closed before the {method} response"))?
+        };
+        let out = match tokio::time::timeout(self.timeout, exchange).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!("SSE MCP request timed out ({method})")),
+        };
+        if out.is_err() {
+            self.pending.lock().await.remove(&id);
+        }
+        out
+    }
+
+    async fn notify(&self, method: &str) {
+        let req = JsonRpcRequest::notification(method);
+        let _ = tokio::time::timeout(self.timeout, self.post(&req, method)).await;
+    }
+}
+
 // ── McpClient ─────────────────────────────────────────────────────────────────
 
 pub struct McpClient {
     pub server_name: String,
     pub tools: Vec<McpToolDef>,
-    pub transport_kind: &'static str, // "stdio" | "http"
+    pub transport_kind: &'static str, // "stdio" | "http" | "sse"
     transport: Box<dyn McpTransport>,
     next_id: AtomicU64,
 }
@@ -652,6 +894,24 @@ impl McpClient {
             server_name,
             tools: Vec::new(),
             transport_kind: "http",
+            transport: Box::new(transport),
+            next_id: AtomicU64::new(1),
+        };
+        client.init().await?;
+        Ok(client)
+    }
+
+    /// Connect to an MCP server over the legacy HTTP+SSE transport.
+    pub async fn connect_sse(
+        server_name: String,
+        url: &str,
+        headers: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let transport = SseTransport::connect(url, headers).await?;
+        let mut client = Self {
+            server_name,
+            tools: Vec::new(),
+            transport_kind: "sse",
             transport: Box::new(transport),
             next_id: AtomicU64::new(1),
         };
@@ -1355,5 +1615,257 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'"#,
             .unwrap_err();
         assert!(err.to_string().contains("exited"), "{err}");
         assert!(t.pending.lock().await.is_empty());
+    }
+
+    /// A legacy HTTP+SSE MCP server: GET opens the stream and announces
+    /// `endpoint` (relative, as the reference SDK sends it); each POST there
+    /// is answered 202 and its reply goes out on the stream. `before`
+    /// events are sent ahead of every reply. Records each request head and
+    /// body, lowercased.
+    async fn legacy_sse_server(
+        endpoint: &'static str,
+        before: Vec<String>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ev_rx = Arc::new(Mutex::new(Some(ev_rx)));
+        let before = Arc::new(before);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, ev_tx, ev_rx, before) =
+                    (log.clone(), ev_tx.clone(), ev_rx.clone(), before.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        req.extend_from_slice(&tmp[..n]);
+                        let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                        if let Some(h) = text.find("\r\n\r\n") {
+                            let len = text
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if req.len() >= h + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let raw = String::from_utf8_lossy(&req).into_owned();
+                    log.lock().unwrap().push(raw.to_ascii_lowercase());
+                    if raw.starts_with("GET ") {
+                        let Some(mut rx) = ev_rx.lock().await.take() else {
+                            return;
+                        };
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                             cache-control: no-cache\r\n\r\n\
+                             : a comment\n\nevent: endpoint\ndata: {endpoint}\n\n"
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        while let Some(ev) = rx.recv().await {
+                            if sock.write_all(ev.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await;
+                    let _ = sock.shutdown().await;
+                    let body = raw.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                    let Ok(msg) = serde_json::from_str::<Value>(body) else {
+                        return;
+                    };
+                    let (Some(id), Some(method)) = (msg.get("id"), msg["method"].as_str()) else {
+                        return; // a notification, or our reply to a server request
+                    };
+                    let result = match method {
+                        "initialize" => {
+                            json!({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}})
+                        }
+                        "tools/list" => {
+                            json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]})
+                        }
+                        "tools/call" => json!({"content": [{"type": "text",
+                            "text": format!("echoed {}", msg["params"]["arguments"]["text"].as_str().unwrap_or(""))}]}),
+                        _ => json!({}),
+                    };
+                    for ev in before.iter() {
+                        let _ = ev_tx.send(ev.clone());
+                    }
+                    let reply = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                    let _ = ev_tx.send(format!("event: message\r\ndata: {reply}\r\n\r\n"));
+                });
+            }
+        });
+        (format!("http://{addr}/sse"), seen)
+    }
+
+    /// ACP hosts may pass `type: "sse"` servers: the client opens the
+    /// stream, posts to the announced endpoint with the host's headers, and
+    /// reads the answers off the stream past notifications and the
+    /// server's own requests (a ping, which gets its reply).
+    #[tokio::test]
+    async fn sse_transport_speaks_legacy_http_sse() {
+        let before = vec![
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n\n"
+                .to_string(),
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n"
+                .to_string(),
+        ];
+        let (url, seen) = legacy_sse_server("/messages?sessionId=abc", before).await;
+        let headers: HashMap<String, String> =
+            [("Authorization".to_string(), "Bearer s3cret".to_string())].into();
+        let client = tokio::time::timeout(
+            Duration::from_secs(20),
+            McpClient::connect_sse("old".into(), &url, &headers),
+        )
+        .await
+        .expect("connect hung")
+        .unwrap();
+        assert_eq!(client.transport_kind, "sse");
+        assert_eq!(client.tools.len(), 1, "{:?}", client.tools);
+        assert_eq!(client.tools[0].name, "echo");
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.call_tool("echo", json!({"text": "hi"})),
+        )
+        .await
+        .expect("tool call hung")
+        .unwrap();
+        assert_eq!(out, "echoed hi");
+
+        // The ping reply is posted from a spawned task; give it a moment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.contains(r#""id":"srv-1""#))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ping went unanswered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen[0].starts_with("get /sse "), "{}", seen[0]);
+        assert!(seen[0].contains("accept: text/event-stream"), "{}", seen[0]);
+        let posts: Vec<&String> = seen.iter().filter(|r| r.starts_with("post ")).collect();
+        assert!(posts.len() >= 4, "{seen:?}"); // initialize, initialized, tools/list, tools/call
+        for r in &posts {
+            assert!(r.starts_with("post /messages?sessionid=abc "), "{r}");
+        }
+        assert!(
+            seen.iter()
+                .all(|r| r.contains("authorization: bearer s3cret")),
+            "{seen:?}"
+        );
+        assert!(seen.iter().any(|r| r.contains("notifications/initialized")));
+        assert!(
+            seen.iter()
+                .any(|r| r.contains(r#""id":"srv-1""#) && r.contains(r#""result":{}"#)),
+            "{seen:?}"
+        );
+    }
+
+    /// The host's headers ride on every POST, so an endpoint event naming
+    /// another host must not be followed.
+    #[tokio::test]
+    async fn sse_transport_refuses_an_endpoint_on_another_origin() {
+        let (url, seen) = legacy_sse_server("http://127.0.0.2:1/steal", vec![]).await;
+        let err = match tokio::time::timeout(
+            Duration::from_secs(20),
+            SseTransport::connect(&url, &HashMap::new()),
+        )
+        .await
+        .expect("connect hung")
+        {
+            Ok(_) => panic!("followed a cross-origin endpoint"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("origin"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the GET");
+    }
+
+    /// A stream that dies fails the waiting call at once, and later calls
+    /// fail fast instead of waiting out the request timeout.
+    #[tokio::test]
+    async fn sse_transport_fails_calls_when_the_stream_ends() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sse", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut tmp = [0u8; 4096];
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if tmp[..n].starts_with(b"GET ") {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+                                  event: endpoint\ndata: /m\n\n",
+                            )
+                            .await;
+                        // Close the stream once the first message is posted.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    } else {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        let t = SseTransport::connect(&url, &HashMap::new()).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(10), t.call(1, "initialize", json!({})))
+            .await
+            .expect("call hung after the stream ended")
+            .unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        let err = tokio::time::timeout(Duration::from_secs(5), t.call(2, "tools/list", json!({})))
+            .await
+            .expect("later call hung")
+            .unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        assert!(t.pending.lock().await.is_empty());
+    }
+
+    /// `HttpServerConfig::sse` (set for an ACP host's `type: "sse"`) picks
+    /// this transport when the session's MCP servers start.
+    #[tokio::test]
+    async fn sse_servers_start_through_the_manager() {
+        let (url, _) = legacy_sse_server("/messages", vec![]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let server =
+            crate::mcp::types::McpServerConfig::Http(crate::mcp::types::HttpServerConfig {
+                url,
+                headers: HashMap::new(),
+                disabled: false,
+                literal: true,
+                sse: true,
+            });
+        let cfg = crate::config::Config {
+            cwd: dir.path().to_path_buf(),
+            strict_mcp_config: true,
+            extra_mcp_servers: [("old".to_string(), server)].into_iter().collect(),
+            ..Default::default()
+        };
+        let tools = crate::mcp::tools_for_config(&cfg).await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"mcp__old__echo"), "{names:?}");
     }
 }

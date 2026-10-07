@@ -121,21 +121,36 @@ impl McpManager {
     ) -> anyhow::Result<McpClient> {
         // Expanded here, not at load, so `/mcp list` and anything that
         // writes the config back keep the placeholders, not the secrets.
+        // Literal servers (an ACP host's) are used as sent: expanding them
+        // would hand this process's secrets to a server the host chose.
         let lookup = |k: &str| std::env::var(k).ok();
-        let x = |v: &str| expand_vars(v, &lookup);
         match cfg {
+            McpServerConfig::Stdio(s) if s.literal => {
+                McpClient::connect_stdio(name, &s.command, &s.args, &s.env, cwd).await
+            }
             McpServerConfig::Stdio(s) => {
                 let (command, args, env) = expand_stdio(s, &lookup)?;
                 McpClient::connect_stdio(name, &command, &args, &env, cwd).await
             }
             McpServerConfig::Http(h) => {
+                let x = |v: &str| {
+                    if h.literal {
+                        Ok(v.to_string())
+                    } else {
+                        expand_vars(v, &lookup)
+                    }
+                };
                 let url = x(&h.url)?;
                 let headers = h
                     .headers
                     .iter()
                     .map(|(k, v)| Ok((k.clone(), x(v)?)))
                     .collect::<anyhow::Result<_>>()?;
-                McpClient::connect_http(name, &url, &headers).await
+                if h.sse {
+                    McpClient::connect_sse(name, &url, &headers).await
+                } else {
+                    McpClient::connect_http(name, &url, &headers).await
+                }
             }
         }
     }
@@ -312,6 +327,7 @@ mod startup_tests {
                 args: vec!["-c".into(), "sleep 30".into()],
                 env: Default::default(),
                 disabled: false,
+                literal: false,
             }),
         )
     }
@@ -331,6 +347,7 @@ cat >/dev/null"#;
                 args: vec!["-c".into(), script.into()],
                 env: Default::default(),
                 disabled: false,
+                literal: false,
             }),
         )
     }
@@ -369,6 +386,7 @@ cat >/dev/null"#;
             args: vec!["./server.sh".into()],
             env: Default::default(),
             disabled: false,
+            literal: false,
         });
         let cfg = crate::config::Config {
             cwd: dir.path().to_path_buf(),
@@ -402,6 +420,7 @@ cat >/dev/null"#;
             ],
             env: [("TOOL".to_string(), format!("${{{unset}:-one}}"))].into(),
             disabled: false,
+            literal: false,
         });
         let cfg = crate::config::Config {
             cwd: dir.path().to_path_buf(),
@@ -412,6 +431,42 @@ cat >/dev/null"#;
         let tools = crate::mcp::tools_for_config(&cfg).await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"mcp__vars__one_two"), "{names:?}");
+    }
+
+    /// An ACP host's servers arrive resolved: a `${VAR}` in them is the
+    /// host's text, not a reference to this process's environment.
+    #[tokio::test]
+    async fn literal_servers_start_without_placeholder_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, server) = fake_server("lit");
+        let McpServerConfig::Stdio(s) = &server else {
+            unreachable!()
+        };
+        let script = format!(
+            r#"printf '%s|%s' "$TOOL" "$1" > seen.txt
+{}"#,
+            s.args[1]
+        );
+        let unset = "OXIDECLAW_TEST_SURELY_UNSET_VAR";
+        let placeholder = format!("${{{unset}}}");
+        let lit = McpServerConfig::Stdio(StdioServerConfig {
+            command: "sh".into(),
+            args: vec!["-c".into(), script, "sh".into(), placeholder.clone()],
+            env: [("TOOL".to_string(), placeholder.clone())].into(),
+            disabled: false,
+            literal: true,
+        });
+        let cfg = crate::config::Config {
+            cwd: dir.path().to_path_buf(),
+            strict_mcp_config: true,
+            extra_mcp_servers: [("lit".to_string(), lit)].into_iter().collect(),
+            ..Default::default()
+        };
+        let tools = crate::mcp::tools_for_config(&cfg).await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"mcp__lit__ping"), "{names:?}");
+        let seen = std::fs::read_to_string(dir.path().join("seen.txt")).unwrap();
+        assert_eq!(seen, format!("{placeholder}|{placeholder}"));
     }
 
     /// ACP and `--headless` sessions take their tools from here; the CLI

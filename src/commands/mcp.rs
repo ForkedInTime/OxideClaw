@@ -203,6 +203,8 @@ pub(super) fn mcp_add_server(
             url: rest.to_string(),
             headers: Default::default(),
             disabled: false,
+            sse: false,
+            literal: false,
         })
     } else {
         let mut parts = rest.split_whitespace().map(str::to_string);
@@ -214,6 +216,7 @@ pub(super) fn mcp_add_server(
             args: parts.collect(),
             env: Default::default(),
             disabled: false,
+            literal: false,
         })
     };
 

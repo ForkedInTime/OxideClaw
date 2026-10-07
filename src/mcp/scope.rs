@@ -341,6 +341,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             disabled: false,
+            literal: false,
         })
     }
 
@@ -418,6 +419,8 @@ mod tests {
             url: "https://mcp.example.test".into(),
             headers: [("Authorization".to_string(), "Bearer abc".to_string())].into(),
             disabled: false,
+            sse: false,
+            literal: false,
         });
         assert!(add("h", http, Scope::Project, repo.path(), home.path(), false).is_err());
         assert!(!mcp_json.exists());

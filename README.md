@@ -219,11 +219,13 @@ Run your own shell commands at eight points: `preToolUse` (exit 2 blocks the too
 
 ### 🧩 &nbsp; Editor integration — Agent Client Protocol
 
-`oxideclaw acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so Zed, JetBrains, and any ACP client can use OxideClaw as their coding agent: streamed replies and thoughts, live tool-call status, permission prompts in the editor's own UI, mid-turn cancel, reopening a saved conversation (`session/load`, TUI sessions included), and the editor's own stdio or HTTP MCP servers. In Zed:
+`oxideclaw acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so Zed, JetBrains, and any ACP client can use OxideClaw as their coding agent: streamed replies and thoughts, live tool-call status, permission prompts in the editor's own UI, mid-turn cancel, reopening a saved conversation (`session/load`, TUI sessions included), and the editor's own stdio, HTTP or SSE MCP servers. In Zed:
 
 ```json
 { "agent_servers": { "OxideClaw": { "command": "oxideclaw", "args": ["acp"] } } }
 ```
+
+Each ACP conversation is saved after every turn, in the same sessions directory as the TUI's, so `/resume` lists it too. To save nothing, use `"args": ["--no-session-persistence", "acp"]`.
 
 ### 🛡️ &nbsp; Sandbox-first execution
 

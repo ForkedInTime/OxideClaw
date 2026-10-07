@@ -180,7 +180,7 @@ impl State {
             "authenticate" => Ok(vec![rpc::response(id, json!({}))]),
             "session/new" => {
                 self.require_initialized(method)?;
-                let sid = self.start_session(params, None).await?;
+                let (sid, _) = self.start_session(params, None).await?;
                 Ok(vec![rpc::response(id, json!({"sessionId": sid}))])
             }
             // Advertised as unsupported: nothing is saved to load.
@@ -241,22 +241,23 @@ impl State {
         let (saved, history) = Session::resume_in(&self.sessions_dir, sid)
             .await
             .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
-        let mut frames: Vec<Value> = replay_updates(sid, &history)
+        let (_, replay) = self.start_session(params, Some((saved, history))).await?;
+        let mut frames: Vec<Value> = replay
             .into_iter()
             .map(|p| rpc::notification("session/update", p))
             .collect();
-        self.start_session(params, Some((saved, history))).await?;
         frames.push(rpc::response(id, json!({})));
         Ok(frames)
     }
 
     /// Start a session for `session/new`, or for `session/load` with the
-    /// saved transcript and its history. Returns the session id.
+    /// saved transcript and its history. Returns the session id and, for a
+    /// load, the `session/update` params that replay the history.
     async fn start_session(
         &mut self,
         params: &Value,
         saved: Option<(Session, Vec<Message>)>,
-    ) -> Result<String, RpcError> {
+    ) -> Result<(String, Vec<Value>), RpcError> {
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -271,6 +272,8 @@ impl State {
         // per-server startup timeout; acceptable for a once-per-session cost.
         let tools = crate::mcp::tools_for_config(&cfg).await;
         let persist = !cfg.no_session_persistence;
+        // The session's own project settings decide, as in a live turn.
+        let show_thinking = cfg.show_thinking_summaries;
         let (approval_in_tx, approval_in_rx) = mpsc::unbounded_channel();
         let mut session = SdkSession::new(
             cfg,
@@ -288,7 +291,9 @@ impl State {
             saved: 0,
             rewrite: false,
         };
+        let mut replay = Vec::new();
         if let Some((file, history)) = saved {
+            replay = replay_updates(&file.id, &history, show_thinking);
             transcript.saved = history.len();
             session.resume_history(file.id.clone(), history);
             transcript.file = Some(file);
@@ -326,7 +331,7 @@ impl State {
                 cancel_requested: false,
             },
         );
-        Ok(session_id)
+        Ok((session_id, replay))
     }
 
     fn start_prompt(&mut self, id: &Value, params: &Value) -> Result<(), RpcError> {
@@ -571,9 +576,8 @@ pub(crate) fn initialize_result(load_session: bool) -> Value {
         "agentCapabilities": {
             "loadSession": load_session,
             "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
-            // `sse` is MCP's deprecated HTTP+SSE transport, which the MCP
-            // client does not speak; `http` is Streamable HTTP.
-            "mcpCapabilities": {"http": true, "sse": false},
+            // `http` is Streamable HTTP; `sse` is MCP's older HTTP+SSE.
+            "mcpCapabilities": {"http": true, "sse": true},
         },
         "agentInfo": {"name": "oxideclaw", "title": "OxideClaw", "version": VERSION},
         "authMethods": [],
@@ -673,9 +677,9 @@ pub(crate) fn prompt_text(blocks: &Value) -> Result<String, RpcError> {
     Ok(text)
 }
 
-/// The `mcpServers` entries of `session/new` / `session/load` that we can
-/// start: stdio, and `http` (Streamable HTTP). Others, `sse` included, are
-/// skipped with a warning, as `mcpCapabilities` tells the client.
+/// The `mcpServers` entries of `session/new` / `session/load`: stdio,
+/// `http` (Streamable HTTP) and `sse` (MCP's legacy HTTP+SSE). Anything
+/// else is skipped with a warning.
 pub(crate) fn mcp_servers(params: &Value) -> Vec<(String, McpServerConfig)> {
     // `env` and `headers` are both arrays of {name, value}.
     let pairs = |v: Option<&Value>| -> HashMap<String, String> {
@@ -696,14 +700,16 @@ pub(crate) fn mcp_servers(params: &Value) -> Vec<(String, McpServerConfig)> {
         let name = s.get("name").and_then(Value::as_str).unwrap_or("mcp");
         let kind = s.get("type").and_then(Value::as_str);
         let server = match (kind, s.get("command").and_then(Value::as_str)) {
-            (Some("http"), _) => match s.get("url").and_then(Value::as_str) {
+            (Some(t @ ("http" | "sse")), _) => match s.get("url").and_then(Value::as_str) {
                 Some(url) => McpServerConfig::Http(HttpServerConfig {
                     url: url.to_string(),
                     headers: pairs(s.get("headers")),
                     disabled: false,
+                    literal: true,
+                    sse: t == "sse",
                 }),
                 None => {
-                    tracing::warn!("acp: ignoring HTTP MCP server {name} without a url");
+                    tracing::warn!("acp: ignoring {t} MCP server {name} without a url");
                     continue;
                 }
             },
@@ -719,6 +725,7 @@ pub(crate) fn mcp_servers(params: &Value) -> Vec<(String, McpServerConfig)> {
                     .collect(),
                 env: pairs(s.get("env")),
                 disabled: false,
+                literal: true,
             }),
             (kind, _) => {
                 tracing::warn!(
@@ -735,8 +742,14 @@ pub(crate) fn mcp_servers(params: &Value) -> Vec<(String, McpServerConfig)> {
 
 /// `session/update` params that replay a saved conversation, in order:
 /// user text, the agent's text and thoughts, and each tool call followed
-/// by its result, shaped as a live turn reports them.
-pub(crate) fn replay_updates(session_id: &str, history: &[Message]) -> Vec<Value> {
+/// by its result, shaped as a live turn reports them. Thoughts are replayed
+/// only with `show_thinking`, as a live turn sends them only with
+/// `showThinkingSummaries`.
+pub(crate) fn replay_updates(
+    session_id: &str,
+    history: &[Message],
+    show_thinking: bool,
+) -> Vec<Value> {
     let params = |u: Value| json!({"sessionId": session_id, "update": u});
     let chunk = |kind: &str, text: &str| {
         params(json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}}))
@@ -756,7 +769,7 @@ pub(crate) fn replay_updates(session_id: &str, history: &[Message]) -> Vec<Value
                     out.push(chunk("agent_message_chunk", text));
                 }
                 (Role::Assistant, ContentBlock::Thinking { thinking, .. })
-                    if !thinking.trim().is_empty() =>
+                    if show_thinking && !thinking.trim().is_empty() =>
                 {
                     out.push(chunk("agent_thought_chunk", thinking));
                 }
@@ -925,7 +938,7 @@ mod tests {
         );
         assert_eq!(
             r["agentCapabilities"]["mcpCapabilities"],
-            json!({"http": true, "sse": false})
+            json!({"http": true, "sse": true})
         );
         assert_eq!(r["agentInfo"]["name"], json!("oxideclaw"));
         assert_eq!(r["agentInfo"]["version"], json!(VERSION));
@@ -1732,22 +1745,24 @@ mod tests {
     }
 
     #[test]
-    fn host_mcp_servers_cover_stdio_and_http_but_not_sse() {
+    fn host_mcp_servers_cover_stdio_http_and_sse() {
         let params = json!({"mcpServers": [
             {"name": "fs", "command": "/bin/fs-mcp", "args": ["--stdio"], "env": [{"name": "K", "value": "v"}]},
             {"type": "http", "name": "api", "url": "https://mcp.example.com/mcp",
              "headers": [{"name": "Authorization", "value": "Bearer t"}]},
             {"type": "sse", "name": "old", "url": "https://mcp.example.com/sse", "headers": []},
             {"type": "http", "name": "nourl", "headers": []},
+            {"type": "websocket", "name": "ws", "url": "wss://mcp.example.com"},
         ]});
         let servers = mcp_servers(&params);
-        assert_eq!(servers.len(), 2, "{servers:?}");
+        assert_eq!(servers.len(), 3, "{servers:?}");
         match &servers[0] {
             (name, McpServerConfig::Stdio(s)) => {
                 assert_eq!(name, "fs");
                 assert_eq!(s.command, "/bin/fs-mcp");
                 assert_eq!(s.args, vec!["--stdio".to_string()]);
                 assert_eq!(s.env.get("K").map(String::as_str), Some("v"));
+                assert!(s.literal, "host values must not be expanded");
             }
             other => panic!("{other:?}"),
         }
@@ -1759,6 +1774,16 @@ mod tests {
                     h.headers.get("Authorization").map(String::as_str),
                     Some("Bearer t")
                 );
+                assert!(h.literal, "host values must not be expanded");
+                assert!(!h.sse);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &servers[2] {
+            (name, McpServerConfig::Http(h)) => {
+                assert_eq!(name, "old");
+                assert_eq!(h.url, "https://mcp.example.com/sse");
+                assert!(h.sse && h.literal);
             }
             other => panic!("{other:?}"),
         }
@@ -1796,7 +1821,7 @@ mod tests {
                 }],
             },
         ];
-        let u = replay_updates("s1", &history);
+        let u = replay_updates("s1", &history, false);
         assert_eq!(u.len(), 3, "{u:?}");
         assert_eq!(u[0]["update"]["content"]["text"], json!("fix it"));
         assert_eq!(u[1]["update"]["title"], json!("Bash: make"));
@@ -1809,6 +1834,35 @@ mod tests {
         assert!(u.iter().all(|p| p["sessionId"] == json!("s1")));
     }
 
+    /// A live turn sends thoughts only with `showThinkingSummaries`; a
+    /// replay must not reveal what the live session kept hidden.
+    #[test]
+    fn replay_shows_thinking_only_when_summaries_are_on() {
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "private reasoning".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+        }];
+        let kinds = |show: bool| -> Vec<Value> {
+            replay_updates("s1", &history, show)
+                .into_iter()
+                .map(|u| u["update"]["sessionUpdate"].clone())
+                .collect()
+        };
+        assert_eq!(kinds(false), vec![json!("agent_message_chunk")]);
+        assert_eq!(
+            kinds(true),
+            vec![json!("agent_thought_chunk"), json!("agent_message_chunk")]
+        );
+    }
+
     #[tokio::test]
     async fn session_load_of_an_unknown_session_is_resource_not_found() {
         let (cfg, dir) = test_config();
@@ -1817,25 +1871,27 @@ mod tests {
             json!({"jsonrpc":"2.0","id":id,"method":"session/load","params":{"sessionId":sid,"cwd":cwd,"mcpServers":[]}})
                 .to_string()
         };
-        // A saved session elsewhere must not be reachable by a relative id.
-        let other = tempfile::tempdir().unwrap();
-        Session::create_in(other.path(), "elsewhere".into())
+        // A saved session next to the sessions dir must not be reachable by
+        // a relative id; without the id check this one would load.
+        let sessions = sessions_in(&dir);
+        Session::create_in(&sessions, "real".into()).await.unwrap();
+        Session::create_in(&dir.path().join("other"), "elsewhere".into())
             .await
             .unwrap();
-        let escape = format!(
-            "../{}/elsewhere",
-            other.path().file_name().unwrap().to_string_lossy()
-        );
+        let escape = "../other/elsewhere";
+        assert!(sessions.join(format!("{escape}.meta")).exists());
+        assert!(!Session::exists_in(&sessions, escape));
+        assert!(Session::resume_in(&sessions, escape).await.is_err());
         let no_id = json!({"jsonrpc":"2.0","id":4,"method":"session/load","params":{"cwd":cwd,"mcpServers":[]}}).to_string();
         let out = drive_in(
             cfg,
-            sessions_in(&dir),
+            sessions,
             format!(
                 "{}\n{}\n{}\n{}\n{}\n",
                 load(9, "early"),
                 init_line(),
                 load(2, "no-such-session"),
-                load(3, &escape),
+                load(3, escape),
                 no_id
             )
             .as_bytes(),
@@ -1869,6 +1925,8 @@ mod tests {
         let (model, model_seen) = text_model("Still hello.").await;
         cfg.model = "ollama:test-model".into();
         cfg.ollama_host = model;
+        // Thoughts replay only when a live turn would show them.
+        cfg.show_thinking_summaries = true;
         let sessions = sessions_in(&dir);
         let sid = "5f0c6d1e-0000-4000-8000-00000000abcd";
         let mut saved = Session::create_in(&sessions, sid.into()).await.unwrap();
@@ -2083,7 +2141,11 @@ mod tests {
                 "session/new",
                 json!({"cwd": dir.path(), "mcpServers": [{
                     "type": "http", "name": "fake", "url": mcp_url,
-                    "headers": [{"name": "Authorization", "value": "Bearer t0k"}],
+                    "headers": [
+                        {"name": "Authorization", "value": "Bearer t0k"},
+                        // Sent resolved by the host: never expanded here.
+                        {"name": "X-Literal", "value": "a${OXIDECLAW_TEST_SURELY_UNSET_VAR}"},
+                    ],
                 }]}),
             )
             .await;
@@ -2137,6 +2199,12 @@ mod tests {
         assert!(
             seen.iter()
                 .all(|r| r.to_ascii_lowercase().contains("authorization: bearer t0k")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().all(|r| r
+                .to_ascii_lowercase()
+                .contains("x-literal: a${oxideclaw_test_surely_unset_var}")),
             "{seen:?}"
         );
         c.close().await;

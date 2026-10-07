@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (config dir, then root or home down to the working directory, symlinks
   inside the project refused), goes into the system prompt last as the
   lowest-priority source, is refreshed by `/reload` and skipped by `--bare`.
+- **ACP `session/load`.** An editor can reopen a saved conversation (one
+  made over ACP, or a TUI or `-p` session): it is replayed as
+  `session/update`s and then continues with the full history. Saved
+  thoughts are replayed only with `showThinkingSummaries`, as in a live turn.
+- **Editor-provided `http` and `sse` MCP servers.** `mcpServers` entries an
+  ACP client passes may use Streamable HTTP or MCP's older HTTP+SSE
+  transport, with the client's `headers`. Their tools ask for permission
+  like any other. The client's values are used as sent: `${VAR}` in them is
+  not expanded from OxideClaw's environment.
 
 ### Changed
 
@@ -66,6 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than one scope instead of deleting every copy. `/mcp enable|disable`
   refuses a project-scope server rather than editing the shared
   `.mcp.json`.
+- **`oxideclaw acp` now saves conversations.** Every ACP session is saved
+  after each turn in the sessions directory the TUI uses (`~/.local/share/oxideclaw/sessions/`
+  by default; see FEATURES.md, "Where files live"), including embedded file contents
+  and tool output, and shows up in `/resume`. Before, nothing was written.
+  To keep the old behaviour, start the agent with
+  `"args": ["--no-session-persistence", "acp"]`.
 - **Auto-fix runs only in trusted projects.** Lint and test commands run the
   project's own code (`build.rs`, `conftest.py`, npm scripts), so a folder
   you have not `/trust`ed now runs none of them and says so once. In a

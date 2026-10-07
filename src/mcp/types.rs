@@ -22,6 +22,11 @@ pub struct StdioServerConfig {
     /// Set by `/mcp disable` and `/plugin disable`; the server is not started.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Values arrived resolved (an ACP host's `mcpServers`), so `${VAR}`
+    /// placeholders are not expanded against this process's environment.
+    /// Never read from or written to a config file.
+    #[serde(skip)]
+    pub literal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +37,15 @@ pub struct HttpServerConfig {
     /// Set by `/mcp disable` and `/plugin disable`; the server is not started.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Speak MCP's legacy HTTP+SSE transport instead of Streamable HTTP.
+    /// Only an ACP host's `type: "sse"` servers set it.
+    #[serde(skip)]
+    pub sse: bool,
+    /// Values arrived resolved (an ACP host's `mcpServers`), so `${VAR}`
+    /// placeholders are not expanded against this process's environment.
+    /// Never read from or written to a config file.
+    #[serde(skip)]
+    pub literal: bool,
 }
 
 impl McpServerConfig {

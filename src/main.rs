@@ -1894,6 +1894,7 @@ fn mcp_add_config(
                 args: args.to_vec(),
                 env,
                 disabled: false,
+                literal: false,
             }))
         }
         "http" => {
@@ -1910,6 +1911,8 @@ fn mcp_add_config(
                 url: target.to_string(),
                 headers: std::collections::HashMap::new(),
                 disabled: false,
+                literal: false,
+                sse: false,
             }))
         }
         other => anyhow::bail!("unknown transport '{other}' (expected stdio or http)"),
@@ -2689,6 +2692,7 @@ mod mcp_scope_tests {
             args: vec!["srv".into()],
             env: [("GITHUB_TOKEN".to_string(), "ghp_x".to_string())].into(),
             disabled: false,
+            literal: false,
         })
     }
 
