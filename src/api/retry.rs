@@ -104,6 +104,10 @@ pub fn is_retryable_transport(e: &reqwest::Error) -> bool {
 /// OpenAI-compatible providers. The RFC also allows an HTTP-date, but no
 /// provider on our supported list sends one and the crate has no date parser,
 /// so a date is ignored rather than mis-parsed as zero.
+///
+/// A value too large for a `Duration` (above ~1.8e19 s) saturates instead of
+/// panicking — `from_secs_f64` would abort the process on a hostile header —
+/// and `decide` then gives up with `RetryAfterTooLong`.
 pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Some(ms) = headers
         .get("retry-after-ms")
@@ -112,14 +116,14 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
         && ms.is_finite()
         && ms >= 0.0
     {
-        return Some(Duration::from_secs_f64(ms / 1000.0));
+        return Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(Duration::MAX));
     }
     let raw = headers.get("retry-after")?.to_str().ok()?;
     let secs = raw.trim().parse::<f64>().ok()?;
     if !secs.is_finite() || secs < 0.0 {
         return None;
     }
-    Some(Duration::from_secs_f64(secs))
+    Some(Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX))
 }
 
 /// What to do after a failed attempt.
@@ -410,6 +414,26 @@ mod tests {
                 "value {v:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn oversized_retry_after_saturates_and_gives_up_instead_of_panicking() {
+        for (name, v) in [("retry-after", "1e20"), ("retry-after-ms", "1e23")] {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(v).unwrap());
+            let d = parse_retry_after(&h);
+            assert_eq!(d, Some(Duration::MAX), "{name}: {v}");
+            assert_eq!(
+                decide(0, true, d, Duration::ZERO, 0.0),
+                RetryDecision::GiveUp(GiveUpReason::RetryAfterTooLong(Duration::MAX))
+            );
+        }
+        // The give-up message formats the saturated value without panicking.
+        assert!(
+            GiveUpReason::RetryAfterTooLong(Duration::MAX)
+                .describe()
+                .contains("try again later")
+        );
     }
 
     #[test]
