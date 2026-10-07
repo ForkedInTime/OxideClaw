@@ -643,10 +643,26 @@ async fn list_sessions_in(dir: &std::path::Path, limit: Option<usize>) -> Result
 
 /// Search the local RAG index and map results to SDK protocol format.
 fn rag_search(cwd: &std::path::Path, query: &str, limit: usize) -> Result<Vec<RagResult>> {
-    let Some(db) = crate::rag::RagDb::open_existing(cwd)? else {
-        return Ok(Vec::new());
+    let target = crate::rag::IndexTarget::for_cwd(cwd, false)
+        .map_err(|why| anyhow::anyhow!("no code index for {}: {why}", cwd.display()))?;
+    rag_search_in(&target, query, limit)
+}
+
+/// `rag_search` against a resolved index. Searching never creates one, so
+/// a missing index is an error rather than an empty database left behind.
+fn rag_search_in(
+    target: &crate::rag::IndexTarget,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<RagResult>> {
+    let Some(db) = target.open_existing()? else {
+        anyhow::bail!(
+            "no code index for {} yet: start oxideclaw there (inside a git repository) or run /index",
+            target.root.display()
+        );
     };
-    let results = crate::rag::search::search(&db, query, limit as i64)?;
+    let mut results = crate::rag::search::search(&db, query, limit as i64)?;
+    target.localize(&mut results);
 
     Ok(results
         .into_iter()
@@ -658,6 +674,49 @@ fn rag_search(cwd: &std::path::Path, query: &str, limit: usize) -> Result<Vec<Ra
             snippet: r.content,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod rag_search_tests {
+    use super::rag_search_in;
+    use crate::rag::IndexTarget;
+
+    /// `rag/search` with no index reports it and creates nothing; once the
+    /// project is indexed it finds code, with paths as seen from the cwd.
+    #[test]
+    fn search_never_creates_an_index() {
+        let home = tempfile::tempdir().unwrap();
+        let idx = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src").join("billing.rs"),
+            "fn compute_invoice_total() -> u32 { 0 }\n",
+        )
+        .unwrap();
+
+        let target = IndexTarget::resolve(
+            Some(idx.path()),
+            &repo.join("src"),
+            Some(home.path()),
+            false,
+        )
+        .unwrap();
+        let err = rag_search_in(&target, "invoice", 5).unwrap_err();
+        assert!(err.to_string().contains("no code index"), "{err:#}");
+        assert_eq!(std::fs::read_dir(idx.path()).unwrap().count(), 0);
+
+        let db = target.open().unwrap();
+        target.index(&db, false).unwrap();
+        let hits = rag_search_in(&target, "invoice", 5).unwrap();
+        assert_eq!(hits[0].file, "billing.rs");
+
+        // $HOME is refused before any database is touched.
+        assert!(
+            IndexTarget::resolve(Some(idx.path()), home.path(), Some(home.path()), false).is_err()
+        );
+    }
 }
 
 #[cfg(test)]

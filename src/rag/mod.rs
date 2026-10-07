@@ -6,9 +6,11 @@
 /// whole files.
 ///
 /// Index location: `$XDG_CACHE_HOME/oxideclaw/rag/<project hash>.db`
-/// (fallback `~/.cache/oxideclaw/rag/`), never inside the project. The walk
-/// honours `.gitignore`, `.git/info/exclude`, the global excludes file and
-/// `.ignore`, and only a git work tree below `$HOME` is indexed on its own.
+/// (fallback `~/.cache/oxideclaw/rag/`), never inside the project; off when
+/// neither is known. A project is the enclosing git work tree (see
+/// `project_root`), walked from its root so `.gitignore`,
+/// `.git/info/exclude`, the global excludes file and `.ignore` all apply,
+/// and only a work tree below `$HOME` is indexed on its own.
 ///
 /// Paid tools charge for this; we do it locally, for free, in a single binary
 /// with zero external dependencies.
@@ -99,10 +101,15 @@ fn ensure_git_excluded(cwd: &Path) {
 pub(crate) const RAG_SCHEMA_VERSION: i64 = 1;
 
 /// Where code indexes live: `$XDG_CACHE_HOME/oxideclaw/rag`, falling back
-/// to `~/.cache/oxideclaw/rag`.
-pub fn cache_index_dir() -> PathBuf {
-    crate::config::Config::cache_dir().join("rag")
+/// to `~/.cache/oxideclaw/rag`. `None` when neither is known: the index is
+/// then off rather than written somewhere relative (inside the project).
+pub fn cache_index_dir() -> Option<PathBuf> {
+    crate::config::Config::cache_dir().map(|d| d.join("rag"))
 }
+
+/// Why there is no index when `cache_index_dir` is `None`.
+pub const NO_CACHE_DIR: &str =
+    "no cache directory ($XDG_CACHE_HOME and the home directory are unset)";
 
 /// `<index_dir>/<first 16 hex digits of sha256(canonical project root)>.db`.
 ///
@@ -152,10 +159,120 @@ pub fn auto_index_refusal(dir: &Path, home: Option<&Path>) -> Option<&'static st
 
 /// The nearest ancestor (or `dir` itself) holding `.git`: a directory in a
 /// normal checkout, a file in a linked worktree or submodule.
-fn git_work_tree_root(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn git_work_tree_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
         .find(|a| a.join(".git").exists())
         .map(Path::to_path_buf)
+}
+
+/// The directory an index launched from `cwd` covers and is keyed by: the
+/// enclosing git work tree, so `repo` and `repo/src` share one index of the
+/// whole project. `cwd` itself outside git, or when the work tree is one
+/// that is never indexed (a dotfiles repo at `$HOME`).
+pub fn project_root(cwd: &Path, home: Option<&Path>) -> PathBuf {
+    let cwd = canonical(cwd);
+    match git_work_tree_root(&cwd) {
+        Some(root) if index_refusal(&root, home).is_none() => root,
+        _ => cwd,
+    }
+}
+
+/// The index for a launch directory: what it covers and where it lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexTarget {
+    /// Canonical project root (see `project_root`); stored paths are
+    /// relative to it.
+    pub root: PathBuf,
+    /// Canonical launch directory, for showing stored paths.
+    pub cwd: PathBuf,
+    pub db_path: PathBuf,
+}
+
+impl IndexTarget {
+    /// The index for `cwd` under `index_dir` (`None`: no cache dir known),
+    /// or why there is none. `auto` applies `auto_index_refusal` (startup,
+    /// per-prompt refresh, print/SDK context); otherwise `index_refusal`
+    /// (`/index`, `/rag`, SDK `rag/search`).
+    pub fn resolve(
+        index_dir: Option<&Path>,
+        cwd: &Path,
+        home: Option<&Path>,
+        auto: bool,
+    ) -> std::result::Result<Self, &'static str> {
+        let refusal = if auto {
+            auto_index_refusal(cwd, home)
+        } else {
+            index_refusal(cwd, home)
+        };
+        if let Some(why) = refusal {
+            return Err(why);
+        }
+        let index_dir = index_dir.ok_or(NO_CACHE_DIR)?;
+        let root = project_root(cwd, home);
+        Ok(Self {
+            db_path: db_path_in(index_dir, &root),
+            cwd: canonical(cwd),
+            root,
+        })
+    }
+
+    /// `resolve` with the real cache dir and home directory.
+    pub fn for_cwd(cwd: &Path, auto: bool) -> std::result::Result<Self, &'static str> {
+        Self::resolve(
+            cache_index_dir().as_deref(),
+            cwd,
+            dirs::home_dir().as_deref(),
+            auto,
+        )
+    }
+
+    /// Open the index, creating it if needed, and retire a pre-cache-dir
+    /// `<root>/.claude/rag.db`.
+    pub fn open(&self) -> Result<RagDb> {
+        retire_legacy_db(&self.root);
+        RagDb::open_at(&self.db_path)
+    }
+
+    /// Open the index only if it exists: searching or inspecting never
+    /// creates one.
+    pub fn open_existing(&self) -> Result<Option<RagDb>> {
+        if !self.db_path.is_file() {
+            return Ok(None);
+        }
+        RagDb::open_at(&self.db_path).map(Some)
+    }
+
+    /// Bring the index up to date with the project.
+    pub fn index(&self, db: &RagDb, force: bool) -> Result<indexer::IndexResult> {
+        indexer::index_project(db, &self.root, force)
+    }
+
+    /// A stored (root-relative) path as seen from the launch directory:
+    /// relative below it, absolute elsewhere in the project.
+    pub fn display_path(&self, stored: &str) -> String {
+        let abs = self.root.join(stored);
+        match abs.strip_prefix(&self.cwd) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => abs.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// `display_path` applied to every result.
+    pub fn localize(&self, results: &mut [search::SearchResult]) {
+        if self.root != self.cwd {
+            for r in results {
+                r.file_path = self.display_path(&r.file_path);
+            }
+        }
+    }
+
+    /// What to tell the user when there is no index to read yet.
+    pub fn missing_message(&self) -> String {
+        format!(
+            "No code index for {} yet. Run /index to build it.",
+            self.root.display()
+        )
+    }
 }
 
 /// Code context for a prompt from the project's index, refreshed first.
@@ -165,20 +282,18 @@ fn git_work_tree_root(dir: &Path) -> Option<PathBuf> {
 /// wherever `auto_index_refusal` says auto-indexing is. `index_dir` is the
 /// cache dir in production and a temp dir in tests.
 pub fn auto_context(index_dir: Option<&Path>, cwd: &Path, user_input: &str) -> String {
-    if let Some(why) = auto_index_refusal(cwd, dirs::home_dir().as_deref()) {
-        debug!("RAG context off: {why}");
-        return String::new();
-    }
-    let db_path = db_path_in(
-        &index_dir.map_or_else(cache_index_dir, Path::to_path_buf),
-        cwd,
-    );
-    if !db_path.exists() {
-        return String::new();
-    }
-    let db = match RagDb::open_at(&db_path) {
-        Ok(db) => db,
-        Err(_) => return String::new(),
+    let index_dir = index_dir.map(Path::to_path_buf).or_else(cache_index_dir);
+    let target =
+        match IndexTarget::resolve(index_dir.as_deref(), cwd, dirs::home_dir().as_deref(), true) {
+            Ok(t) => t,
+            Err(why) => {
+                debug!("RAG context off: {why}");
+                return String::new();
+            }
+        };
+    let db = match target.open_existing() {
+        Ok(Some(db)) => db,
+        Ok(None) | Err(_) => return String::new(),
     };
 
     // Skip if the index is empty (not yet built)
@@ -189,12 +304,12 @@ pub fn auto_context(index_dir: Option<&Path>, cwd: &Path, user_input: &str) -> S
     // Only the TUI indexes on its own; without this, print/SDK/ACP turns
     // inject whatever a past TUI run stored, including deleted files and
     // code this session already edited. Incremental, so cheap when idle.
-    if let Err(e) = indexer::index_project(&db, cwd, false) {
+    if let Err(e) = target.index(&db, false) {
         debug!("RAG refresh failed: {e}");
     }
 
     // Fetch more candidates, then filter by relevance threshold
-    let results = match search::search(&db, user_input, 20) {
+    let mut results = match search::search(&db, user_input, 20) {
         Ok(r) => r,
         Err(e) => {
             debug!("RAG search failed: {e}");
@@ -205,6 +320,7 @@ pub fn auto_context(index_dir: Option<&Path>, cwd: &Path, user_input: &str) -> S
     if results.is_empty() {
         return String::new();
     }
+    target.localize(&mut results);
 
     // Filter: only keep results with a decent relevance score.
     // FTS5 rank is negative (closer to 0 = more relevant); discard weak matches.
@@ -299,14 +415,10 @@ pub struct RagDb {
 }
 
 impl RagDb {
-    /// Open (or create) the index for `project` in the user's cache dir.
-    pub fn open(project: &Path) -> Result<Self> {
-        Self::open_in(&cache_index_dir(), project)
-    }
-
     /// Open (or create) the index for `project` under `index_dir`, retiring
     /// a pre-cache-dir `<project>/.claude/rag.db` on the way.
-    pub fn open_in(index_dir: &Path, project: &Path) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_in(index_dir: &Path, project: &Path) -> Result<Self> {
         retire_legacy_db(project);
         Self::open_at(&db_path_in(index_dir, project))
     }
@@ -383,22 +495,6 @@ impl RagDb {
 
         debug!("RAG database opened at {}", db_path.display());
         Ok(Self { conn, db_path })
-    }
-
-    /// Open the index only if a previous run already created it. Read-only
-    /// consumers (SDK `rag/search`) use this so a one-shot query does not
-    /// leave an empty index behind.
-    pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
-        Self::open_existing_in(&cache_index_dir(), cwd)
-    }
-
-    /// `open_existing` with the index directory given.
-    pub fn open_existing_in(index_dir: &Path, cwd: &Path) -> Result<Option<Self>> {
-        let path = db_path_in(index_dir, cwd);
-        if !path.is_file() {
-            return Ok(None);
-        }
-        Self::open_at(&path).map(Some)
     }
 
     /// Total number of indexed chunks.
@@ -558,19 +654,13 @@ mod tests {
     fn open_existing_does_not_create_the_database() {
         let tmp = TempDir::new().unwrap();
         let idx = TempDir::new().unwrap();
-        assert!(
-            RagDb::open_existing_in(idx.path(), tmp.path())
-                .unwrap()
-                .is_none()
-        );
+        let t = IndexTarget::resolve(Some(idx.path()), tmp.path(), None, false).unwrap();
+        assert!(t.open_existing().unwrap().is_none());
         assert!(!tmp.path().join(".claude").exists());
         assert_eq!(std::fs::read_dir(idx.path()).unwrap().count(), 0);
-        RagDb::open_in(idx.path(), tmp.path()).unwrap();
-        assert!(
-            RagDb::open_existing_in(idx.path(), tmp.path())
-                .unwrap()
-                .is_some()
-        );
+        t.open().unwrap();
+        assert!(t.open_existing().unwrap().is_some());
+        assert!(!tmp.path().join(".claude").exists());
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -909,6 +999,158 @@ mod tests {
         std::fs::create_dir(proj.path().join(".git")).unwrap();
         let ctx = auto_context(Some(idx.path()), proj.path(), "compute invoice total");
         assert!(ctx.contains("compute_invoice_total"), "{ctx}");
+    }
+
+    fn write_files(root: &Path, files: &[(&str, &str)]) {
+        for (rel, body) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+    }
+
+    fn stored_files(db: &RagDb) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT DISTINCT file_path FROM code_chunks ORDER BY file_path")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Launched from a directory the repository ignores (`/secrets/`, a
+    /// nested `config/local/`, a hidden `.private/`), nothing in it is
+    /// indexed: the walk starts at the work-tree root, so the parent rules
+    /// that exclude it apply.
+    #[test]
+    fn launching_from_a_gitignored_directory_indexes_nothing_in_it() {
+        let home = TempDir::new().unwrap();
+        let idx = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_files(
+            &repo,
+            &[
+                (".gitignore", "/secrets/\nconfig/local/\n.private/\n"),
+                ("src/app.rs", "fn start_app() {}\n"),
+                (
+                    "secrets/keys.py",
+                    "def signing_key():\n    return 'sk-live'\n",
+                ),
+                ("config/local/creds.rs", "fn local_creds() {}\n"),
+                (".private/notes.rs", "fn private_notes() {}\n"),
+            ],
+        );
+
+        for launch in ["secrets", "config/local", ".private"] {
+            let cwd = repo.join(launch);
+            let target =
+                IndexTarget::resolve(Some(idx.path()), &cwd, Some(home.path()), true).unwrap();
+            assert_eq!(target.root, canonical(&repo), "{launch}");
+            let db = target.open().unwrap();
+            target.index(&db, true).unwrap();
+            assert_eq!(stored_files(&db), ["src/app.rs"], "{launch}");
+            for secret in ["signing_key", "local_creds", "private_notes"] {
+                let ctx = auto_context(Some(idx.path()), &cwd, secret);
+                assert!(!ctx.contains(secret), "{launch}: {secret} leaked:\n{ctx}");
+            }
+
+            // Indexing the ignored directory on its own yields nothing too.
+            let alone = RagDb::open_at(&idx.path().join("alone.db")).unwrap();
+            indexer::index_project(&alone, &cwd, true).unwrap();
+            assert_eq!(alone.chunk_count().unwrap(), 0, "{launch}");
+        }
+    }
+
+    /// `repo` and `repo/src` are one project: one database, keyed by the
+    /// work-tree root, covering the whole tree, with paths shown relative
+    /// to where the user launched.
+    #[test]
+    fn a_subdirectory_launch_shares_the_project_index() {
+        let home = TempDir::new().unwrap();
+        let idx = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_files(
+            &repo,
+            &[
+                (
+                    "src/billing.rs",
+                    "fn compute_invoice_total() -> u32 { 0 }\n",
+                ),
+                ("lib/tax.rs", "fn compute_invoice_tax() -> u32 { 0 }\n"),
+            ],
+        );
+        let at = |dir: &Path| {
+            IndexTarget::resolve(Some(idx.path()), dir, Some(home.path()), true).unwrap()
+        };
+        let top = at(&repo);
+        let sub = at(&repo.join("src"));
+        assert_eq!(sub.root, top.root);
+        assert_eq!(sub.db_path, top.db_path);
+        assert_eq!(sub.db_path, db_path_in(idx.path(), &repo));
+
+        let db = sub.open().unwrap();
+        sub.index(&db, false).unwrap();
+        assert_eq!(stored_files(&db), ["lib/tax.rs", "src/billing.rs"]);
+        assert_eq!(sub.display_path("src/billing.rs"), "billing.rs");
+        assert_eq!(
+            sub.display_path("lib/tax.rs"),
+            canonical(&repo).join("lib/tax.rs").to_string_lossy()
+        );
+        assert_eq!(top.display_path("src/billing.rs"), "src/billing.rs");
+
+        let ctx = auto_context(Some(idx.path()), &repo.join("src"), "compute invoice total");
+        assert!(ctx.contains("billing.rs"), "{ctx}");
+        assert!(!ctx.contains("src/billing.rs"), "{ctx}");
+        assert_eq!(
+            std::fs::read_dir(idx.path())
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().path().extension() == Some("db".as_ref()))
+                .count(),
+            1,
+            "one database"
+        );
+
+        // Outside git, an explicit /index covers the directory itself.
+        let plain = home.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let t = IndexTarget::resolve(Some(idx.path()), &plain, Some(home.path()), false).unwrap();
+        assert_eq!(t.root, canonical(&plain));
+        // Under a dotfiles repo at $HOME, too: $HOME is never the project.
+        std::fs::create_dir(home.path().join(".git")).unwrap();
+        let t = IndexTarget::resolve(Some(idx.path()), &plain, Some(home.path()), false).unwrap();
+        assert_eq!(t.root, canonical(&plain));
+    }
+
+    /// Without a cache dir there is no index, never one somewhere relative.
+    #[test]
+    fn no_cache_dir_means_no_index() {
+        let home = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for auto in [true, false] {
+            assert_eq!(
+                IndexTarget::resolve(None, &repo, Some(home.path()), auto),
+                Err(NO_CACHE_DIR)
+            );
+        }
+    }
+
+    /// Reading an index (search, status, clear) never creates one.
+    #[test]
+    fn open_existing_creates_nothing() {
+        let home = TempDir::new().unwrap();
+        let idx = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let t = IndexTarget::resolve(Some(idx.path()), &repo, Some(home.path()), false).unwrap();
+        assert!(t.open_existing().unwrap().is_none());
+        assert_eq!(std::fs::read_dir(idx.path()).unwrap().count(), 0);
+        t.open().unwrap();
+        assert!(t.open_existing().unwrap().is_some());
     }
 
     /// An old-layout `<project>/.claude/rag.db`: index tables and memories

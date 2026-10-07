@@ -1396,15 +1396,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             }
         }
         CommandAction::IndexProject { force } => {
-            let cwd = config.cwd.clone();
-            if let Some(why) = crate::rag::index_refusal(&cwd, dirs::home_dir().as_deref()) {
-                app.entries.push(ChatEntry::system(format!(
-                    "Not indexing {}: {why}.",
-                    cwd.display()
-                )));
-                app.scroll_to_bottom();
-                return Ok(());
-            }
+            let target = match crate::rag::IndexTarget::for_cwd(&config.cwd, false) {
+                Ok(t) => t,
+                Err(why) => {
+                    app.entries.push(ChatEntry::system(format!(
+                        "Not indexing {}: {why}.",
+                        config.cwd.display()
+                    )));
+                    app.scroll_to_bottom();
+                    return Ok(());
+                }
+            };
             let label = if force {
                 "Full re-index"
             } else {
@@ -1419,8 +1421,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let tx2 = tx.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let db = crate::rag::RagDb::open(&cwd)?;
-                    crate::rag::indexer::index_project(&db, &cwd, force)
+                    let db = target.open()?;
+                    target.index(&db, force)
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("Index task panicked: {e}")));
@@ -1445,16 +1447,16 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             });
         }
         CommandAction::RagSearch(query) => {
-            let cwd = config.cwd.clone();
-            match crate::rag::RagDb::open(&cwd) {
-                Ok(db) => {
+            match existing_index(&config.cwd) {
+                Ok((target, db)) => {
                     match crate::rag::search::search(&db, &query, 10) {
                         Ok(results) if results.is_empty() => {
                             app.entries.push(ChatEntry::system(format!(
-                                "No results for '{query}'. Run /index first to build the index."
+                                "No results for '{query}'. Run /index to refresh the index."
                             )));
                         }
-                        Ok(results) => {
+                        Ok(mut results) => {
+                            target.localize(&mut results);
                             let mut lines = vec![format!(
                                 "RAG search: '{}' — {} results\n",
                                 query,
@@ -1488,17 +1490,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         }
                     }
                 }
-                Err(e) => {
-                    app.entries
-                        .push(ChatEntry::system(format!("RAG database error: {e}")));
-                }
+                Err(msg) => app.entries.push(ChatEntry::system(msg)),
             }
             app.scroll_to_bottom();
         }
         CommandAction::RagStatus => {
-            let cwd = config.cwd.clone();
-            match crate::rag::RagDb::open(&cwd) {
-                Ok(db) => {
+            match existing_index(&config.cwd) {
+                Ok((target, db)) => {
                     let chunks = db.chunk_count().unwrap_or(0);
                     let files = db.file_count().unwrap_or(0);
                     let size_bytes = db.db_size();
@@ -1527,7 +1525,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                          Files indexed: {files}\n\
                          Code chunks:   {chunks}\n\
                          Database size: {size}\n\
+                         Project:       {}\n\
                          DB path:       {}",
+                        target.root.display(),
                         db.db_path.display()
                     );
                     if !lang_breakdown.is_empty() {
@@ -1535,17 +1535,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     }
                     app.entries.push(ChatEntry::system(text));
                 }
-                Err(e) => {
-                    app.entries
-                        .push(ChatEntry::system(format!("RAG database error: {e}")));
-                }
+                Err(msg) => app.entries.push(ChatEntry::system(msg)),
             }
             app.scroll_to_bottom();
         }
         CommandAction::RagClear => {
-            let cwd = config.cwd.clone();
-            match crate::rag::RagDb::open(&cwd) {
-                Ok(db) => {
+            match existing_index(&config.cwd) {
+                Ok((_, db)) => {
                     let old_chunks = db.chunk_count().unwrap_or(0);
                     match db.clear() {
                         Ok(()) => {
@@ -1559,10 +1555,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         }
                     }
                 }
-                Err(e) => {
-                    app.entries
-                        .push(ChatEntry::system(format!("RAG database error: {e}")));
-                }
+                Err(msg) => app.entries.push(ChatEntry::system(msg)),
             }
             app.scroll_to_bottom();
         }
@@ -2883,6 +2876,21 @@ fn reloaded_model(
     }
     last_seen.clone_from(&resolved);
     resolved.filter(|m| m != current)
+}
+
+/// The code index `/rag search`, `/rag status` and `/rag clear` read, opened
+/// only if it exists: none of them may create one (in `$HOME` or `/` they
+/// would leave an empty database behind). `Err` is the message to show.
+fn existing_index(
+    cwd: &std::path::Path,
+) -> std::result::Result<(crate::rag::IndexTarget, crate::rag::RagDb), String> {
+    let target = crate::rag::IndexTarget::for_cwd(cwd, false)
+        .map_err(|why| format!("No code index for {}: {why}.", cwd.display()))?;
+    match target.open_existing() {
+        Ok(Some(db)) => Ok((target, db)),
+        Ok(None) => Err(target.missing_message()),
+        Err(e) => Err(format!("RAG database error: {e}")),
+    }
 }
 
 #[cfg(test)]

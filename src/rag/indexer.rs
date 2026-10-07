@@ -398,11 +398,20 @@ fn too_large_to_index(meta: &std::fs::Metadata) -> bool {
     meta.len() > MAX_INDEX_BYTES
 }
 
-/// Index a project directory into the RAG database.
+/// Index a project directory into the RAG database; stored paths are
+/// relative to `project`.
 /// Incremental: only re-indexes files whose mtime changed.
 /// Set `force` to true to clear and re-index everything.
-pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult> {
+///
+/// Inside a git work tree the walk starts at the work tree's root and only
+/// descends towards `project`, so every rule above `project` applies to it:
+/// an ignored `project` (a launch from `repo/secrets/` with `/secrets/` in
+/// `repo/.gitignore`) yields nothing. Walking from `project` itself would
+/// not, since the ignore walker never matches its root against them.
+pub fn index_project(db: &RagDb, project: &Path, force: bool) -> Result<IndexResult> {
     let start = Instant::now();
+    let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let walk_root = super::git_work_tree_root(&project).unwrap_or_else(|| project.clone());
     let ext_map = ext_to_lang();
 
     if force {
@@ -417,14 +426,21 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
     // Collect files to index. `.gitignore` (in git repos and out of them),
     // `.git/info/exclude`, the global excludes file and `.ignore` all apply.
     // Hidden files are kept as before; hidden dirs and SKIP_DIRS are not.
-    let walker = ignore::WalkBuilder::new(cwd)
+    let scope = project.clone();
+    let walker = ignore::WalkBuilder::new(&walk_root)
         .follow_links(false)
         .hidden(false)
         .require_git(false)
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
+            let path = e.path();
+            if !path.starts_with(&scope) {
+                // Between the work-tree root and the project: only the
+                // directories leading down to it.
+                return scope.starts_with(path);
+            }
             let name = e.file_name().to_string_lossy();
-            // Skip hidden dirs and known build/vendor dirs (but not the root cwd itself)
-            if e.file_type().is_some_and(|t| t.is_dir()) && e.depth() > 0 {
+            // Skip hidden dirs and known build/vendor dirs (but not the project itself)
+            if e.file_type().is_some_and(|t| t.is_dir()) && path != scope {
                 return !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref());
             }
             true
@@ -463,7 +479,7 @@ pub fn index_project(db: &RagDb, cwd: &Path, force: bool) -> Result<IndexResult>
 
         // Get relative path for storage
         let rel_path = path
-            .strip_prefix(cwd)
+            .strip_prefix(&project)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
@@ -623,15 +639,18 @@ mod tests {
             .map(|(p, c)| (p.as_str(), c.as_str()))
             .collect();
         let tmp = setup_project(&refs);
-        drop(RagDb::open(tmp.path()).unwrap());
+        let idx = TempDir::new().unwrap();
+        let db_path = idx.path().join("rag.db");
+        drop(RagDb::open_at(&db_path).unwrap());
 
         let root = tmp.path().to_path_buf();
+        let writer_path = db_path.clone();
         let indexer = std::thread::spawn(move || {
-            let db = RagDb::open(&root).unwrap();
+            let db = RagDb::open_at(&writer_path).unwrap();
             index_project(&db, &root, true).unwrap();
         });
 
-        let reader = rusqlite::Connection::open(tmp.path().join(".claude/rag.db")).unwrap();
+        let reader = rusqlite::Connection::open(&db_path).unwrap();
         let mut partial = false;
         while !indexer.is_finished() {
             let n: i64 = reader

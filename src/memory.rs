@@ -91,6 +91,20 @@ impl MemoryStore {
         Ok(store)
     }
 
+    /// Open the project's memory store only if it has one (or a
+    /// pre-cache-dir `.claude/rag.db` whose memories move into one), so
+    /// reading memories (the system prompt every -p/SDK/browse engine builds)
+    /// never adds `.claude/memory.db` to a project that has none. Writes
+    /// (`/memory add`, auto-capture) go through `open`.
+    pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
+        let legacy = cwd.join(".claude").join("rag.db");
+        if memory_db_path(cwd).is_file() || legacy.is_file() {
+            Self::open(cwd).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Open (or create) the memory database at `path`.
     pub(crate) fn open_at(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -143,19 +157,6 @@ impl MemoryStore {
         )?;
         debug!("MemoryStore opened at {}", path.display());
         Ok(Self { conn })
-    }
-
-    /// Open the project's memory store only if it has one (or a
-    /// pre-cache-dir `.claude/rag.db` whose memories move into one), so
-    /// read-only callers (the system prompt every -p/SDK/browse engine
-    /// builds) never add `.claude/memory.db` to a project that has none.
-    pub fn open_existing(cwd: &Path) -> Result<Option<Self>> {
-        let legacy = cwd.join(".claude").join("rag.db");
-        if memory_db_path(cwd).is_file() || legacy.is_file() {
-            Self::open(cwd).map(Some)
-        } else {
-            Ok(None)
-        }
     }
 
     /// Copy every memory from another database's `memory` table, keeping

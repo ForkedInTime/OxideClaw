@@ -254,11 +254,13 @@ Rust, Python, JavaScript, TypeScript, Go, Java, C, Bash
 /rag clear           # clear the index
 ```
 
-The index auto-updates when files change between queries. It lives in `.claude/rag.db` (with the project's `/memory` entries); the interactive TUI builds it on start, while `-p`, SDK and ACP sessions only use an index that already exists and never create one. OxideClaw adds `**/.claude/rag.db*` to the repo's private `.git/info/exclude` so `/checkpoint`, `/commit` and `/spawn merge` never commit it.
+The index auto-updates when files change between queries. The interactive TUI builds it on start, while `-p`, SDK and ACP sessions only use an index that already exists and never create one. When `.claude/memory.db` is opened, OxideClaw adds `**/.claude/memory.db*` to the repo's private `.git/info/exclude` so `/checkpoint`, `/commit` and `/spawn merge` never commit your memories; `/undo` snapshots skip it too.
 
 **Where it runs.** The index builds on its own (at TUI startup and before each prompt, and is refreshed for `-p`, SDK and ACP turns once one exists) only when the working directory is inside a git repository. Elsewhere the TUI shows `Code index off: not inside a git repository` once and `-p`/SDK stay silent; `/index` still works there on request. Your home directory and `/` are never indexed, not even by `/index`.
 
-**Where it lives.** `$XDG_CACHE_HOME/oxideclaw/rag/<hash>.db` (default `~/.cache/oxideclaw/rag/`), where `<hash>` is the first 16 hex digits of the SHA-256 of the project's canonical path. Nothing is written into the project, and the cache can be deleted at any time. `/rag status` prints the path.
+**What it covers.** The whole git work tree, wherever in it you start: launching from `repo/src` uses and refreshes the same index as launching from `repo`, and the walk starts at the work-tree root so every `.gitignore` rule applies (starting inside an ignored directory indexes nothing from it). Outside git, `/index` covers the directory it runs in.
+
+**Where it lives.** `$XDG_CACHE_HOME/oxideclaw/rag/<hash>.db` (default `~/.cache/oxideclaw/rag/`), where `<hash>` is the first 16 hex digits of the SHA-256 of the canonical work-tree root (the directory itself outside git). With neither `$XDG_CACHE_HOME` nor a home directory set, the index is off. The code index writes nothing into the project; `/memory` notes live in `.claude/memory.db`, which is only created once memories are used (a `/memory` command or auto-capture), not by every session. The cache can be deleted at any time. `/rag search`, `/rag status` and `/rag clear` only read an existing index, and `/rag status` prints its path.
 
 Older versions kept the index in `<project>/.claude/rag.db`. On first use that file is deleted without being searched again, once its tables confirm it is an OxideClaw index; any memories in it move to `.claude/memory.db` first. A `.claude/rag.db` belonging to anything else is left alone.
 

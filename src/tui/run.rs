@@ -763,32 +763,34 @@ async fn run_loop(
     // ── Background RAG indexing (incremental, non-blocking) ────────────────
     // Only inside a git work tree, never $HOME or /: gitignore is what keeps
     // local secrets out of the index, and a home directory is not a project.
-    if let Some(why) = crate::rag::auto_index_refusal(&config.cwd, dirs::home_dir().as_deref()) {
-        app.entries
-            .push(ChatEntry::system(format!("Code index off: {why}")));
-    } else {
-        let cwd = config.cwd.clone();
-        let tx2 = tx.clone();
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let db = crate::rag::RagDb::open(&cwd)?;
-                crate::rag::indexer::index_project(&db, &cwd, false)
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("RAG index panicked: {e}")));
-            match result {
-                Ok(r) if r.files_indexed > 0 => {
-                    let _ = tx2.send(crate::tui::events::AppEvent::SystemMessage(format!(
-                        "Codebase indexed — {} files, {} chunks ({:.0}ms)",
-                        r.files_indexed, r.chunks_added, r.elapsed_ms
-                    )));
+    // The index covers the whole work tree, wherever in it we started.
+    match crate::rag::IndexTarget::for_cwd(&config.cwd, true) {
+        Err(why) => app
+            .entries
+            .push(ChatEntry::system(format!("Code index off: {why}"))),
+        Ok(target) => {
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let db = target.open()?;
+                    target.index(&db, false)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("RAG index panicked: {e}")));
+                match result {
+                    Ok(r) if r.files_indexed > 0 => {
+                        let _ = tx2.send(crate::tui::events::AppEvent::SystemMessage(format!(
+                            "Codebase indexed — {} files, {} chunks ({:.0}ms)",
+                            r.files_indexed, r.chunks_added, r.elapsed_ms
+                        )));
+                    }
+                    Ok(_) => {} // nothing new to index — stay silent
+                    Err(e) => {
+                        tracing::warn!("Background RAG indexing failed: {e}");
+                    }
                 }
-                Ok(_) => {} // nothing new to index — stay silent
-                Err(e) => {
-                    tracing::warn!("Background RAG indexing failed: {e}");
-                }
-            }
-        });
+            });
+        }
     }
 
     // The user's own argv, so it is sent like a typed prompt (`oxideclaw

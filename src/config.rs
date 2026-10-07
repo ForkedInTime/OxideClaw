@@ -1368,8 +1368,9 @@ impl Config {
 
     /// Path to the cache directory (XDG-aware): `$XDG_CACHE_HOME/oxideclaw`,
     /// else `~/.cache/oxideclaw`. Only regenerable data (code indexes, the
-    /// update-check answer).
-    pub fn cache_dir() -> PathBuf {
+    /// update-check answer). `None` when neither an absolute
+    /// `$XDG_CACHE_HOME` nor a home directory is known.
+    pub fn cache_dir() -> Option<PathBuf> {
         cache_dir_in(
             std::env::var("XDG_CACHE_HOME").ok().as_deref(),
             dirs::home_dir().as_deref(),
@@ -1813,10 +1814,13 @@ pub fn app_dir(base: &Path) -> PathBuf {
 
 /// `Config::cache_dir` for a given `$XDG_CACHE_HOME` and home directory. A
 /// relative or empty `$XDG_CACHE_HOME` is ignored, as the XDG spec requires.
-fn cache_dir_in(xdg: Option<&str>, home: Option<&Path>) -> PathBuf {
+/// No relative fallback: `./.cache` would put the cache in the project.
+fn cache_dir_in(xdg: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
     match xdg.map(Path::new).filter(|x| x.is_absolute()) {
-        Some(xdg) => app_dir(xdg),
-        None => app_dir(&home.unwrap_or(Path::new(".")).join(".cache")),
+        Some(xdg) => Some(app_dir(xdg)),
+        None => home
+            .filter(|h| h.is_absolute())
+            .map(|h| app_dir(&h.join(".cache"))),
     }
 }
 
@@ -1926,14 +1930,28 @@ mod data_dir_tests {
         let home = Path::new("/home/u");
         assert_eq!(
             cache_dir_in(Some("/xdg/cache"), Some(home)),
-            PathBuf::from("/xdg/cache/oxideclaw")
+            Some(PathBuf::from("/xdg/cache/oxideclaw"))
         );
         for unset in [None, Some(""), Some("rel/cache")] {
             assert_eq!(
                 cache_dir_in(unset, Some(home)),
-                PathBuf::from("/home/u/.cache/oxideclaw"),
+                Some(PathBuf::from("/home/u/.cache/oxideclaw")),
                 "{unset:?}"
             );
+        }
+    }
+
+    /// With no absolute `$XDG_CACHE_HOME` and no (absolute) home directory
+    /// there is no cache dir at all, rather than `./.cache` in the project.
+    #[test]
+    fn no_home_and_no_xdg_cache_home_means_no_cache_dir() {
+        assert_eq!(
+            cache_dir_in(Some("/xdg/cache"), None),
+            Some(PathBuf::from("/xdg/cache/oxideclaw"))
+        );
+        for xdg in [None, Some(""), Some("rel/cache")] {
+            assert_eq!(cache_dir_in(xdg, None), None, "{xdg:?}");
+            assert_eq!(cache_dir_in(xdg, Some(Path::new("rel"))), None, "{xdg:?}");
         }
     }
 
@@ -2493,10 +2511,11 @@ mod external_system_prompt_tests {
         );
     }
 
-    /// Every -p/SDK/browse engine builds this prompt; reading memory must not
-    /// leave an empty `.claude/rag.db` in a project that never indexed.
+    /// Building the prompt reads memories but never creates a memory
+    /// store: every -p/SDK/browse engine builds it, and a project without
+    /// one gets no `.claude/` from a session.
     #[test]
-    fn building_the_prompt_does_not_create_the_rag_db() {
+    fn system_prompt_does_not_create_a_memory_store() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             cwd: dir.path().to_path_buf(),

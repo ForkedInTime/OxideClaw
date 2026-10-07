@@ -132,9 +132,14 @@ pub fn spawn(config: &Config, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) 
     {
         return;
     }
+    // No cache dir (no home and no absolute $XDG_CACHE_HOME): nothing would
+    // hold the answer, so every launch would ask GitHub. Skip instead.
+    let Some(cache_dir) = Config::cache_dir() else {
+        return;
+    };
     tokio::spawn(async move {
-        let check = || {
-            latest_version(&Config::cache_dir(), SystemTime::now(), || {
+        let check = move || {
+            latest_version(&cache_dir, SystemTime::now(), || {
                 crate::latest_release_version(TIMEOUT)
             })
         };
