@@ -405,9 +405,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // way, so only other backends' overloads are retried here.
                     // The connection cases stay for a drop on the first event.
                     let overloaded = !matches!(client, crate::api::ApiBackend::Anthropic(_))
-                        && (err_str.contains("529")
-                            || err_str.contains("overloaded")
-                            || err_str.contains("Overloaded"));
+                        && crate::api::retry::is_overloaded(&e);
                     let is_retryable = overloaded
                         || err_str.contains("connection")
                         || err_str.contains("reset by peer");

@@ -92,7 +92,7 @@ impl QueryEngine {
         client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
             eprintln!("{}", n.message().yellow());
         }));
-        // With a distinct --fallback-model, `query` switches models on the
+        // With a distinct --fallback-model, `stream_turn` switches models on the
         // first overload; a backoff before that would only delay it.
         client.set_retry_overloaded(
             config
@@ -200,6 +200,49 @@ impl QueryEngine {
         }
     }
 
+    /// One model call. An overload before any text has been shown switches
+    /// to `--fallback-model` once; after text, the fallback's answer would
+    /// follow a half-shown first one. Returns the model that answered, which
+    /// is the one to bill.
+    async fn stream_turn(
+        &self,
+        request: MessagesRequest,
+        mut on_text: impl FnMut(&str),
+    ) -> Result<(StreamedResponse, String)> {
+        let mut emitted = false;
+        let first = self
+            .client
+            .messages_stream(request.clone(), |chunk| {
+                emitted = true;
+                on_text(chunk);
+            })
+            .await;
+        let err = match first {
+            Ok(r) => return Ok((r, request.model)),
+            Err(e) => e,
+        };
+        let fallback = self
+            .config
+            .fallback_model
+            .as_deref()
+            .filter(|fb| *fb != request.model);
+        let Some(fb) = fallback.filter(|_| !emitted && crate::api::retry::is_overloaded(&err))
+        else {
+            return Err(err);
+        };
+        let note = format!("Model overloaded — retrying with {fb}");
+        if self.quiet {
+            tracing::warn!("{note}");
+        } else {
+            eprintln!("{}", note.yellow());
+        }
+        // Thinking shape, effort and max_tokens are per model: Opus 5
+        // settings can be a 400 on an older fallback.
+        let fb_req = self.request_for(fb, request.tools);
+        let r = self.client.messages_stream(fb_req, on_text).await?;
+        Ok((r, fb.to_string()))
+    }
+
     /// Add a user message and run the agentic loop until stop_reason == EndTurn.
     /// Mirrors the main query() function in query.ts.
     pub async fn query(&mut self, user_input: impl Into<String>) -> Result<()> {
@@ -261,63 +304,22 @@ impl QueryEngine {
                 print!("\n{} ", "Claude:".cyan().bold());
             }
             let include_partial = self.include_partial_messages && self.stream_json_output;
-            // Try the call; on 529 with fallback_model, retry once with fallback
-            let response = {
-                let model = request.model.clone();
-                let res = self
-                    .client
-                    .messages_stream(request.clone(), |chunk| {
-                        if self.stream_json_output {
-                            if include_partial {
-                                let event =
-                                    serde_json::json!({"type":"partial_text","text": chunk});
-                                println!("{}", event);
-                            }
-                            full_text.push_str(chunk);
-                        } else if human {
-                            print!("{chunk}");
-                        } else {
-                            full_text.push_str(chunk);
+            let stream_json = self.stream_json_output;
+            let (response, served_model) = self
+                .stream_turn(request, |chunk| {
+                    if stream_json {
+                        if include_partial {
+                            let event = serde_json::json!({"type":"partial_text","text": chunk});
+                            println!("{}", event);
                         }
-                    })
-                    .await;
-                match res {
-                    Err(ref e) if is_overloaded_error(e) => {
-                        if let Some(ref fb) = self.config.fallback_model.clone() {
-                            if fb != &model {
-                                eprintln!(
-                                    "{}",
-                                    format!("Model overloaded — retrying with {fb}").yellow()
-                                );
-                                full_text.clear();
-                                // Thinking shape, effort and max_tokens are
-                                // per model: Opus 5 settings can be a 400 on
-                                // an older fallback.
-                                let fb_req = self.request_for(fb, request.tools.clone());
-                                self.client.messages_stream(fb_req, |chunk| {
-                                    if self.stream_json_output {
-                                        if include_partial {
-                                            let event = serde_json::json!({"type":"partial_text","text": chunk});
-                                            println!("{}", event);
-                                        }
-                                        full_text.push_str(chunk);
-                                    } else if human {
-                                        print!("{chunk}");
-                                    } else {
-                                        full_text.push_str(chunk);
-                                    }
-                                }).await?
-                            } else {
-                                res?
-                            }
-                        } else {
-                            res?
-                        }
+                        full_text.push_str(chunk);
+                    } else if human {
+                        print!("{chunk}");
+                    } else {
+                        full_text.push_str(chunk);
                     }
-                    Err(e) => return Err(e),
-                    Ok(r) => r,
-                }
-            };
+                })
+                .await?;
             if human {
                 println!(); // newline after streamed text
             }
@@ -355,12 +357,12 @@ impl QueryEngine {
             }
 
             // Track cost and check budget
-            let turn_cost = estimate_cost_usd(&self.config.model, &response.usage);
+            let turn_cost = estimate_cost_usd(&served_model, &response.usage);
             self.cumulative_cost_usd += turn_cost;
             // /browse runs on this loop: its caller's /cost and /budget
             // only see what reaches the sink.
             if let Some(sink) = &self.usage_sink {
-                let _ = sink.send((self.config.model.clone(), response.usage.clone()));
+                let _ = sink.send((served_model, response.usage.clone()));
             }
             if let Some(budget) = self.config.max_budget_usd
                 && self.cumulative_cost_usd >= budget
@@ -754,9 +756,6 @@ impl QueryEngine {
                 tracing::warn!("{}", n.message());
             },
         ));
-        // No fallback-model path here, so the client must ride out an
-        // overload itself.
-        self.client.set_retry_overloaded(true);
         self.messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -788,9 +787,8 @@ impl QueryEngine {
             let request = self.request_for(&self.config.model, tool_defs);
 
             let mut turn_text = String::new();
-            let response = self
-                .client
-                .messages_stream(request, |chunk| {
+            let (response, served_model) = self
+                .stream_turn(request, |chunk| {
                     turn_text.push_str(chunk);
                 })
                 .await?;
@@ -798,9 +796,9 @@ impl QueryEngine {
                 final_text = turn_text;
             }
 
-            self.cumulative_cost_usd += estimate_cost_usd(&self.config.model, &response.usage);
+            self.cumulative_cost_usd += estimate_cost_usd(&served_model, &response.usage);
             if let Some(sink) = &self.usage_sink {
-                let _ = sink.send((self.config.model.clone(), response.usage.clone()));
+                let _ = sink.send((served_model, response.usage.clone()));
             }
             if let Some(budget) = self.config.max_budget_usd
                 && self.cumulative_cost_usd >= budget
@@ -1034,12 +1032,6 @@ impl QueryEngine {
     }
 }
 
-/// Returns true if the error is an HTTP 529 (overloaded) response.
-fn is_overloaded_error(e: &anyhow::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("529") || msg.contains("overloaded") || msg.contains("Overloaded")
-}
-
 /// Per-call cost in USD, from the same price table as `/cost`.
 fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
     crate::cost::model_price(model).cost(
@@ -1253,6 +1245,73 @@ pub(crate) mod scripted_api_tests {
             "{}",
             e.cumulative_cost_usd
         );
+    }
+
+    fn http_error(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn fallback_engine(url: String, dir: &std::path::Path) -> QueryEngine {
+        let config = Config {
+            model: "claude-opus-5".into(),
+            fallback_model: Some("claude-haiku-4-5".into()),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.to_path_buf(),
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        c.set_retry_overloaded(false);
+        e.client = ApiBackend::Anthropic(c);
+        e
+    }
+
+    /// Sub-agents (query_and_collect) never used --fallback-model, and a 400
+    /// whose body held "529" inside a token count was taken for an overload
+    /// and re-sent to the fallback, where it was bound to fail again.
+    #[tokio::test]
+    async fn overload_switches_to_the_fallback_but_a_529_digit_run_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let overloaded = http_error(
+            "529 Overloaded",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let ok = sse(
+            &[serde_json::json!({"type":"text","text":"from fallback"})],
+            "end_turn",
+        );
+        let (url, seen) = serve(vec![overloaded, ok]).await;
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut e = fallback_engine(url, dir.path()).with_usage_sink(Some(sink));
+        e.query_and_collect("hi").await.unwrap();
+        assert_eq!(e.last_assistant_text().as_deref(), Some("from fallback"));
+        let models: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap()["model"].to_string())
+            .collect();
+        assert_eq!(models, vec!["\"claude-opus-5\"", "\"claude-haiku-4-5\""]);
+        let (billed, _) = rx.try_recv().unwrap();
+        assert_eq!(billed, "claude-haiku-4-5", "bill the model that answered");
+
+        let too_long = http_error(
+            "400 Bad Request",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 205290 tokens > 200000 maximum"}}"#,
+        );
+        let ok = sse(
+            &[serde_json::json!({"type":"text","text":"unreachable"})],
+            "end_turn",
+        );
+        let (url, seen) = serve(vec![too_long, ok]).await;
+        let mut e = fallback_engine(url, dir.path());
+        assert!(e.query("hi").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1, "a 400 is not an overload");
     }
 
     /// `-c -p` ran a fresh conversation: the resumed turns must be sent

@@ -9,9 +9,9 @@
 //! Two deliberate scope limits:
 //!
 //!   * **529 is retried only when the caller asks** (`retry_overloaded`).
-//!     The Anthropic client does unless `--fallback-model` is set: then the
-//!     fallback path in `query_engine` switches models immediately, and
-//!     sleeping 30s before doing that would be strictly worse.
+//!     The Anthropic client does unless a distinct `--fallback-model` is set:
+//!     then the headless loops in `query_engine` switch models immediately,
+//!     and sleeping 30s before doing that would be strictly worse.
 //!   * **Retries happen only before any bytes are streamed.** Every caller
 //!     retries at the send-and-check-status step, so a retry can never
 //!     duplicate text the user has already seen.
@@ -74,6 +74,18 @@ pub type RetryNotifier = Arc<dyn Fn(&RetryNotice) + Send + Sync>;
 /// retrying a 401 hammers an auth failure.
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Whether `e` reports an overloaded API: HTTP 529 as every backend formats
+/// it (`<who> error 529 ...`) or an overload named in the body or SSE event.
+/// A bare "529" is not enough: "prompt is too long: 205290 tokens" holds one,
+/// and treating that 400 as an overload re-sent a request bound to fail.
+pub fn is_overloaded(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    let status_529 = msg
+        .match_indices("error 529")
+        .any(|(i, m)| !msg[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()));
+    status_529 || msg.to_ascii_lowercase().contains("overloaded")
 }
 
 /// True for transport failures that a retry can plausibly fix.
@@ -330,6 +342,30 @@ mod tests {
         for s in [200, 400, 401, 403, 404, 413, 422, 529] {
             assert!(!is_retryable_status(s), "{s} should not retry");
         }
+    }
+
+    #[test]
+    fn overload_is_the_529_status_not_any_529_digits() {
+        let e = |s: &str| anyhow::anyhow!("{s}");
+        for over in [
+            "API stream error 529 <unknown status code>: {}",
+            "API error 529: {}",
+            "Groq error 529 <unknown status code>: busy",
+            "Ollama error 529",
+            "Stream error overloaded_error: Overloaded",
+        ] {
+            assert!(is_overloaded(&e(over)), "{over}");
+        }
+        for not in [
+            "API stream error 400 Bad Request: prompt is too long: 205290 tokens > 200000",
+            "API error 400 Bad Request: max_tokens: 65290 > 64000",
+            "API error 400 Bad Request: invalid_request_error 52900",
+        ] {
+            assert!(!is_overloaded(&e(not)), "{not}");
+        }
+        // Context wrapping must not hide it.
+        let wrapped = e("API stream error 529 <unknown status code>: {}").context("call failed");
+        assert!(is_overloaded(&wrapped));
     }
 
     #[test]
