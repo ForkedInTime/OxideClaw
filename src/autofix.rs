@@ -15,6 +15,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
@@ -254,15 +255,22 @@ pub fn should_trigger(config: &AutoFixConfig, autonomy_mode: &str) -> bool {
 /// `"npm test"`. The first whitespace-separated token is the program,
 /// the rest are argv. `timeout_secs` caps total wall-clock runtime; if the
 /// process is still running past it we send SIGKILL and return
-/// `CommandResult::Timeout`. Pass `0` to wait indefinitely.
+/// `CommandResult::Timeout`. Pass `0` to wait indefinitely. Setting
+/// `cancel` (Esc in the TUI) kills the command the same way and returns
+/// `Skipped`: lint and tests otherwise ran on, unseen, for minutes.
 ///
 /// NOTE on implementation: the original spec called for `wait_timeout`, but
 /// pulling in a new dep for ~20 lines isn't worth it. We use a poll+kill loop
 /// via `try_wait`, which has the same behavior with no extra deps.
-pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
+pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool) -> CommandResult {
     if cmd.trim().is_empty() {
         return CommandResult::Skipped {
             reason: "empty test command".to_string(),
+        };
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return CommandResult::Skipped {
+            reason: "cancelled".to_string(),
         };
     }
     // Through the shell, so quoting, env assignments and `&&` work
@@ -353,7 +361,8 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
         match polled {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if has_timeout && start.elapsed() >= timeout {
+                let cancelled = cancel.load(Ordering::SeqCst);
+                if cancelled || (has_timeout && start.elapsed() >= timeout) {
                     // The whole group: test binaries outlive a killed `cargo`
                     // and would hold the pipes open.
                     #[cfg(unix)]
@@ -362,6 +371,11 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
                     }
                     let _ = child.kill();
                     let _ = child.wait();
+                    if cancelled {
+                        return CommandResult::Skipped {
+                            reason: "cancelled".to_string(),
+                        };
+                    }
                     return CommandResult::Timeout;
                 }
                 std::thread::sleep(poll);
@@ -450,6 +464,7 @@ pub fn run_checks(
     lint_cmd: Option<&str>,
     test_cmd: Option<&str>,
     timeout_secs: u64,
+    cancel: &AtomicBool,
 ) -> CheckOutcome {
     if lint_cmd.is_none() && test_cmd.is_none() {
         return CheckOutcome::NoRunners;
@@ -459,7 +474,7 @@ pub fn run_checks(
     let mut lint_failed = false;
 
     if let Some(cmd) = lint_cmd {
-        match run_command(cwd, cmd, timeout_secs) {
+        match run_command(cwd, cmd, timeout_secs, cancel) {
             CommandResult::Pass => {}
             CommandResult::Fail { stderr } => {
                 lint_failed = true;
@@ -487,7 +502,7 @@ pub fn run_checks(
     let mut test_failed = false;
 
     if let Some(cmd) = test_cmd {
-        match run_command(cwd, cmd, timeout_secs) {
+        match run_command(cwd, cmd, timeout_secs, cancel) {
             CommandResult::Pass => {}
             CommandResult::Fail { stderr } => {
                 test_failed = true;
@@ -602,6 +617,7 @@ pub fn run_auto_fix_check(
     config: &AutoFixConfig,
     autonomy_mode: &str,
     retries_used: u32,
+    cancel: &AtomicBool,
 ) -> AutoFixAction {
     if !should_trigger(config, autonomy_mode) {
         return AutoFixAction::Continue { status: None };
@@ -631,6 +647,7 @@ pub fn run_auto_fix_check(
         lint_cmd.as_deref(),
         test_cmd.as_deref(),
         config.timeout_secs,
+        cancel,
     );
 
     match outcome {
@@ -685,6 +702,8 @@ pub fn run_auto_fix_check(
 
 #[cfg(test)]
 mod tests {
+    static NOT_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     // ── Auto-detected runners must be runnable ───────────────────────────────
 
     #[cfg(unix)]
@@ -693,6 +712,28 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Esc only aborted the async task; the lint/test process it was
+    /// waiting on ran on to completion or its timeout.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_kills_a_running_check() {
+        let td = tempfile::tempdir().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let r = super::run_command(td.path(), "sleep 30", 0, &cancel);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(matches!(r, super::CommandResult::Skipped { .. }), "{r:?}");
+        // A cancelled lint never goes on to start the tests.
+        let outcome = super::run_checks(td.path(), Some("true"), Some("touch ran"), 0, &cancel);
+        assert!(matches!(outcome, super::CheckOutcome::Skipped { .. }));
+        assert!(!td.path().join("ran").exists());
     }
 
     #[cfg(unix)]
@@ -800,7 +841,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 10,
         };
-        let action = super::run_auto_fix_check(proj.path(), &cfg, "auto-edit", 0);
+        let action = super::run_auto_fix_check(proj.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
         assert!(
             matches!(action, super::AutoFixAction::Retry { .. }),
             "{action:?}"
@@ -817,6 +858,7 @@ mod tests {
             td.path(),
             "echo build-noise >&2; head -c 200000 /dev/zero | tr '\\0' x; echo; echo 'test result: FAILED'; exit 1",
             30,
+            &NOT_CANCELLED,
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         match r {
@@ -852,7 +894,12 @@ mod tests {
     fn leftover_background_jobs_do_not_hold_the_check() {
         let td = tempfile::TempDir::new().unwrap();
         let started = std::time::Instant::now();
-        let r = run_command(td.path(), "sleep 30 & echo 'test failed'; exit 1", 20);
+        let r = run_command(
+            td.path(),
+            "sleep 30 & echo 'test failed'; exit 1",
+            20,
+            &NOT_CANCELLED,
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
@@ -878,7 +925,7 @@ mod tests {
         }
         let td = tempfile::TempDir::new().unwrap();
         let started = std::time::Instant::now();
-        let r = run_command(td.path(), "setsid sleep 15 & exit 0", 2);
+        let r = run_command(td.path(), "setsid sleep 15 & exit 0", 2, &NOT_CANCELLED);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
@@ -892,7 +939,12 @@ mod tests {
     fn commands_run_through_the_shell() {
         let td = tempfile::TempDir::new().unwrap();
         assert!(matches!(
-            run_command(td.path(), "test \"a b\" = 'a b' && X=1 true", 10),
+            run_command(
+                td.path(),
+                "test \"a b\" = 'a b' && X=1 true",
+                10,
+                &NOT_CANCELLED
+            ),
             CommandResult::Pass
         ));
     }
@@ -987,6 +1039,7 @@ mod tests {
             Some("true"), // lint: unix `true` exits 0
             Some("true"), // tests: same
             5,
+            &NOT_CANCELLED,
         );
         assert!(matches!(outcome, CheckOutcome::Pass), "got {outcome:?}");
     }
@@ -998,7 +1051,13 @@ mod tests {
         let sentinel = dir.path().join("tests_ran");
         let sentinel_str = sentinel.display().to_string();
         let test_cmd = format!("sh -c 'touch {sentinel_str}'");
-        let outcome = run_checks(dir.path(), Some("false"), Some(&test_cmd), 5);
+        let outcome = run_checks(
+            dir.path(),
+            Some("false"),
+            Some(&test_cmd),
+            5,
+            &NOT_CANCELLED,
+        );
         match outcome {
             CheckOutcome::Fail {
                 lint_stderr: _,
@@ -1020,7 +1079,7 @@ mod tests {
     #[test]
     fn run_checks_lint_pass_tests_fail() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), Some("true"), Some("false"), 5);
+        let outcome = run_checks(dir.path(), Some("true"), Some("false"), 5, &NOT_CANCELLED);
         match outcome {
             CheckOutcome::Fail {
                 lint_stderr,
@@ -1036,7 +1095,7 @@ mod tests {
     #[test]
     fn run_checks_no_runners() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), None, None, 5);
+        let outcome = run_checks(dir.path(), None, None, 5, &NOT_CANCELLED);
         assert!(
             matches!(outcome, CheckOutcome::NoRunners),
             "got {outcome:?}"
@@ -1046,14 +1105,14 @@ mod tests {
     #[test]
     fn run_checks_lint_only_pass() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), Some("true"), None, 5);
+        let outcome = run_checks(dir.path(), Some("true"), None, 5, &NOT_CANCELLED);
         assert!(matches!(outcome, CheckOutcome::Pass), "got {outcome:?}");
     }
 
     #[test]
     fn run_checks_tests_only_fail() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), None, Some("false"), 5);
+        let outcome = run_checks(dir.path(), None, Some("false"), 5, &NOT_CANCELLED);
         match outcome {
             CheckOutcome::Fail {
                 lint_stderr,
@@ -1157,7 +1216,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
         assert!(
             matches!(action, AutoFixAction::Continue { .. }),
             "got {action:?}"
@@ -1175,7 +1234,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
         match action {
             AutoFixAction::Retry { feedback, status } => {
                 assert!(feedback.contains("Your last edits failed"));
@@ -1198,7 +1257,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 1);
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 1, &NOT_CANCELLED);
         match action {
             AutoFixAction::Retry { feedback, status } => {
                 assert!(feedback.contains("## Tests"));
@@ -1219,7 +1278,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3);
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3, &NOT_CANCELLED);
         match action {
             AutoFixAction::GiveUp { status } => {
                 assert!(status.contains("cap reached"));
@@ -1241,7 +1300,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
         match action {
             AutoFixAction::Continue { status } => {
                 assert!(status.is_none(), "trigger off should be silent");
@@ -1261,7 +1320,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "suggest", 0);
+        let action = run_auto_fix_check(dir.path(), &cfg, "suggest", 0, &NOT_CANCELLED);
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
     }
 
@@ -1276,7 +1335,7 @@ mod tests {
             max_retries: 3,
             timeout_secs: 5,
         };
-        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+        let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &NOT_CANCELLED);
         assert!(matches!(action, AutoFixAction::Continue { status: None }));
     }
 }

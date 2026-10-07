@@ -8,6 +8,7 @@
 
 use oxideclaw::autofix::{AutoFixAction, AutoFixConfig, AutoFixTrigger, run_auto_fix_check};
 use std::fs;
+use std::sync::atomic::AtomicBool;
 use tempfile::tempdir;
 
 fn base_cfg() -> AutoFixConfig {
@@ -25,7 +26,7 @@ fn base_cfg() -> AutoFixConfig {
 fn empty_dir_no_runners_continues_silently() {
     let dir = tempdir().unwrap();
     let cfg = base_cfg();
-    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &AtomicBool::new(false));
     assert!(matches!(action, AutoFixAction::Continue { status: None }));
 }
 
@@ -42,7 +43,7 @@ fn cargo_project_detects_and_passes_with_overrides() {
     cfg.lint_command = Some("true".to_string());
     cfg.test_command = Some("true".to_string());
 
-    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &AtomicBool::new(false));
     match action {
         AutoFixAction::Continue { status } => {
             assert!(status.is_some());
@@ -59,7 +60,7 @@ fn lint_fail_under_cap_returns_retry_with_anticheat() {
     cfg.lint_command = Some("sh -c 'echo \"warning: unused variable\" >&2; exit 1'".to_string());
     cfg.test_command = Some("true".to_string());
 
-    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0);
+    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 0, &AtomicBool::new(false));
     match action {
         AutoFixAction::Retry { feedback, status } => {
             assert!(feedback.contains("Your last edits failed"));
@@ -79,7 +80,7 @@ fn cap_reached_returns_giveup_with_working_tree_note() {
     cfg.lint_command = Some("false".to_string());
     cfg.test_command = Some("true".to_string());
 
-    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3);
+    let action = run_auto_fix_check(dir.path(), &cfg, "auto-edit", 3, &AtomicBool::new(false));
     match action {
         AutoFixAction::GiveUp { status } => {
             assert!(status.contains("cap reached"));
@@ -96,7 +97,7 @@ fn trigger_autonomous_skips_in_read_only_mode() {
     cfg.trigger = AutoFixTrigger::Autonomous;
     cfg.lint_command = Some("false".to_string());
 
-    let action = run_auto_fix_check(dir.path(), &cfg, "read-only", 0);
+    let action = run_auto_fix_check(dir.path(), &cfg, "read-only", 0, &AtomicBool::new(false));
     assert!(matches!(action, AutoFixAction::Continue { status: None }));
 }
 
@@ -108,6 +109,6 @@ fn trigger_off_short_circuits() {
     cfg.lint_command = Some("false".to_string());
     cfg.test_command = Some("false".to_string());
 
-    let action = run_auto_fix_check(dir.path(), &cfg, "full-auto", 0);
+    let action = run_auto_fix_check(dir.path(), &cfg, "full-auto", 0, &AtomicBool::new(false));
     assert!(matches!(action, AutoFixAction::Continue { status: None }));
 }

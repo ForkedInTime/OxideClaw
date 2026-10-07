@@ -939,12 +939,24 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // Lint and tests can run for minutes; keep them off the
                     // async worker that also drives the UI channel.
                     let (auto_fix, autonomy) = (config.auto_fix.clone(), config.autonomy.clone());
+                    // Esc aborts this task at the await below, which leaves
+                    // the blocking check running; dropping the guard there
+                    // tells it to kill its lint/test processes.
+                    struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for CancelOnDrop {
+                        fn drop(&mut self) {
+                            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let _cancel_on_abort = CancelOnDrop(cancel.clone());
                     let action = match tokio::task::spawn_blocking(move || {
                         crate::autofix::run_auto_fix_check(
                             &work_cwd,
                             &auto_fix,
                             &autonomy,
                             auto_fix_retries,
+                            &cancel,
                         )
                     })
                     .await
@@ -1561,6 +1573,88 @@ mod loop_guard_tests {
         let (seen, errors) = run_with_probe(false, &["Planner", "Agent"]).await;
         assert_eq!(errors, Vec::<String>::new());
         assert_eq!(seen, vec![true]);
+    }
+
+    /// Stands in for Write: succeeds without touching the disk.
+    struct FakeWrite;
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FakeWrite {
+        fn name(&self) -> &str {
+            "Write"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+            Ok(ToolOutput::success("written"))
+        }
+    }
+
+    /// Esc aborts the task while the auto-fix check runs; the lint/test
+    /// process it started ran on, unseen, until it finished or timed out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_the_turn_kills_the_running_auto_fix_check() {
+        use crate::query_engine::scripted_api_tests::serve;
+        let input = serde_json::json!({"file_path": "a.txt", "content": "x"}).to_string();
+        let events = [
+            serde_json::json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"w1","name":"Write","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let write = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, _) = serve(vec![write]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut t, mut rx) = task(url, dir.path(), None);
+        t.tools = vec![std::sync::Arc::new(FakeWrite)];
+        t.perm_state = PermissionState::new(false, &["Write".into()], &[]);
+        t.config.autonomy = "auto-edit".into();
+        t.config.auto_fix = crate::autofix::AutoFixConfig {
+            trigger: crate::autofix::AutoFixTrigger::Always,
+            test_command: Some("echo $$ > check.pid; exec sleep 30".into()),
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        let pid_file = dir.path().join("check.pid");
+        let handle = tokio::spawn(run_api_task(t));
+        let pid = loop {
+            if let Ok(p) = std::fs::read_to_string(&pid_file)
+                && let Ok(p) = p.trim().parse::<i32>()
+            {
+                break p;
+            }
+            assert!(!handle.is_finished(), "the check never started");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        handle.abort();
+        let _ = handle.await;
+
+        let alive = || unsafe { libc::kill(pid, 0) } == 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let still_running = alive();
+        if still_running {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        assert!(!still_running, "the check outlived the cancelled turn");
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, AppEvent::Done { .. }),
+                "a cancelled turn sent Done"
+            );
+        }
     }
 
     /// A connection that dies after the headers but before any text is
