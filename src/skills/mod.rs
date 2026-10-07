@@ -255,12 +255,26 @@ pub fn parse_skill_invocation(input: &str) -> Option<(&str, &str)> {
 
 /// Load all skills from bundled set + ~/.claude/skills/ + ./.claude/skills/.
 pub async fn load_skills() -> HashMap<String, Skill> {
+    load_skills_in(std::path::Path::new(".")).await
+}
+
+/// `load_skills` for a project rooted at `cwd`. The Skill and DiscoverSkills
+/// tools go through this so the model sees exactly the skills `/name` runs,
+/// bundled ones included.
+pub async fn load_skills_in(cwd: &std::path::Path) -> HashMap<String, Skill> {
+    let global_dir = crate::config::Config::claude_dir().join("skills");
+    load_skills_from(&global_dir, &cwd.join(".claude").join("skills")).await
+}
+
+/// Later sources override earlier ones: bundled, then global, then project.
+pub(crate) async fn load_skills_from(
+    global_dir: &std::path::Path,
+    local_dir: &std::path::Path,
+) -> HashMap<String, Skill> {
     let mut skills = HashMap::new();
     for s in bundled_skills() {
         skills.insert(s.name.clone(), s);
     }
-    let global_dir = crate::config::Config::claude_dir().join("skills");
-    let local_dir = std::path::Path::new(".claude").join("skills");
     for dir in [global_dir, local_dir] {
         if let Ok(mut entries) = fs::read_dir(&dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -382,7 +396,26 @@ mod frontmatter_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_skill_invocation;
+    use super::{load_skills_from, parse_skill_invocation};
+
+    #[tokio::test]
+    async fn project_skills_override_global_and_bundled_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("xdg/oxideclaw/skills");
+        let local = dir.path().join("proj/.claude/skills");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(global.join("deploy.md"), "global deploy").unwrap();
+        std::fs::write(global.join("both.md"), "global copy").unwrap();
+        std::fs::write(local.join("both.md"), "project copy").unwrap();
+        std::fs::write(local.join("commit.md"), "project commit").unwrap();
+
+        let skills = load_skills_from(&global, &local).await;
+        assert_eq!(skills["deploy"].prompt_template, "global deploy");
+        assert_eq!(skills["both"].prompt_template, "project copy");
+        assert_eq!(skills["commit"].prompt_template, "project commit");
+        assert!(skills.contains_key("review"), "bundled skills are kept");
+    }
 
     #[test]
     fn skill_name_ends_at_any_whitespace() {

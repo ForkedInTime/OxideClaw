@@ -1,11 +1,13 @@
 /// SkillTool — port of skill.ts
 /// Looks up a skill by name from the skills registry and executes it.
-/// Skills are .md files in the global config dir's skills/ or .claude/skills/ — each is a prompt template.
+/// Skills are the built-in set plus .md files in the global config dir's skills/
+/// or .claude/skills/ — the same set `/name` runs.
 use super::{Tool, ToolContext, ToolOutput, async_trait};
+use crate::skills::Skill;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 pub struct SkillTool;
 
@@ -25,8 +27,9 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a skill by name. Skills are markdown prompt templates stored in \
-        the global skills dir (~/.claude/skills/ by default) or .claude/skills/. \
+        "Execute a skill by name. Skills are the built-in skills (commit, review, \
+        explain, fix, test) plus markdown prompt templates in the global skills dir \
+        (skills/ under the config dir, ~/.claude/skills/ by default) or .claude/skills/. \
         Use DiscoverSkills to list available skills."
     }
 
@@ -36,7 +39,7 @@ impl Tool for SkillTool {
             "properties": {
                 "skill": {
                     "type": "string",
-                    "description": "Skill name (the filename without .md extension)"
+                    "description": "Skill name, as listed by DiscoverSkills"
                 },
                 "args": {
                     "type": "string",
@@ -58,72 +61,34 @@ impl Tool for SkillTool {
             ));
         }
 
-        let global = crate::config::Config::claude_dir().join("skills");
-        let path = find_skill(&ctx.cwd, &global, &input.skill)?;
-        // Skill is unprompted and echoes the file back, so a repo-shipped
-        // `.claude/skills/setup.md -> ~/.ssh/id_rsa` would hand the model the
-        // key that Read refuses.
-        if let Some(err) = super::check_sensitive_path_resolved(&path, super::SensitiveOp::Read) {
-            return Ok(err);
-        }
-        let skill_content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Cannot read skill {}: {e}", input.skill))?;
-
-        // Expand the skill content (strip frontmatter, optionally append args)
-        let prompt = expand_skill(&skill_content, input.args.as_deref());
-
-        // Return the expanded prompt — the caller (run_api_task) will send it
-        // as a user message. We signal this with a special prefix.
-        Ok(ToolOutput::success(format!("[SKILL_PROMPT]\n{prompt}")))
+        let skills = crate::skills::load_skills_in(&ctx.cwd).await;
+        Ok(invoke(&skills, &input.skill, input.args.as_deref()))
     }
 }
 
-/// `global` must be the same dir `/name` loads from (`Config::claude_dir()`),
-/// or a skill under CLAUDE_CONFIG_DIR / XDG works as `/name` but is "not
-/// found" here.
-fn find_skill(cwd: &std::path::Path, global: &std::path::Path, name: &str) -> Result<PathBuf> {
-    // Local project skills override global ones
-    let dirs = [cwd.join(".claude").join("skills"), global.to_path_buf()];
-
-    for dir in &dirs {
-        let path = dir.join(format!("{name}.md"));
-        if path.exists() {
-            return Ok(path);
-        }
+/// Expands the skill exactly as `/name` would, so `{{ARGS}}` and declared
+/// params are filled in rather than reaching the model as literal
+/// placeholders. The loader already refuses skill files that link to key
+/// material.
+fn invoke(skills: &HashMap<String, Skill>, name: &str, args: Option<&str>) -> ToolOutput {
+    let Some(skill) = skills.get(name) else {
+        return ToolOutput::error(format!(
+            "Skill '{name}' not found in .claude/skills/, {} or the built-in skills.\n\
+            Use DiscoverSkills to see available skills.",
+            crate::config::Config::claude_dir().join("skills").display()
+        ));
+    };
+    let args = args.unwrap_or("").trim();
+    let mut prompt = skill.expand_named(args);
+    // A template with nowhere to put free-form args would silently drop the
+    // caller's context.
+    let has_slot =
+        skill.prompt_template.contains("{{ARGS}}") || skill.prompt_template.contains("{{args}}");
+    if !args.is_empty() && !has_slot && skill.params.is_empty() {
+        prompt = format!("{prompt}\n\n{args}");
     }
-
-    Err(anyhow::anyhow!(
-        "Skill '{}' not found. Searched in .claude/skills/ and {}.\n\
-        Use DiscoverSkills to see available skills.",
-        name,
-        global.display()
-    ))
-}
-
-/// Strip YAML frontmatter (between --- delimiters) and optionally append args.
-fn expand_skill(content: &str, args: Option<&str>) -> String {
-    let stripped = strip_frontmatter(content);
-    if let Some(extra) = args {
-        if extra.trim().is_empty() {
-            stripped
-        } else {
-            format!("{stripped}\n\n{extra}")
-        }
-    } else {
-        stripped
-    }
-}
-
-fn strip_frontmatter(content: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.first().map(|l| l.trim()) == Some("---") {
-        // Find closing ---
-        if let Some(end) = lines[1..].iter().position(|l| l.trim() == "---") {
-            return lines[end + 2..].join("\n").trim_start().to_string();
-        }
-    }
-    content.trim_start().to_string()
+    // The caller (run_api_task) sends this on as a user message.
+    ToolOutput::success(format!("[SKILL_PROMPT]\n{prompt}"))
 }
 
 #[cfg(test)]
@@ -155,29 +120,62 @@ mod tests {
         }
     }
 
-    /// The global dir was hard-coded to ~/.claude/skills, so skills under
-    /// CLAUDE_CONFIG_DIR or XDG config were invisible to the model.
-    #[test]
-    fn find_skill_searches_the_given_global_dir_after_the_project() {
-        let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("xdg/oxideclaw/skills");
-        let cwd = dir.path().join("proj");
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::create_dir_all(cwd.join(".claude/skills")).unwrap();
-        std::fs::write(global.join("deploy.md"), "global").unwrap();
-        std::fs::write(global.join("both.md"), "global").unwrap();
-        std::fs::write(cwd.join(".claude/skills/both.md"), "local").unwrap();
+    fn text(out: &ToolOutput) -> String {
+        format!("{:?}", out.content)
+    }
 
-        assert_eq!(
-            find_skill(&cwd, &global, "deploy").unwrap(),
-            global.join("deploy.md")
+    /// The tool re-read the file and only stripped frontmatter, so the model
+    /// got `{{ARGS}}` / `{{param}}` verbatim and no param defaults.
+    #[tokio::test]
+    async fn placeholders_and_param_defaults_are_expanded_like_slash_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let local = dir.path().join("proj/.claude/skills");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(
+            local.join("deploy.md"),
+            "---\nname: deploy\nparams:\n  env:\n    default: staging\n---\nDeploy to {{env}}.",
+        )
+        .unwrap();
+        std::fs::write(
+            local.join("legacy.md"),
+            "# Legacy\nDesc\n---\nRun {{ARGS}} now",
+        )
+        .unwrap();
+        std::fs::write(local.join("plain.md"), "Just do it").unwrap();
+        let skills = crate::skills::load_skills_from(&global, &local).await;
+
+        let out = invoke(&skills, "deploy", None);
+        assert!(!out.is_error);
+        assert!(text(&out).contains("Deploy to staging."), "{}", text(&out));
+        assert!(text(&invoke(&skills, "deploy", Some("env=prod"))).contains("Deploy to prod."));
+
+        let out = text(&invoke(&skills, "legacy", Some("the tests")));
+        assert!(out.contains("Run the tests now"), "{out}");
+        assert!(
+            !out.contains("Legacy") && !out.contains("{{ARGS}}"),
+            "{out}"
         );
-        assert_eq!(
-            find_skill(&cwd, &global, "both").unwrap(),
-            cwd.join(".claude/skills/both.md")
+
+        // No slot for args: they are appended instead of dropped.
+        let out = text(&invoke(&skills, "plain", Some("in src/")));
+        assert!(
+            out.contains("Just do it") && out.contains("in src/"),
+            "{out}"
         );
-        let err = find_skill(&cwd, &global, "nope").unwrap_err().to_string();
-        assert!(err.contains(&global.display().to_string()), "{err}");
+    }
+
+    /// Bundled skills (/commit, /review, ...) were "not found" by the tool.
+    #[tokio::test]
+    async fn bundled_skills_are_found_and_unknown_names_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills =
+            crate::skills::load_skills_from(&dir.path().join("g"), &dir.path().join("l")).await;
+        let out = invoke(&skills, "commit", Some("--amend"));
+        assert!(!out.is_error);
+        assert!(text(&out).contains("git commit") && text(&out).contains("--amend"));
+        assert!(invoke(&skills, "nope", None).is_error);
     }
 
     #[cfg(unix)]
@@ -190,19 +188,13 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::os::unix::fs::symlink(&key, skills.join("setup.md")).unwrap();
         std::fs::write(skills.join("ok.md"), "do the thing").unwrap();
-        let ctx = ToolContext::new(dir.path().join("proj"));
+        let skills = crate::skills::load_skills_from(&dir.path().join("global"), &skills).await;
 
-        let out = SkillTool
-            .execute(json!({"skill": "setup"}), &ctx)
-            .await
-            .unwrap();
+        let out = invoke(&skills, "setup", None);
         assert!(out.is_error);
-        assert!(!format!("{:?}", out.content).contains("KEYBODY"));
+        assert!(!text(&out).contains("KEYBODY"));
 
-        let out = SkillTool
-            .execute(json!({"skill": "ok"}), &ctx)
-            .await
-            .unwrap();
-        assert!(!out.is_error && format!("{:?}", out.content).contains("do the thing"));
+        let out = invoke(&skills, "ok", None);
+        assert!(!out.is_error && text(&out).contains("do the thing"));
     }
 }
