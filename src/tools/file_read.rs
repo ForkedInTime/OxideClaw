@@ -268,6 +268,38 @@ fn clean_path(p: &Path) -> PathBuf {
     out.iter().collect()
 }
 
+/// Models write `~/.zshrc` the way a shell would; without expansion that is a
+/// relative path and Write would create a literal `<cwd>/~/.zshrc`. Only `~`
+/// and `~/...` are expanded (not `~user`). The result is an ordinary absolute
+/// path and goes through the same sensitive/protected-path checks as one.
+pub fn expand_home(file_path: &str) -> Result<Option<PathBuf>> {
+    let rest = match file_path.strip_prefix('~') {
+        Some("") => "",
+        Some(r) if r.starts_with(std::path::is_separator) => &r[1..],
+        _ => return Ok(None),
+    };
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot expand '{file_path}': home directory unknown"))?;
+    Ok(Some(if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    }))
+}
+
+/// The directory Grep and Glob search: `~` expanded, relative paths joined
+/// to `cwd`. Unlike [`resolve_path`] there is no containment check, since
+/// searching outside the project is an ordinary request.
+pub fn resolve_search_path(path: Option<&str>, cwd: &Path) -> Result<PathBuf> {
+    let Some(p) = path else {
+        return Ok(cwd.to_path_buf());
+    };
+    if let Some(home) = expand_home(p)? {
+        return Ok(home);
+    }
+    Ok(cwd.join(p))
+}
+
 /// Resolve a user-supplied path for a tool. Relative paths are joined to
 /// `cwd` and lexically cleaned; if the cleaned result escapes `cwd` (e.g.
 /// `../../etc/passwd`), this returns an error instead of a path the caller
@@ -278,6 +310,9 @@ fn clean_path(p: &Path) -> PathBuf {
 /// subject to [`super::check_sensitive_path`]. The containment check here
 /// is a defense-in-depth layer specifically targeting relative-path escapes.
 pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf> {
+    if let Some(home) = expand_home(file_path)? {
+        return Ok(home);
+    }
     let input = Path::new(file_path);
     if input.is_absolute() {
         return Ok(input.to_path_buf());
@@ -397,6 +432,31 @@ mod tests {
 
         let past = text(&read(&ctx, json!({"file_path": "huge.log", "offset": n + 5})).await);
         assert!(past.contains(&format!("the file has {n} lines")), "{past}");
+    }
+
+    #[test]
+    fn tilde_paths_resolve_to_the_home_directory() {
+        let Some(home) = dirs::home_dir() else { return };
+        let cwd = Path::new("/proj");
+        assert_eq!(resolve_path("~/.zshrc", cwd).unwrap(), home.join(".zshrc"));
+        assert_eq!(resolve_path("~", cwd).unwrap(), home);
+        // `~user` and a `~` mid-name are not shell expansions.
+        assert_eq!(resolve_path("~bob/x", cwd).unwrap(), cwd.join("~bob/x"));
+        assert_eq!(resolve_path("a/~/b", cwd).unwrap(), cwd.join("a/~/b"));
+
+        assert_eq!(
+            resolve_search_path(Some("~/src"), cwd).unwrap(),
+            home.join("src")
+        );
+        assert_eq!(
+            resolve_search_path(Some("lib"), cwd).unwrap(),
+            cwd.join("lib")
+        );
+        assert_eq!(
+            resolve_search_path(Some("/abs"), cwd).unwrap(),
+            Path::new("/abs")
+        );
+        assert_eq!(resolve_search_path(None, cwd).unwrap(), cwd);
     }
 
     #[tokio::test]

@@ -133,16 +133,9 @@ impl Tool for GlobTool {
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: GlobInput = serde_json::from_value(input)?;
 
-        let base = match &input.path {
-            Some(p) => {
-                let p = Path::new(p);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    ctx.cwd.join(p)
-                }
-            }
-            None => ctx.cwd.clone(),
+        let base = match super::file_read::resolve_search_path(input.path.as_deref(), &ctx.cwd) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
 
         // One walk per `{a,b}` alternative, each from its own literal prefix.

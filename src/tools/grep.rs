@@ -205,16 +205,9 @@ async fn run_with_rg(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutput>
         args.push(g.clone());
     }
 
-    let search_path = match &input.path {
-        Some(p) => {
-            let p = Path::new(p);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                ctx.cwd.join(p)
-            }
-        }
-        None => ctx.cwd.clone(),
+    let search_path = match super::file_read::resolve_search_path(input.path.as_deref(), &ctx.cwd) {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolOutput::error(e.to_string())),
     };
 
     // rg skips dotfiles by default, which hid .github/, .eslintrc, .vscode/
@@ -362,16 +355,9 @@ async fn run_with_regex(input: &GrepInput, ctx: &ToolContext) -> Result<ToolOutp
         .dot_matches_new_line(input.multiline)
         .build()?;
 
-    let search_path = match &input.path {
-        Some(p) => {
-            let p = Path::new(p);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                ctx.cwd.join(p)
-            }
-        }
-        None => ctx.cwd.clone(),
+    let search_path = match super::file_read::resolve_search_path(input.path.as_deref(), &ctx.cwd) {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolOutput::error(e.to_string())),
     };
 
     let deny = read_deny(ctx);
