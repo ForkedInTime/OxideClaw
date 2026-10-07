@@ -6,8 +6,8 @@
 ///
 /// Index location: `<project>/.claude/rag.db`
 ///
-/// This is the feature [redacted] charges $20/month for.  We do it locally, for free,
-/// in a single binary with zero external dependencies.
+/// Paid tools charge for this; we do it locally, for free, in a single binary
+/// with zero external dependencies.
 pub mod indexer;
 pub mod search;
 

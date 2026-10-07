@@ -1733,7 +1733,7 @@ async fn run_loop(
             // shutting down, we MUST drop its oneshot::Sender so the awaiting
             // tool-executor task resolves to Deny (via the Err(_) branch in
             // the PermissionRequest handler above). This prevents the
-            // terminal-close = auto-approve bug class (see [redacted] #17276).
+            // terminal-close = auto-approve bug class.
             //
             // Dropping the PendingPermission is equivalent to "Deny" because
             // the executor side already maps Err(_) on reply_rx to Deny.

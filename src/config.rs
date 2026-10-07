@@ -1212,7 +1212,7 @@ impl Config {
     }
 
     /// Load and merge all AGENTS.md files in priority order (same as CLAUDE.md).
-    /// Industry-standard agent configuration — works across OxideClaw, [redacted], [redacted], etc.
+    /// Industry-standard agent configuration — works across OxideClaw and other AGENTS.md-aware agents.
     pub fn load_agents_md(cwd: &Path) -> String {
         Self::load_agents_md_in(&Self::claude_dir(), cwd)
     }
