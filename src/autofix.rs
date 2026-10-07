@@ -926,7 +926,15 @@ mod tests {
         }
         let td = tempfile::TempDir::new().unwrap();
         let started = std::time::Instant::now();
-        let r = run_command(td.path(), "setsid sleep 15 & exit 0", 2, &NOT_CANCELLED);
+        // Exit only once the job has left the group: exiting first let the
+        // group kill reach it before its setsid() under a loaded test run.
+        let r = run_command(
+            td.path(),
+            "setsid sh -c ': > escaped; exec sleep 15' & \
+             while [ ! -e escaped ]; do sleep 0.05; done; exit 0",
+            2,
+            &NOT_CANCELLED,
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
