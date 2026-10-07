@@ -120,7 +120,7 @@ How it compares with the agents people actually run. Every cell was checked agai
 | Parallel agents in git worktrees | ✅ | ✅ | ✅ swarm, no worktrees | ✅ | **✅ `spawn`, up to 8** |
 | Voice input (Whisper) | ✅ | — | ✅ | ✅ | **✅** |
 | Browser automation in the binary | via Chrome extension | ✅ | ✅ | — | **✅ 9 CDP tools** |
-| Ollama with native tool calling | ❌ | ✅ | ✅ | ✅ | **✅** |
+| Ollama with native tool calling | ✅ via Ollama's Anthropic-compatible API (`ANTHROPIC_BASE_URL`) | ✅ | ✅ | ✅ | **✅** |
 | OpenAI-compatible providers | ❌ | ✅ | ✅ | ✅ | **✅ 9 providers** |
 | Lifecycle hooks | ✅ | ✅ | — | ✅ | **✅ 8 events** |
 | MCP servers | ✅ | ✅ | ✅ | ✅ | **✅** |
@@ -171,7 +171,7 @@ Every assistant turn silently snapshots the working tree to `refs/oxideclaw/sess
 
 ### 🔌 &nbsp; Works offline via Ollama — with working tool use
 
-Full tool use over Ollama's native format, so local models can read, edit, and run things. Claude Code cannot talk to Ollama at all. Auto-falls back to prompt-injected JSON on models that don't support native tools.
+Full tool use via Ollama's OpenAI-compatible endpoint, so local models can read, edit, and run things. Models without native tool support are detected on first use and drop to text-only chat (no file or command access) from then on.
 
 ### 🌐 &nbsp; Built-in browser automation — no extra server
 
