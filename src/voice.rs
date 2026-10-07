@@ -5,7 +5,7 @@
 ///   1. Local `whisper` CLI (openai-whisper)
 ///   2. OpenAI-compatible /v1/audio/transcriptions API endpoint
 ///      (reads WHISPER_API_KEY, else OPENAI_API_KEY, from env), also used
-///      when local whisper fails or hears nothing
+///      when local whisper fails
 ///
 /// Usage:
 ///   /voice          — show status + setup instructions
@@ -217,11 +217,14 @@ pub async fn transcribe(api_url: Option<&str>, api_key: Option<&str>) -> Result<
     transcribe_api(&wav, url, &key).await
 }
 
-/// Whether the local whisper result stands. A failure or an empty
-/// transcript (whisper erroring out, or a broken install) used to be final
-/// even with an API key set, so voice input and spoken approvals just died.
+/// Whether the local whisper result stands. A failure (whisper erroring
+/// out, or a broken install) used to be final even with an API key set, so
+/// voice input and spoken approvals just died. An empty transcript is
+/// silence, and stays local: uploading it would send mic audio to the cloud
+/// for local-only users with an OPENAI_API_KEY (set for the provider), once
+/// per voice-approval listen window.
 fn local_transcript_is_final(local: &Result<String>, have_api_key: bool) -> bool {
-    !have_api_key || matches!(local, Ok(text) if !text.is_empty())
+    !have_api_key || local.is_ok()
 }
 
 async fn transcribe_local(wav: &std::path::Path) -> Result<String> {
@@ -1574,17 +1577,27 @@ async fn install_clone_sample(
 /// Remove the voice clone sample, reverting to XTTS v2 default speaker.
 pub async fn remove_voice_clone() -> Result<String> {
     let dir = voice_clone_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
+    remove_clone_files(&dir).await
+}
+
+/// Deletes the sample and the backup `install_clone_sample` keeps: a voice
+/// recording the user asked to delete must not linger as `.prev.wav`.
+async fn remove_clone_files(dir: &std::path::Path) -> Result<String> {
     let sample = dir.join("my-voice.wav");
-    if sample.exists() {
-        tokio::fs::remove_file(&sample).await?;
-        let meta = dir.join("meta.txt");
-        let _ = tokio::fs::remove_file(&meta).await;
-        Ok(format!(
-            "Voice clone removed. TTS reverted to XTTS v2 default speaker ({XTTS_DEFAULT_SPEAKER})."
-        ))
-    } else {
-        Ok("No voice clone configured.".into())
+    let prev = dir.join("my-voice.prev.wav");
+    if !sample.exists() && !prev.exists() {
+        return Ok("No voice clone configured.".into());
     }
+    for f in [&sample, &prev] {
+        if f.exists() {
+            tokio::fs::remove_file(f).await?;
+        }
+    }
+    let _ = tokio::fs::remove_file(dir.join("meta.txt")).await;
+    let _ = tokio::fs::remove_file(dir.join("meta.prev.txt")).await;
+    Ok(format!(
+        "Voice clone removed. TTS reverted to XTTS v2 default speaker ({XTTS_DEFAULT_SPEAKER})."
+    ))
 }
 
 /// Synthesise `text` using XTTS v2 with the user's cloned voice.
@@ -1661,9 +1674,9 @@ mod transcription_fallback_tests {
     use anyhow::anyhow;
 
     #[test]
-    fn a_failed_or_empty_local_transcript_falls_back_to_the_api() {
+    fn a_failed_local_transcript_falls_back_to_the_api() {
         assert!(!local_transcript_is_final(&Err(anyhow!("usage")), true));
-        assert!(!local_transcript_is_final(&Ok(String::new()), true));
+        assert!(local_transcript_is_final(&Ok(String::new()), true));
         assert!(local_transcript_is_final(&Ok("hello".into()), true));
         // Without a key the local result is all there is.
         assert!(local_transcript_is_final(&Err(anyhow!("usage")), false));
@@ -2009,5 +2022,18 @@ mod clone_sample_tests {
         assert!(prev_meta.contains(CloneTier::Premium.label()));
         let meta = std::fs::read_to_string(clone_dir.join("meta.txt")).unwrap();
         assert!(meta.contains(CloneTier::Quick.label()));
+
+        // Remove deletes the backup too, not just the current sample.
+        remove_clone_files(&clone_dir).await.unwrap();
+        let left: Vec<String> = std::fs::read_dir(&clone_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".wav") || (n.starts_with("meta") && n.ends_with(".txt")))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(
+            remove_clone_files(&clone_dir).await.unwrap(),
+            "No voice clone configured."
+        );
     }
 }

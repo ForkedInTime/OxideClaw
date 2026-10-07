@@ -245,8 +245,10 @@ Follow-up QA pass (medium-severity findings, 2026-10-07).
   prints over the TUI.
 - **Voice.** XTTS replies play at the right rate and are not cut off after
   30 s on CPU; a session with TTS on starts the server at launch, and
-  `/voice speak off` and quitting stop it. whisper.cpp input works and
-  local failures fall back to the API; the picker's default speaker is used;
+  `/voice speak off` and quitting stop it. whisper.cpp binaries are no
+  longer mistaken for openai-whisper (they printed usage and transcribed
+  nothing), and a failed local transcription falls back to the API when a
+  key is set; the picker's default speaker is used;
   an abandoned clone, a refused `/voice speak on`, a voice error or a
   finished transcription no longer clobber other state.
 - **TUI.** Esc cancels turns, `/browse` and TTS in vim mode, and really
