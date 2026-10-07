@@ -95,7 +95,7 @@ impl Tool for PowerShellTool {
                 .kill_on_drop(true)
                 .envs(&ctx.env);
             #[cfg(unix)]
-            cmd.process_group(0);
+            super::bash::new_session(cmd.as_std_mut());
 
             let mut guard = super::bash::ProcessGroupGuard::new(cmd.spawn()?);
             let mut child_out = guard

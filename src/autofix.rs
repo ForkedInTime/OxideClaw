@@ -269,9 +269,11 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64) -> CommandResult {
     // (`pytest -k "a b"` used to be split on the space).
     #[cfg(unix)]
     let mut command = {
-        use std::os::unix::process::CommandExt;
         let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd).process_group(0);
+        c.arg("-c").arg(cmd);
+        // Own process group for the timeout kill, and no controlling terminal
+        // so a check that prompts on /dev/tty fails instead of hanging.
+        crate::tools::bash::new_session(&mut c);
         c
     };
     #[cfg(not(unix))]
@@ -767,6 +769,23 @@ mod tests {
             }
             other => panic!("expected Fail, got {other:?}"),
         }
+    }
+
+    /// A check that prompts on /dev/tty must fail, not hang as a stopped
+    /// background job: the shell leads its own session with no terminal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commands_run_in_their_own_session() {
+        let td = tempfile::TempDir::new().unwrap();
+        assert!(matches!(
+            run_command(
+                td.path(),
+                "read -r pid comm state ppid pgrp sid rest < /proc/$$/stat; \
+                 test \"$sid\" = \"$$\" && test \"$pgrp\" = \"$$\"",
+                10
+            ),
+            CommandResult::Pass
+        ));
     }
 
     #[cfg(unix)]

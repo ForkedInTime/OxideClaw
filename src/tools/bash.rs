@@ -16,13 +16,13 @@ use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 ///   2. Any grandchildren spawned by the shell (e.g. `sleep 100 &`) would be
 ///      reparented to init and continue running as orphans.
 ///
-/// By putting the shell in its own process group (`setpgid(0,0)` via
-/// `process_group(0)`) and sending SIGKILL to the negated pgid on drop, we
+/// By putting the shell in its own process group (a new session via
+/// [`new_session`]) and sending SIGKILL to the negated pgid on drop, we
 /// guarantee the whole subtree dies when the tool future is dropped (Esc
 /// cancellation, tokio::time::timeout, task::abort, etc.).
 pub(crate) struct ProcessGroupGuard {
     child: Child,
-    /// Process group ID = child pid (we always spawn with process_group(0)).
+    /// Process group ID = child pid (we always spawn with [`new_session`]).
     /// `None` means the child was already reaped cleanly via `wait().await`,
     /// so Drop becomes a no-op.
     pgid: Option<i32>,
@@ -61,6 +61,28 @@ impl Drop for ProcessGroupGuard {
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
+    }
+}
+
+/// Start the command as leader of a new session: its own process group (pgid
+/// == pid, which [`ProcessGroupGuard`] relies on) and no controlling terminal.
+///
+/// `process_group(0)` alone left it a background job in the TUI's session, so
+/// anything that opens `/dev/tty` to prompt (sudo, ssh, git's credential
+/// prompt) was stopped by SIGTTIN/SIGTTOU and sat there until the timeout.
+/// With no terminal that open fails with ENXIO and the command errors at once.
+#[cfg(unix)]
+pub(crate) fn new_session(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and only calls setsid,
+    // which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -352,13 +374,11 @@ impl Tool for BashTool {
                 .kill_on_drop(true)
                 .envs(&extra_env);
 
-            // Put the shell in its own process group so we can SIGKILL the
-            // entire subtree on cancellation. Without this, grandchildren
-            // spawned via `sh -c '... & ...'` escape as orphans.
+            // Own process group so we can SIGKILL the entire subtree on
+            // cancellation. Without this, grandchildren spawned via
+            // `sh -c '... & ...'` escape as orphans.
             #[cfg(unix)]
-            {
-                cmd.process_group(0);
-            }
+            new_session(cmd.as_std_mut());
 
             let mut guard = ProcessGroupGuard::new(cmd.spawn()?);
             let child = guard.child_mut();
@@ -513,5 +533,42 @@ mod tests {
             })
             .collect();
         assert!(text.contains("v=from-settings"), "{text}");
+    }
+
+    /// The shell must lead its own session: as a mere background process
+    /// group in the TUI's session, `sudo`/`ssh` prompts on /dev/tty stopped it
+    /// (SIGTTIN/SIGTTOU) until the timeout.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn command_runs_in_its_own_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.default_shell = Some("sh".into());
+        let out = BashTool
+            .execute(
+                serde_json::json!({
+                    "command": "read -r pid comm state ppid pgrp sid rest < /proc/$$/stat; \
+                                echo \"pid=$pid pgrp=$pgrp sid=$sid\""
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text: String = out
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::api::types::ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect();
+        let field = |k: &str| {
+            text.split_whitespace()
+                .find_map(|w| w.strip_prefix(k))
+                .unwrap_or_else(|| panic!("no {k} in {text}"))
+                .to_string()
+        };
+        let pid = field("pid=");
+        assert_eq!(field("pgrp="), pid, "{text}");
+        assert_eq!(field("sid="), pid, "{text}");
     }
 }

@@ -507,9 +507,10 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
     // Own process group so a timeout can take out anything the hook spawned,
-    // rather than leaving orphans reparented to init.
+    // rather than leaving orphans reparented to init; a new session so a hook
+    // that touches /dev/tty fails instead of being stopped as a background job.
     #[cfg(unix)]
-    cmd.process_group(0);
+    crate::tools::bash::new_session(cmd.as_std_mut());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
