@@ -96,6 +96,10 @@ pub struct SdkSession {
     /// the next prompt arrives (ACP), not at once: a one-shot SDK session
     /// never sends one, and the summary would be a call nobody reads.
     summarise_pending: bool,
+    /// Compaction replaced earlier messages since the last
+    /// `take_history_rewritten`, so a saved transcript must be rewritten,
+    /// not appended to.
+    history_rewritten: bool,
 }
 
 impl SdkSession {
@@ -155,6 +159,7 @@ impl SdkSession {
             child_tokens: (0, 0),
             child_cache_tokens: (0, 0),
             summarise_pending: false,
+            history_rewritten: false,
         })
     }
 
@@ -163,12 +168,29 @@ impl SdkSession {
         &self.config.model
     }
 
-    /// Execute a full agentic turn: prompt → stream → tool loop → complete.
+    /// Continue a saved conversation: later turns run under `session_id`
+    /// with `messages` as the history.
+    pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
+        self.session_id = session_id;
+        self.messages = messages;
+    }
+
+    /// The conversation so far, as sent to the model.
+    pub fn history(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Whether compaction rewrote earlier messages since the last call.
+    pub fn take_history_rewritten(&mut self) -> bool {
+        std::mem::take(&mut self.history_rewritten)
+    }
+
     /// Handle used to cancel a running turn from another task.
     pub fn cancel_signal(&self) -> Arc<CancelSignal> {
         Arc::clone(&self.cancel)
     }
 
+    /// Execute a full agentic turn: prompt → stream → tool loop → complete.
     pub async fn execute_turn(&mut self, prompt: String) -> Result<TurnEnd> {
         let turn_start = Instant::now();
         let mut turn_input_tokens: u64 = 0;
@@ -422,6 +444,7 @@ impl SdkSession {
                 match crate::compact::compact_needed(context_tok, window) {
                     crate::compact::CompactNeeded::Snip => {
                         if crate::compact::snip_compact(&mut self.messages, &self.config.model) {
+                            self.history_rewritten = true;
                             self.forget_reads();
                         }
                     }
@@ -615,6 +638,7 @@ impl SdkSession {
                 crate::compact::snip_compact(&mut self.messages, &self.config.model);
             }
         }
+        self.history_rewritten = true;
         self.forget_reads();
         (usage.input_tokens, usage.output_tokens)
     }
