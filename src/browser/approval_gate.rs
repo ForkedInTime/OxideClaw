@@ -640,10 +640,13 @@ impl ToolMiddleware for ApprovalGateMiddleware {
         }
     }
 
-    async fn after_tool(&self, tool_name: &str, _output: &str) -> Option<String> {
+    async fn after_tool(&self, tool_name: &str, output: &str) -> Option<String> {
         // Step counting is owned by StepEmitterMiddleware (runs after this middleware).
-        // A navigation leaves the form behind.
-        if tool_name == "browser_navigate" {
+        // A navigation leaves the form behind. A failed one (bad scheme,
+        // blocked host) never left the page, so the filled form is still
+        // there and Enter must stay gated; "Navigated to:" is only emitted
+        // by browser_navigate's success path.
+        if tool_name == "browser_navigate" && output.starts_with("Navigated to:") {
             self.sensitive_fill_pending.store(false, Ordering::SeqCst);
         }
         None
@@ -760,6 +763,29 @@ mod wiring_tests {
             2,
             "fill and the Enter that submits it must both prompt"
         );
+    }
+
+    /// A navigate that fails before leaving the page keeps the filled form,
+    /// so it must not disarm the Enter gate; a real navigation does.
+    #[tokio::test]
+    async fn a_failed_navigate_keeps_enter_gated_after_a_sensitive_fill() {
+        let (mw, host) = middleware();
+        let fill = json!({"selector": "Card number", "value": "4111"});
+        mw.before_tool("browser_fill", &fill).await;
+        mw.after_tool(
+            "browser_navigate",
+            "Tool error: navigation URL 'x' is missing an http(s):// scheme",
+        )
+        .await;
+        assert!(mw.sensitive_fill_pending.load(Ordering::SeqCst));
+        mw.after_tool(
+            "browser_navigate",
+            "Navigated to: https://shop.example/done\nTitle: Done",
+        )
+        .await;
+        assert!(!mw.sensitive_fill_pending.load(Ordering::SeqCst));
+        drop(mw);
+        assert_eq!(host.await.unwrap(), 1, "only the fill prompted");
     }
 
     /// A denied prompt leaves the step counter where it was, so the next
