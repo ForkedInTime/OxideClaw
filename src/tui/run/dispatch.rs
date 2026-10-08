@@ -2707,17 +2707,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if let Some((skill_name, args)) = parse_skill_invocation(&input)
                 && let Some(skill) = skills.get(skill_name)
             {
-                let mut prompt = match skill.invoke(args, &perm_state.read_deny("Read")) {
-                    Ok(prompt) => prompt,
-                    Err(why) => {
-                        app.entries.push(ChatEntry::error(format!(
-                            "Skill '{}' could not be loaded: {why}",
-                            skill.name
-                        )));
-                        app.scroll_to_bottom();
-                        return Ok(());
-                    }
-                };
+                let mut prompt =
+                    match skill.invoke(args, &perm_state.read_deny("Read", &config.cwd)) {
+                        Ok(prompt) => prompt,
+                        Err(why) => {
+                            app.entries.push(ChatEntry::error(format!(
+                                "Skill '{}' could not be loaded: {why}",
+                                skill.name
+                            )));
+                            app.scroll_to_bottom();
+                            return Ok(());
+                        }
+                    };
                 if config.disable_skill_shell_execution {
                     prompt.push_str("\n\nNote: shell command execution (Bash tool) is disabled for skill invocations.");
                 }
@@ -3512,6 +3513,7 @@ mod slash_tests {
                 session: &mut session,
                 saved_count: &mut 0,
                 mcp_statuses: &[],
+                mcp_failed: &[],
                 spawn_registry: &spawn_registry,
             },
         )
@@ -3536,6 +3538,7 @@ mod slash_tests {
                     session: &mut session,
                     saved_count: &mut 0,
                     mcp_statuses: &[],
+                    mcp_failed: &[],
                     spawn_registry: &spawn_registry,
                 },
             )
@@ -3679,6 +3682,7 @@ mod slash_tests {
                 category: None,
                 params: Vec::new(),
                 skill_file: None,
+                disable_model_invocation: false,
             },
         );
         let mut app = App::new("claude-sonnet-4-6", dir.path());

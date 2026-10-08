@@ -33,7 +33,7 @@ impl Tool for DiscoverSkillsTool {
         let deny = ctx
             .permission_gate
             .as_ref()
-            .map(|g| g.read_deny("Read"))
+            .map(|g| g.read_deny("Read", &ctx.cwd))
             .unwrap_or_default();
         let loaded = crate::skills::load_skills_in(&ctx.cwd, &deny).await;
         Ok(ToolOutput::success(render(&loaded)))

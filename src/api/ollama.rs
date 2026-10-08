@@ -610,7 +610,7 @@ impl OllamaClient {
             let body = resp.text().await.unwrap_or_default();
             // If the model doesn't support tools, cache that and retry without them
             if status.as_u16() == 400 && body.contains("does not support tools") {
-                self.no_tools.lock().unwrap().insert(model);
+                self.no_tools.lock().unwrap().insert(model.clone());
                 debug!("Model does not support tools — disabling its tools for this session");
                 let patched_system = patch_system_no_tools(&system_str);
                 oai_request.messages =
@@ -1055,13 +1055,23 @@ mod tests {
                 let len: usize = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length:"))
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap();
+                    .map_or(0, |v| v.trim().parse().unwrap());
                 while buf.len() < body_start + len {
                     let n = sock.read(&mut chunk).await.unwrap();
                     buf.extend_from_slice(&chunk[..n]);
+                }
+                // The served-window lookup (/api/ps, /api/show) after a reply
+                // is not a chat request.
+                if !head
+                    .lines()
+                    .next()
+                    .is_some_and(|l| l.contains("/chat/completions"))
+                {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    let _ = sock.shutdown().await;
+                    continue;
                 }
                 let body: serde_json::Value =
                     serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();

@@ -1093,9 +1093,7 @@ pub fn split_compound_command(cmd: &str, grammar: ShellGrammar) -> Vec<&str> {
         // descriptor instead; splitting there turned `cargo test 2>&1` into a
         // stray `1` part that no allow rule matches. `defeats_prefix_rules`
         // still sees the `>` of any form that can write a file.
-        if c == '&'
-            && (cmd[..i].ends_with(['>', '<']) || cmd[i + 1..].starts_with('>'))
-        {
+        if c == '&' && (cmd[..i].ends_with(['>', '<']) || cmd[i + 1..].starts_with('>')) {
             continue;
         }
         if matches!(c, '&' | '|' | ';' | '\n' | '\r') {

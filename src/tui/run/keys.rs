@@ -1559,6 +1559,7 @@ mod ctrl_c_tests {
             session: &mut session,
             saved_count: &mut 0,
             mcp_statuses: &[],
+            mcp_failed: &[],
             spawn_registry: &spawn_registry,
         })
         .await
@@ -1738,6 +1739,7 @@ mod prompt_hook_tests {
             session: &mut session,
             saved_count: &mut 0,
             mcp_statuses: &[],
+            mcp_failed: &[],
             spawn_registry: &spawn_registry,
         })
         .await
@@ -1760,6 +1762,7 @@ mod prompt_hook_tests {
                     session: &mut session,
                     saved_count: &mut 0,
                     mcp_statuses: &[],
+                    mcp_failed: &[],
                     spawn_registry: &spawn_registry,
                 },
             )

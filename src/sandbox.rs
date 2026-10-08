@@ -168,6 +168,9 @@ pub fn strict_check(cmd: &str) -> Option<String> {
 /// on our update-ref, `post-checkout` on `worktree add`) would run outside
 /// any sandbox. They do not stop `filter.*` drivers; see
 /// `autocommit::check_filters_unchanged`.
+// Read through the library's `autocommit::git_cmd`, which the binary's host
+// git calls use too, so the binary's own copy of this module never names it.
+#[allow(dead_code)]
 pub(crate) const GIT_NO_REPO_CODE: [&str; 4] = [
     "-c",
     "core.fsmonitor=false",

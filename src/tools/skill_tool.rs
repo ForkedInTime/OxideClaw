@@ -66,7 +66,7 @@ impl Tool for SkillTool {
         let deny = ctx
             .permission_gate
             .as_ref()
-            .map(|g| g.read_deny("Read"))
+            .map(|g| g.read_deny("Read", &ctx.cwd))
             .unwrap_or_default();
         let skills = crate::skills::load_skills_in(&ctx.cwd, &deny).await.skills;
         Ok(invoke(&skills, &input.skill, input.args.as_deref(), &deny))
@@ -252,7 +252,7 @@ mod tests {
         .unwrap();
         let deny = crate::permissions::PermissionState::new(false, &[], &["Read(./.env)".into()])
             .with_cwd(&proj)
-            .read_deny("Read");
+            .read_deny("Read", &proj);
 
         let loaded =
             crate::skills::load_skills_at(&proj, &dir.path().join("cfg"), None, &deny).await;
