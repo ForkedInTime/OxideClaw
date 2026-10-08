@@ -789,6 +789,10 @@ async fn speak_via_server(
             "-s",
             // An HTTP error must fail here, not be saved as the "audio".
             "--fail",
+            // curl honours http_proxy/ALL_PROXY for loopback too; the XTTS
+            // server is only ever on this machine.
+            "--noproxy",
+            "*",
             "-X",
             "POST",
             &format!("http://127.0.0.1:{XTTS_SERVER_PORT}/tts"),

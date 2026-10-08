@@ -603,7 +603,12 @@ async fn find_free_port() -> Result<u16> {
 async fn poll_cdp_endpoint(port: u16, child: &mut Child) -> Result<String> {
     let list_url = format!("http://127.0.0.1:{port}/json/list");
     let new_url = format!("http://127.0.0.1:{port}/json/new?about:blank");
-    let client = reqwest::Client::new();
+    // reqwest applies HTTP(S)_PROXY/ALL_PROXY even to 127.0.0.1 (only
+    // NO_PROXY exempts it), and a remote proxy has no Chrome on this port.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
 
     for attempt in 0..30 {
         // A Chrome that refused to start used to cost the full 6 s and
