@@ -39,8 +39,9 @@ const DEFAULT_MAX_TOKENS: u32 = 8_192;
 /// error and no recovery short of killing the process.
 pub(crate) const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Bound the gap between body chunks by [`SSE_IDLE_TIMEOUT`]; on expiry yield
-/// one `TimedOut` error and end.
+/// Bound the gap between body chunks by `idle` ([`SSE_IDLE_TIMEOUT`] unless
+/// the caller knows a longer silence is normal); on expiry yield one
+/// `TimedOut` error and end.
 ///
 /// The timer runs on bytes, not parsed events: the SSE parser swallows comment
 /// lines without yielding anything, so OpenRouter's `: OPENROUTER PROCESSING`
@@ -48,6 +49,7 @@ pub(crate) const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// timer, and the healthy request was aborted as stalled and re-sent.
 pub(crate) fn idle_bounded<S, B, E>(
     stream: S,
+    idle: std::time::Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<B, std::io::Error>> + Unpin
 where
     S: futures_util::Stream<Item = std::result::Result<B, E>>,
@@ -55,16 +57,16 @@ where
 {
     Box::pin(futures_util::stream::unfold(
         Some(Box::pin(stream)),
-        |state| async move {
+        move |state| async move {
             let mut stream = state?;
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+            match tokio::time::timeout(idle, stream.next()).await {
                 Err(_) => Some((
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
                             "SSE stream stalled: no data received for {}s — the connection \
                              was likely dropped upstream. Retry the request.",
-                            SSE_IDLE_TIMEOUT.as_secs()
+                            idle.as_secs()
                         ),
                     )),
                     None,
@@ -404,7 +406,7 @@ impl ClaudeClient {
             return Err(anyhow!("API stream error {status}: {body}"));
         }
 
-        let mut stream = idle_bounded(resp.bytes_stream()).eventsource();
+        let mut stream = idle_bounded(resp.bytes_stream(), SSE_IDLE_TIMEOUT).eventsource();
 
         // Tool schemas by name, so string arguments are only re-parsed where
         // the schema asks for an array or object.
@@ -1493,7 +1495,7 @@ mod sse_idle_tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_stream_errors_instead_of_hanging_forever() {
         let bytes = futures_util::stream::pending::<Result<Vec<u8>, Infallible>>();
-        let mut stream = idle_bounded(bytes).eventsource();
+        let mut stream = idle_bounded(bytes, SSE_IDLE_TIMEOUT).eventsource();
 
         let err = next_sse_event(&mut stream)
             .await
@@ -1519,7 +1521,7 @@ mod sse_idle_tests {
             tokio::time::sleep(quiet).await;
             Ok::<_, Infallible>(b"data: late but valid\n\n".to_vec())
         });
-        let mut stream = idle_bounded(bytes).eventsource();
+        let mut stream = idle_bounded(bytes, SSE_IDLE_TIMEOUT).eventsource();
 
         let got = next_sse_event(&mut stream)
             .await
@@ -1542,7 +1544,7 @@ mod sse_idle_tests {
             };
             Some((Ok::<_, Infallible>(chunk.to_vec()), i + 1))
         });
-        let mut stream = idle_bounded(bytes).eventsource();
+        let mut stream = idle_bounded(bytes, SSE_IDLE_TIMEOUT).eventsource();
 
         let got = next_sse_event(&mut stream)
             .await
@@ -1560,7 +1562,7 @@ mod sse_idle_tests {
             Ok(b"data: first\n\n".to_vec()),
             Err("error decoding response body"),
         ]);
-        let mut stream = idle_bounded(bytes).eventsource();
+        let mut stream = idle_bounded(bytes, SSE_IDLE_TIMEOUT).eventsource();
         assert!(next_sse_event(&mut stream).await.unwrap().is_some());
         let err = next_sse_event(&mut stream).await.unwrap_err().to_string();
         assert!(err.contains("connection dropped"), "{err}");
@@ -1597,7 +1599,7 @@ mod sse_idle_tests {
         let bytes = futures_util::stream::once(async {
             Err::<Vec<u8>, _>(std::io::Error::other("connection reset"))
         });
-        let mut stream = idle_bounded(bytes).eventsource();
+        let mut stream = idle_bounded(bytes, SSE_IDLE_TIMEOUT).eventsource();
 
         let err = next_sse_event(&mut stream).await.unwrap_err();
         assert!(err.to_string().contains("connection reset"), "{err}");

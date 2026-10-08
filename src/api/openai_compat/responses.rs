@@ -456,9 +456,31 @@ enum End {
 /// failure after the 200 is an `Err`, never a short reply that looks done.
 pub(super) async fn parse_responses_stream(
     resp: reqwest::Response,
-    mut on_text: impl FnMut(&str),
+    idle: std::time::Duration,
+    on_text: impl FnMut(&str),
 ) -> Result<(StreamedResponse, Vec<TurnItem>)> {
-    let mut stream = crate::api::idle_bounded(resp.bytes_stream()).eventsource();
+    parse_responses_bytes(resp.bytes_stream(), idle, on_text).await
+}
+
+/// How long a reasoning model's stream may send nothing. With summaries
+/// off OpenAI streams nothing between a reasoning item's start and end,
+/// and `-pro` or `xhigh` reasoning can run for several minutes.
+const REASONING_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// [`parse_responses_stream`] over the body's bytes.
+async fn parse_responses_bytes<S, B, E>(
+    bytes: S,
+    idle: std::time::Duration,
+    mut on_text: impl FnMut(&str),
+) -> Result<(StreamedResponse, Vec<TurnItem>)>
+where
+    S: futures_util::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut stream = crate::api::idle_bounded(bytes, idle).eventsource();
+    // A reasoning item has started; see the stall handling below.
+    let mut reasoning_started = false;
     let mut result = StreamedResponse::default();
     let mut text_buf = String::new();
     // output_index → that message item's text; a new item starts a new
@@ -475,7 +497,24 @@ pub(super) async fn parse_responses_stream(
     let mut refusal = false;
     let mut end: Option<End> = None;
 
-    while let Some(event) = crate::api::next_sse_event(&mut stream).await? {
+    loop {
+        let event = match crate::api::next_sse_event(&mut stream).await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            // Silence after a reasoning item started is the model thinking,
+            // not a dropped connection. The stall error names the
+            // connection, which the TUI retries; re-sending would pay for
+            // the same reasoning again and none of it reaches /cost.
+            Err(e) if reasoning_started && e.to_string().contains("stalled") => {
+                return Err(anyhow!(
+                    "the model's reasoning produced no output for {}s and the turn was \
+                     abandoned. The reasoning may still be billed by the provider, but it is \
+                     not counted in /cost or /budget.",
+                    idle.as_secs()
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         if event.data == "[DONE]" {
             break;
         }
@@ -520,6 +559,7 @@ pub(super) async fn parse_responses_stream(
             t @ ("response.output_item.added" | "response.output_item.done") => {
                 let done = t == "response.output_item.done";
                 let item = &v["item"];
+                reasoning_started |= item["type"] == "reasoning";
                 match item["type"].as_str() {
                     Some("function_call") => {
                         let entry = calls.entry(idx).or_default();
@@ -766,7 +806,12 @@ impl OpenAiCompatClient {
             resp = self.send_responses(&url, &body).await?;
         }
 
-        let (result, items) = parse_responses_stream(resp, on_text).await?;
+        let idle = if reasoning_model {
+            REASONING_IDLE_TIMEOUT
+        } else {
+            crate::api::SSE_IDLE_TIMEOUT
+        };
+        let (result, items) = parse_responses_stream(resp, idle, on_text).await?;
         if let Some(key) = turn_key(&result.content) {
             record_turn(
                 &mut store.lock().unwrap_or_else(|e| e.into_inner()),
@@ -1751,6 +1796,55 @@ mod tests {
         );
         assert_eq!(bodies[1]["reasoning"], json!({"effort": "low"}));
         assert_eq!(bodies[2]["reasoning"], json!({"effort": "low"}));
+    }
+
+    /// A reasoning model that thinks silently past the 120 s stall bound
+    /// was cut off and re-sent (the stall error names the connection), each
+    /// attempt billed and none counted. Its bound is longer, and a stall
+    /// mid-reasoning is reported as such, not as a dropped connection.
+    #[tokio::test(start_paused = true)]
+    async fn silent_reasoning_gets_a_longer_bound_and_is_not_retried() {
+        use futures_util::StreamExt as _;
+        let started = format!(
+            "data: {}\n\n",
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": []}})
+        );
+        let silent_for = |quiet: std::time::Duration| {
+            let first = started.clone();
+            futures_util::stream::iter([Ok::<_, std::convert::Infallible>(first.into_bytes())])
+                .chain(futures_util::stream::once(async move {
+                    tokio::time::sleep(quiet).await;
+                    Ok(text_turn().into_bytes())
+                }))
+        };
+
+        // Five silent minutes are fine for a reasoning model.
+        let quiet = std::time::Duration::from_secs(300);
+        let (r, _) = parse_responses_bytes(silent_for(quiet), REASONING_IDLE_TIMEOUT, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+
+        // Past the bound: not a "connection" error, which the TUI re-sends.
+        let quiet = REASONING_IDLE_TIMEOUT + std::time::Duration::from_secs(1);
+        let err = parse_responses_bytes(silent_for(quiet), REASONING_IDLE_TIMEOUT, |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reasoning produced no output"), "{err}");
+        assert!(!err.contains("connection"), "{err}");
+
+        // A stall before any reasoning still reads as a dropped connection.
+        let err = parse_responses_bytes(
+            futures_util::stream::pending::<Result<Vec<u8>, std::convert::Infallible>>(),
+            crate::api::SSE_IDLE_TIMEOUT,
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("connection"), "{err}");
     }
 
     /// The text-only fallback for a model without tool support existed only

@@ -715,7 +715,8 @@ pub(crate) async fn parse_oai_stream(
     resp: reqwest::Response,
     mut on_text: impl FnMut(&str),
 ) -> Result<(StreamedResponse, HashMap<String, String>)> {
-    let mut stream = super::idle_bounded(resp.bytes_stream()).eventsource();
+    let mut stream =
+        super::idle_bounded(resp.bytes_stream(), super::SSE_IDLE_TIMEOUT).eventsource();
     let mut result = StreamedResponse::default();
 
     let mut text_buf = String::new();
