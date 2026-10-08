@@ -2391,7 +2391,7 @@ mod router_tests {
                 }],
             });
         }
-        history.extend(task.messages.drain(..));
+        history.append(&mut task.messages);
         task.messages = history;
         task.tools = vec![std::sync::Arc::new(crate::tools::glob::GlobTool) as DynTool];
         run_api_task(task).await;

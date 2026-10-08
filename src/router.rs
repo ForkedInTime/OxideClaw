@@ -1280,6 +1280,8 @@ pub(crate) mod fake_chat {
         /// One tool call: name and JSON arguments.
         Tool(&'static str, &'static str),
         /// A tool call whose usage reports this many prompt tokens.
+        // Only the TUI's tests use it, and the library build has no TUI.
+        #[allow(dead_code)]
         ToolAt(&'static str, &'static str, u64),
         /// An HTTP error with this status and body.
         Status(u16, &'static str),
