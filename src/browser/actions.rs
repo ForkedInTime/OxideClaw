@@ -9,7 +9,7 @@ use super::BrowserSession;
 use super::cdp::CdpClient;
 use crate::net_policy::{LoopbackGrants, NetPolicy};
 use anyhow::{Result, bail};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// URL schemes the browser is allowed to navigate to. Anything else
 /// (`javascript:`, `data:`, `file:`, `ftp:`, …) is rejected up front so a
@@ -318,6 +318,13 @@ pub async fn active_element_label(client: &CdpClient, implicit_submit: bool) -> 
         .map(|s| s.to_string())
 }
 
+/// The centre of a CDP box-model quad `[x1,y1,x2,y2,x3,y3,x4,y4]`. `None`
+/// for anything shorter, which a non-Chrome `browserCdpEndpoint` may send.
+fn quad_center(content: &Value) -> Option<(f64, f64)> {
+    let c = |i: usize| content.get(i).and_then(Value::as_f64);
+    Some(((c(0)? + c(2)?) / 2.0, (c(1)? + c(5)?) / 2.0))
+}
+
 /// Click an element by @ref.
 pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<String> {
     let node_id = session.resolve_ref(element_ref)?;
@@ -348,13 +355,7 @@ pub async fn click(session: &mut BrowserSession, element_ref: &str) -> Result<St
         .send("DOM.getBoxModel", json!({"backendNodeId": node_id}))
         .await
         .unwrap_or_default();
-    let content = &box_model["model"]["content"];
-    if let Some(coords) = content.as_array()
-        && coords.len() >= 4
-    {
-        let x = (coords[0].as_f64().unwrap_or(0.0) + coords[2].as_f64().unwrap_or(0.0)) / 2.0;
-        let y = (coords[1].as_f64().unwrap_or(0.0) + coords[5].as_f64().unwrap_or(0.0)) / 2.0;
-
+    if let Some((x, y)) = quad_center(&box_model["model"]["content"]) {
         // Mouse click sequence
         for event_type in ["mousePressed", "mouseReleased"] {
             client
@@ -676,6 +677,20 @@ pub async fn wait_for(client: &CdpClient, condition: &str, timeout_ms: u64) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard checked four entries and then read `coords[5]`, so a
+    /// short quad from a non-Chrome CDP endpoint panicked (and aborted).
+    #[test]
+    fn short_or_malformed_quads_fall_back_instead_of_panicking() {
+        assert_eq!(
+            quad_center(&json!([10, 20, 30, 20, 30, 40, 10, 40])),
+            Some((20.0, 30.0))
+        );
+        assert_eq!(quad_center(&json!([10, 20, 30, 40])), None);
+        assert_eq!(quad_center(&json!([10, 20, 30, 40, 50])), None);
+        assert_eq!(quad_center(&json!(null)), None);
+        assert_eq!(quad_center(&json!({"x": 1})), None);
+    }
 
     #[test]
     fn navigation_accepts_http_and_https() {
