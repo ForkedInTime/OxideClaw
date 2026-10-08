@@ -245,9 +245,26 @@ impl IndexTarget {
         RagDb::open_at(&self.db_path).map(Some)
     }
 
-    /// Bring the index up to date with the project.
+    /// Bring the index up to date with the project, after any pass already
+    /// running on it (`/index`: the user asked for this one).
     pub fn index(&self, db: &RagDb, force: bool) -> Result<indexer::IndexResult> {
+        let _pass = IndexPass::claim(&self.db_path, true);
         indexer::index_project(db, &self.root, force)
+    }
+
+    /// `index` for the automatic refreshes (startup, each prompt, print/SDK
+    /// context): `None` without indexing when a pass is already running.
+    /// On a first build that takes minutes, every prompt used to start
+    /// another walk parsing the same files and fighting for the write lock.
+    pub fn refresh(&self, db: &RagDb) -> Result<Option<indexer::IndexResult>> {
+        let Some(_pass) = IndexPass::claim(&self.db_path, false) else {
+            debug!(
+                "RAG refresh skipped: {} is being indexed",
+                self.db_path.display()
+            );
+            return Ok(None);
+        };
+        indexer::index_project(db, &self.root, false).map(Some)
     }
 
     /// A stored (root-relative) path as seen from the launch directory:
@@ -275,6 +292,37 @@ impl IndexTarget {
             "No code index for {} yet. Run /index to build it.",
             self.root.display()
         )
+    }
+}
+
+/// The indexes this process is writing, by database path.
+static INDEXING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static INDEX_DONE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// One index pass in flight on a database; released on drop.
+struct IndexPass(PathBuf);
+
+impl IndexPass {
+    /// Claim `db_path`, waiting for a running pass when `wait`, otherwise
+    /// `None` while one runs.
+    fn claim(db_path: &Path, wait: bool) -> Option<Self> {
+        let mut running = INDEXING.lock().unwrap_or_else(|e| e.into_inner());
+        while running.iter().any(|p| p == db_path) {
+            if !wait {
+                return None;
+            }
+            running = INDEX_DONE.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+        running.push(db_path.to_path_buf());
+        Some(Self(db_path.to_path_buf()))
+    }
+}
+
+impl Drop for IndexPass {
+    fn drop(&mut self) {
+        let mut running = INDEXING.lock().unwrap_or_else(|e| e.into_inner());
+        running.retain(|p| p != &self.0);
+        INDEX_DONE.notify_all();
     }
 }
 
@@ -307,7 +355,7 @@ pub fn auto_context(index_dir: Option<&Path>, cwd: &Path, user_input: &str) -> S
     // Only the TUI indexes on its own; without this, print/SDK/ACP turns
     // inject whatever a past TUI run stored, including deleted files and
     // code this session already edited. Incremental, so cheap when idle.
-    if let Err(e) = target.index(&db, false) {
+    if let Err(e) = target.refresh(&db) {
         debug!("RAG refresh failed: {e}");
     }
 
@@ -940,6 +988,40 @@ mod tests {
         drop(RagDb::open_at(&path).unwrap());
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    /// Automatic refreshes skip while a pass runs on the same index; an
+    /// explicit /index waits for it and then runs.
+    #[test]
+    fn a_refresh_skips_while_the_index_is_being_written() {
+        let home = TempDir::new().unwrap();
+        let idx = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_files(&repo, &[("lib.rs", "fn refreshed_symbol() {}\n")]);
+        let target =
+            IndexTarget::resolve(Some(idx.path()), &repo, Some(home.path()), true).unwrap();
+        let db = target.open().unwrap();
+
+        let running = IndexPass::claim(&target.db_path, false).unwrap();
+        assert!(target.refresh(&db).unwrap().is_none());
+        assert_eq!(db.chunk_count().unwrap(), 0, "the skipped refresh indexed");
+
+        // `index` blocks until the running pass is done.
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = released.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(running);
+        });
+        target.index(&db, false).unwrap();
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+        releaser.join().unwrap();
+        assert_eq!(stored_files(&db), ["lib.rs"]);
+
+        // Nothing running any more: the refresh runs.
+        assert!(target.refresh(&db).unwrap().is_some());
     }
 
     /// Re-opening an already-current DB must be idempotent — no duplicate

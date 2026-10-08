@@ -1049,12 +1049,12 @@ async fn run_loop(
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let db = target.open()?;
-                    target.index(&db, false)
+                    target.refresh(&db)
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("RAG index panicked: {e}")));
                 match result {
-                    Ok(r) if r.files_indexed > 0 => {
+                    Ok(Some(r)) if r.files_indexed > 0 => {
                         let _ = tx2.send(crate::tui::events::AppEvent::SystemMessage(format!(
                             "Codebase indexed — {} files, {} chunks ({:.0}ms)",
                             r.files_indexed, r.chunks_added, r.elapsed_ms

@@ -843,13 +843,14 @@ async fn submit_line(raw: String, ctx: KeyCtx<'_>) -> Result<()> {
     push_prompt_turn(messages, user_content, session).await;
 
     // Background incremental re-index: pick up any files changed since last index.
-    // Fire-and-forget — doesn't block the user's message from being sent.
+    // Fire-and-forget — doesn't block the user's message from being sent, and
+    // skipped while the startup build or an earlier refresh is still running.
     // Off where startup said so (outside a git repo, $HOME, /).
     if let Ok(target) = crate::rag::IndexTarget::for_cwd(&config.cwd, true) {
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(db) = target.open() {
-                    let _ = target.index(&db, false);
+                    let _ = target.refresh(&db);
                 }
             })
             .await;
