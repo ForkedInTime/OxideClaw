@@ -958,7 +958,10 @@ impl Settings {
                 .and_then(Autonomy::parse)
                 .unwrap_or_default()
                 .effective(
-                    project.sandbox_enabled.or(global.sandbox_enabled).unwrap_or(false),
+                    project
+                        .sandbox_enabled
+                        .or(global.sandbox_enabled)
+                        .unwrap_or(false),
                     project
                         .sandbox_mode
                         .as_deref()
@@ -1907,12 +1910,16 @@ mod project_trust_tests {
                 ..Settings::default()
             };
             let m = Settings::merge_with_trust(global, project, None, trusted);
-            let runs = crate::permissions::autonomy::full_auto_blocker(true, "bwrap", false)
-                .is_none();
+            let runs =
+                crate::permissions::autonomy::full_auto_blocker(true, "bwrap", false).is_none();
             if trusted && runs {
                 assert_eq!(m.autonomy.as_deref(), Some("auto-edit"));
             } else {
-                assert_eq!(m.autonomy.as_deref(), Some("full-auto"), "trusted {trusted}");
+                assert_eq!(
+                    m.autonomy.as_deref(),
+                    Some("full-auto"),
+                    "trusted {trusted}"
+                );
                 assert!(m.notices[0].contains("(\"ask\")"), "{:?}", m.notices);
             }
             // Where the user's full-auto does run, auto-edit tightens it.

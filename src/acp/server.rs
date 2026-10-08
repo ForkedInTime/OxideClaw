@@ -1550,7 +1550,11 @@ mod tests {
         let mut c = Client::start(cfg, sessions_in(&dir));
         c.init().await;
         let (_, created) = c
-            .call(1, "session/new", json!({"cwd": dir.path(), "mcpServers": []}))
+            .call(
+                1,
+                "session/new",
+                json!({"cwd": dir.path(), "mcpServers": []}),
+            )
             .await;
         let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
         let (_, answer) = c.call(2, "session/prompt", prompt(&sid, "hi")).await;
@@ -2420,7 +2424,8 @@ mod tests {
         // session/close drops a live or evicted session; an unknown id is
         // not found.
         for (n, sid) in [(50, &ids[2]), (51, &ids[1])] {
-            let close = json!({"jsonrpc":"2.0","id":n,"method":"session/close","params":{"sessionId":sid}});
+            let close =
+                json!({"jsonrpc":"2.0","id":n,"method":"session/close","params":{"sessionId":sid}});
             let out = st.handle_line(&close.to_string()).await;
             assert_eq!(out[0]["result"], json!({}), "{out:?}");
             assert!(!st.sessions.contains_key(sid) && !st.evicted.contains_key(sid));
