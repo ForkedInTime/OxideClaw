@@ -1493,8 +1493,13 @@ pub(super) fn git_checkpoint(
         return Ok("No changes to checkpoint.".into());
     }
 
-    // Stage all changes
-    git().args(["add", "-A"]).output()?;
+    // A failed add (index.lock held, unreadable file) would otherwise
+    // commit only what was already staged under a full-count reply.
+    let add = git().args(["add", "-A"]).output()?;
+    if !add.status.success() {
+        let err = String::from_utf8_lossy(&add.stderr);
+        anyhow::bail!("git add failed: {err}");
+    }
 
     // Create commit
     let ts = chrono_free_timestamp();
@@ -1514,7 +1519,24 @@ pub(super) fn git_checkpoint(
     let hash = git().args(["rev-parse", "--short", "HEAD"]).output()?;
     let short = String::from_utf8_lossy(&hash.stdout).trim().to_string();
 
-    let changed: usize = status_text.lines().count();
+    // Count what the commit holds: porcelain shows an untracked directory
+    // as one line. `--root` so a first commit is not counted as empty.
+    let tree = git()
+        .args([
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            "HEAD",
+        ])
+        .output()?;
+    let changed = tree
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .count();
     Ok(format!(
         "Checkpoint created: {short} ({changed} files) — \"{full_msg}\"\nUse `git reset HEAD~1` to undo."
     ))
@@ -2699,5 +2721,64 @@ mod router_tests {
         // Every tool_use answered, the last word is the mid tier's.
         assert_eq!(messages.last().unwrap().role, Role::Assistant);
         assert_eq!(messages.len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::git_checkpoint;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q"]);
+        git(d, &["config", "user.name", "t"]);
+        git(d, &["config", "user.email", "t@t"]);
+        git(d, &["config", "commit.gpgsign", "false"]);
+        git(d, &["config", "core.excludesFile", "/dev/null"]);
+        dir
+    }
+
+    /// An untracked directory is one porcelain line, so a checkpoint of
+    /// three new files reported "(2 files)".
+    #[test]
+    fn checkpoint_counts_committed_files() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/b.txt"), "b").unwrap();
+        std::fs::write(d.join("sub/c.txt"), "c").unwrap();
+        let msg = git_checkpoint(d, Some("first")).unwrap();
+        assert!(msg.contains("(3 files)"), "{msg}");
+
+        std::fs::write(d.join("a.txt"), "changed").unwrap();
+        let msg = git_checkpoint(d, None).unwrap();
+        assert!(msg.contains("(1 files)"), "{msg}");
+    }
+
+    /// A failed `git add` was ignored and the commit went ahead with
+    /// whatever was already staged.
+    #[test]
+    fn checkpoint_stops_when_staging_fails() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::write(d.join(".git/index.lock"), "").unwrap();
+        let err = git_checkpoint(d, None).unwrap_err().to_string();
+        assert!(err.contains("git add failed"), "{err}");
     }
 }
