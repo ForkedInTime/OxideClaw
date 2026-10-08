@@ -2005,13 +2005,18 @@ fn mcp_add_config(
     use crate::mcp::types::{HttpServerConfig, McpServerConfig, StdioServerConfig};
     match transport {
         "stdio" => {
+            // A bare `-e KEY` is not a pass-through: dropping it silently
+            // left the server without the variable it was added for.
             let env = env
                 .iter()
-                .filter_map(|kv| {
-                    let (k, v) = kv.split_once('=')?;
-                    Some((k.to_string(), v.to_string()))
+                .map(|kv| match kv.split_once('=') {
+                    Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+                    _ => Err(anyhow::anyhow!(
+                        "--env expects KEY=VALUE, got '{kv}' (to pass a variable \
+                         through, write -e {kv}='${{{kv}}}')"
+                    )),
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             Ok(McpServerConfig::Stdio(StdioServerConfig {
                 command: target.to_string(),
                 args: args.to_vec(),
@@ -2515,6 +2520,16 @@ mod mcp_add_tests {
         assert_eq!(s.env["TOKEN"], "a=b");
 
         assert!(mcp_add_config("sse", "https://x.test", &[], &[]).is_err());
+
+        // `-e GITHUB_TOKEN` used to be dropped while the add reported success.
+        let err = mcp_add_config("stdio", "npx", &args, &["GITHUB_TOKEN".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("KEY=VALUE") && err.contains("'GITHUB_TOKEN'"),
+            "{err}"
+        );
+        assert!(mcp_add_config("stdio", "npx", &args, &["=v".into()]).is_err());
         assert!(mcp_add_config("http", "npx", &[], &[]).is_err());
         assert!(mcp_add_config("http", "https://x.test", &args, &[]).is_err());
     }
