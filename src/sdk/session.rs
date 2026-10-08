@@ -497,6 +497,9 @@ impl SdkSession {
                     // whose request was rejected (say, too large) would resend
                     // it, and fail the same way, on every later prompt.
                     self.messages.truncate(base);
+                    // That took this turn's Read results out of the history
+                    // too: a re-read must return the file again.
+                    self.forget_reads();
                     return Err(e.context("API stream call failed"));
                 }
             };
@@ -1743,6 +1746,35 @@ mod guard_tests {
 
         assert!(s.execute_turn("hi".into()).await.is_err());
         assert!(s.messages.is_empty(), "the rejected turn stayed in history");
+    }
+
+    /// A failed request drops the turn's Read results from the history; a
+    /// cache entry left behind answered the next Read of that file with
+    /// "unchanged since last read" and no content.
+    #[tokio::test]
+    async fn a_failed_request_forgets_the_turns_reads() {
+        use crate::query_engine::scripted_api_tests::serve;
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#;
+        let (url, _) = serve(vec![format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = session(cfg(dir.path()));
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(c);
+        // What a Read earlier in the turn left in the cache.
+        s.read_cache
+            .lock()
+            .unwrap()
+            .insert(dir.path().join("big.rs"), 42);
+
+        assert!(s.execute_turn("read big.rs".into()).await.is_err());
+
+        assert!(s.messages.is_empty());
+        assert!(s.read_cache.lock().unwrap().is_empty(), "stale read kept");
     }
 
     /// The SDK sidecar and ACP sent `thinking: None, output_config: None`
