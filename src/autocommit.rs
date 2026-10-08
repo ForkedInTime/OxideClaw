@@ -715,20 +715,69 @@ fn list_tree_files(cwd: &Path, tree: &str) -> Vec<String> {
     git_cmd(cwd)
         // Paths from the root even when cwd is a subdirectory, where plain
         // `ls-tree -r` lists only that subdirectory's part of the tree.
-        .args(["ls-tree", "-r", "--full-tree", "--name-only", tree])
+        // `-z`: without it core.quotePath prints `"caf\303\251.txt"`, which
+        // never equals the raw name `diff-tree -z` gives for the same file.
+        .args(["ls-tree", "-r", "-z", "--full-tree", "--name-only", tree])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        })
+        .map(|o| nul_paths(&o.stdout).collect())
         .unwrap_or_default()
+}
+
+/// Those of `paths` that a snapshot of the chain or the session base
+/// holds. Only these paths are looked up, newest snapshot first, stopping
+/// once all are found: listing every snapshot's whole tree on each /undo
+/// took seconds in a long session in a big repository.
+fn recorded_paths(cwd: &Path, auto_commits: &[String], paths: Vec<String>) -> Vec<String> {
+    let mut unseen: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let mut revs: Vec<String> = auto_commits
+        .iter()
+        .rev()
+        .map(|c| format!("{c}^{{tree}}"))
+        .collect();
+    if let Some(first) = auto_commits.first() {
+        revs.push(format!("{first}^^{{tree}}")); // absent for a root first commit
+    }
+    for rev in &revs {
+        if unseen.is_empty() {
+            break;
+        }
+        let wanted: Vec<&str> = unseen.iter().copied().collect();
+        let mut found = Vec::new();
+        // Chunked to stay well under the argument-length limit.
+        for chunk in wanted.chunks(500) {
+            let out = git_cmd(cwd)
+                // The names are file names, not patterns.
+                .env("GIT_LITERAL_PATHSPECS", "1")
+                .args([
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    "--full-tree",
+                    "--name-only",
+                    rev,
+                    "--",
+                ])
+                .args(chunk)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output();
+            if let Ok(o) = out
+                && o.status.success()
+            {
+                found.extend(nul_paths(&o.stdout));
+            }
+        }
+        for p in &found {
+            unseen.remove(p.as_str());
+        }
+    }
+    let unseen: std::collections::HashSet<String> =
+        unseen.into_iter().map(str::to_string).collect();
+    paths.into_iter().filter(|p| !unseen.contains(p)).collect()
 }
 
 /// The tree the chain holds at `position`: 0 is the session base (the
@@ -869,25 +918,6 @@ fn restore(
     let tree_sha = position_tree(cwd, auto_commits, target_position)?;
 
     let target_files = list_tree_files(cwd, &tree_sha);
-    // Only files some reachable state recorded are ever removed; a file the
-    // user created after the last turn is not the undone turns' doing. Every
-    // turn and the session base count, not just the newest turn: a file turn
-    // 1 created and turn 2 deleted is back after `/undo 1` and must go again
-    // on `/undo 0` (or `/redo 2`). The live tree is held by a snapshot or the
-    // recovery ref, so removing these stays recoverable.
-    let mut snapshotted = std::collections::HashSet::new();
-    let mut revs: Vec<String> = auto_commits
-        .iter()
-        .map(|c| format!("{c}^{{tree}}"))
-        .collect();
-    if let Some(first) = auto_commits.first() {
-        revs.push(format!("{first}^^{{tree}}")); // absent for a root first commit
-    }
-    for r in &revs {
-        if let Ok(tree) = git_output(git_cmd(cwd).args(["rev-parse", "--verify", "-q", r])) {
-            snapshotted.extend(list_tree_files(cwd, &tree));
-        }
-    }
 
     let live_tree = stage_live_tree(cwd, auto_commits)?;
     // A step along the timeline touches only the paths the undone (or
@@ -917,14 +947,23 @@ fn restore(
     // Safe to delete: save_unrecorded_worktree below makes sure the live
     // tree is held by a snapshot or the recovery ref, and a timeline step
     // only removes paths the from-snapshot holds unedited.
-    let orphaned_files: Vec<String> = nul_paths(&diff_trees(
+    // Only files some reachable state recorded are ever removed; a file the
+    // user created after the last turn is not the undone turns' doing. Every
+    // turn and the session base count, not just the newest turn: a file turn
+    // 1 created and turn 2 deleted is back after `/undo 1` and must go again
+    // on `/undo 0` (or `/redo 2`).
+    let orphaned_files = recorded_paths(
         cwd,
-        &live_tree,
-        &tree_sha,
-        Some("--diff-filter=D"),
-    )?)
-    .filter(|p| snapshotted.contains(p) && in_scope(p))
-    .collect();
+        auto_commits,
+        nul_paths(&diff_trees(
+            cwd,
+            &live_tree,
+            &tree_sha,
+            Some("--diff-filter=D"),
+        )?)
+        .filter(|p| in_scope(p))
+        .collect(),
+    );
 
     if let Some(from_tree) = &from_tree {
         let edited: std::collections::HashSet<String> =
@@ -2133,6 +2172,34 @@ mod restore_tests {
         assert!(is_git_repo(&sub));
         restore_from(&sub, "s", &commits, 0, 1).unwrap();
         assert!(sub.join("src/main.rs").exists(), "/redo still works");
+    }
+
+    /// `ls-tree` without `-z` quoted non-ASCII names, which then never
+    /// matched the raw names `diff-tree -z` gives: /undo left every file
+    /// with such a name that the undone turn created. A name that reads as
+    /// pathspec magic must be looked up literally too.
+    #[test]
+    fn undo_removes_created_files_with_unusual_names() {
+        let td = init_test_repo();
+        initial_commit(td.path());
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        let mut names = vec!["café.txt", "docs/日本語.md", "a b[1].txt"];
+        if cfg!(unix) {
+            names.push(":odd.txt");
+        }
+        for n in &names {
+            write_file(td.path(), n, "x\n");
+        }
+        snapshot_turn(td.path(), &cfg, "s", "add", 1, &mut commits, &mut pos, None).unwrap();
+
+        let report = restore_from(td.path(), "s", &commits, 1, 0).unwrap();
+        assert_eq!(report.orphaned_files.len(), names.len(), "{report:?}");
+        for n in &names {
+            assert!(!td.path().join(n).exists(), "{n} left behind");
+        }
+        assert!(td.path().join("README.md").exists());
     }
 
     /// /undo left files the undone turn created on disk, so the next turn's
