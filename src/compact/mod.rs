@@ -222,6 +222,29 @@ pub fn drop_thinking(messages: &mut [Message]) {
     }
 }
 
+/// Ready a saved history to be continued. Its system prompt, tools and
+/// model may have changed since it was written (an ACP load adds the
+/// editor's tools and constraints, a CLAUDE.md or memory edit changes the
+/// prompt), and models that bind thinking signatures to all of those reject
+/// the old blocks with a 400 on every later request. Only the new turn's own
+/// thinking has to be replayed, so drop the rest when the session model or a
+/// router tier binds.
+pub fn prepare_resumed_history(
+    messages: &mut [Message],
+    model: &str,
+    router: Option<&crate::router::RouterConfig>,
+) {
+    let binds = crate::api::thinking::binds_thinking_to_conversation;
+    let tier_binds = router.filter(|r| r.enabled).is_some_and(|r| {
+        crate::router::Complexity::ALL
+            .iter()
+            .any(|&t| binds(r.model_for(t)))
+    });
+    if binds(model) || tier_binds {
+        drop_thinking(messages);
+    }
+}
+
 // ── summarizeCompact ─────────────────────────────────────────────────────────
 
 const SUMMARISE_SYSTEM: &str = "\
@@ -838,6 +861,49 @@ mod snip_tests {
                     .any(|b| matches!(b, ContentBlock::Thinking { .. }))
             })
             .collect()
+    }
+
+    /// A loaded history replayed its signed thinking under a new system
+    /// prompt and tool list: a 400 on every prompt for models that bind it.
+    #[test]
+    fn a_resumed_history_drops_thinking_where_a_model_binds_it() {
+        let loaded = || {
+            vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: "q".into() }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Thinking {
+                        thinking: "hmm".into(),
+                        signature: "sig".into(),
+                    }],
+                },
+            ]
+        };
+        let mut h = loaded();
+        prepare_resumed_history(&mut h, "claude-sonnet-5", None);
+        assert_eq!(h, loaded(), "Sonnet 5 does not bind its thinking");
+
+        prepare_resumed_history(&mut h, "claude-opus-5-5", None);
+        assert_eq!(h.len(), 2, "no turn removed");
+        assert_eq!(
+            h[1].content,
+            vec![ContentBlock::Text {
+                text: "(no response)".into()
+            }]
+        );
+
+        // A routed session can send the next prompt to a binding tier.
+        let mut router = crate::router::RouterConfig::new("claude-sonnet-5");
+        router.high_model = "claude-opus-5-5".into();
+        let mut h = loaded();
+        prepare_resumed_history(&mut h, "claude-sonnet-5", Some(&router));
+        assert_eq!(h, loaded(), "the router is off");
+        router.enabled = true;
+        prepare_resumed_history(&mut h, "claude-sonnet-5", Some(&router));
+        assert!(thinking_at(&h).is_empty());
     }
 
     /// Redacted thinking is bound like signed thinking: left behind after an

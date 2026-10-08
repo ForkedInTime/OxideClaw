@@ -341,6 +341,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let display = entries_from_messages(&loaded_messages);
                         *saved_count = loaded_messages.len();
                         *messages = loaded_messages;
+                        crate::compact::prepare_resumed_history(
+                            messages,
+                            &config.model,
+                            Some(&app.router),
+                        );
                         app.entries = display;
                         app.streaming = String::new();
                         app.show_welcome = false;
@@ -835,6 +840,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         let count = msgs.len();
                         let display = entries_from_messages(&msgs);
                         *messages = msgs;
+                        // Signed on another machine, under its system prompt.
+                        crate::compact::prepare_resumed_history(
+                            messages,
+                            &config.model,
+                            Some(&app.router),
+                        );
                         // The import is its own conversation: appending it to
                         // the current session's file interleaved the two.
                         // A fresh session (as /clear) keeps the old one

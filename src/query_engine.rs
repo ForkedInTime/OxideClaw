@@ -1107,7 +1107,12 @@ impl QueryEngine {
 
     /// Continue a saved conversation: the next `query` sends `messages`
     /// first, under that session's id.
-    pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
+    pub fn resume_history(&mut self, session_id: String, mut messages: Vec<Message>) {
+        crate::compact::prepare_resumed_history(
+            &mut messages,
+            &self.config.model,
+            self.router.as_ref(),
+        );
         self.session_id = Some(session_id);
         self.messages = messages;
         // Nothing is written back under --no-session-persistence, so a
@@ -1662,6 +1667,33 @@ pub(crate) mod scripted_api_tests {
             ..Config::default()
         };
         assert!(retry_overloads(&no_key, "ollama:big"));
+    }
+
+    /// `-p --resume` replayed signed thinking under today's system prompt
+    /// (memory, CLAUDE.md, OS version): a 400 for models that bind it.
+    #[test]
+    fn a_resumed_history_drops_bound_thinking() {
+        let config = Config {
+            model: "claude-opus-5-5".into(),
+            api_key: "sk-ant-test".into(),
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        let thought = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "t".into(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::Text { text: "a".into() },
+            ],
+        };
+        e.resume_history("s".into(), vec![thought]);
+        assert_eq!(
+            e.messages[0].content,
+            vec![ContentBlock::Text { text: "a".into() }]
+        );
     }
 
     /// `-c -p` ran a fresh conversation: the resumed turns must be sent

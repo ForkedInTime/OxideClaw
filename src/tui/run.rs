@@ -850,6 +850,11 @@ async fn run_loop(
                     app.show_welcome = false;
                     saved_count = loaded_messages.len();
                     messages = loaded_messages;
+                    crate::compact::prepare_resumed_history(
+                        &mut messages,
+                        &config.model,
+                        Some(&app.router),
+                    );
                     let label = if config.fork_session {
                         "Forked"
                     } else {
@@ -1148,6 +1153,11 @@ async fn run_loop(
                     let display = entries_from_messages(&loaded_messages);
                     saved_count = loaded_messages.len();
                     messages = loaded_messages;
+                    crate::compact::prepare_resumed_history(
+                        &mut messages,
+                        &config.model,
+                        Some(&app.router),
+                    );
                     app.entries = display;
                     app.streaming = String::new();
                     app.show_welcome = false;

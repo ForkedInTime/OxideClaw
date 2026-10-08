@@ -175,7 +175,12 @@ impl SdkSession {
 
     /// Continue a saved conversation: later turns run under `session_id`
     /// with `messages` as the history.
-    pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
+    pub fn resume_history(&mut self, session_id: String, mut messages: Vec<Message>) {
+        crate::compact::prepare_resumed_history(
+            &mut messages,
+            &self.config.model,
+            self.router.as_ref(),
+        );
         self.session_id = session_id;
         self.messages = messages;
         // A saved session can be past this model's window (a routed TUI
@@ -1861,6 +1866,50 @@ mod guard_tests {
         assert_eq!(texts[1], "next", "the turn's prompt survives");
         assert_eq!(texts[2], "ok");
         assert!(!seen.lock().unwrap()[2].contains("old question"));
+    }
+
+    /// ACP session/load continued a TUI session's signed thinking under a
+    /// system prompt with `<sdk_constraints>` and the editor's tools: a 400
+    /// on every prompt for models that bind thinking to the conversation.
+    #[tokio::test]
+    async fn a_loaded_history_is_sent_without_bound_thinking() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let (url, seen) = serve(vec![sse(
+            &[serde_json::json!({"type":"text","text":"ok"})],
+            "end_turn",
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.model = "claude-opus-5-5".into();
+        let (mut s, _) = session(c);
+        let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        client.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(client);
+        s.resume_history(
+            "loaded".into(),
+            vec![
+                text_message(Role::User, "old question"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "signed in the TUI".into(),
+                            signature: "sig".into(),
+                        },
+                        ContentBlock::Text {
+                            text: "old answer".into(),
+                        },
+                    ],
+                },
+            ],
+        );
+
+        s.execute_turn("next".into()).await.unwrap();
+
+        let body = &seen.lock().unwrap()[0];
+        assert!(body.contains("old answer"), "{body}");
+        assert!(!body.contains("signed in the TUI"), "{body}");
     }
 
     /// A loaded session already past the summarise threshold is summarised
