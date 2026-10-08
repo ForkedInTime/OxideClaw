@@ -798,8 +798,8 @@ pub fn ask_rule_narrows(ask: &str, allow: &str) -> bool {
     // Only command rules are compared by content: `Bash(npm test:*)` is not
     // narrowed by `Bash(git push:*)`. Path and domain rules are not worth
     // intersecting for a rule that only saves a prompt.
-    let command_rule = ask_tool.eq_ignore_ascii_case("Bash")
-        || ask_tool.eq_ignore_ascii_case("PowerShell");
+    let command_rule =
+        ask_tool.eq_ignore_ascii_case("Bash") || ask_tool.eq_ignore_ascii_case("PowerShell");
     let (true, Some(ask_inner), Some(allow_inner)) = (command_rule, ask_inner, allow_inner) else {
         return true;
     };

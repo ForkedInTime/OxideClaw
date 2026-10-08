@@ -272,7 +272,10 @@ mod tests {
         // (here a read outside the project and a fetch) to `ask` / `deny`.
         for (tool, input) in [
             ("Read", serde_json::json!({"file_path": "/etc/passwd"})),
-            ("WebFetch", serde_json::json!({"url": "https://example.com/"})),
+            (
+                "WebFetch",
+                serde_json::json!({"url": "https://example.com/"}),
+            ),
         ] {
             assert_eq!(e.evaluate(tool, &input), ApprovalDecision::Ask, "{tool}");
             assert_eq!(

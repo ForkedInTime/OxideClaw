@@ -2211,7 +2211,10 @@ mod helper_mode_tests {
         )
         .unwrap();
         let s = Settings::load_in(home.path(), repo.path());
-        assert_eq!(s.permissions.allow, vec!["Bash(npm test:*)", "Read(./src/**)"]);
+        assert_eq!(
+            s.permissions.allow,
+            vec!["Bash(npm test:*)", "Read(./src/**)"]
+        );
         assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
         assert!(s.notices[0].contains("Bash(git:*)"), "{:?}", s.notices);
     }

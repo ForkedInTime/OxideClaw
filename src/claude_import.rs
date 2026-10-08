@@ -1458,7 +1458,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         for entry in walkdir::WalkDir::new(dir) {
             let entry = entry.unwrap();
-            let mode = if entry.file_type().is_dir() { 0o755 } else { 0o644 };
+            let mode = if entry.file_type().is_dir() {
+                0o755
+            } else {
+                0o644
+            };
             std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(mode)).unwrap();
         }
     }
