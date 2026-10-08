@@ -351,8 +351,15 @@ pub fn move_sessions_to_data_dir(config: &Path, data: &Path) -> Option<String> {
     }
     let moved = std::fs::create_dir_all(data)
         .and_then(|()| std::fs::rename(&src, &dst))
-        .map(|()| "moved")
-        .or_else(|_| copy_dir(&src, &dst).map(|_| "copied"));
+        .map(|()| {
+            // A failed chmod is reported, never a reason to undo the move.
+            #[cfg(unix)]
+            if let Err(e) = make_tree_private(&dst) {
+                tracing::warn!("could not make {} owner-only: {e}", dst.display());
+            }
+            "moved"
+        })
+        .or_else(|_| copy_dir_private(&src, &dst).map(|_| "copied"));
     Some(match moved {
         Ok(how) => format!(
             "OxideClaw {how} your sessions to {} (XDG data dir).",
@@ -791,15 +798,79 @@ fn copy_sessions(src: &Path, dst: &Path) -> std::io::Result<usize> {
         for name in [format!("{id}.meta"), format!("{id}.jsonl")] {
             let from = src.join(&name);
             if from.symlink_metadata().is_ok_and(|m| m.is_file()) {
-                copy_file(&from, &dst.join(&name))?;
+                copy_private(&from, &dst.join(&name))?;
             }
         }
         let snapshots = src.join(id);
         if snapshots.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            copy_dir(&snapshots, &dst.join(id))?;
+            copy_dir_private(&snapshots, &dst.join(id))?;
         }
     }
     Ok(ids.len())
+}
+
+/// Sessions hold tool output, file contents and secrets. Older versions
+/// wrote them with umask defaults (0644 in a 0755 dir); the copy is owner-only
+/// (0600 in 0700), as the session module writes them now.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// [`copy_file`] for session files; see [`create_private_dir`].
+fn copy_private(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        create_private_dir(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(dst);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// [`copy_dir`] for session trees; see [`create_private_dir`].
+fn copy_dir_private(src: &Path, dst: &Path) -> std::io::Result<usize> {
+    create_private_dir(dst)?;
+    let mut n = 0;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            n += copy_dir_private(&entry.path(), &to)?;
+        } else if ty.is_file() && !to.exists() {
+            copy_private(&entry.path(), &to)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Give a renamed sessions tree the modes [`copy_dir_private`] would have.
+/// Symlinks are left alone, so nothing outside the tree changes mode.
+#[cfg(unix)]
+fn make_tree_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            make_tree_private(&entry.path())?;
+        } else if ty.is_file() {
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
 }
 
 /// Copy a directory tree, regular files only: symlinks are skipped, so a
@@ -1381,16 +1452,62 @@ mod tests {
         );
     }
 
+    /// Older versions wrote sessions with umask defaults.
+    #[cfg(unix)]
+    fn make_world_readable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.unwrap();
+            let mode = if entry.file_type().is_dir() { 0o755 } else { 0o644 };
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_private_tree(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut files = 0;
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.unwrap();
+            let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+            if entry.file_type().is_dir() {
+                assert_eq!(mode, 0o700, "{}", entry.path().display());
+            } else {
+                assert_eq!(mode, 0o600, "{}", entry.path().display());
+                files += 1;
+            }
+        }
+        assert!(files > 0, "nothing under {}", dir.display());
+    }
+
+    /// The migrated copy of 0644 sessions in a 0755 dir is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn migrated_sessions_are_owner_only() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = fake_claude(td.path());
+        make_world_readable(&claude.join("sessions"));
+        let data = td.path().join("data");
+        migrate(&claude, &td.path().join("config"), &data);
+        assert!(data.join("sessions/abc.jsonl").is_file());
+        assert_private_tree(&data.join("sessions"));
+    }
+
     #[test]
     fn sessions_in_the_old_xdg_config_dir_move_to_the_data_dir() {
         let td = tempfile::tempdir().unwrap();
         let config = td.path().join("config/oxideclaw");
         let data = td.path().join("data/oxideclaw");
         write(&config.join("sessions/abc.meta"), "{}");
+        write(&config.join("sessions/abc/snapshots/turn-1/a.txt"), "old");
+        #[cfg(unix)]
+        make_world_readable(&config.join("sessions"));
         let line = move_sessions_to_data_dir(&config, &data).unwrap();
         assert!(line.contains("moved"), "{line}");
         assert!(data.join("sessions/abc.meta").is_file());
         assert!(!config.join("sessions").exists());
+        #[cfg(unix)]
+        assert_private_tree(&data.join("sessions"));
         // Once only; and never onto existing sessions.
         write(&config.join("sessions/later.meta"), "{}");
         assert_eq!(move_sessions_to_data_dir(&config, &data), None);
