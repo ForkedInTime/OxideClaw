@@ -777,7 +777,23 @@ fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(src, dst).map(|_| ())
+    std::fs::copy(src, dst)?;
+    keep_mtime(src, dst);
+    Ok(())
+}
+
+/// `std::fs::copy` keeps the mode but not the timestamps. The session list
+/// and `--continue` order sessions by their transcript's mtime, and
+/// `cleanupPeriodDays` prunes by it, so a copy stamped "now" would make
+/// every migrated session look like the latest. Best effort: a timestamp is
+/// no reason to fail the migration.
+fn keep_mtime(src: &Path, dst: &Path) {
+    if let Ok(at) = std::fs::metadata(src).and_then(|m| m.modified()) {
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(dst)
+            .and_then(|f| f.set_modified(at));
+    }
 }
 
 /// Copy OxideClaw's sessions (`<id>.meta`, `<id>.jsonl` and the `<id>/`
@@ -834,6 +850,7 @@ fn copy_private(src: &Path, dst: &Path) -> std::io::Result<()> {
             return Err(e);
         }
     }
+    keep_mtime(src, dst);
     Ok(())
 }
 
@@ -886,6 +903,7 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<usize> {
             n += copy_dir(&entry.path(), &to)?;
         } else if ty.is_file() && !to.exists() {
             std::fs::copy(entry.path(), &to)?;
+            keep_mtime(&entry.path(), &to);
             n += 1;
         }
     }
@@ -1516,5 +1534,35 @@ mod tests {
         write(&config.join("sessions/later.meta"), "{}");
         assert_eq!(move_sessions_to_data_dir(&config, &data), None);
         assert_eq!(move_sessions_to_data_dir(&data, &data), None);
+    }
+
+    /// The session list and `--continue` go by each transcript's mtime: a
+    /// migration that stamped every copy "now" put a months-old session
+    /// first. The cross-filesystem fallback copies the same way.
+    #[test]
+    fn migrated_sessions_keep_their_age() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = fake_claude(td.path());
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        for name in ["abc.jsonl", "abc/snapshots/turn-1/a.txt"] {
+            std::fs::File::options()
+                .write(true)
+                .open(claude.join("sessions").join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let (config, data) = (td.path().join("config"), td.path().join("data"));
+        migrate(&claude, &config, &data);
+        let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        assert_eq!(mtime(&data.join("sessions/abc.jsonl")), old);
+        assert_eq!(
+            mtime(&data.join("sessions/abc/snapshots/turn-1/a.txt")),
+            old
+        );
+
+        let other = td.path().join("other");
+        copy_dir_private(&data.join("sessions"), &other).unwrap();
+        assert_eq!(mtime(&other.join("abc.jsonl")), old);
     }
 }
