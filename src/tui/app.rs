@@ -753,6 +753,11 @@ pub struct App {
     /// The finished hooks' result for the prompt text they were shown,
     /// taken by the replayed submit's gate.
     pub prompt_hook_result: Option<(String, crate::hooks::HookResult)>,
+
+    /// Ollama tags for `/model` Tab completion, per host: each probe can
+    /// take its 2 s timeout inside the key handler. The /model picker
+    /// refreshes it.
+    pub ollama_tags: Option<(String, Vec<String>)>,
 }
 
 /// A prompt waiting on its userPromptSubmit hooks.
@@ -915,6 +920,7 @@ impl App {
             browse_approval_rx: None,
             prompt_hooks: None,
             prompt_hook_result: None,
+            ollama_tags: None,
         }
     }
 

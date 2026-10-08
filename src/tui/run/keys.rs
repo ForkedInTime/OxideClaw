@@ -587,22 +587,35 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 return Ok(());
             }
 
-            // "/model ollama:<prefix>" → complete from installed Ollama models
+            // "/model <part>" → complete from the known models, and from the
+            // installed Ollama models when the query or the session is on
+            // Ollama: the probe blocks the key handler for up to 2 s.
             if let Some(after) = raw.strip_prefix("/model ") {
                 let query = after.trim();
-                // Get installed models from Ollama
-                let ollama_host = &config.ollama_host;
-                let models = crate::api::list_ollama_models(ollama_host).await;
-                // Strip "ollama:" prefix for display, filter by what's typed
-                let typed_bare = query.strip_prefix("ollama:").unwrap_or(query);
-                let matches: Vec<String> = models
-                    .iter()
-                    .filter(|m| {
-                        let bare = crate::api::strip_ollama_prefix(m);
-                        bare.contains(typed_bare)
-                    })
-                    .cloned()
-                    .collect();
+                let mut matches: Vec<String> = if query.starts_with("ollama:") {
+                    Vec::new()
+                } else {
+                    crate::commands::KNOWN_MODELS
+                        .iter()
+                        .map(|(id, _)| id.to_string())
+                        .filter(|id| id.contains(query))
+                        .collect()
+                };
+                if query.starts_with("ollama:") || crate::api::is_ollama_model(&config.model) {
+                    let host = &config.ollama_host;
+                    if app.ollama_tags.as_ref().is_none_or(|(h, _)| h != host) {
+                        let tags = crate::api::list_ollama_models(host).await;
+                        app.ollama_tags = Some((host.clone(), tags));
+                    }
+                    let typed_bare = query.strip_prefix("ollama:").unwrap_or(query);
+                    if let Some((_, tags)) = &app.ollama_tags {
+                        matches.extend(
+                            tags.iter()
+                                .filter(|m| crate::api::strip_ollama_prefix(m).contains(typed_bare))
+                                .cloned(),
+                        );
+                    }
+                }
                 match matches.len() {
                     0 => {}
                     1 => {
@@ -610,15 +623,15 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         app.cursor = app.input.len();
                     }
                     _ => {
-                        let mut lines = vec!["Installed Ollama models:\n".to_string()];
-                        let ids: Vec<String> = matches.clone();
+                        let mut lines = vec!["Models:\n".to_string()];
                         for (i, m) in matches.iter().enumerate() {
                             lines.push(format!("  {}. {}", i + 1, m));
                         }
                         lines.push(String::new());
                         lines
                             .push("  ↑↓ select · Enter switch · 1-9 quick pick · Esc close".into());
-                        app.overlay = Some(Overlay::with_items("models", lines.join("\n"), ids));
+                        app.overlay =
+                            Some(Overlay::with_items("models", lines.join("\n"), matches));
                     }
                 }
             // "/cmd" with no space → complete slash command names + plugin:command
@@ -1580,6 +1593,32 @@ mod ctrl_c_tests {
         app.overlay = Some(Overlay::with_items("models", "x", vec!["m".into()]));
         press(&mut app, ctrl_c()).await;
         assert!(app.should_quit);
+    }
+
+    /// Tab on `/model cla…` probed Ollama inside the key handler (2 s on an
+    /// unreachable host) and only ever completed Ollama tags.
+    #[tokio::test]
+    async fn model_tab_completes_known_models_without_probing_ollama() {
+        let config = || Config {
+            ollama_host: "http://127.0.0.1:9".into(),
+            ..Config::default()
+        };
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.input = "/model haiku".chars().collect();
+        press_with(&mut app, config(), tab).await;
+        assert_eq!(
+            app.input.iter().collect::<String>(),
+            "/model claude-haiku-4-5"
+        );
+        assert!(app.ollama_tags.is_none(), "probed Ollama");
+
+        app.input = "/model ollama:".chars().collect();
+        press_with(&mut app, config(), tab).await;
+        assert_eq!(
+            app.ollama_tags,
+            Some(("http://127.0.0.1:9".to_string(), Vec::new()))
+        );
     }
 
     /// With an overlay open (or during a turn) Ctrl+R was swallowed and

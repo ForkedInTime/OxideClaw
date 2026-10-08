@@ -272,6 +272,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::ListModels => {
             // Build combined Anthropic + Ollama interactive model picker
             let ollama_models = crate::api::list_ollama_models(&config.ollama_host).await;
+            app.ollama_tags = Some((config.ollama_host.clone(), ollama_models.clone()));
             let mut lines = Vec::new();
             let mut ids = Vec::new();
             let total = crate::commands::KNOWN_MODELS.len() + ollama_models.len();
