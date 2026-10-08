@@ -364,6 +364,48 @@ impl StdioTransport {
     }
 }
 
+/// Cancels a stdio request its caller stopped waiting for. stdio has no
+/// per-request stream to close, so the server learns of it only from
+/// `notifications/cancelled`; without it a single-threaded server keeps
+/// working on the abandoned call and queues the next one behind it. A
+/// server that honours the cancel never replies, so the pending entry is
+/// removed here too.
+struct CancelOnDrop<'a> {
+    transport: &'a StdioTransport,
+    id: u64,
+    method: &'a str,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `initialize` must not be cancelled, and before the probe answers
+        // the server may be one that expects `initialize` first.
+        if !matches!(self.method, "initialize" | "server/discover") {
+            let note = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": self.id, "reason": "client stopped waiting" },
+            });
+            let _ = self.transport.stdin_tx.send(note.to_string());
+        }
+        let id = self.id;
+        if let Ok(mut pending) = self.transport.pending.try_lock() {
+            pending.remove(&id);
+            return;
+        }
+        let pending = Arc::clone(&self.transport.pending);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 /// Where a shell would find a bare `command`, walking PATH × PATHEXT.
 /// Windows process creation only tries `<name>.exe`, but `npx` (the usual
 /// MCP launcher) and most Node and Python shims are `.cmd` files, so
@@ -409,12 +451,20 @@ impl McpTransport for StdioTransport {
             return Err(anyhow!("MCP server stdin closed"));
         }
 
+        // Fires on the timeout below and when the caller drops this future
+        // (Esc, a cancelled turn or SDK/ACP request).
+        let mut cancel = CancelOnDrop {
+            transport: self,
+            id,
+            method,
+            armed: true,
+        };
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(reply) => reply.map_err(|_| anyhow!("MCP server disconnected"))?,
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                Err(anyhow!("MCP request timed out ({})", method))
+            Ok(reply) => {
+                cancel.armed = false;
+                reply.map_err(|_| anyhow!("MCP server disconnected"))?
             }
+            Err(_) => Err(anyhow!("MCP request timed out ({})", method)),
         }
     }
 
@@ -2237,6 +2287,38 @@ cat >/dev/null"#,
         assert_eq!(out["r1"]["result"], json!({}));
         assert_eq!(out["r2"]["id"], json!("s2"));
         assert_eq!(out["r2"]["error"]["code"], json!(-32601));
+    }
+
+    /// A call abandoned by its caller (Esc, a cancelled turn) or by the
+    /// timeout was never cancelled on the server, which kept working on it,
+    /// and its pending entry stayed until a reply that never came.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_abandoned_call_is_cancelled_on_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cmd, args) = sh_server(
+            r#"read call; read cancel; read next
+printf '{"jsonrpc":"2.0","id":2,"result":{"cancel":%s}}\n' "$cancel"
+cat >/dev/null"#,
+        );
+        let t = StdioTransport::connect(&cmd, &args, &HashMap::new(), dir.path())
+            .await
+            .unwrap();
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(300),
+            t.call(1, "tools/call", json!({ "name": "slow" })),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the server never answers the call");
+        assert!(t.pending.lock().await.is_empty());
+
+        let out = tokio::time::timeout(Duration::from_secs(10), t.call(2, "tools/list", json!({})))
+            .await
+            .expect("no cancel reached the server")
+            .unwrap();
+        assert_eq!(out["cancel"]["method"], "notifications/cancelled");
+        assert_eq!(out["cancel"]["params"]["requestId"], json!(1));
+        assert!(out["cancel"].get("id").is_none(), "{out}");
     }
 
     /// A stray non-UTF-8 line (a print() under a cp1252 locale) ended the
