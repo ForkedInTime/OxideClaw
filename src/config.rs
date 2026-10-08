@@ -1823,7 +1823,8 @@ impl Config {
     /// `CLAUDE.md` / `AGENTS.md`, plugins, memory, `local-mcp/`.
     ///
     /// Priority: `$OXIDECLAW_CONFIG_DIR` > `$CLAUDE_CONFIG_DIR` (deprecated,
-    /// and ignored when it names Claude Code's `~/.claude`) >
+    /// and ignored when it names `~/.claude` or another directory Claude
+    /// Code has used) >
     /// `$XDG_CONFIG_HOME/oxideclaw` > `~/.config/oxideclaw`. Never
     /// `~/.claude`: that directory belongs to Claude Code, and OxideClaw only
     /// reads from it (see [`Config::claude_code_dir`]).
@@ -1833,7 +1834,11 @@ impl Config {
 
     /// [`Config::config_dir`] and how it was picked, from the real environment.
     pub fn config_dir_choice() -> ConfigDirChoice {
-        resolve_config_dir(&|k| std::env::var(k).ok(), dirs::home_dir().as_deref())
+        resolve_config_dir(
+            &|k| std::env::var(k).ok(),
+            dirs::home_dir().as_deref(),
+            &is_claude_code_dir,
+        )
     }
 
     /// Claude Code's user directory, `~/.claude`. OxideClaw reads `CLAUDE.md`,
@@ -2541,8 +2546,9 @@ pub enum ConfigDirSource {
     Override,
     /// `$CLAUDE_CONFIG_DIR`: honoured for one more release, with a warning.
     ClaudeConfigDir,
-    /// `$CLAUDE_CONFIG_DIR` named Claude Code's own `~/.claude`, so it was
-    /// ignored and the XDG default used instead.
+    /// `$CLAUDE_CONFIG_DIR` named Claude Code's own `~/.claude`, or a
+    /// directory Claude Code has used (Claude Code reads the same variable),
+    /// so it was ignored and the XDG default used instead.
     ClaudeConfigDirIgnored,
     /// `$XDG_CONFIG_HOME/oxideclaw`, else `~/.config/oxideclaw`.
     Xdg,
@@ -2561,6 +2567,10 @@ impl ConfigDirSource {
 pub struct ConfigDirChoice {
     pub dir: PathBuf,
     pub source: ConfigDirSource,
+    /// The Claude Code directory an ignored `$CLAUDE_CONFIG_DIR` named.
+    /// Older versions kept their settings and sessions there, so the
+    /// first-run migration copies from it instead of `~/.claude`.
+    pub ignored: Option<PathBuf>,
 }
 
 impl ConfigDirChoice {
@@ -2574,8 +2584,12 @@ impl ConfigDirChoice {
                 self.dir.display()
             )),
             ConfigDirSource::ClaudeConfigDirIgnored => Some(format!(
-                "warning: CLAUDE_CONFIG_DIR points at Claude Code's ~/.claude, which OxideClaw \
-                 no longer writes to; ignoring it and using {}.",
+                "warning: CLAUDE_CONFIG_DIR points at a Claude Code directory ({}), which \
+                 OxideClaw no longer writes to; ignoring it and using {}.",
+                self.ignored
+                    .as_deref()
+                    .unwrap_or(Path::new("~/.claude"))
+                    .display(),
                 self.dir.display()
             )),
             ConfigDirSource::Override | ConfigDirSource::Xdg => None,
@@ -2583,11 +2597,28 @@ impl ConfigDirChoice {
     }
 }
 
-/// `Config::config_dir_choice` for an injected environment (`var`) and home
-/// directory, so the precedence is testable without touching process env.
+/// Something only Claude Code writes into its config dir. Claude Code reads
+/// `$CLAUDE_CONFIG_DIR` too, so a value set for it must not make its
+/// settings, hooks and MCP servers OxideClaw's, nor OxideClaw write there.
+pub(crate) fn is_claude_code_dir(dir: &Path) -> bool {
+    [
+        "projects",
+        "todos",
+        "statsig",
+        ".claude.json",
+        ".credentials.json",
+    ]
+    .iter()
+    .any(|m| dir.join(m).exists())
+}
+
+/// `Config::config_dir_choice` for an injected environment (`var`), home
+/// directory and Claude Code check, so the precedence is testable without
+/// touching process env.
 pub(crate) fn resolve_config_dir(
     var: &dyn Fn(&str) -> Option<String>,
     home: Option<&Path>,
+    is_claude_code: &dyn Fn(&Path) -> bool,
 ) -> ConfigDirChoice {
     let set = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     if let Some(dir) = ENV_PREFIXES
@@ -2597,17 +2628,21 @@ pub(crate) fn resolve_config_dir(
         return ConfigDirChoice {
             dir,
             source: ConfigDirSource::Override,
+            ignored: None,
         };
     }
     let mut source = ConfigDirSource::Xdg;
+    let mut ignored = None;
     if let Some(dir) = set("CLAUDE_CONFIG_DIR") {
         let claude_code = home.map(|h| h.join(".claude"));
-        if claude_code.is_some_and(|c| same_dir(&dir, &c)) {
+        if claude_code.is_some_and(|c| same_dir(&dir, &c)) || is_claude_code(&dir) {
             source = ConfigDirSource::ClaudeConfigDirIgnored;
+            ignored = Some(dir);
         } else {
             return ConfigDirChoice {
                 dir,
                 source: ConfigDirSource::ClaudeConfigDir,
+                ignored: None,
             };
         }
     }
@@ -2623,6 +2658,7 @@ pub(crate) fn resolve_config_dir(
     ConfigDirChoice {
         dir: app_dir(&base),
         source,
+        ignored,
     }
 }
 
@@ -2680,7 +2716,9 @@ fn data_dir_in(
 
 #[cfg(test)]
 mod data_dir_tests {
-    use super::{ConfigDirSource, cache_dir_in, data_dir_in, resolve_config_dir};
+    use super::{
+        ConfigDirSource, cache_dir_in, data_dir_in, is_claude_code_dir, resolve_config_dir,
+    };
     use std::path::{Path, PathBuf};
 
     /// A path that is absolute on every platform (`/x` has no drive on
@@ -2700,7 +2738,7 @@ mod data_dir_tests {
     #[test]
     fn no_home_never_means_a_cwd_relative_dir() {
         for home in [None, Some(Path::new("rel/home"))] {
-            let dir = resolve_config_dir(&|_| None, home).dir;
+            let dir = resolve_config_dir(&|_| None, home, &is_claude_code_dir).dir;
             assert!(dir.is_absolute(), "{}", dir.display());
             let data = data_dir_in(None, home, None, |_| false);
             assert!(data.is_absolute(), "{}", data.display());
@@ -2760,6 +2798,7 @@ mod data_dir_tests {
         let got = resolve_config_dir(
             &env(&[("XDG_CONFIG_HOME", xdg.to_str().unwrap())]),
             Some(home),
+            &is_claude_code_dir,
         );
         assert_eq!(got.dir, xdg.join("oxideclaw"));
         assert_eq!(got.source, ConfigDirSource::Xdg);
@@ -2769,7 +2808,7 @@ mod data_dir_tests {
             &[("XDG_CONFIG_HOME", "")],
             &[("XDG_CONFIG_HOME", "rel")],
         ] {
-            let got = resolve_config_dir(&env(unset), Some(home));
+            let got = resolve_config_dir(&env(unset), Some(home), &is_claude_code_dir);
             assert_eq!(got.dir, home.join(".config/oxideclaw"), "{unset:?}");
         }
     }
@@ -2784,14 +2823,18 @@ mod data_dir_tests {
             ("CLAUDE_CONFIG_DIR", "/cc"),
             ("XDG_CONFIG_HOME", "/xdg"),
         ];
-        let got = resolve_config_dir(&env(&vars), Some(&home));
+        let got = resolve_config_dir(&env(&vars), Some(&home), &is_claude_code_dir);
         assert_eq!(got.dir, PathBuf::from("/ox"));
         assert_eq!(got.source, ConfigDirSource::Override);
         assert_eq!(got.notice(), None);
-        let got = resolve_config_dir(&env(&vars[1..]), Some(&home));
+        let got = resolve_config_dir(&env(&vars[1..]), Some(&home), &is_claude_code_dir);
         assert_eq!(got.dir, PathBuf::from("/rusty"), "pre-rename name");
         // Empty means unset.
-        let got = resolve_config_dir(&env(&[("OXIDECLAW_CONFIG_DIR", "")]), Some(&home));
+        let got = resolve_config_dir(
+            &env(&[("OXIDECLAW_CONFIG_DIR", "")]),
+            Some(&home),
+            &is_claude_code_dir,
+        );
         assert_eq!(got.dir, home.join(".config/oxideclaw"));
     }
 
@@ -2800,7 +2843,11 @@ mod data_dir_tests {
     #[test]
     fn claude_config_dir_is_deprecated_and_never_dot_claude() {
         let home = abs("home/u");
-        let got = resolve_config_dir(&env(&[("CLAUDE_CONFIG_DIR", "/profile")]), Some(&home));
+        let got = resolve_config_dir(
+            &env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
+            Some(&home),
+            &is_claude_code_dir,
+        );
         assert_eq!(got.dir, PathBuf::from("/profile"));
         assert_eq!(got.source, ConfigDirSource::ClaudeConfigDir);
         let warning = got.notice().unwrap();
@@ -2815,11 +2862,65 @@ mod data_dir_tests {
             let got = resolve_config_dir(
                 &env(&[("CLAUDE_CONFIG_DIR", dot_claude.to_str().unwrap())]),
                 Some(&home),
+                &is_claude_code_dir,
             );
             assert_eq!(got.dir, home.join(".config/oxideclaw"));
             assert_eq!(got.source, ConfigDirSource::ClaudeConfigDirIgnored);
             assert!(got.notice().unwrap().contains("ignoring"));
         }
+    }
+
+    /// Claude Code reads `$CLAUDE_CONFIG_DIR` too: a directory it has used
+    /// is ignored like `~/.claude` and kept as the migration source, while
+    /// a plain profile dir is still OxideClaw's.
+    #[test]
+    fn claude_config_dir_that_claude_code_uses_is_ignored() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        for marker in [
+            "projects",
+            "todos",
+            "statsig",
+            ".claude.json",
+            ".credentials.json",
+        ] {
+            let cc = td
+                .path()
+                .join(format!("cc-{}", marker.trim_start_matches('.')));
+            std::fs::create_dir_all(&cc).unwrap();
+            if marker.starts_with('.') {
+                std::fs::write(cc.join(marker), "{}").unwrap();
+            } else {
+                std::fs::create_dir(cc.join(marker)).unwrap();
+            }
+            let got = resolve_config_dir(
+                &env(&[("CLAUDE_CONFIG_DIR", cc.to_str().unwrap())]),
+                Some(&home),
+                &is_claude_code_dir,
+            );
+            assert_eq!(
+                got.source,
+                ConfigDirSource::ClaudeConfigDirIgnored,
+                "{marker}"
+            );
+            assert_eq!(got.dir, home.join(".config/oxideclaw"), "{marker}");
+            assert_eq!(got.ignored.as_deref(), Some(cc.as_path()), "{marker}");
+            assert!(!got.source.is_explicit());
+            let notice = got.notice().unwrap();
+            assert!(notice.contains(&*cc.to_string_lossy()), "{notice}");
+        }
+
+        let profile = td.path().join("profile");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::write(profile.join("settings.json"), "{}").unwrap();
+        let got = resolve_config_dir(
+            &env(&[("CLAUDE_CONFIG_DIR", profile.to_str().unwrap())]),
+            Some(&home),
+            &is_claude_code_dir,
+        );
+        assert_eq!(got.source, ConfigDirSource::ClaudeConfigDir);
+        assert_eq!(got.dir, profile);
+        assert_eq!(got.ignored, None);
     }
 
     /// A symlink to `~/.claude` is still `~/.claude`.
@@ -2833,6 +2934,7 @@ mod data_dir_tests {
         let got = resolve_config_dir(
             &env(&[("CLAUDE_CONFIG_DIR", home.join("cc").to_str().unwrap())]),
             Some(home),
+            &is_claude_code_dir,
         );
         assert_eq!(got.source, ConfigDirSource::ClaudeConfigDirIgnored);
         assert_eq!(got.dir, home.join(".config/oxideclaw"));

@@ -1821,6 +1821,7 @@ mod tests {
         let own = |dir: &str, source| ConfigDirChoice {
             dir: dir.into(),
             source,
+            ignored: None,
         };
         assert_eq!(
             never_written_with(&cc, &own("/x", ConfigDirSource::Xdg), Some(dot.clone())),
@@ -1862,6 +1863,7 @@ mod tests {
         let own = crate::config::ConfigDirChoice {
             dir: td.path().join("own"),
             source: crate::config::ConfigDirSource::Xdg,
+            ignored: None,
         };
         let roots = never_written_with(&claude, &own, Some(dot_claude.clone()));
         let target = dot_claude.join("sessions");

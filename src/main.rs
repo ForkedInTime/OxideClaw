@@ -693,7 +693,11 @@ fn prepare_config_dirs() {
     // A directory the user named is theirs to fill.
     if !choice.source.is_explicit() {
         let data = Config::data_dir();
-        if let Some(claude) = Config::claude_code_dir().filter(|d| d.is_dir())
+        // An ignored $CLAUDE_CONFIG_DIR is where older versions, which
+        // honoured it, kept their settings and sessions.
+        if let Some(claude) = (choice.ignored.clone())
+            .or_else(Config::claude_code_dir)
+            .filter(|d| d.is_dir())
             && claude_import::needs_migration(&choice.dir)
         {
             for line in claude_import::migrate(&claude, &choice.dir, &data) {

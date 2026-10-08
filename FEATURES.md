@@ -627,7 +627,7 @@ Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, 
 
 | Purpose | Default | Override |
 |---------|---------|----------|
-| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, skills, `memory.md`, plugins, `local-mcp/`) | `~/.config/oxideclaw/` | `$OXIDECLAW_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` (an absolute path). `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning, unless it names `~/.claude` |
+| Config (`settings.json`, global `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, skills, `memory.md`, plugins, `local-mcp/`) | `~/.config/oxideclaw/` | `$OXIDECLAW_CONFIG_DIR`; else `$XDG_CONFIG_HOME/oxideclaw/` (an absolute path). `$CLAUDE_CONFIG_DIR` still works for one more release, with a warning, unless it names `~/.claude` or a directory Claude Code has used (one holding `projects/`, `todos/`, `statsig/`, `.claude.json` or `.credentials.json`); the first run then migrates from that directory |
 | Sessions | `~/.local/share/oxideclaw/sessions/` | `$XDG_DATA_HOME/oxideclaw/sessions/`. With `$OXIDECLAW_CONFIG_DIR` (or `$CLAUDE_CONFIG_DIR`) and no `$XDG_DATA_HOME`, `<config dir>/sessions/` |
 | Cache: code index (`rag/`) and the update-check answer | `~/.cache/oxideclaw/` | `$XDG_CACHE_HOME/oxideclaw/` (an absolute path; a relative one is ignored) |
 | Skills | `<config dir>/skills/`, plus the project and `~/.claude/` directories in [Skills](#skills) | — |
@@ -671,7 +671,7 @@ OxideClaw is XDG Base Directory compliant and never writes to Claude Code's `~/.
 | `OXIDECLAW_NO_UPDATE_CHECK` | `1` turns off the TUI's daily update check (same as `"updateCheck": false`). Shell only. |
 | `OXIDECLAW_BROWSER_NO_SANDBOX` | `1` lets `/browse` run Chrome without its sandbox when OxideClaw runs as root (Docker, CI); pages then run unsandboxed as root. Shell only. |
 | `OXIDECLAW_CONFIG_DIR` | Config directory (default `~/.config/oxideclaw`). Shell only, not `.env` |
-| `CLAUDE_CONFIG_DIR` | Deprecated alias for `OXIDECLAW_CONFIG_DIR`, honoured with a warning for one more release; ignored when it names `~/.claude` |
+| `CLAUDE_CONFIG_DIR` | Deprecated alias for `OXIDECLAW_CONFIG_DIR`, honoured with a warning for one more release; ignored when it names `~/.claude` or another directory Claude Code has used |
 | `XDG_CONFIG_HOME` | Config directory base (`$XDG_CONFIG_HOME/oxideclaw`) |
 | `XDG_DATA_HOME` | Sessions directory base (`$XDG_DATA_HOME/oxideclaw`), under the rule in [Where files live](#where-files-live) |
 | `XDG_CACHE_HOME` | Cache directory base (code index, update-check answer) |
