@@ -627,6 +627,15 @@ pub fn snapshot_turn(
             .or_else(|| resolve_head(cwd))
     };
     let parent_tree = parent.as_deref().and_then(|p| tree_of_commit(cwd, p));
+    // A parent this repository lacks (a chain resumed from elsewhere, or
+    // pruned) fails `commit-tree` anyway; fail before re-hashing the whole
+    // tree with no seed.
+    if let (Some(p), None) = (&parent, &parent_tree) {
+        anyhow::bail!(
+            "snapshot {} is not in this repository (session resumed elsewhere, or pruned)",
+            &p[..7.min(p.len())]
+        );
+    }
     let td = tempfile::TempDir::new()?;
     let tree_sha = stage_worktree(cwd, parent_tree.as_deref(), &td.path().join("turn.index"))?;
 

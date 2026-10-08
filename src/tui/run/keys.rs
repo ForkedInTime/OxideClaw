@@ -551,7 +551,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 app.entries.push(ChatEntry::system(msg));
             }
             app.btw_note = None;
-            begin_agent_turn(session, config).await;
+            begin_agent_turn(session, config, tools).await;
 
             // Build message content — text + optional image attachment
             let mut user_content: Vec<ContentBlock> = Vec::new();

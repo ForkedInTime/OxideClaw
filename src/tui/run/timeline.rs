@@ -549,7 +549,7 @@ mod tests {
         /// One turn as the run loop drives it: prompt on the timeline, the
         /// agent's edits, then `Done` saves the transcript and snapshots.
         async fn turn(&mut self, prompt: &str, edits: &[(&str, &str)]) {
-            begin_agent_turn(&mut self.session, &self.config).await;
+            begin_agent_turn(&mut self.session, &self.config, &[]).await;
             self.app.entries.push(ChatEntry::user(prompt));
             push_prompt_turn(
                 &mut self.messages,
@@ -594,7 +594,7 @@ mod tests {
         /// A turn that edits files and is then cancelled with Esc: it ends
         /// through the key handler, never through `Done`.
         async fn cancelled_turn(&mut self, prompt: &str, edits: &[(&str, &str)]) {
-            begin_agent_turn(&mut self.session, &self.config).await;
+            begin_agent_turn(&mut self.session, &self.config, &[]).await;
             self.app.entries.push(ChatEntry::user(prompt));
             push_prompt_turn(
                 &mut self.messages,
@@ -1085,7 +1085,7 @@ mod tests {
     async fn a_failed_image_prompt_keeps_the_timeline_paired() {
         let mut h = Harness::new(true).await;
         h.turn("one", &[("a.txt", "a1\n")]).await;
-        begin_agent_turn(&mut h.session, &h.config).await;
+        begin_agent_turn(&mut h.session, &h.config, &[]).await;
         h.app.entries.push(ChatEntry::user("look"));
         push_prompt_turn(
             &mut h.messages,
@@ -1182,6 +1182,95 @@ mod tests {
         h.redo(1).await;
         assert!(h.last_note().contains("not in this repository"));
         assert_eq!(h.prompts().await, vec!["one", "two", "three"]);
+    }
+
+    /// Hand edits and new files made between two turns are not the next
+    /// turn's: /undo of it keeps them, and /redo brings it back on top.
+    #[tokio::test]
+    async fn hand_edits_between_turns_survive_the_undo_of_the_next_turn() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n"), ("b.txt", "b1\n")]).await;
+        h.write("b.txt", "mine\n");
+        h.write("notes.md", "my notes\n");
+        h.turn("two", &[("a.txt", "a2\n")]).await;
+
+        h.undo(1).await;
+        let note = h.last_note();
+        assert!(note.contains("Files restored"), "{note}");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+        assert_eq!(h.read("b.txt").as_deref(), Some("mine\n"));
+        assert_eq!(h.read("notes.md").as_deref(), Some("my notes\n"));
+
+        h.redo(1).await;
+        assert_eq!(h.read("a.txt").as_deref(), Some("a2\n"));
+        assert_eq!(h.read("b.txt").as_deref(), Some("mine\n"));
+        assert_eq!(h.read("notes.md").as_deref(), Some("my notes\n"));
+        assert_eq!(h.prompts().await, vec!["one", "two"]);
+    }
+
+    /// The same after a resume: work done while the session was closed is
+    /// not reverted by /undo of the first turn after it.
+    #[tokio::test]
+    async fn work_done_before_a_resume_survives_the_undo() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.write("a.txt", "days of work\n");
+        h.write("new.rs", "fn main() {}\n");
+
+        let (session, messages) = Session::resume_in(h.sessions.path(), "s1").await.unwrap();
+        h.saved = messages.len();
+        h.messages = messages;
+        h.session = session;
+        h.app = App::new("claude-sonnet-4-6", h.repo.path());
+        h.turn("two", &[("b.txt", "b2\n")]).await;
+
+        h.undo(1).await;
+        assert_eq!(h.read("b.txt"), None);
+        assert_eq!(h.read("a.txt").as_deref(), Some("days of work\n"));
+        assert_eq!(h.read("new.rs").as_deref(), Some("fn main() {}\n"));
+
+        // Back past the gap: turn one's own edit goes, the work between
+        // the turns with it (it sits on top of turn one), and /redo puts
+        // it back.
+        h.undo(1).await;
+        assert_eq!(h.read("a.txt").as_deref(), Some("a0\n"));
+        assert_eq!(h.read("new.rs"), None);
+        h.redo(2).await;
+        assert_eq!(h.read("a.txt").as_deref(), Some("days of work\n"));
+        assert_eq!(h.read("new.rs").as_deref(), Some("fn main() {}\n"));
+        assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"));
+    }
+
+    /// Resumed in another repository, the session's chain is useless here:
+    /// it starts a new one, so the turns run here are snapshotted and undo
+    /// their files, instead of every snapshot failing on a missing parent.
+    #[tokio::test]
+    async fn a_chain_from_another_repo_starts_over_on_the_next_turn() {
+        let mut h = Harness::new(true).await;
+        h.three_turns().await;
+        let mut other = Harness::new(true).await;
+        std::mem::swap(&mut h.repo, &mut other.repo);
+        h.config.cwd = h.repo.path().to_path_buf();
+
+        h.turn("four", &[("a.txt", "four\n")]).await;
+        assert_eq!(h.session.meta.auto_commits.len(), 1, "a new chain");
+        assert_eq!(h.session.meta.undo_position, 1);
+        assert_eq!(h.session.meta.timeline.len(), 1, "old marks dropped");
+
+        h.undo(1).await;
+        let note = h.last_note();
+        assert!(note.contains("Files restored"), "{note}");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a0\n"));
+        assert_eq!(
+            other.read("a.txt").as_deref(),
+            Some("a3\n"),
+            "repo A untouched"
+        );
+
+        // Earlier turns move the conversation only.
+        h.undo(1).await;
+        assert!(h.last_note().contains("predate"), "{}", h.last_note());
+        assert_eq!(h.prompts().await, vec!["one", "two"]);
     }
 
     /// A hand edit to a file the undone turns did not touch neither blocks

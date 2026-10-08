@@ -272,7 +272,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
-            begin_agent_turn(session, config).await;
+            begin_agent_turn(session, config, tools).await;
             push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session).await;
             let snapshot = messages.clone();
             let c2 = client.clone();
@@ -1357,7 +1357,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::user(input.clone()));
                 app.scroll_to_bottom();
                 app.start_loading();
-                begin_agent_turn(session, config).await;
+                begin_agent_turn(session, config, tools).await;
                 push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session)
                     .await;
                 let snapshot = messages.clone();
@@ -2216,7 +2216,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             )));
             app.scroll_to_bottom();
             app.start_loading();
-            begin_agent_turn(session, config).await;
+            begin_agent_turn(session, config, tools).await;
 
             // Create channels for progress events and approval prompts
             let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
@@ -2280,7 +2280,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
-            begin_agent_turn(session, config).await;
+            begin_agent_turn(session, config, tools).await;
             push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session).await;
             let snapshot = messages.clone();
             let c2 = client.clone();
@@ -2324,7 +2324,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::user(input.clone()));
             app.scroll_to_bottom();
             app.start_loading();
-            begin_agent_turn(session, config).await;
+            begin_agent_turn(session, config, tools).await;
             push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session).await;
             let snapshot = messages.clone();
             let c2 = client.clone();
@@ -2548,7 +2548,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.entries.push(ChatEntry::user(input));
                 app.scroll_to_bottom();
                 app.start_loading();
-                begin_agent_turn(session, config).await;
+                begin_agent_turn(session, config, tools).await;
                 push_prompt_turn(messages, vec![ContentBlock::Text { text: prompt }], session)
                     .await;
                 let snapshot = messages.clone();

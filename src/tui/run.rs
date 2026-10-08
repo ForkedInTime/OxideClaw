@@ -164,13 +164,60 @@ async fn push_prompt_turn(
     }
 }
 
-/// Record the session base before an agent turn can touch files. Needed
-/// whenever the next snapshot would be the first after the base (position
-/// 0): without it turn 1 parents on HEAD and `/undo` to the session base
-/// wipes whatever was uncommitted, including edits made since startup or
-/// since an earlier `/undo` to the base.
-async fn begin_agent_turn(session: &mut Session, config: &Config) {
-    if !config.auto_commit.enabled || session.meta.undo_position != 0 {
+/// Put the files on the undo chain as they are before an agent turn can
+/// touch them, so the turn's mark (`TurnMark.before`) is exactly what /undo
+/// of it returns to.
+///
+/// At position 0 that is the session base: without it turn 1 parents on
+/// HEAD and `/undo` to the base wipes whatever was uncommitted, including
+/// edits made since startup or since an earlier `/undo` to the base.
+///
+/// Further on, anything that changed since the last snapshot (hand edits,
+/// new files, a pull or branch switch, a `-p` run, days of work before a
+/// resume) gets its own snapshot. Left out, the next turn's snapshot took
+/// it in and /undo of that turn reverted it, deleting files the user made.
+///
+/// A chain from another repository (a session resumed elsewhere) or one
+/// whose snapshots were pruned cannot be extended here: every snapshot
+/// failed on its missing parent and the session never got file undo back.
+/// It starts over from a fresh base; its turns stay undoable for the
+/// conversation only.
+async fn begin_agent_turn(session: &mut Session, config: &Config, tools: &[DynTool]) {
+    if !config.auto_commit.enabled
+        || crate::tools::session_cwd(tools, &config.cwd) != config.cwd
+        || !oxideclaw::autocommit::is_git_repo(&config.cwd)
+    {
+        return;
+    }
+    if !session.meta.auto_commits.is_empty() {
+        let (cwd, commits) = (config.cwd.clone(), session.meta.auto_commits.clone());
+        let position = session.meta.undo_position;
+        let resolves = tokio::task::spawn_blocking(move || {
+            oxideclaw::autocommit::chain_resolves(&cwd, &commits, &[position])
+        })
+        .await
+        .unwrap_or(true);
+        if !resolves {
+            tracing::info!(
+                "autoCommit: session {}'s snapshots are not in this repository; starting a new chain",
+                session.id
+            );
+            session.meta.auto_commits.clear();
+            session.meta.undo_position = 0;
+            session.meta.base_commit = None;
+            // Marks and redo turns point at positions of the old chain.
+            session.meta.timeline.clear();
+            session.meta.redo.clear();
+            if let Err(e) = session.save_redo(false).await {
+                tracing::warn!("autoCommit: failed to remove the redo turns: {e}");
+            }
+            if let Err(e) = session.save_meta().await {
+                tracing::warn!("autoCommit: failed to save meta after a chain reset: {e}");
+            }
+        }
+    }
+    if session.meta.undo_position != 0 {
+        snapshot_between_turns(session, config).await;
         return;
     }
     let base = match oxideclaw::autocommit::snapshot_base(&config.cwd) {
@@ -185,6 +232,56 @@ async fn begin_agent_turn(session: &mut Session, config: &Config) {
         if let Err(e) = session.save_meta().await {
             tracing::warn!("autoCommit: failed to save meta after base snapshot: {e}");
         }
+    }
+}
+
+/// The between-turns snapshot of [`begin_agent_turn`]. Nothing changed is
+/// the usual case and records nothing.
+async fn snapshot_between_turns(session: &mut Session, config: &Config) {
+    let (cwd, prefix, id) = (
+        config.cwd.clone(),
+        config.auto_commit.message_prefix.clone(),
+        session.id.clone(),
+    );
+    let base = session.meta.base_commit.clone();
+    let mut commits = session.meta.auto_commits.clone();
+    let mut position = session.meta.undo_position;
+    let turn_index = position as u32 + 1;
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let out = oxideclaw::autocommit::snapshot_turn_raw(
+            &cwd,
+            &prefix,
+            &id,
+            "changes made between turns",
+            turn_index,
+            &mut commits,
+            &mut position,
+            base.as_deref(),
+        );
+        (out, commits, position)
+    })
+    .await;
+    match snapshot {
+        Ok((Ok(oxideclaw::autocommit::SnapshotOutcome::Committed { .. }), commits, position)) => {
+            session.meta.auto_commits = commits;
+            session.meta.undo_position = position;
+            // The snapshot cut the chain the redo turns point into. A
+            // prompt clears them anyway; /browse never does.
+            if !session.meta.redo.is_empty() {
+                session.meta.redo.clear();
+                if let Err(e) = session.save_redo(false).await {
+                    tracing::warn!("autoCommit: failed to remove the redo turns: {e}");
+                }
+            }
+            if let Err(e) = session.save_meta().await {
+                tracing::warn!("autoCommit: failed to save meta after snapshot: {e}");
+            }
+        }
+        Ok((Ok(_), _, _)) => {}
+        Ok((Err(e), _, _)) => {
+            tracing::warn!("autoCommit: could not snapshot the changes made between turns: {e}")
+        }
+        Err(e) => tracing::warn!("autoCommit: between-turns snapshot task failed: {e}"),
     }
 }
 
@@ -1491,7 +1588,7 @@ async fn run_loop(
                             )));
                             app.scroll_to_bottom();
                             app.start_loading();
-                            begin_agent_turn(&mut session, &config).await;
+                            begin_agent_turn(&mut session, &config, &tools).await;
                             let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
                             let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
                             app.browse_progress_rx = Some(progress_rx);
