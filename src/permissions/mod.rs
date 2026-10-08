@@ -1258,6 +1258,12 @@ fn deny_candidates(cmd: &str, grammar: ShellGrammar, depth: usize) -> Option<Vec
                     .collect::<Vec<_>>()
                     .join(" ");
                 out.extend(deny_candidates(&script, grammar, depth + 1)?);
+            } else if word == "git" {
+                // `git -C . push` runs `git push`.
+                let sub = without_git_global_options(tail, grammar);
+                if sub.len() < tail.trim_start().len() {
+                    out.push(format!("git {sub}"));
+                }
             }
             let prefix = COMMAND_PREFIXES.contains(&word);
             let option = wrapped
@@ -1277,6 +1283,31 @@ fn deny_candidates(cmd: &str, grammar: ShellGrammar, depth: usize) -> Option<Vec
         out.extend(deny_candidates(body, grammar, depth + 1)?);
     }
     Some(out)
+}
+
+/// `git`'s arguments after its global options (`-C <dir>`, `-c <k=v>`,
+/// `--git-dir=<dir>`, `--no-pager`, ...): the subcommand and what follows.
+fn without_git_global_options(mut args: &str, grammar: ShellGrammar) -> &str {
+    const TAKES_VALUE: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+    ];
+    loop {
+        let (word, tail) = first_word(args, grammar);
+        if !word.starts_with('-') || word == "--" {
+            return args.trim_start();
+        }
+        args = if TAKES_VALUE.contains(&word) {
+            first_word(tail, grammar).1
+        } else {
+            tail
+        };
+    }
 }
 
 /// The script of `bash -c '<script>'` (any POSIX shell, fish, or
@@ -2121,6 +2152,11 @@ mod tests {
             "! git push",
             "nohup git push &",
             "time git push",
+            "command git push",
+            "git -C . push",
+            "git -c core.hooksPath=x --no-pager push origin",
+            "git --git-dir=.git --work-tree . push",
+            "env git -C sub push --force",
             "cat <(git push)",
             "f() { git push; }; f",
             "x=$(echo $(git push))",
@@ -2133,6 +2169,7 @@ mod tests {
             "echo '$(git push)'",
             "echo git push",
             "git status",
+            "git -C push status",
             "awk '{print \"git push\"}' f",
             "cat <<'EOF'\n$(git push)\nEOF",
             "echo ${HOME} # it's fine",
