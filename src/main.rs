@@ -305,6 +305,7 @@ struct Cli {
     setting_sources: Vec<String>,
 
     /// Tools to make available: "" = none, "default" = all, or specific names
+    /// (comma-separated; an unknown name stops startup)
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
 
@@ -1055,8 +1056,10 @@ async fn run() -> Result<()> {
         config.max_turns = cli.max_turns;
     }
     // --tools first: --allowed-tools rules add their tool to its list.
-    config.apply_tools_flag(&cli.tools);
-    if let Err(e) = config.apply_tool_flags(&cli.allowed_tools, &cli.disallowed_tools) {
+    if let Err(e) = config
+        .apply_tools_flag(&cli.tools)
+        .and_then(|()| config.apply_tool_flags(&cli.allowed_tools, &cli.disallowed_tools))
+    {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }

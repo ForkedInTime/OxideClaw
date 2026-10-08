@@ -954,18 +954,48 @@ impl Config {
     /// `default` every tool, anything else only the tools named. Call it
     /// before `apply_tool_flags`, which adds `--allowed-tools` rules' tools
     /// to the list.
-    pub fn apply_tools_flag(&mut self, tools: &[String]) {
+    ///
+    /// Names are checked like `--allowed-tools` names: the list is matched
+    /// exactly, so `"Read, Grep"`'s ` Grep` or a misspelling used to drop
+    /// the tool silently, and `--tools Raed` offered none at all.
+    pub fn apply_tools_flag(&mut self, tools: &[String]) -> std::result::Result<(), String> {
         if tools.is_empty() {
-            return;
+            return Ok(());
         }
-        let raw = tools.join(",");
-        if raw.is_empty() {
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if names.is_empty() {
             self.allowed_tools = vec!["__none__".to_string()];
-        } else if raw.eq_ignore_ascii_case("default") {
+        } else if let [one] = names[..]
+            && one.eq_ignore_ascii_case("default")
+        {
             self.allowed_tools.clear();
         } else {
-            self.allowed_tools = tools.to_vec();
+            let known = crate::tools::builtin_tool_names(self);
+            self.allowed_tools = names
+                .into_iter()
+                .map(|name| {
+                    if name.to_ascii_lowercase().starts_with("mcp__") {
+                        return Ok(name.to_string());
+                    }
+                    known
+                        .iter()
+                        .find(|k| k.eq_ignore_ascii_case(name))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "--tools: unknown tool `{name}`. Known tools: {}; MCP tools \
+                                 are named mcp__<server>__<tool>.",
+                                known.join(", ")
+                            )
+                        })
+                })
+                .collect::<std::result::Result<_, _>>()?;
         }
+        Ok(())
     }
 
     /// Apply `--allowed-tools` / `--disallowed-tools` (each empty when the
@@ -4383,16 +4413,31 @@ mod tool_flag_tests {
     fn tools_flag_keeps_a_rule_tool_and_rejects_competing_lists() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg(dir.path());
-        c.apply_tools_flag(&v(&["Read"]));
+        c.apply_tools_flag(&v(&["Read"])).unwrap();
         c.apply_tool_flags(&v(&["Bash(git status:*)"]), &[])
             .unwrap();
         assert_eq!(c.allowed_tools, ["Read", "Bash"]);
         assert_eq!(c.permissions_allow, ["Bash(git status:*)"]);
         assert_eq!(tool_names(&c), ["Bash", "Read"]);
 
+        // Padded names are trimmed; unknown ones stop startup instead of
+        // silently offering fewer tools.
+        let mut c = cfg(dir.path());
+        c.apply_tools_flag(&v(&["read", " Grep"])).unwrap();
+        assert_eq!(tool_names(&c), ["Grep", "Read"]);
+        let mut c = cfg(dir.path());
+        let err = c.apply_tools_flag(&v(&["Raed"])).unwrap_err();
+        assert!(err.contains("unknown tool `Raed`"), "{err}");
+        let mut c = cfg(dir.path());
+        c.apply_tools_flag(&v(&["Read", "mcp__github"])).unwrap();
+        assert_eq!(c.allowed_tools, ["Read", "mcp__github"]);
+        let mut c = cfg(dir.path());
+        c.apply_tools_flag(&v(&[" Default "])).unwrap();
+        assert!(c.allowed_tools.is_empty());
+
         // `--tools default` lifts nothing that --allowed-tools set.
         let mut c = cfg(dir.path());
-        c.apply_tools_flag(&v(&["default"]));
+        c.apply_tools_flag(&v(&["default"])).unwrap();
         c.apply_tool_flags(&v(&["Read,Grep"]), &[]).unwrap();
         assert_eq!(tool_names(&c), ["Grep", "Read"]);
 
@@ -4402,7 +4447,7 @@ mod tool_flag_tests {
             (vec![""], vec!["Read"], "offers no tools"),
         ] {
             let mut c = cfg(dir.path());
-            c.apply_tools_flag(&v(&tools));
+            c.apply_tools_flag(&v(&tools)).unwrap();
             let err = c.apply_tool_flags(&v(&allowed), &[]).unwrap_err();
             assert!(err.contains(needle), "{err}");
             assert!(c.permissions_allow.is_empty());
@@ -4410,7 +4455,7 @@ mod tool_flag_tests {
 
         // --disallowed-tools still narrows a --tools list.
         let mut c = cfg(dir.path());
-        c.apply_tools_flag(&v(&["Read", "Grep"]));
+        c.apply_tools_flag(&v(&["Read", "Grep"])).unwrap();
         c.apply_tool_flags(&[], &v(&["Grep"])).unwrap();
         assert_eq!(tool_names(&c), ["Read"]);
     }
