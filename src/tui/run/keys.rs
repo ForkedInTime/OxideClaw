@@ -411,7 +411,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 
         // Ctrl+S — stop TTS playback without cancelling generation
         (Char('s'), KeyModifiers::CONTROL) => {
-            if let Some(stop_tx) = app.tts_stop_tx.take() {
+            if let Some(stop_tx) = app.tts_stop_tx.take().filter(|t| !t.is_closed()) {
                 let _ = stop_tx.send(());
                 app.entries
                     .push(ChatEntry::system("TTS stopped.".to_string()));
@@ -420,7 +420,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         }
 
         // Escape — stop TTS if playing, or cancel API request if loading
-        (Esc, _) if app.tts_stop_tx.is_some() && !app.is_loading => {
+        (Esc, _) if tts_playing(app) && !app.is_loading => {
             if let Some(stop_tx) = app.tts_stop_tx.take() {
                 let _ = stop_tx.send(());
             }
@@ -941,13 +941,19 @@ fn esc_disarms_clone(app: &App) -> bool {
 /// TTS is running and Ctrl+S must reach their cancel/stop arms: vim would eat
 /// them as a mode switch, and while loading every other key is blocked, so
 /// Ctrl+C (quit) was the only way out.
+/// The sender outlives playback (nothing clears it when `speak` returns),
+/// but its receiver is dropped then, so a closed sender means no TTS.
+fn tts_playing(app: &App) -> bool {
+    app.tts_stop_tx.as_ref().is_some_and(|t| !t.is_closed())
+}
+
 fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
     if !app.vim_enabled {
         return false;
     }
     let clone_armed = app.pending_clone_tier.is_some() && !app.voice_recording;
     let cancels_work =
-        key.code == KeyCode::Esc && (app.is_loading || app.tts_stop_tx.is_some() || clone_armed);
+        key.code == KeyCode::Esc && (app.is_loading || tts_playing(app) || clone_armed);
     let stops_tts = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
     !(cancels_work || stops_tts)
 }
@@ -1051,6 +1057,19 @@ mod vim_routing_tests {
             &app,
             &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
         ));
+    }
+
+    /// After a reply or `/voice test` finished speaking, the next Esc
+    /// printed "TTS stopped." instead of entering vim normal mode.
+    #[test]
+    fn finished_tts_does_not_take_esc() {
+        let mut app = vim_app(true);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        app.tts_stop_tx = Some(stop_tx);
+        drop(stop_rx);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!tts_playing(&app));
+        assert!(vim_routes_key(&app, &esc));
     }
 }
 
