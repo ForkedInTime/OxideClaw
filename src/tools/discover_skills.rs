@@ -51,9 +51,15 @@ pub(super) fn render(loaded: &crate::skills::LoadedSkills) -> String {
     out
 }
 
-/// One `/name — description` line per skill, sorted by name.
+/// One `/name — description` line per skill, sorted by name. Skills marked
+/// `disable-model-invocation` are the user's to run, so the model is not
+/// told about them.
 fn list_skills(skills: &HashMap<String, Skill>) -> String {
-    let mut names: Vec<&String> = skills.keys().collect();
+    let mut names: Vec<&String> = skills
+        .iter()
+        .filter(|(_, s)| !s.disable_model_invocation)
+        .map(|(name, _)| name)
+        .collect();
     names.sort();
     names
         .into_iter()

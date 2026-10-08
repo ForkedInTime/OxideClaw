@@ -91,6 +91,12 @@ fn invoke(
             crate::config::Config::config_dir().join("skills").display()
         ));
     };
+    // Checked before `invoke` so the body of a user-only skill is never read.
+    if skill.disable_model_invocation {
+        return ToolOutput::error(format!(
+            "Skill '{name}' can only be run by the user (/{name})"
+        ));
+    }
     match skill.invoke(args.unwrap_or(""), deny) {
         // The caller (run_api_task) sends this on as a user message.
         Ok(prompt) => ToolOutput::success(format!("[SKILL_PROMPT]\n{prompt}")),
@@ -268,5 +274,49 @@ mod tests {
         let loaded =
             crate::skills::load_skills_at(&proj, &dir.path().join("cfg"), None, &no_deny()).await;
         assert!(loaded.skills.contains_key("notes"));
+    }
+
+    /// `disable-model-invocation: true` was dropped by the parser, so the
+    /// model could find and run a user-only deploy skill on its own.
+    #[tokio::test]
+    async fn user_only_skills_are_hidden_from_and_refused_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        let skills_dir = proj.join(".claude/skills");
+        for (name, flag) in [
+            ("deploy", "true"),
+            ("release", "\"True\""),
+            ("lint", "false"),
+        ] {
+            std::fs::create_dir_all(skills_dir.join(name)).unwrap();
+            std::fs::write(
+                skills_dir.join(name).join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: d\ndisable-model-invocation: {flag}\n---\nBODY-{name}"
+                ),
+            )
+            .unwrap();
+        }
+        let loaded =
+            crate::skills::load_skills_at(&proj, &dir.path().join("cfg"), None, &no_deny()).await;
+        assert!(loaded.invalid.is_empty(), "{:?}", loaded.invalid);
+
+        let listing = super::super::discover_skills::render(&loaded);
+        assert!(
+            !listing.contains("/deploy") && !listing.contains("/release"),
+            "{listing}"
+        );
+        assert!(listing.contains("/lint"), "{listing}");
+
+        for name in ["deploy", "release"] {
+            let out = invoke(&loaded.skills, name, None, &no_deny());
+            assert!(out.is_error, "{}", text(&out));
+            assert!(!text(&out).contains("BODY"), "{}", text(&out));
+            // `/name` calls `Skill::invoke` directly and still runs it.
+            let prompt = loaded.skills[name].invoke("", &no_deny()).unwrap();
+            assert!(prompt.contains(&format!("BODY-{name}")), "{prompt}");
+        }
+        let out = invoke(&loaded.skills, "lint", None, &no_deny());
+        assert!(!out.is_error && text(&out).contains("BODY-lint"));
     }
 }

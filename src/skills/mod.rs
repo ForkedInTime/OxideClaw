@@ -49,6 +49,11 @@ pub struct Skill {
     /// The `SKILL.md` of a directory skill. Its body is read only by
     /// [`Skill::invoke`]; `prompt_template` is left empty.
     pub skill_file: Option<PathBuf>,
+    /// Claude Code's `disable-model-invocation: true`: only the user may run
+    /// it (`/name`). The flag marks side-effecting workflows (deploy,
+    /// release), so DiscoverSkills hides the skill and the Skill tool
+    /// refuses it.
+    pub disable_model_invocation: bool,
 }
 
 impl Skill {
@@ -215,6 +220,12 @@ fn parse_yaml_skill(content: &str, fallback_name: &str) -> Result<Skill> {
         .replace(' ', "-");
     let description = yaml["description"].as_str().unwrap_or("").to_string();
     let category = yaml["category"].as_str().map(|s| s.to_string());
+    // A quoted `"true"` must not silently leave the skill open to the model.
+    let disable_model_invocation = match &yaml["disable-model-invocation"] {
+        serde_yaml::Value::Bool(b) => *b,
+        serde_yaml::Value::String(v) => v.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    };
 
     let mut params = Vec::new();
     if let Some(map) = yaml["params"].as_mapping() {
@@ -254,6 +265,7 @@ fn parse_yaml_skill(content: &str, fallback_name: &str) -> Result<Skill> {
         category,
         params,
         skill_file: None,
+        disable_model_invocation,
     })
 }
 
@@ -289,6 +301,7 @@ fn parse_legacy_skill(content: &str, fallback_name: &str) -> Result<Skill> {
         category: None,
         params: Vec::new(),
         skill_file: None,
+        disable_model_invocation: false,
     })
 }
 
@@ -540,6 +553,7 @@ fn parse_skill_md(content: &str, dir_name: &str) -> std::result::Result<Skill, S
             category: None,
             params: Vec::new(),
             skill_file: None,
+            disable_model_invocation: false,
         }
     };
     if skill.name.is_empty() {
@@ -595,6 +609,7 @@ fn bundled_skills() -> Vec<Skill> {
             category: code.clone(),
             params: vec![],
             skill_file: None,
+            disable_model_invocation: false,
         },
         Skill {
             name: "fix".into(),
@@ -606,6 +621,7 @@ fn bundled_skills() -> Vec<Skill> {
             category: code.clone(),
             params: vec![],
             skill_file: None,
+            disable_model_invocation: false,
         },
         Skill {
             name: "test".into(),
@@ -616,6 +632,7 @@ fn bundled_skills() -> Vec<Skill> {
             category: code,
             params: vec![],
             skill_file: None,
+            disable_model_invocation: false,
         },
     ]
 }

@@ -2983,6 +2983,7 @@ mod budget_tests {
                 category: None,
                 params: Vec::new(),
                 skill_file: None,
+                disable_model_invocation: false,
             },
         );
         let statuses = [crate::mcp::types::McpServerStatus {
