@@ -285,6 +285,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sandbox on Linux. Deny rules apply in every mode. A stored `auto-edit` or
   `full-auto` from an older version is changed to `ask` once, with a
   message.
+- **Stricter defaults from the second QA pass.** `full-auto` also needs the
+  bwrap sandbox's network off (`/sandbox network on` drops the session to
+  `ask`). `/trust` and `/reload` apply a project's `permissions.allow`
+  rules, `env`, `defaultShell` and router at once, and revoking trust drops
+  them along with its sandbox loosenings. `/spawn merge` no longer runs your
+  git hooks on its commit and merge. Bash timeouts are capped at 10 minutes.
+  `-p --output-format json` prints one result object for the whole run, and
+  SIGHUP ends `-p`, `--headless` and `acp` with status 129. On Windows the
+  Bash tool runs Git Bash, never WSL's `System32\bash.exe`.
+
+### Fixed
+
+Second QA pass, 162 verified findings (2026-10-08).
+
+- **Permission rules.** Bare `Edit` and `Read` deny rules cover the whole
+  tool family. Bash deny rules see subshells, substitutions, `VAR=`
+  prefixes, `git -C . push` and tab or double-space variants, and
+  PowerShell or a non-bash `defaultShell` is checked with its own quoting.
+  Prefix rules allow `2>&1` and ask on PowerShell subexpressions. Project
+  path rules follow an entered worktree, an allow rule a Claude Code ask
+  rule narrows prompts, and `/permissions` lists every tool that prompts.
+  Claude Code's `hookSpecificOutput.permissionDecision` is honoured,
+  imported `"$CLAUDE_PROJECT_DIR"` guards run, and `--tools` rejects
+  unknown names.
+- **Context that outgrew the window.** Sub-agents and long TUI turns compact
+  between tool rounds against the turn's tier; a "prompt too long" in `-p`,
+  sub-agents, SDK or ACP is compacted and retried once, and one compacting
+  cannot fix ends the turn instead of looping. Ollama, `llama-server`,
+  OpenAI and Gemini models get their real windows (Ollama's as it serves
+  them, with a notice when a conversation no longer fits). The thrash guard
+  fires, `/budget` stops auto-compaction, and auto-snips are saved.
+- **Router and budget.** `routerBudget` caps `-p` and SDK sessions, the
+  classifier call no longer resets the ctx %, a Claude 5 classifier does
+  not think through its 16 tokens, a tool-less Ollama tier keeps tools for
+  the others, `-p --fallback-model` reaches its own provider, and `/router`
+  savings count cache reads and writes.
+- **`/undo`, `/redo` and sessions.** Edits made between turns, a first turn
+  that committed, a turn compacted mid-way, created files with non-ASCII
+  names and sessions resumed in another repo all undo correctly; the session
+  directory is never deleted. `-p --resume`, ACP `session/load` and
+  `/compact` end the timeline they would corrupt. `-p` with a session saves
+  even when a request fails or a signal stops it, `--no-session-persistence`
+  leaves no files, migrated sessions keep their age, and a loaded session no
+  longer replays bound thinking into a 400.
+- **ACP and SDK.** Prompts over 4 MB, refusals, cancelled permission
+  prompts, a 60 s dialog timeout and re-reads after a failed turn behave;
+  editor-opened sessions stop their MCP servers, and a session past its
+  window compacts.
+- **Language servers and auto-fix.** pyright, typescript-language-server and
+  pylsp work under bwrap; a slow or stalled server no longer hangs a call or
+  drops healthy ones; servers never keep stale text after `/undo` or shell
+  edits; auto-fix keeps errors on untouched lines, drops ones the model just
+  fixed, and Esc keeps the last tool's real result.
+- **Skills.** Claude Code `SKILL.md` files without frontmatter, repo-root
+  skills from a subdirectory, `$ARGUMENTS` / `$N` / `${CLAUDE_SKILL_DIR}`
+  and `disable-model-invocation` work; names that clash with built-ins are
+  flagged, and `/agents` survives an `AGENT.md` symlink.
+- **MCP.** `.mcp.json` HTTP and `sse` entries, `mcp add -e KEY`, name
+  clashes and servers that fail to start are reported instead of silently
+  mishandled; Esc and timeouts cancel stdio calls, long calls are not cut
+  at 60 s, and stdio and SSE servers can no longer exhaust memory or CPU.
+- **Web and browser.** Chrome starts behind a proxy and on macOS and
+  Windows, `oxideclaw browse` closes Chrome when the goal is missed,
+  WebFetch reads XHTML, RSS, Atom and mixed-case types without freezing on
+  deep HTML, and IPv6 proxies and short click quads no longer fail pages.
+- **Providers and cost.** Claude Code's `opusplan`, `[1m]` and `default`
+  model values work; Gemini 3.x Flash-Lite and OpenRouter's OpenAI models
+  are billed correctly; the Responses API falls back to text for tool-less
+  models and no longer cuts off silent reasoning at 120 s.
+- **TUI.** Ctrl+C quits from dialogs, PageDown and page keys work during a
+  turn, Ctrl+R stops a recording anywhere, stray `*` and backticks render,
+  helpers no longer print over the screen, closing the terminal no longer
+  orphans tools, `userPromptSubmit` hooks run for every prompt-sending
+  command without freezing the screen (Esc cancels them), and `/diff`,
+  `/checkpoint`, `/memory`, `/teleport` and `/browse` cancel behave.
+- **Code index and `/watch`.** Methods of long impls are indexed by name,
+  prompts during the first index start no extra passes, a large top hit
+  keeps code context, restored files are re-indexed, and `/watch` ignores
+  `node_modules`, `target/` and `.venv`.
 
 ### Fixed
 
@@ -696,6 +775,26 @@ Low-severity QA pass (2026-10-07).
 
 ### Security
 
+- **Nothing planted in `.git` runs on the host.** bwrap keeps git hooks,
+  config and the agent/hook config files read-only, and every git command
+  OxideClaw runs itself skips hooks and `core.fsmonitor` and refuses
+  repo-local filter drivers it did not see at startup (`EnterWorktree`,
+  `ExitWorktree`, `/spawn`, `/checkpoint`, `/diff`, `/branch`). Sandbox
+  wrappers are parsed by `/bin/sh` whatever `defaultShell` says.
+- **API keys stay out of tool commands.** Keys loaded from `.env` are
+  removed from Bash, PowerShell, language-server and auto-fix children,
+  and with a sandbox on every provider key is.
+- **Untrusted projects** can no longer send prompts to another provider
+  through `model` or phase routing, nor loosen a `full-auto` that runs as
+  `ask`; `full-auto` in the SDK pre-approves only shell commands and
+  in-project edits.
+- **Network checks.** WebFetch stops at cross-host redirects so domain deny
+  rules see every host; NAT64, IPv4-compatible and 6to4 addresses and DNS
+  rebinding no longer bypass the private-network checks; other local users
+  cannot use the browser's policy proxy with your proxy credentials.
+- **Imports and files.** A gateway `apiKeyHelper` is not imported to send
+  its keys to Anthropic, the first-run import no longer sends voice to
+  OpenAI, and migrated sessions and the code index are owner-only.
 - **Dependency advisories cleared.** `rustls` 0.23.37 → 0.23.45
   (RUSTSEC-2026-0285). `lru` 0.12.5 → 0.18.5 (RUSTSEC-2026-0002, -0253),
   which needed `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29.
