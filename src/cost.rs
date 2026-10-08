@@ -344,8 +344,11 @@ fn is_opus_4_0_or_4_1(m: &str) -> bool {
 /// Token usage for a single model.
 #[derive(Debug, Clone, Default)]
 pub struct ModelUsage {
+    /// Uncached input; cache reads and writes are counted apart.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub turns: u32,
     pub cost_usd: f64,
     /// Cost for this model is based on approximate rates, not published ones.
@@ -430,6 +433,8 @@ impl CostTracker {
         }
         entry.input_tokens += input_tokens;
         entry.output_tokens += output_tokens;
+        entry.cache_read_tokens += cache_read;
+        entry.cache_write_tokens += cache_write;
         entry.turns += 1;
         entry.cost_usd += cost;
 
@@ -565,12 +570,20 @@ impl CostTracker {
     /// Estimate the savings from routing (compare actual cost vs all-high-model cost).
     pub fn routing_savings(&self, high_model: &str) -> f64 {
         let high_price = model_price(high_model);
+        // Priced the way `total_cost_usd` was: cache traffic included, and
+        // the long-context tier judged per request (here, per average
+        // request), not on the session's summed prompt.
         let hypothetical: f64 = self
             .by_model
             .values()
             .map(|u| {
-                (u.input_tokens as f64 / 1_000_000.0) * high_price.input
-                    + (u.output_tokens as f64 / 1_000_000.0) * high_price.output
+                let turns = u64::from(u.turns.max(1));
+                high_price.cost(
+                    u.input_tokens / turns,
+                    u.output_tokens / turns,
+                    u.cache_read_tokens / turns,
+                    u.cache_write_tokens / turns,
+                ) * turns as f64
             })
             .sum();
         (hypothetical - self.total_cost_usd).max(0.0)
@@ -633,8 +646,7 @@ mod tests {
                     output_tokens: 1,
                     turns: 1,
                     cost_usd: cost,
-                    estimated: false,
-                    fallback: false,
+                    ..Default::default()
                 },
             );
         }
@@ -800,6 +812,25 @@ mod tests {
         // Haiku cost 5 × (0.010 + 0.010) = 0.10; Opus 4.6 would have been
         // 5 × (0.050 + 0.050) = 0.50 → 0.40 saved.
         assert!((savings - 0.40).abs() < 0.01, "{savings}");
+    }
+
+    /// The hypothetical all-high-tier cost left out cache reads and writes,
+    /// which the actual cost it is compared with includes, so a session
+    /// that was mostly cache traffic showed little or no saving.
+    #[test]
+    fn routing_savings_count_cache_traffic() {
+        let mut tracker = CostTracker::new();
+        for _ in 0..5 {
+            tracker.record_with_cache("claude-haiku-4-5-20251001", 1_000, 2_000, 100_000, 10_000);
+        }
+        let opus = model_price("claude-opus-4-6-20250514");
+        let haiku = model_price("claude-haiku-4-5-20251001");
+        let want = 5.0
+            * (opus.cost(1_000, 2_000, 100_000, 10_000)
+                - haiku.cost(1_000, 2_000, 100_000, 10_000));
+        let savings = tracker.routing_savings("claude-opus-4-6-20250514");
+        assert!(want > 0.5, "{want}");
+        assert!((savings - want).abs() < 1e-9, "{savings} vs {want}");
     }
 }
 
