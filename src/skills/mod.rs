@@ -314,25 +314,47 @@ pub struct LoadedSkills {
     pub skills: HashMap<String, Skill>,
     /// Each skipped skill file with the reason, in load order.
     pub invalid: Vec<(PathBuf, String)>,
+    /// Skills named like a built-in command, with their file: `/name` runs
+    /// the built-in, so only the Skill tool can run them.
+    pub shadowed: Vec<(PathBuf, String)>,
 }
 
 impl LoadedSkills {
-    /// One notice naming every skipped skill file, or `None` when all loaded.
+    /// One notice naming every skipped skill file and every skill a built-in
+    /// command hides, or `None` when there is neither.
     pub fn warning(&self) -> Option<String> {
-        if self.invalid.is_empty() {
-            return None;
+        let mut parts = Vec::new();
+        if !self.invalid.is_empty() {
+            let lines: Vec<String> = self
+                .invalid
+                .iter()
+                .map(|(path, why)| format!("  {} — {why}", path.display()))
+                .collect();
+            parts.push(format!(
+                "Skipped {} invalid skill(s):\n{}",
+                self.invalid.len(),
+                lines.join("\n")
+            ));
         }
-        let lines: Vec<String> = self
-            .invalid
-            .iter()
-            .map(|(path, why)| format!("  {} — {why}", path.display()))
-            .collect();
-        Some(format!(
-            "Skipped {} invalid skill(s):\n{}",
-            self.invalid.len(),
-            lines.join("\n")
-        ))
+        if !self.shadowed.is_empty() {
+            let lines: Vec<String> = self
+                .shadowed
+                .iter()
+                .map(|(path, name)| format!("  /{name} — {}", path.display()))
+                .collect();
+            parts.push(format!(
+                "These skills share a name with a built-in command, so /name runs the built-in; rename the skill to run it as a command:\n{}",
+                lines.join("\n")
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
+}
+
+/// Whether a built-in slash command owns `name`: commands are matched before
+/// skills, so `/name` never reaches a skill called that.
+pub fn is_builtin_command(name: &str) -> bool {
+    crate::commands::SLASH_COMMANDS.contains(&name)
 }
 
 /// Load the skills for a project rooted at `cwd`: the bundled set plus every
@@ -402,7 +424,8 @@ fn project_levels(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
 
 /// [`load_skills_in`] with the config and home directories passed in. On a
 /// name collision the earlier directory wins, then the earlier path within
-/// one directory; bundled skills only fill names nothing else uses.
+/// one directory; bundled skills only fill names nothing else uses. The
+/// bundled set has no `commit` or `review`: those are built-in commands.
 pub(crate) async fn load_skills_at(
     cwd: &Path,
     config_dir: &Path,
@@ -411,6 +434,7 @@ pub(crate) async fn load_skills_at(
 ) -> LoadedSkills {
     let mut skills = HashMap::new();
     let mut invalid = Vec::new();
+    let mut shadowed = Vec::new();
     for (dir, flat) in skill_dirs(cwd, config_dir, home) {
         let Ok(mut entries) = fs::read_dir(&dir).await else {
             continue;
@@ -455,7 +479,12 @@ pub(crate) async fn load_skills_at(
             };
             match skill {
                 Ok(skill) => {
-                    skills.entry(skill.name.clone()).or_insert(skill);
+                    if !skills.contains_key(&skill.name) {
+                        if is_builtin_command(&skill.name) {
+                            shadowed.push((file, skill.name.clone()));
+                        }
+                        skills.insert(skill.name.clone(), skill);
+                    }
                 }
                 Err(why) => invalid.push((file, why)),
             }
@@ -464,7 +493,11 @@ pub(crate) async fn load_skills_at(
     for s in bundled_skills() {
         skills.entry(s.name.clone()).or_insert(s);
     }
-    LoadedSkills { skills, invalid }
+    LoadedSkills {
+        skills,
+        invalid,
+        shadowed,
+    }
 }
 
 /// Read a skill file through Read's deny-list and the user's Read deny
@@ -553,28 +586,6 @@ fn first_paragraph(body: &str) -> String {
 fn bundled_skills() -> Vec<Skill> {
     let code = Some("code".to_string());
     vec![
-        Skill {
-            name: "commit".into(),
-            description: "Create a git commit with a well-formatted message".into(),
-            prompt_template: "Please create a git commit for the current staged changes. \
-                Follow conventional commit format. Run git diff --staged first to see the changes, \
-                then write a commit message and run git commit. {{ARGS}}"
-                .into(),
-            category: code.clone(),
-            params: vec![],
-            skill_file: None,
-        },
-        Skill {
-            name: "review".into(),
-            description: "Review code changes for quality and correctness".into(),
-            prompt_template: "Please review the following code/changes for correctness, \
-                quality, potential bugs, and style issues. Be specific about any problems found. \
-                {{ARGS}}"
-                .into(),
-            category: code.clone(),
-            params: vec![],
-            skill_file: None,
-        },
         Skill {
             name: "explain".into(),
             description: "Explain how a piece of code works".into(),
@@ -708,7 +719,7 @@ mod tests {
         assert_eq!(skills["deploy"].prompt_template, "global deploy");
         assert_eq!(skills["both"].prompt_template, "project copy");
         assert_eq!(skills["commit"].prompt_template, "project commit");
-        assert!(skills.contains_key("review"), "bundled skills are kept");
+        assert!(skills.contains_key("explain"), "bundled skills are kept");
     }
 
     /// Only flat `*.md` files were read, so a `<name>/SKILL.md` skill in any
@@ -1010,6 +1021,40 @@ mod tests {
         let loaded = load_skills_at(&plain, &cfg, None, &none).await;
         assert!(!loaded.skills.contains_key("up"));
         assert!(!loaded.skills.contains_key("outside"));
+    }
+
+    /// `/review` and `/commit` always run the built-in commands, yet a
+    /// user's `review` skill and the bundled `review`/`commit` skills were
+    /// listed as runnable with no word that /name would never reach them.
+    #[tokio::test]
+    async fn skills_named_like_built_in_commands_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let [_, _, claude, ..] = locations(dir.path());
+        write(
+            &at(&claude, "review/SKILL.md"),
+            &skill_md("review", "Our review", "b"),
+        );
+        write(&claude.join("deploy-check.md"), "Check the deploy");
+        let loaded = load(dir.path()).await;
+        assert!(loaded.invalid.is_empty(), "{:?}", loaded.invalid);
+        assert_eq!(
+            loaded.shadowed,
+            vec![(at(&claude, "review/SKILL.md"), "review".to_string())]
+        );
+        let warning = loaded.warning().unwrap();
+        assert!(warning.contains("built-in command"), "{warning}");
+        assert!(warning.contains("/review"), "{warning}");
+        assert!(!warning.contains("deploy-check"), "{warning}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let bundled = load(empty.path()).await;
+        assert!(bundled.warning().is_none(), "{:?}", bundled.warning());
+        for name in bundled.skills.keys() {
+            assert!(
+                !super::is_builtin_command(name),
+                "bundled /{name} is shadowed"
+            );
+        }
     }
 
     #[tokio::test]

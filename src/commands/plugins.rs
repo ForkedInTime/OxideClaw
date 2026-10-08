@@ -342,11 +342,12 @@ pub(super) fn cmd_powerup(args: &str) -> CommandAction {
             "Skills are reusable instructions you run as /<name> commands.\n\
              \n\
              **Built-in skills**\n\
-             - /commit   — write a conventional git commit\n\
-             - /review   — code review\n\
              - /fix      — diagnose and fix a bug\n\
              - /explain  — explain a piece of code\n\
              - /test     — write tests\n\
+             \n\
+             /commit and /review are built-in commands, not skills; a skill\n\
+             with a command's name cannot run as /<name>.\n\
              \n\
              **Create your own**\n\
              Make .agents/skills/my-skill/SKILL.md in your project (or\n\

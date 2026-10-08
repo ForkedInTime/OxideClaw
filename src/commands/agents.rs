@@ -12,8 +12,8 @@ pub(super) fn cmd_skills(ctx: &CommandContext) -> CommandAction {
              frontmatter giving its `name` and `description`.\n\
              Each skill becomes a /<name> command.\n\
              \n\
-             Example: .agents/skills/review/SKILL.md\n\
-             Then type /review [args] to run it.",
+             Example: .agents/skills/deploy-check/SKILL.md\n\
+             Then type /deploy-check [args] to run it.",
             skills = crate::config::Config::config_dir().join("skills").display()
         ));
     }
@@ -31,7 +31,15 @@ pub(super) fn cmd_skills(ctx: &CommandContext) -> CommandAction {
             } else {
                 skill.description.clone()
             };
-            lines.push(format!("  /{name} — {desc}"));
+            // Built-in commands are matched first, so /name never
+            // reaches this skill; say so rather than list it as runnable.
+            if crate::skills::is_builtin_command(name) {
+                lines.push(format!(
+                    "  /{name} — {desc} (hidden by the built-in /{name}; rename the skill to use it)"
+                ));
+            } else {
+                lines.push(format!("  /{name} — {desc}"));
+            }
         }
     }
     lines.push(String::new());

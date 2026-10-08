@@ -122,7 +122,7 @@ mod tests {
         assert!(lines.contains(&"/both — project copy"), "{out}");
         assert!(lines.contains(&"/deploy — Deploy"), "{out}");
         assert!(lines.contains(&"/lint — Run the linters"), "{out}");
-        assert!(lines.iter().any(|l| l.starts_with("/commit — ")), "{out}");
+        assert!(lines.iter().any(|l| l.starts_with("/explain — ")), "{out}");
         let mut sorted = lines.clone();
         sorted.sort();
         assert_eq!(lines, sorted);

@@ -28,8 +28,7 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a skill by name. Skills are the built-in skills (commit, review, \
-        explain, fix, test) plus Agent Skills (<name>/SKILL.md) and markdown prompt \
+        "Execute a skill by name. Skills are the built-in skills (explain, fix, test) plus Agent Skills (<name>/SKILL.md) and markdown prompt \
         templates in the project's .agents/skills/, .oxideclaw/skills/ or .claude/skills/, \
         the config dir's skills/ or ~/.claude/skills/. Returns the skill's instructions; \
         follow them. Use DiscoverSkills to list available skills."
@@ -184,7 +183,7 @@ mod tests {
         );
     }
 
-    /// Bundled skills (/commit, /review, ...) were "not found" by the tool.
+    /// Bundled skills (/fix, /explain, ...) were "not found" by the tool.
     #[tokio::test]
     async fn bundled_skills_are_found_and_unknown_names_are_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -192,9 +191,9 @@ mod tests {
             crate::skills::load_skills_at(dir.path(), &dir.path().join("g"), None, &no_deny())
                 .await
                 .skills;
-        let out = invoke(&skills, "commit", Some("--amend"), &no_deny());
+        let out = invoke(&skills, "fix", Some("the login button"), &no_deny());
         assert!(!out.is_error);
-        assert!(text(&out).contains("git commit") && text(&out).contains("--amend"));
+        assert!(text(&out).contains("root cause") && text(&out).contains("the login button"));
         assert!(invoke(&skills, "nope", None, &no_deny()).is_error);
     }
 
