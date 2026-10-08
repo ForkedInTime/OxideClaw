@@ -26,6 +26,22 @@ fn skill_turn_tools(tools: &[DynTool], disable_shell: bool) -> Vec<DynTool> {
         .collect()
 }
 
+/// teleport.json holds the whole transcript (tool output, files read,
+/// secrets from .env), so it gets the 0600 that session files get. The
+/// chmod comes first because `write_json_atomic` keeps an existing file's
+/// mode, and an export from an older build may have left it 0644.
+fn write_teleport(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    crate::config::write_json_atomic(path, json)
+}
+
 /// Run one `/command` line: build the `CommandContext`, dispatch, and
 /// apply the resulting `CommandAction` to app/session state.
 pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()> {
@@ -783,7 +799,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 "turn_count": messages.iter().filter(|m| is_prompt(m)).count(),
             });
             match serde_json::to_string_pretty(&export_data) {
-                Ok(json_str) => match std::fs::write(&teleport_path, &json_str) {
+                Ok(json_str) => match write_teleport(&teleport_path, &json_str) {
                     Ok(()) => {
                         app.overlay = Some(Overlay::new(
                             "teleport",
@@ -3298,5 +3314,28 @@ mod diff_tests {
             .map(|f| (f.path.as_str(), f.additions, f.deletions))
             .collect();
         assert_eq!(summary, [("docs/日本.md", 2, 1), ("z.txt", 1, 0)], "{diff}");
+    }
+}
+
+#[cfg(test)]
+mod teleport_tests {
+    /// `/teleport export` wrote the transcript with the umask mode (0644),
+    /// readable by every local user, and kept an old file's 0644.
+    #[cfg(unix)]
+    #[test]
+    fn teleport_export_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new-config-dir").join("teleport.json");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        super::write_teleport(&path, "{}").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_teleport(&path, "{\"a\":1}").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}");
     }
 }
