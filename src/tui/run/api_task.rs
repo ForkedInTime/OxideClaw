@@ -1213,6 +1213,10 @@ pub(super) async fn run_api_task(task: ApiTask) {
                         });
                     }
                 }
+                // The escalation and the auto-fix check below can run for
+                // minutes; an Esc there must find the last call's real
+                // result, not "Not completed".
+                publish_history(&history, &messages, &results);
 
                 if let Some((name, streak)) = loop_hit {
                     // A routed turn gets one more try a tier up, with the
@@ -2105,6 +2109,7 @@ mod loop_guard_tests {
             ..Default::default()
         };
         let pid_file = dir.path().join("check.pid");
+        let history = t.history.clone();
         let handle = tokio::spawn(run_api_task(t));
         let pid = loop {
             if let Ok(p) = std::fs::read_to_string(&pid_file)
@@ -2128,6 +2133,15 @@ mod loop_guard_tests {
             unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
         assert!(!still_running, "the check outlived the cancelled turn");
+        // The Write finished before the check started: the adopted history
+        // must say so, or the model redoes it next turn.
+        let (adopted, _) = recover_turn_history(&history, &[], 0).unwrap();
+        let results = &adopted.last().unwrap().content;
+        assert!(
+            matches!(results.as_slice(), [ContentBlock::ToolResult { tool_use_id, content, is_error: None }]
+                if tool_use_id == "w1" && content == &vec![ToolResultContent::text("written")]),
+            "{results:?}"
+        );
         while let Ok(ev) = rx.try_recv() {
             assert!(
                 !matches!(ev, AppEvent::Done { .. }),
