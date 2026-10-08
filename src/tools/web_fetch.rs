@@ -85,16 +85,22 @@ impl Tool for WebFetchTool {
         if !status.is_success() {
             return Ok(ToolOutput::error(format!("HTTP {status}: {}", input.url)));
         }
-        let content_type = fetched.content_type;
+        // Media types are case-insensitive (`Text/HTML` is HTML).
+        let content_type = fetched.content_type.to_ascii_lowercase();
+        let mime = content_type.split(';').next().unwrap_or("").trim();
         let bytes = fetched.body;
         // Report where the content actually came from (after redirects).
         let final_url = fetched.final_url;
 
-        // Convert to readable text
-        let text = if content_type.contains("text/html") || content_type.is_empty() {
+        // Convert to readable text. XML (feeds, sitemaps) is text as it is.
+        let text = if mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml" {
             let html = crate::net_policy::decode_body(&content_type, &bytes);
             convert_html(html, CONVERT_DEADLINE, html_to_text).await
-        } else if content_type.contains("text/") || content_type.contains("json") {
+        } else if mime.starts_with("text/")
+            || mime.contains("json")
+            || mime == "application/xml"
+            || mime.ends_with("+xml")
+        {
             crate::net_policy::decode_body(&content_type, &bytes)
         } else {
             return Ok(ToolOutput::error(format!(
@@ -916,6 +922,39 @@ mod tests {
         assert!(text(&out).contains("Call WebFetch again"), "{}", text(&out));
         assert!(!text(&out).contains("denied"));
         assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Media types were matched case-sensitively and XHTML, RSS, Atom and
+    /// plain XML were refused as unsupported.
+    #[tokio::test]
+    async fn xhtml_xml_feeds_and_mixed_case_types_are_read() {
+        let (base, _) = scripted_server(vec![
+            ok_with("Text/HTML; Charset=UTF-8", "<p>Hello <b>html</b></p>"),
+            ok_with("application/xhtml+xml", "<p>Hello <b>xhtml</b></p>"),
+            ok_with("application/rss+xml", "<rss><title>feed</title></rss>"),
+            ok_with("application/atom+xml", "<feed><title>atom</title></feed>"),
+            ok_with("Application/XML", "<urlset>sitemap</urlset>"),
+            ok_with("application/octet-stream", "bin"),
+        ])
+        .await;
+        for want in [
+            "Hello html",
+            "Hello xhtml",
+            "<title>feed</title>",
+            "<title>atom</title>",
+            "<urlset>sitemap</urlset>",
+        ] {
+            let out = run(NetPolicy::LOCAL_OK, &base).await;
+            assert!(!out.is_error, "{want}: {}", text(&out));
+            assert!(text(&out).contains(want), "{want}: {}", text(&out));
+        }
+        let out = run(NetPolicy::LOCAL_OK, &base).await;
+        assert!(out.is_error);
+        assert!(
+            text(&out).contains("Unsupported content type"),
+            "{}",
+            text(&out)
+        );
     }
 
     #[tokio::test]
