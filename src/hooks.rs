@@ -499,6 +499,12 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     cmd.env("CLAUDE_HOOK_EVENT", env.event);
     cmd.env("CLAUDE_SESSION_ID", env.session_id);
     cmd.env("CLAUDE_CWD", env.cwd.to_string_lossy().as_ref());
+    // Claude Code hooks commonly run `"$CLAUDE_PROJECT_DIR"/.claude/hooks/x.sh`.
+    // Unset, that path is `/.claude/...`, the shell exits 127 and an imported
+    // guard allows every call. Project settings load from `<cwd>/.claude`, so
+    // cwd is the project root here.
+    cmd.env("CLAUDE_PROJECT_DIR", env.cwd);
+    cmd.env("OXIDECLAW_PROJECT_DIR", env.cwd);
 
     if let Some(name) = env.tool_name {
         cmd.env("TOOL_NAME", name);
@@ -1171,6 +1177,26 @@ mod tests {
         let r = run(r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#).await;
         assert!(r.should_continue);
         assert_eq!(r.decision, None, "allow grants nothing");
+    }
+
+    /// Claude Code hooks locate their script through `$CLAUDE_PROJECT_DIR`.
+    /// Unset, the shell exited 127 (non-blocking) and the guard allowed the call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_project_dir_finds_the_guard_script() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_dir = dir.path().join(".claude/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let guard = hooks_dir.join("guard.sh");
+        std::fs::write(&guard, "#!/bin/sh\necho 'guarded' >&2\nexit 2\n").unwrap();
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for var in ["CLAUDE_PROJECT_DIR", "OXIDECLAW_PROJECT_DIR"] {
+            let cmd = format!("\"${var}\"/.claude/hooks/guard.sh");
+            let r = run_pre_tool_hooks(&cfg_pre(&cmd), "Bash", "{}", "sess", dir.path()).await;
+            assert!(!r.should_continue, "{var}: guard did not run");
+            assert_eq!(r.stop_reason.as_deref(), Some("guarded"));
+        }
     }
 
     #[tokio::test]

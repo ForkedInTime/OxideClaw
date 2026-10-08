@@ -493,6 +493,23 @@ pub fn import_claude(
                 regex.join(", ")
             ));
         }
+        // A guard that rewrites the call (say, adding `--dry-run`) instead of
+        // denying it would run the original call here.
+        let rewriting: Vec<&str> = hooks
+            .entries
+            .get("preToolUse")
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["command"].as_str())
+            .filter(|c| c.contains("updatedInput"))
+            .collect();
+        if !rewriting.is_empty() {
+            lines.push(format!(
+                "  check these preToolUse hooks: OxideClaw does not apply `updatedInput`, \
+                 so the call runs unchanged: {}",
+                rewriting.join(", ")
+            ));
+        }
     }
     if opts.permissions {
         let target = root
@@ -1171,6 +1188,32 @@ mod tests {
         // The result parses as OxideClaw settings with the hook in force.
         let parsed = crate::settings::Settings::load_file(&config.join("settings.json"));
         assert_eq!(parsed.hooks.unwrap().pre_tool_use[0].command, "audit");
+    }
+
+    /// A guard that rewrites the call through `updatedInput` would run the
+    /// original call here; the import names it.
+    #[test]
+    fn import_claude_flags_hooks_that_rewrite_tool_input() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join("claude");
+        write(
+            &claude.join("settings.json"),
+            r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "jq '{hookSpecificOutput: {updatedInput: .tool_input}}'"},
+                {"type": "command", "command": "audit"}
+            ]}]}}"#,
+        );
+        let config = td.path().join("config");
+        let opts = ImportOptions {
+            hooks: true,
+            ..Default::default()
+        };
+        let lines = import_claude(&claude, &config, opts).unwrap();
+        let note = lines
+            .iter()
+            .find(|l| l.contains("updatedInput"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(note.contains("jq '") && !note.contains("audit"), "{note}");
     }
 
     #[test]
