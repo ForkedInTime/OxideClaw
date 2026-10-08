@@ -1063,15 +1063,20 @@ impl SseTransport {
             }
             let mut stream = Box::pin(resp.bytes_stream());
             let mut buf: Vec<u8> = Vec::new();
+            // As in `sse_response`: a large event arriving in small chunks
+            // is not rescanned from its start on every chunk.
+            let mut scanned = 0usize;
             loop {
-                while let Some((end, sep)) = sse_event_end(&buf, 0) {
+                while let Some((end, sep)) = sse_event_end(&buf, scanned) {
                     let event: Vec<u8> = buf.drain(..end + sep).collect();
+                    scanned = 0;
                     if let Some((kind, data)) = sse_event_fields(&event[..end])
                         && kind == "endpoint"
                     {
                         return Ok((data, stream, buf));
                     }
                 }
+                scanned = buf.len().saturating_sub(3);
                 match stream.next().await {
                     Some(chunk) => {
                         buf.extend_from_slice(&chunk?);
@@ -1104,9 +1109,11 @@ impl SseTransport {
             let (pending, closed) = (pending.clone(), closed.clone());
             let (client, endpoint) = (client.clone(), endpoint.clone());
             tokio::spawn(async move {
+                let mut scanned = 0usize;
                 loop {
-                    while let Some((end, sep)) = sse_event_end(&buf, 0) {
+                    while let Some((end, sep)) = sse_event_end(&buf, scanned) {
                         let event: Vec<u8> = buf.drain(..end + sep).collect();
+                        scanned = 0;
                         let Some((kind, data)) = sse_event_fields(&event[..end]) else {
                             continue;
                         };
@@ -1118,6 +1125,8 @@ impl SseTransport {
                         };
                         Self::dispatch(msg, &pending, &client, &endpoint).await;
                     }
+                    // A terminator may straddle the next chunk boundary.
+                    scanned = buf.len().saturating_sub(3);
                     match stream.next().await {
                         Some(Ok(chunk)) if buf.len() + chunk.len() <= MAX_HTTP_BODY_BYTES => {
                             buf.extend_from_slice(&chunk);
@@ -2645,6 +2654,99 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'"#,
             }
         });
         (format!("http://{addr}/sse"), seen)
+    }
+
+    /// The SSE reader resumes its search for an event's end where the last
+    /// chunk left off; events, and their `\r\n\r\n` terminators, split
+    /// across chunks must still be found.
+    #[tokio::test]
+    async fn sse_transport_reads_events_split_across_chunks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if req.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&req).into_owned()
+        }
+        async fn trickle(sock: &mut tokio::net::TcpStream, parts: &[&str]) {
+            for part in parts {
+                sock.write_all(part.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sse", listener.local_addr().unwrap());
+        let (id_tx, id_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let id_rx = Arc::new(Mutex::new(Some(id_rx)));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (id_tx, id_rx) = (id_tx.clone(), id_rx.clone());
+                tokio::spawn(async move {
+                    let raw = read_request(&mut sock).await;
+                    if raw.starts_with("GET ") {
+                        let mut rx = id_rx.lock().await.take().unwrap();
+                        trickle(
+                            &mut sock,
+                            &[
+                                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+                                "event: endpoint\r\ndata: /m\r\n\r",
+                                "\n",
+                            ],
+                        )
+                        .await;
+                        while let Some(id) = rx.recv().await {
+                            let reply = json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}})
+                                .to_string();
+                            let (a, b) = reply.split_at(reply.len() / 2);
+                            let parts = ["event: message\r\nda", "ta: ", a, b, "\r\n", "\r\n"];
+                            trickle(&mut sock, &parts).await;
+                        }
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await;
+                    let body = raw.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                    if let Ok(msg) = serde_json::from_str::<Value>(body) {
+                        let _ = id_tx.send(msg["id"].clone());
+                    }
+                });
+            }
+        });
+        let t = tokio::time::timeout(
+            Duration::from_secs(10),
+            SseTransport::connect(&url, &HashMap::new()),
+        )
+        .await
+        .expect("endpoint event never found")
+        .unwrap();
+        assert_eq!(t.endpoint.path(), "/m");
+        for id in 1..=2 {
+            let out =
+                tokio::time::timeout(Duration::from_secs(10), t.call(id, "tools/list", json!({})))
+                    .await
+                    .expect("response event never found")
+                    .unwrap();
+            assert_eq!(out, json!({"ok": true}));
+        }
     }
 
     /// ACP hosts may pass `type: "sse"` servers: the client opens the
