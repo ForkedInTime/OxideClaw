@@ -548,6 +548,18 @@ impl SdkSession {
                 final_text = turn_text;
             }
 
+            // The TUI says the same once. Here it goes where the thoughts
+            // would have, or an ACP editor's thoughts just stop arriving.
+            if self.client.take_summary_notice() {
+                self.send_notif(SdkNotification::ThinkingDelta {
+                    session_id: self.session_id.clone(),
+                    content: "Note: OpenAI refused reasoning summaries (they need a verified \
+                              organization), so showThinkingSummaries is ignored for this \
+                              session."
+                        .into(),
+                });
+            }
+
             // Same switch as the TUI's thinking display; ACP maps these to
             // agent_thought_chunk.
             if self.config.show_thinking_summaries {
@@ -2176,6 +2188,77 @@ mod guard_tests {
         let last = bodies[4]["messages"].as_array().unwrap();
         assert_eq!(last.len(), 2, "{last:?}");
         assert_eq!(last[1]["content"][0]["text"], "second");
+    }
+
+    /// OpenAI refusing reasoning summaries was announced only in the TUI;
+    /// SDK and ACP hosts just stopped getting thoughts.
+    #[tokio::test]
+    async fn refused_reasoning_summaries_are_announced_once() {
+        use crate::query_engine::scripted_api_tests::serve;
+        let refusal = serde_json::json!({"error": {
+            "message": "Your organization must be verified to generate reasoning summaries.",
+            "type": "invalid_request_error", "param": "reasoning.summary", "code": "unsupported_value"}})
+        .to_string();
+        let http = |status: &str, ctype: &str, body: String| {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let turn = || {
+            let events = [
+                serde_json::json!({"type": "response.output_item.added", "output_index": 0,
+                    "item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}}),
+                serde_json::json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
+                    "content_index": 0, "delta": "ok"}),
+                serde_json::json!({"type": "response.output_item.done", "output_index": 0,
+                    "item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
+                             "content": [{"type": "output_text", "text": "ok", "annotations": []}]}}),
+                serde_json::json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                .collect();
+            http("200 OK", "text/event-stream", body)
+        };
+        let (url, seen) = serve(vec![
+            http("400 Bad Request", "application/json", refusal),
+            turn(),
+            turn(),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, mut nrx) = session_with_notifs(cfg(dir.path()));
+        s.config.model = "openai-compat:gpt-5".into();
+        s.config.openai_api = crate::api::OpenAiApi::Responses;
+        s.config.show_thinking_summaries = true;
+        s.client = ApiBackend::OpenAiCompat(
+            crate::api::openai_compat::OpenAiCompatClient::from_model_env(
+                "openai-compat:gpt-5",
+                crate::api::OpenAiApi::Responses,
+                |k| (k == "OPENAI_BASE_URL").then(|| url.clone()),
+            )
+            .unwrap(),
+        );
+
+        let notices = |nrx: &mut mpsc::UnboundedReceiver<SdkNotification>| {
+            let mut n = 0;
+            while let Ok(e) = nrx.try_recv() {
+                if let SdkNotification::ThinkingDelta { content, .. } = e
+                    && content.contains("refused reasoning summaries")
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
+        s.execute_turn("hi".into()).await.unwrap();
+        assert_eq!(notices(&mut nrx), 1);
+        s.execute_turn("again".into()).await.unwrap();
+        assert_eq!(notices(&mut nrx), 0, "told once");
+        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     fn session_with_notifs(cfg: Config) -> (SdkSession, mpsc::UnboundedReceiver<SdkNotification>) {

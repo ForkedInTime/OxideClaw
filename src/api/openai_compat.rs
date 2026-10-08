@@ -1021,7 +1021,7 @@ impl OpenAiCompatClient {
         Self::from_model_env(model, api, |k| std::env::var(k).ok())
     }
 
-    fn from_model_env(
+    pub(crate) fn from_model_env(
         model: &str,
         api: OpenAiApi,
         env: impl Fn(&str) -> Option<String>,
