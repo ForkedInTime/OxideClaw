@@ -447,6 +447,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
     let mut loop_guard = LoopGuard::default();
 
     let mut iterations: u32 = 0;
+    // The last request overflowed and was answered by compacting. A second
+    // overflow straight after means the fixed part of the request (system
+    // prompt, tool definitions, maxTokens) leaves no room: compacting again
+    // only summarises the summary, billing a call each time.
+    let mut overflow_compacted = false;
     // Retries consumed by the auto-fix loop within the current user turn.
     // Reset to 0 on every user prompt; the retry helper enforces the cap.
     let mut auto_fix_retries: u32 = 0;
@@ -646,6 +651,15 @@ pub(super) async fn run_api_task(task: ApiTask) {
         {
             continue;
         }
+        if should_compact_retry && overflow_compacted {
+            let _ = tx.send(AppEvent::TurnFailed(
+                "Prompt still exceeds the model's context window after compacting: the system \
+                 prompt, tool definitions or maxTokens leave no room. Use a larger-window model, \
+                 lower maxTokens or disable MCP servers or tools."
+                    .into(),
+            ));
+            return;
+        }
         if should_compact_retry {
             let _ = tx.send(AppEvent::SystemMessage(
                 "Prompt too long — auto-compacting context…".into(),
@@ -707,6 +721,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     // The summary dropped the bodies of this turn's reads;
                     // a re-read must return the file, not "unchanged".
                     read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    overflow_compacted = true;
                     continue; // retry outer loop with compacted history
                 }
                 Err(compact_err) => {
@@ -718,6 +733,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
             }
         }
 
+        // The compacted request fit; a later overflow in a long turn may
+        // compact again.
+        overflow_compacted = false;
         task_cost.record_with_cache(
             &config.model,
             response.usage.input_tokens,
@@ -1789,6 +1807,50 @@ mod loop_guard_tests {
         }
         assert_eq!(failed, None);
         assert!(compacted && done);
+    }
+
+    /// When the system prompt and tools alone exceed the window, every
+    /// compacted retry overflowed again while the small summary request
+    /// kept succeeding, so the turn summarised its own summary up to 50
+    /// times. A second overflow straight after compacting ends the turn.
+    #[tokio::test]
+    async fn an_overflow_that_compacting_cannot_fix_fails_the_turn() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let body = r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 9000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let overflow = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
+        let (url, seen) = serve(vec![
+            overflow.clone(),
+            text("summary"),
+            overflow.clone(),
+            text("summary of the summary"),
+            overflow,
+            text("answer"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (t, mut rx) = task(url, dir.path(), None);
+        run_api_task(t).await;
+
+        assert_eq!(seen.lock().unwrap().len(), 3, "compacted more than once");
+        let (mut compactions, mut failed) = (0, None);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Compacted { .. } => compactions += 1,
+                AppEvent::TurnFailed(e) => failed = Some(e),
+                _ => {}
+            }
+        }
+        assert_eq!(compactions, 1);
+        assert!(
+            failed
+                .as_deref()
+                .is_some_and(|e| e.contains("after compacting")),
+            "{failed:?}"
+        );
     }
 
     /// The mid-turn compact never ran the documented preCompact /
