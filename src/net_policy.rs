@@ -285,10 +285,16 @@ struct GrantState {
     /// Loopback `host:port` the proxy refused for want of a grant, not yet
     /// reported to the model.
     blocked: std::collections::BTreeSet<String>,
+    /// Whether each domain name the proxy routed first resolved to public
+    /// addresses, keyed by [`host_key`]. See [`LoopbackGrants::check_rebind`].
+    name_public: std::collections::HashMap<String, bool>,
 }
 
 /// Most refused loopback services held for one report.
 const MAX_BLOCKED: usize = 16;
+
+/// Most domain names whose address class the browser proxy remembers.
+const MAX_NAME_CLASSES: usize = 4096;
 
 impl LoopbackGrants {
     fn state(&self) -> std::sync::MutexGuard<'_, GrantState> {
@@ -336,6 +342,63 @@ impl LoopbackGrants {
         let mut s = self.state();
         if s.blocked.len() < MAX_BLOCKED {
             s.blocked.insert(format!("{host}:{port}"));
+        }
+    }
+
+    /// Refuse a DNS answer for `url`'s name whose class (public, or
+    /// private/loopback) differs from the first answer the proxy saw for it,
+    /// or that mixes both. Grants for loopback names only work under the
+    /// strict policy; with `allowPrivateNetworkFetch` on, a page served from
+    /// a public name could otherwise rebind that name onto loopback or the
+    /// LAN and read those services same-origin. Addresses the user granted
+    /// for this very name are left out of the comparison.
+    fn check_rebind(&self, url: &Url, addrs: &[SocketAddr]) -> Result<()> {
+        let Some(Host::Domain(name)) = url.host() else {
+            return Ok(());
+        };
+        let key = host_key(name);
+        if key == "localhost" || key.ends_with(".localhost") {
+            return Ok(());
+        }
+        let (mut public, mut private) = (false, false);
+        for a in addrs {
+            if self.covers(name, *a) {
+                continue;
+            }
+            if NetPolicy::STRICT.check_ip(a.ip()).is_ok() {
+                public = true;
+            } else {
+                private = true;
+            }
+        }
+        if public && private {
+            bail!("{name} resolved to both public and private addresses (DNS rebinding)");
+        }
+        if !public && !private {
+            return Ok(());
+        }
+        let mut s = self.state();
+        match s.name_public.get(&key) {
+            Some(&was) if was != public => bail!(
+                "{name} now resolves to {} addresses but first resolved to {} ones (DNS rebinding)",
+                if public { "public" } else { "private" },
+                if was { "public" } else { "private" },
+            ),
+            Some(_) => Ok(()),
+            // No eviction: a page could flush its own name out by looking
+            // up many others. Once full, unknown names stay public-only.
+            None if s.name_public.len() >= MAX_NAME_CLASSES => {
+                if private {
+                    bail!(
+                        "{name} resolves to a private address and was not seen before (DNS rebinding guard is full)"
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                s.name_public.insert(key, public);
+                Ok(())
+            }
         }
     }
 
@@ -880,6 +943,9 @@ where
 {
     match addresses(url, lookup).await? {
         Ok(addrs) => {
+            if let Some(g) = grants {
+                g.check_rebind(url, &addrs)?;
+            }
             if let Err(e) = policy.check_addrs(url, &addrs, grants) {
                 // Refused only for want of a grant: a page's request to a
                 // local service nobody approved. Recorded so the model can
@@ -2410,6 +2476,92 @@ mod tests {
         .await;
         assert!(got.starts_with("HTTP/1.1 403"), "{got}");
         assert!(grants.take_blocked().is_empty());
+    }
+
+    /// With `allowPrivateNetworkFetch` on, the browser proxy let a public
+    /// name that later resolved to loopback or the LAN straight through, so
+    /// a page could rebind its own name onto a local service and read it
+    /// same-origin. A name's first address class now sticks.
+    #[tokio::test]
+    async fn a_name_that_switches_address_class_is_refused_under_local_ok() {
+        let answers: std::sync::Mutex<std::collections::HashMap<String, Vec<&str>>> =
+            Default::default();
+        let set = |host: &str, ips: &[&'static str]| {
+            answers.lock().unwrap().insert(host.into(), ips.to_vec());
+        };
+        let lookup = |host: String, port: u16| {
+            let ips = answers
+                .lock()
+                .unwrap()
+                .get(host.trim_end_matches('.'))
+                .cloned()
+                .unwrap_or_default();
+            async move {
+                Ok(ips
+                    .iter()
+                    .map(|ip| SocketAddr::new(ip.parse().unwrap(), port))
+                    .collect::<Vec<_>>())
+            }
+        };
+        let grants = LoopbackGrants::default();
+        let go = |url: &str| {
+            let url = Url::parse(url).unwrap();
+            let (grants, lookup) = (&grants, &lookup);
+            async move {
+                route::<(), _, _>(&NetPolicy::LOCAL_OK, Some(grants), &url, None, lookup)
+                    .await
+                    .map(|_| ())
+            }
+        };
+
+        set("evil.example", &["93.184.215.14"]);
+        go("http://evil.example:8080/").await.unwrap();
+        set("evil.example", &["127.0.0.1"]);
+        let e = go("http://evil.example:8080/").await.unwrap_err();
+        assert!(e.to_string().contains("DNS rebinding"), "{e}");
+        set("evil.example", &["192.168.1.1"]);
+        let e = go("http://EVIL.example./").await.unwrap_err();
+        assert!(e.to_string().contains("DNS rebinding"), "{e}");
+        set("evil.example", &["93.184.215.15"]);
+        go("http://evil.example/").await.unwrap();
+
+        // A LAN name stays private, and a mixed answer is refused outright.
+        set("nas.example", &["192.168.1.10"]);
+        go("http://nas.example/").await.unwrap();
+        set("nas.example", &["93.184.215.14"]);
+        assert!(go("http://nas.example/").await.is_err());
+        set("mixed.example", &["93.184.215.14", "127.0.0.1"]);
+        assert!(go("http://mixed.example/").await.is_err());
+
+        // IP literals and localhost involve no rebindable answer.
+        go("http://127.0.0.1:3000/").await.unwrap();
+        set("localhost", &["127.0.0.1"]);
+        go("http://localhost:3000/").await.unwrap();
+
+        // A grant for the exact name the user approved still wins.
+        set("dev.example", &["93.184.215.14"]);
+        go("http://dev.example:5173/").await.unwrap();
+        set("dev.example", &["127.0.0.1"]);
+        assert!(go("http://dev.example:5173/").await.is_err());
+        grants.grant(
+            &Url::parse("http://dev.example:5173/").unwrap(),
+            &["127.0.0.1:5173".parse().unwrap()],
+        );
+        go("http://dev.example:5173/").await.unwrap();
+
+        // WebFetch (no grants, no page JS) is unchanged.
+        set("evil.example", &["127.0.0.1"]);
+        assert!(
+            route::<(), _, _>(
+                &NetPolicy::LOCAL_OK,
+                None,
+                &Url::parse("http://evil.example/").unwrap(),
+                None,
+                &lookup,
+            )
+            .await
+            .is_ok()
+        );
     }
 
     /// The preflight refused every name it could not resolve, though the
