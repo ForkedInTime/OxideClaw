@@ -147,6 +147,7 @@ fn lint_checks(cwd: &std::path::Path) -> Vec<&'static str> {
 pub(super) fn cmd_branch(ctx: &CommandContext) -> CommandAction {
     let run = |args: &[&str]| -> Option<String> {
         std::process::Command::new("git")
+            .args(crate::sandbox::GIT_NO_REPO_CODE)
             .args(args)
             .current_dir(&ctx.config.cwd)
             .output()
@@ -176,6 +177,7 @@ pub(super) fn cmd_branch(ctx: &CommandContext) -> CommandAction {
     // XY code (" M" read as staged "M"), and its empty filter hid the
     // clean-tree line.
     let status = std::process::Command::new("git")
+        .args(crate::sandbox::GIT_NO_REPO_CODE)
         .args(["status", "--short"])
         .current_dir(&ctx.config.cwd)
         .output()

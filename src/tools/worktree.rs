@@ -90,6 +90,7 @@ impl Tool for EnterWorktreeTool {
 
         // Validate we're in a git repo
         let git_check = Command::new("git")
+            .args(crate::sandbox::GIT_NO_REPO_CODE)
             .args(["rev-parse", "--git-dir"])
             .current_dir(&ctx.cwd)
             .output()
@@ -119,6 +120,7 @@ impl Tool for EnterWorktreeTool {
         // Find git root
         let git_root = String::from_utf8_lossy(
             &Command::new("git")
+                .args(crate::sandbox::GIT_NO_REPO_CODE)
                 .args(["rev-parse", "--show-toplevel"])
                 .current_dir(&ctx.cwd)
                 .output()
@@ -140,6 +142,7 @@ impl Tool for EnterWorktreeTool {
 
         // Create worktree + branch
         let output = Command::new("git")
+            .args(crate::sandbox::GIT_NO_REPO_CODE)
             .args([
                 "worktree",
                 "add",
@@ -237,6 +240,7 @@ impl Tool for ExitWorktreeTool {
         }
         args.push(s.path.to_str().unwrap_or(""));
         let output = Command::new("git")
+            .args(crate::sandbox::GIT_NO_REPO_CODE)
             .args(&args)
             .current_dir(&s.original_cwd)
             .output()

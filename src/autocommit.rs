@@ -120,16 +120,8 @@ pub(crate) fn git_cmd(cwd: &Path) -> std::process::Command {
     cmd.env("LC_ALL", "C");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
-    // A sandboxed Bash call can write `.git/` when cwd is the repo root, and
-    // these commands run on the host: a planted fsmonitor or hook (e.g.
-    // `reference-transaction` on our update-ref) would run outside the
-    // sandbox. Plumbing needs neither, so neither is ever honoured.
-    cmd.args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-    ]);
+    // A command run outside bwrap can write `.git/`: see GIT_NO_REPO_CODE.
+    cmd.args(crate::sandbox::GIT_NO_REPO_CODE);
     cmd
 }
 

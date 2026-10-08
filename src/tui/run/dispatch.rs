@@ -2641,7 +2641,10 @@ async fn uncommitted_diff(
     // Separate args, never `sh -c` with a formatted path (shell injection).
     let git = |args: &[&str]| {
         let mut cmd = tokio::process::Command::new("git");
-        cmd.args(args).current_dir(cwd);
+        // A planted fsmonitor would run on the host for /diff.
+        cmd.args(crate::sandbox::GIT_NO_REPO_CODE)
+            .args(args)
+            .current_dir(cwd);
         if let Some(p) = path {
             cmd.arg("--").arg(p);
         }

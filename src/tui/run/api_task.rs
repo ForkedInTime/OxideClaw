@@ -1381,6 +1381,7 @@ pub(super) fn git_checkpoint(
 
     // Check if we're in a git repo
     let in_repo = Command::new("git")
+        .args(crate::sandbox::GIT_NO_REPO_CODE)
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
@@ -1392,6 +1393,7 @@ pub(super) fn git_checkpoint(
 
     // Check for changes
     let status = Command::new("git")
+        .args(crate::sandbox::GIT_NO_REPO_CODE)
         .args(["status", "--porcelain"])
         .current_dir(cwd)
         .output()?;
@@ -1402,6 +1404,7 @@ pub(super) fn git_checkpoint(
 
     // Stage all changes
     Command::new("git")
+        .args(crate::sandbox::GIT_NO_REPO_CODE)
         .args(["add", "-A"])
         .current_dir(cwd)
         .output()?;
@@ -1412,6 +1415,7 @@ pub(super) fn git_checkpoint(
     let full_msg = format!("[checkpoint] {msg} ({ts})");
 
     let commit = Command::new("git")
+        .args(crate::sandbox::GIT_NO_REPO_CODE)
         .args(["commit", "-m", &full_msg, "--no-verify"])
         .current_dir(cwd)
         .output()?;
@@ -1423,6 +1427,7 @@ pub(super) fn git_checkpoint(
 
     // Get the short hash
     let hash = Command::new("git")
+        .args(crate::sandbox::GIT_NO_REPO_CODE)
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(cwd)
         .output()?;

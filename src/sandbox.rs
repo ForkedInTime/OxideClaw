@@ -162,6 +162,19 @@ pub fn strict_check(cmd: &str) -> Option<String> {
     None
 }
 
+/// Global options for a git command OxideClaw runs on the host on its own:
+/// no fsmonitor, no hooks. A command run without the bwrap sandbox can write
+/// `.git/`, and a planted fsmonitor or hook (e.g. `reference-transaction`
+/// on our update-ref, `post-checkout` on `worktree add`) would run outside
+/// any sandbox. They do not stop `filter.*` drivers; see
+/// `autocommit::check_filters_unchanged`.
+pub(crate) const GIT_NO_REPO_CODE: [&str; 4] = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+];
+
 // ── bwrap (bubblewrap) wrapper ────────────────────────────────────────────────
 
 /// Wrap a shell command string in a bubblewrap sandbox.
@@ -282,6 +295,7 @@ fn bwrap_wrap_with_home(
          --tmpfs /tmp \
          {home_binds}\
          --bind {cwd} {cwd} \
+         {host_run_binds}\
          --proc /proc \
          --dev /dev \
          --chdir {cwd} \
@@ -293,9 +307,37 @@ fn bwrap_wrap_with_home(
         shell = sandbox_shell(),
         cwd = cwd_quoted,
         home_binds = home_binds,
+        host_run_binds = host_run_binds(cwd),
         net_flag = net_flag,
         shell_quoted = shell_quote(command),
     )
+}
+
+/// Read-only binds, after the project's read-write one, over the files in
+/// it that code outside the sandbox runs (`HOST_RUN_PATHS`: git hooks and
+/// config, the agent's project config, hook-manager config), so a command
+/// cannot plant a hook or fsmonitor that the user's next `git commit` runs
+/// unsandboxed. `.git` itself is bound first: a mount point cannot be
+/// renamed or replaced, so the protected files cannot be swapped out from
+/// above. A symlink is skipped: bwrap would mount over its target.
+fn host_run_binds(cwd: &std::path::Path) -> String {
+    let real = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_symlink());
+    let mut out = String::new();
+    let git = cwd.join(".git");
+    if real(&git) && git.is_dir() {
+        let q = shell_quote(&git.display().to_string());
+        out.push_str(&format!("--bind {q} {q} "));
+    }
+    for rel in crate::permissions::autonomy::HOST_RUN_PATHS {
+        let p = cwd.join(rel);
+        // A parent symlink (`.git/hooks` under a linked `.git`) as well.
+        let parent_real = p.parent().is_none_or(|d| d == cwd || real(d));
+        if real(&p) && parent_real {
+            let q = shell_quote(&p.display().to_string());
+            out.push_str(&format!("--ro-bind-try {q} {q} "));
+        }
+    }
+    out
 }
 
 /// The shell inside the namespace sandboxes: bash, the Bash tool's
@@ -359,6 +401,12 @@ pub fn apply_sandbox(
                      or switch mode: /sandbox enable strict"
                         .into(),
                 );
+            }
+            // A repo without `.git/hooks` would let a command create it
+            // with a hook in it; git makes it on `init` anyway.
+            let git = cwd.join(".git");
+            if git.is_dir() && !git.is_symlink() {
+                let _ = std::fs::create_dir(git.join("hooks"));
             }
             Ok(bwrap_wrap(command, cwd, allow_network))
         }
@@ -642,6 +690,85 @@ mod tests {
         assert!(
             tmpfs < home && home < bind,
             "a $HOME under /tmp must not be hidden, and cwd must win: {cmd}"
+        );
+    }
+
+    /// The project bind left `.git/hooks` and `.git/config` writable, so a
+    /// command full-auto pre-approved could plant a hook or fsmonitor that
+    /// the user's next `git commit` ran outside the sandbox.
+    #[test]
+    fn bwrap_rebinds_host_run_files_read_only_after_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "").unwrap();
+        std::fs::write(root.join(".mcp.json"), "{}").unwrap();
+        std::fs::create_dir(root.join(".claude")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path(), root.join(".husky")).unwrap();
+        let cmd = bwrap_wrap_with_home("ls", root, false, None, &no_env);
+        let at = |what: &str| {
+            cmd.find(what)
+                .unwrap_or_else(|| panic!("{what} missing: {cmd}"))
+        };
+        let q = |rel: &str| shell_quote(&root.join(rel).display().to_string());
+        let project = at(&format!(
+            "--bind {r} {r} ",
+            r = shell_quote(&root.display().to_string())
+        ));
+        let git = at(&format!("--bind {g} {g} ", g = q(".git")));
+        assert!(project < git, "{cmd}");
+        for rel in [".git/hooks", ".git/config", ".mcp.json", ".claude"] {
+            assert!(
+                git < at(&format!("--ro-bind-try {p} {p} ", p = q(rel))),
+                "{rel}: {cmd}"
+            );
+        }
+        // Missing paths and symlinks get no bind.
+        assert!(!cmd.contains(".githooks"), "{cmd}");
+        assert!(!cmd.contains(".husky"), "{cmd}");
+    }
+
+    /// Run in a real bwrap where one works: the planted hook, the rewritten
+    /// config and a `.git` swapped for one of the command's own all fail.
+    #[test]
+    fn a_bwrap_command_cannot_plant_git_hooks_or_config() {
+        let usable = bwrap_available()
+            && std::process::Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "true"])
+                .status()
+                .is_ok_and(|s| s.success());
+        if !usable {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        let script = "printf x > .git/hooks/post-checkout; \
+                      printf '[core]\\nfsmonitor=evil\\n' > .git/config; \
+                      mv .git .git.old; \
+                      printf ok > notes.txt";
+        let wrapped = apply_sandbox(script, "bwrap", root, false).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "ok",
+            "{log}"
+        );
+        assert!(!root.join(".git/hooks/post-checkout").exists(), "{log}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/config")).unwrap(),
+            "[core]\n"
+        );
+        assert!(
+            root.join(".git").is_dir() && !root.join(".git.old").exists(),
+            "{log}"
         );
     }
 

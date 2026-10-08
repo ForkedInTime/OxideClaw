@@ -35,6 +35,33 @@ pub enum Verdict {
     Rules,
 }
 
+/// Protected paths, relative to the project root, whose contents code
+/// outside any sandbox runs later: git's hooks and config (fsmonitor,
+/// `core.hooksPath`, filter drivers, submodules'), Mercurial and Sapling
+/// config hooks, OxideClaw's and Claude Code's project config (hooks, MCP
+/// servers) and the hook managers' config. bwrap binds the ones that exist
+/// read-only, so a command `full-auto` pre-approved cannot plant code that
+/// runs unsandboxed on the user's next `git commit` or session.
+pub(crate) const HOST_RUN_PATHS: &[&str] = &[
+    ".git/hooks",
+    ".git/config",
+    ".git/config.worktree",
+    ".git/modules",
+    ".hg/hgrc",
+    ".sl/config",
+    ".claude",
+    ".oxideclaw",
+    ".agents",
+    ".husky",
+    ".githooks",
+    ".mcp.json",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yml",
+    ".lefthook.yaml",
+];
+
 /// The tools that write files.
 pub const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
@@ -414,6 +441,10 @@ mod tests {
 
     #[test]
     fn protected_paths_are_recognised_anywhere_in_the_project() {
+        // What bwrap keeps read-only is what auto-edit protects.
+        for p in HOST_RUN_PATHS {
+            assert!(is_protected(Path::new(p)), "{p}");
+        }
         for p in [
             ".git/hooks/pre-commit",
             "sub/.git/config",
