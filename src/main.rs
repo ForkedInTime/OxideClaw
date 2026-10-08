@@ -718,7 +718,9 @@ fn prepare_config_dirs() {
     }
 }
 
-/// Exit status owed to a SIGINT/SIGTERM that ended -p, --headless or acp.
+/// Exit status owed to a SIGINT/SIGTERM that ended -p, --headless or acp,
+/// or to a `browse` run that missed its goal; `main` exits with it after
+/// the runtime (and every guard on a child process) is dropped.
 static SIGNAL_EXIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
 /// Runs `fut` to completion, or returns None once SIGINT/SIGTERM arrives.
@@ -1354,8 +1356,14 @@ async fn run() -> Result<()> {
         // failure such as a missing key included) is a non-zero
         // exit for scripts and CI.
         println!("{}", serde_json::to_string_pretty(&result)?);
+        // process::exit runs no destructors, and Chrome (kill_on_drop, temp
+        // profile) outlived every unsuccessful run. Close it here and let
+        // main exit with the code once the runtime is down.
+        if let Some(s) = &shared_state.browser_session {
+            s.lock().await.close().await;
+        }
         if !result.achieved {
-            std::process::exit(1);
+            let _ = SIGNAL_EXIT.set(1);
         }
         return Ok(());
     }
