@@ -22,6 +22,7 @@ pub(super) struct KeyCtx<'a> {
     pub(super) session: &'a mut Session,
     pub(super) saved_count: &'a mut usize,
     pub(super) mcp_statuses: &'a [crate::mcp::types::McpServerStatus],
+    pub(super) mcp_failed: &'a [String],
     pub(super) spawn_registry: &'a crate::spawn::SpawnRegistry,
 }
 
@@ -41,6 +42,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         session,
         saved_count,
         mcp_statuses,
+        mcp_failed,
         spawn_registry,
     } = ctx;
     use KeyCode::*;
@@ -494,6 +496,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                         session,
                         saved_count,
                         mcp_statuses,
+                        mcp_failed,
                         spawn_registry,
                     },
                 )
@@ -701,6 +704,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                 session_name: &session.meta.name,
                 claudemd: &config.claudemd,
                 mcp_statuses,
+                mcp_failed,
                 brief_mode: app.brief_mode,
                 btw_note: app.btw_note.as_deref(),
             };
@@ -1171,6 +1175,7 @@ mod overlay_key_tests {
             session: &mut session,
             saved_count: &mut 0,
             mcp_statuses: &[],
+            mcp_failed: &[],
             spawn_registry: &spawn_registry,
         })
         .await

@@ -731,6 +731,7 @@ mod tests {
                 session: &mut self.session,
                 saved_count: &mut self.saved,
                 mcp_statuses: &[],
+                mcp_failed: &[],
                 spawn_registry: &spawn_registry,
             })
             .await
@@ -951,6 +952,7 @@ mod tests {
             session: &mut h.session,
             saved_count: &mut h.saved,
             mcp_statuses: &[],
+            mcp_failed: &[],
             spawn_registry: &spawn_registry,
         })
         .await

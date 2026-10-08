@@ -356,6 +356,9 @@ pub struct CommandContext<'a> {
     pub claudemd: &'a str,
     /// MCP server statuses (for /mcp command)
     pub mcp_statuses: &'a [McpServerStatus],
+    /// Servers that failed or timed out at startup, by name, so /mcp and
+    /// /doctor can say so instead of acting as if none were configured.
+    pub mcp_failed: &'a [String],
     /// Whether brief/concise mode is currently active
     pub brief_mode: bool,
     /// Current btw note (if any)
@@ -695,6 +698,7 @@ mod removed_command_tests {
             session_name: "",
             claudemd: "",
             mcp_statuses: &[],
+            mcp_failed: &[],
             brief_mode: false,
             btw_note: None,
         };

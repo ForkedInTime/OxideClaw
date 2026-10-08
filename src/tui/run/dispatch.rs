@@ -44,6 +44,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         session,
         saved_count,
         mcp_statuses,
+        mcp_failed,
         spawn_registry,
     } = k;
     let last_assistant = app
@@ -69,6 +70,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         session_name: &session.meta.name,
         claudemd: &config.claudemd,
         mcp_statuses,
+        mcp_failed,
         brief_mode: app.brief_mode,
         btw_note: app.btw_note.as_deref(),
     };
@@ -2982,6 +2984,7 @@ mod reload_tests {
                 session: &mut session,
                 saved_count: &mut 0,
                 mcp_statuses: &[],
+                mcp_failed: &[],
                 spawn_registry: &spawn_registry,
             },
         )
@@ -3158,6 +3161,7 @@ mod budget_tests {
             session_name: "",
             claudemd: "",
             mcp_statuses: &[],
+            mcp_failed: &[],
             brief_mode: false,
             btw_note: None,
         };

@@ -25,7 +25,18 @@ fn cmd_mcp_in(args: &str, ctx: &CommandContext, config_dir: &std::path::Path) ->
                     waiting.join(", ")
                 )
             });
+            let failed_note =
+                (!ctx.mcp_failed.is_empty()).then(|| crate::mcp::failed_notice(ctx.mcp_failed));
             if ctx.mcp_statuses.is_empty() {
+                // The add hint is for a first server, not one that broke.
+                if let Some(note) = failed_note {
+                    let mut text = format!("No MCP servers connected.\n\n{note}");
+                    if let Some(trust) = trust_note {
+                        text.push_str("\n\n");
+                        text.push_str(&trust);
+                    }
+                    return CommandAction::Message(text);
+                }
                 let mut text = String::from(
                     "No MCP servers connected.\n\n\
                     Add one: /mcp add <name> <command> [args...]\n\
@@ -65,6 +76,9 @@ fn cmd_mcp_in(args: &str, ctx: &CommandContext, config_dir: &std::path::Path) ->
             }
 
             lines.push(String::new());
+            if let Some(note) = failed_note {
+                lines.push(note);
+            }
             if let Some(note) = trust_note {
                 lines.push(note);
             }
@@ -385,6 +399,7 @@ mod tests {
             session_name: "",
             claudemd: "",
             mcp_statuses: &statuses,
+            mcp_failed: &[],
             brief_mode: false,
             btw_note: None,
         };
@@ -413,5 +428,61 @@ mod tests {
         assert!(msg(mcp_remove_server("--scope user gh", r, h)).contains("user scope"));
         assert!(msg(mcp_remove_server("gh", r, h)).contains("local scope"));
         assert!(msg(mcp_remove_server("gh", r, h)).contains("not found"));
+    }
+
+    /// A configured server that failed at startup did not appear at all:
+    /// `/mcp` said none were connected and suggested adding one.
+    #[test]
+    fn list_names_servers_that_failed_to_start() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let config = Config {
+            cwd: repo.path().to_path_buf(),
+            ..Config::default()
+        };
+        let skills = HashMap::new();
+        let todo = TodoState::default();
+        let failed = ["gh".to_string()];
+        let statuses = [crate::mcp::types::McpServerStatus {
+            name: "fs".into(),
+            transport: "stdio",
+            protocol: "2026-07-28".into(),
+            tool_count: 1,
+        }];
+        let ctx = |statuses| CommandContext {
+            config: &config,
+            tokens_in: 0,
+            context_window: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cost_summary: String::new(),
+            cost_recorded: false,
+            cache_write_tokens: 0,
+            vim_mode: false,
+            skills: &skills,
+            todo_state: &todo,
+            last_assistant: None,
+            session_id: "s",
+            session_name: "",
+            claudemd: "",
+            mcp_statuses: statuses,
+            mcp_failed: &failed,
+            brief_mode: false,
+            btw_note: None,
+        };
+
+        let only_failed = msg(cmd_mcp_in("", &ctx(&[]), home.path()));
+        assert!(
+            only_failed.contains("failed to start") && only_failed.contains(": gh."),
+            "{only_failed}"
+        );
+        assert!(!only_failed.contains("Add one"), "{only_failed}");
+
+        let mixed = msg(cmd_mcp_in("list", &ctx(&statuses), home.path()));
+        assert!(mixed.contains("1 connected"), "{mixed}");
+        assert!(
+            mixed.contains("failed to start") && mixed.contains(": gh."),
+            "{mixed}"
+        );
     }
 }

@@ -725,6 +725,7 @@ async fn run_loop(
     let mcp_manager = McpManager::start_for_config(&config).await;
     let mcp_tools = mcp_dyn_tools(&mcp_manager);
     let mcp_statuses = mcp_manager.statuses();
+    let mcp_failed = mcp_manager.failed.clone();
 
     let mcp_clients = mcp_manager.clients.clone();
     let (mut tools, shared_state) = all_tools_with_state_and_mcp(&config, mcp_tools, mcp_clients);
@@ -772,6 +773,10 @@ async fn run_loop(
     }
     if let Some(warning) = skills_warning {
         app.entries.push(ChatEntry::system(warning));
+    }
+    if !mcp_failed.is_empty() {
+        app.entries
+            .push(ChatEntry::system(crate::mcp::failed_notice(&mcp_failed)));
     }
     if !config.settings_load_errors.is_empty() {
         app.entries
@@ -1014,6 +1019,7 @@ async fn run_loop(
                 session: &mut session,
                 saved_count: &mut saved_count,
                 mcp_statuses: &mcp_statuses,
+                mcp_failed: &mcp_failed,
                 spawn_registry: &spawn_registry,
             })
             .await?;
@@ -1705,6 +1711,7 @@ async fn run_loop(
                             session: &mut session,
                             saved_count: &mut saved_count,
                             mcp_statuses: &mcp_statuses,
+                            mcp_failed: &mcp_failed,
                             spawn_registry: &spawn_registry,
                         }).await?;
                     }

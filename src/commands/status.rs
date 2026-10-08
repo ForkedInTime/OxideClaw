@@ -246,6 +246,9 @@ pub(super) fn cmd_doctor(ctx: &CommandContext) -> CommandAction {
             tc
         ));
     }
+    if !ctx.mcp_failed.is_empty() {
+        checks.push(format!("  ✗ {}", crate::mcp::failed_notice(ctx.mcp_failed)));
+    }
 
     // Whisper
     let whisper_ok = std::process::Command::new("whisper")
@@ -597,6 +600,7 @@ mod status_command_tests {
             session_name: "",
             claudemd: "",
             mcp_statuses: &[],
+            mcp_failed: &[],
             brief_mode: false,
             btw_note: None,
         };

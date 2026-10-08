@@ -588,6 +588,7 @@ mod prompt_command_tests {
             session_name: "",
             claudemd: "",
             mcp_statuses: &[],
+            mcp_failed: &[],
             brief_mode: false,
             btw_note: None,
         };

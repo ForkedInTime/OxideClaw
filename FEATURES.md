@@ -169,7 +169,7 @@ Claude Code sessions import with `oxideclaw config import-claude --sessions`; se
 
 | Command | Description |
 |---------|-------------|
-| `/mcp` | List connected MCP servers, their scope and negotiated protocol revision, and project servers waiting for `/trust` |
+| `/mcp` | List connected MCP servers, their scope and negotiated protocol revision, servers that failed to start, and project servers waiting for `/trust` |
 | `/mcp add [--scope local\|project\|user] [--force] <name> <command\|url> [args...]` | Add an MCP server (stdio command or HTTP URL), local scope by default; `--force` writes a literal secret to the project scope |
 | `/mcp remove [--scope <s>] <name>` | Remove a server; `--scope` is needed when the name is in more than one scope |
 | `/mcp get <name>` | Show a server's config in every scope that defines it |

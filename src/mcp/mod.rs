@@ -65,6 +65,19 @@ impl Tool for McpDynamicTool {
     }
 }
 
+/// What the TUI, `/mcp` and `/doctor` say about servers that failed to
+/// start. The reason is only in the log: the TUI owns the terminal.
+pub fn failed_notice(names: &[String]) -> String {
+    format!(
+        "MCP server{} failed to start, so {} tools are unavailable: {}. The reason is \
+         in {}; `oxideclaw mcp list` checks them again.",
+        if names.len() == 1 { "" } else { "s" },
+        if names.len() == 1 { "its" } else { "their" },
+        names.join(", "),
+        std::env::temp_dir().join("oxideclaw.log").display()
+    )
+}
+
 // ── Helper: build DynTool list from an McpManager ────────────────────────────
 
 /// Built-in tools plus every configured MCP server's tools, for the entry
