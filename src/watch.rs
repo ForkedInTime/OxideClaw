@@ -283,7 +283,7 @@ mod tests {
         }
         let reported = paths_to_report(
             &paths,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             &["rs".into(), "py".into(), "js".into()],
             Duration::from_secs(10),
             &mut HashMap::new(),
