@@ -394,13 +394,15 @@ pub fn command_shell(
 }
 
 pub fn bash_tool_shell(default_shell: Option<&str>, login_shell: Option<&str>) -> String {
-    bash_tool_shell_with(default_shell, login_shell, has_bash)
+    bash_tool_shell_with(default_shell, login_shell, || {
+        bash_program().map(str::to_string)
+    })
 }
 
 fn bash_tool_shell_with(
     default_shell: Option<&str>,
     login_shell: Option<&str>,
-    has_bash: impl Fn() -> bool,
+    bash: impl Fn() -> Option<String>,
 ) -> String {
     if let Some(s) = default_shell {
         return s.to_string();
@@ -411,23 +413,89 @@ fn bash_tool_shell_with(
     if let Some(s) = login_is(&["bash", "zsh"]) {
         return s.to_string();
     }
-    if has_bash() {
-        return "bash".to_string();
+    if let Some(bash) = bash() {
+        return bash;
     }
     login_is(&["sh", "ash", "dash", "ksh", "mksh", "posh"])
         .unwrap_or("sh")
         .to_string()
 }
 
-/// Whether `bash` is on PATH (looked up once).
+/// Whether there is a bash to run (looked up once).
 pub fn has_bash() -> bool {
-    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HAS.get_or_init(|| {
-        std::env::var_os("PATH").is_some_and(|p| {
-            std::env::split_paths(&p)
-                .any(|d| d.join("bash").is_file() || d.join("bash.exe").is_file())
-        })
+    bash_program().is_some()
+}
+
+/// The bash the tool runs: `bash` when it is on PATH, or on Windows Git
+/// Bash's absolute path (see [`windows_git_bash`]). Looked up once.
+fn bash_program() -> Option<&'static str> {
+    static BASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BASH.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let dir = |var: &str| std::env::var_os(var).map(std::path::PathBuf::from);
+            windows_git_bash(
+                std::env::var_os("PATH").as_deref(),
+                dir("SystemRoot").or_else(|| dir("windir")).as_deref(),
+                dir("LOCALAPPDATA").as_deref(),
+                dir("ProgramFiles").as_deref(),
+            )
+            .map(|p| p.to_string_lossy().into_owned())
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var_os("PATH")
+                .is_some_and(|p| {
+                    std::env::split_paths(&p)
+                        .any(|d| d.join("bash").is_file() || d.join("bash.exe").is_file())
+                })
+                .then(|| "bash".to_string())
+        }
     })
+    .as_deref()
+}
+
+/// Git Bash on Windows, as an absolute path. A bare `bash` is looked up in
+/// System32 before PATH, and System32\bash.exe (like the WindowsApps alias)
+/// is the WSL launcher: commands ran inside a Linux distro, with /mnt/c paths
+/// and none of the Windows toolchain. So PATH is walked here, skipping those,
+/// then Git for Windows' layout next to `git.exe` (`Git\cmd\git.exe` ->
+/// `Git\bin\bash.exe`), then the default install dir.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_git_bash(
+    path: Option<&std::ffi::OsStr>,
+    system_root: Option<&std::path::Path>,
+    local_app_data: Option<&std::path::Path>,
+    program_files: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        s.trim_end_matches('\\').to_string()
+    };
+    let wsl_dirs: Vec<String> = system_root
+        .map(norm)
+        .into_iter()
+        .chain(local_app_data.map(|d| norm(&d.join("Microsoft").join("WindowsApps"))))
+        .collect();
+    let is_wsl = |dir: &Path| {
+        let d = norm(dir);
+        wsl_dirs
+            .iter()
+            .any(|w| d == *w || d.starts_with(&format!("{w}\\")))
+    };
+    let dirs: Vec<PathBuf> = path
+        .map(|p| std::env::split_paths(p).filter(|d| !is_wsl(d)).collect())
+        .unwrap_or_default();
+    let file = |p: PathBuf| p.is_file().then_some(p);
+    dirs.iter()
+        .find_map(|d| file(d.join("bash.exe")))
+        .or_else(|| {
+            dirs.iter()
+                .filter(|d| d.join("git.exe").is_file())
+                .find_map(|d| file(d.parent()?.join("bin").join("bash.exe")))
+        })
+        .or_else(|| file(program_files?.join("Git").join("bin").join("bash.exe")))
 }
 
 pub struct BashTool;
@@ -767,7 +835,8 @@ mod shell_choice_tests {
 
     #[test]
     fn non_bash_login_shells_fall_back_to_bash() {
-        let shell = |d: Option<&str>, l: Option<&str>| bash_tool_shell_with(d, l, || true);
+        let shell =
+            |d: Option<&str>, l: Option<&str>| bash_tool_shell_with(d, l, || Some("bash".into()));
         for login in [
             "/usr/bin/fish",
             "/usr/bin/nu",
@@ -813,11 +882,48 @@ mod shell_choice_tests {
         );
     }
 
+    /// On Windows a bare `bash` ran System32\bash.exe, the WSL launcher,
+    /// even with Git Bash first on PATH: commands ran inside a Linux distro.
+    #[test]
+    fn windows_bash_is_git_bash_never_the_wsl_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let mk = |rel: &str| {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            p
+        };
+        let windows = root.path().join("Windows");
+        let local = root.path().join("Local");
+        let wsl = mk("Windows/System32/bash.exe");
+        mk("Local/Microsoft/WindowsApps/bash.exe");
+        let git_bash = mk("Git/bin/bash.exe");
+        mk("Git/cmd/git.exe");
+        let path =
+            |dirs: &[&str]| std::env::join_paths(dirs.iter().map(|d| root.path().join(d))).unwrap();
+        let find = |p: &std::ffi::OsStr, pf: Option<&std::path::Path>| {
+            windows_git_bash(Some(p), Some(&windows), Some(&local), pf)
+        };
+
+        // WSL dirs skipped, wherever they sit on PATH.
+        let p = path(&["Windows/System32", "Local/Microsoft/WindowsApps", "Git/bin"]);
+        assert_eq!(find(&p, None), Some(git_bash.clone()));
+        // Only git.exe on PATH (Git\cmd): its sibling bin\bash.exe.
+        let p = path(&["Windows/System32", "Git/cmd"]);
+        assert_eq!(find(&p, None), Some(git_bash.clone()));
+        // Nothing on PATH: the default install dir.
+        let p = path(&["Windows/System32"]);
+        assert_eq!(find(&p, Some(root.path())), Some(git_bash));
+        // Only WSL: no bash, so the tool falls back to a POSIX shell.
+        assert_eq!(find(&p, None), None);
+        assert!(wsl.is_file());
+    }
+
     /// Alpine/BusyBox ship no bash and set SHELL=/bin/sh: every Bash tool
     /// call failed to spawn a `bash` that does not exist.
     #[test]
     fn without_bash_a_posix_shell_runs_commands() {
-        let shell = |l: Option<&str>| bash_tool_shell_with(None, l, || false);
+        let shell = |l: Option<&str>| bash_tool_shell_with(None, l, || None);
         assert_eq!(shell(Some("/bin/sh")), "/bin/sh");
         assert_eq!(shell(Some("/bin/ash")), "/bin/ash");
         assert_eq!(shell(Some("/usr/bin/fish")), "sh");
