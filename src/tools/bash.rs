@@ -165,6 +165,10 @@ pub(crate) fn new_session(cmd: &mut std::process::Command) {
 }
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes, same as TypeScript default
+/// Longest a model may ask one command to run (Claude Code's cap too).
+/// Uncapped, a timeout of a day held a headless run that long, since
+/// cancelling an SDK turn does not interrupt a running tool.
+const MAX_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const MAX_OUTPUT_BYTES: usize = 1_000_000; // 1MB cap
 const CHUNK_SIZE: usize = 8192;
 
@@ -500,11 +504,26 @@ fn windows_git_bash(
 
 pub struct BashTool;
 
+/// Milliseconds as any JSON number: models send `300000.0` as often as
+/// `300000`, and a plain u64 failed the whole call on the float.
+fn lenient_ms<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    match Option::<serde_json::Number>::deserialize(d)? {
+        None => Ok(None),
+        Some(n) => n
+            .as_f64()
+            .filter(|ms| ms.is_finite() && *ms >= 0.0)
+            .map(|ms| Some(ms.round() as u64))
+            .ok_or_else(|| {
+                serde::de::Error::custom("timeout must be a non-negative number of milliseconds")
+            }),
+    }
+}
+
 #[derive(Deserialize)]
 #[allow(dead_code)] // fields populated by serde from LLM tool calls
 struct BashInput {
     command: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_ms")]
     timeout: Option<u64>,
     #[serde(default)]
     description: Option<String>,
@@ -533,8 +552,10 @@ impl Tool for BashTool {
                     "description": "The bash command to execute"
                 },
                 "timeout": {
-                    "type": "number",
-                    "description": "Timeout in milliseconds (default: 120000)"
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_TIMEOUT_MS,
+                    "description": "Timeout in milliseconds (default: 120000, max: 600000)"
                 },
                 "description": {
                     "type": "string",
@@ -547,7 +568,10 @@ impl Tool for BashTool {
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let input: BashInput = serde_json::from_value(input)?;
-        let timeout_ms = input.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let timeout_ms = input
+            .timeout
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .min(MAX_TIMEOUT_MS);
 
         // Apply sandbox if enabled
         let allow_net = ctx.sandbox_allow_network;
@@ -724,6 +748,30 @@ impl Tool for BashTool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The schema said "number", so models sent `300000.0`, and the u64 field
+    /// failed the whole call; there was no cap on the value either.
+    #[test]
+    fn timeout_accepts_any_json_number_and_is_capped() {
+        let parse = |t: serde_json::Value| {
+            serde_json::from_value::<BashInput>(serde_json::json!({"command": "x", "timeout": t}))
+                .map(|i| i.timeout)
+        };
+        assert_eq!(parse(serde_json::json!(300000.0)).unwrap(), Some(300_000));
+        assert_eq!(parse(serde_json::json!(1500.4)).unwrap(), Some(1500));
+        assert_eq!(parse(serde_json::json!(5000)).unwrap(), Some(5000));
+        assert_eq!(parse(serde_json::Value::Null).unwrap(), None);
+        assert!(parse(serde_json::json!(-1)).is_err());
+        assert_eq!(
+            serde_json::from_value::<BashInput>(serde_json::json!({"command": "x"}))
+                .unwrap()
+                .timeout,
+            None
+        );
+        let schema = BashTool.input_schema();
+        assert_eq!(schema["properties"]["timeout"]["type"], "integer");
+        assert_eq!(schema["properties"]["timeout"]["maximum"], MAX_TIMEOUT_MS);
+    }
 
     /// settings.json `env` was documented as reaching Bash but was never set
     /// on the child process.
