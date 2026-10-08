@@ -899,7 +899,11 @@ impl Upstream {
             );
             return None;
         }
-        let host = url.host_str()?.to_string();
+        // Unbracketed: `connect` parses `::1`, not `[::1]`, as an address.
+        let host = match url.host()? {
+            Host::Ipv6(ip) => ip.to_string(),
+            h => h.to_string(),
+        };
         let port = url.port_or_known_default()?;
         let auth = (!url.username().is_empty()).then(|| {
             use base64::Engine as _;
@@ -1840,6 +1844,11 @@ mod tests {
             (bare.host.as_str(), bare.port, bare.auth),
             ("proxy", 8080, None)
         );
+        // An IPv6 literal proxy: the host must be connectable as given.
+        let v6 = Upstream::from_vars(vars(&[("HTTPS_PROXY", "http://[fd00::10]:3128")])).unwrap();
+        assert_eq!(v6.host, "fd00::10");
+        use std::net::ToSocketAddrs as _;
+        assert!((v6.host.as_str(), v6.port).to_socket_addrs().is_ok());
         assert!(Upstream::from_vars(vars(&[("ALL_PROXY", "socks5://proxy:1080")])).is_none());
         assert!(Upstream::from_vars(vars(&[])).is_none());
     }
