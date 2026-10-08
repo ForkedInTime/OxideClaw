@@ -306,6 +306,7 @@ pub(super) async fn undo(
         }
     };
     let n = plan.undone.len();
+    let prompts_before = prompt_indices(messages).len();
     messages.truncate(plan.cut);
     messages.shrink_to_fit();
     session.meta.timeline.truncate(plan.keep);
@@ -336,7 +337,11 @@ pub(super) async fn undo(
         tracing::warn!("[undo] failed to save the redo turns: {e}");
     }
 
-    // Display: drop everything from the n-th last prompt on.
+    // Display: drop everything from the n-th last prompt on. That is only
+    // the right cut while the screen shows one User entry per prompt. A
+    // compaction leaves the summarised prompts on screen with no entry for
+    // the summary, and a resumed or redone turn shows auto-fix feedback as
+    // User entries too; then the screen is rebuilt from what is left.
     let user_entries: Vec<usize> = app
         .entries
         .iter()
@@ -344,7 +349,7 @@ pub(super) async fn undo(
         .filter(|(_, e)| matches!(e.kind, crate::tui::app::EntryKind::User))
         .map(|(i, _)| i)
         .collect();
-    if user_entries.len() >= n {
+    if user_entries.len() == prompts_before && n <= user_entries.len() {
         app.entries.truncate(user_entries[user_entries.len() - n]);
     } else {
         app.entries = entries_from_messages(messages);
@@ -1085,6 +1090,77 @@ mod tests {
         assert!(h.last_note().contains("predate"), "{}", h.last_note());
         assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
         assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"));
+    }
+
+    fn user_entries(app: &App) -> Vec<String> {
+        app.entries
+            .iter()
+            .filter(|e| matches!(e.kind, crate::tui::app::EntryKind::User))
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// The summarised prompts stay on screen with no entry for the summary,
+    /// so counting User entries cut too little: undoing the summary left
+    /// every pre-compaction prompt showing.
+    #[tokio::test]
+    async fn undo_past_a_compaction_clears_the_summarised_prompts_from_the_screen() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.turn("two", &[("b.txt", "b2\n")]).await;
+        h.compact(true).await;
+        h.turn("three", &[("a.txt", "a3\n")]).await;
+
+        h.undo(2).await;
+
+        assert!(h.messages.is_empty());
+        assert!(user_entries(&h.app).is_empty(), "{:?}", user_entries(&h.app));
+    }
+
+    /// A redone turn is drawn from its messages, where auto-fix feedback in
+    /// a tool-result message shows as a User entry; /undo 1 cut at that
+    /// entry and left the turn's prompt on screen.
+    #[tokio::test]
+    async fn undo_of_a_redone_turn_with_auto_fix_feedback_clears_its_prompt() {
+        let mut h = Harness::new(true).await;
+        h.three_turns().await;
+        h.undo(1).await;
+        let turn = &mut h.session.meta.redo.last_mut().unwrap().messages;
+        turn.insert(
+            1,
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Edit".into(),
+                    input: serde_json::json!({"file_path": "a.txt"}),
+                }],
+            },
+        );
+        turn.insert(
+            2,
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: vec![crate::api::types::ToolResultContent::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Lint failed: fix it".into(),
+                    },
+                ],
+            },
+        );
+        h.redo(1).await;
+        assert_eq!(user_entries(&h.app).len(), 4, "feedback shows as a User entry");
+
+        h.undo(1).await;
+
+        assert_eq!(user_entries(&h.app), vec!["one", "two"]);
     }
 
     /// A compaction ends /redo: the undone turns would go back after a
