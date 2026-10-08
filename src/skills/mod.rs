@@ -78,13 +78,20 @@ impl Skill {
                 &loaded
             }
         };
+        let skill_dir = self.skill_file.as_deref().and_then(Path::parent);
+        let (template, dollar_slot) = expand_claude_args(&skill.prompt_template, args, skill_dir);
+        let skill = Skill {
+            prompt_template: template,
+            ..skill.clone()
+        };
         let mut prompt = skill.expand_named(args);
-        let has_slot = skill.prompt_template.contains("{{ARGS}}")
+        let has_slot = dollar_slot
+            || skill.prompt_template.contains("{{ARGS}}")
             || skill.prompt_template.contains("{{args}}");
         if !args.is_empty() && !has_slot && skill.params.is_empty() {
             prompt = format!("{prompt}\n\n{args}");
         }
-        if let Some(dir) = self.skill_file.as_deref().and_then(Path::parent) {
+        if let Some(dir) = skill_dir {
             prompt = format!(
                 "Base directory for this skill: {}\n\
                  Paths in the skill are relative to it; read those files only when you need them.\n\n{prompt}",
@@ -141,6 +148,64 @@ impl Skill {
         // Legacy {{ARGS}} still gets the raw blob.
         out.replace("{{ARGS}}", args).replace("{{args}}", args)
     }
+}
+
+/// Fill Claude Code's placeholders, so its skills work as they are:
+/// `$ARGUMENTS` is the raw args, `$ARGUMENTS[N]` and `$N` the Nth word
+/// (from 0), `${CLAUDE_SKILL_DIR}` the skill's folder. Returns whether the
+/// template had an argument slot, so the args are not appended as well.
+/// A bare `$N` past the last word is left alone: it is as likely an `awk`
+/// or shell `$1` in the skill's own instructions as a placeholder.
+fn expand_claude_args(template: &str, args: &str, dir: Option<&Path>) -> (String, bool) {
+    if !template.contains('$') {
+        return (template.to_string(), false);
+    }
+    let words = shell_words(args);
+    let mut out = String::with_capacity(template.len());
+    let mut slot = false;
+    let mut rest = template;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        if let Some(r) = after.strip_prefix("{CLAUDE_SKILL_DIR}")
+            && let Some(dir) = dir
+        {
+            out.push_str(&dir.display().to_string());
+            rest = r;
+            continue;
+        }
+        if let Some(r) = after.strip_prefix("ARGUMENTS") {
+            if let Some(index) = r.strip_prefix('[')
+                && let Some(close) = index.find(']')
+                && let Ok(n) = index[..close].trim().parse::<usize>()
+            {
+                slot = true;
+                out.push_str(words.get(n).map_or("", String::as_str));
+                rest = &index[close + 1..];
+                continue;
+            }
+            if !r.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                slot = true;
+                out.push_str(args);
+                rest = r;
+                continue;
+            }
+        }
+        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0
+            && let Ok(n) = after[..digits].parse::<usize>()
+            && let Some(word) = words.get(n)
+        {
+            slot = true;
+            out.push_str(word);
+            rest = &after[digits..];
+            continue;
+        }
+        out.push('$');
+        rest = after;
+    }
+    out.push_str(rest);
+    (out, slot)
 }
 
 /// Split `args` on whitespace, honoring single and double quotes.
@@ -854,6 +919,49 @@ mod tests {
         assert!(
             prompt.ends_with("Read the issue, then fix it.\n\n#42"),
             "{prompt}"
+        );
+    }
+
+    /// Claude Code's `$ARGUMENTS`, `$N` and `${CLAUDE_SKILL_DIR}` reached
+    /// the model verbatim, with the args appended at the bottom instead.
+    #[tokio::test]
+    async fn claude_code_argument_placeholders_are_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let [_, _, claude, ..] = locations(dir.path());
+        let skill_dir = at(&claude, "fix-issue");
+        write(
+            &skill_dir.join("SKILL.md"),
+            "---\ndescription: d\n---\nFix issue $ARGUMENTS following our standards.\n\
+             Repo $0, issue $ARGUMENTS[1], label $2; missing [$ARGUMENTS[5]].\n\
+             Run ${CLAUDE_SKILL_DIR}/check.sh and awk '{print $7}'. Cost $5 or $ARGUMENTSX.",
+        );
+        let loaded = load(dir.path()).await;
+        let none = ReadDeny::default();
+        let prompt = loaded.skills["fix-issue"]
+            .invoke("web 123 \"needs review\"", &none)
+            .unwrap();
+        let body = prompt.split_once("\n\n").unwrap().1;
+        assert_eq!(
+            body,
+            format!(
+                "Fix issue web 123 \"needs review\" following our standards.\n\
+                 Repo web, issue 123, label needs review; missing [].\n\
+                 Run {}/check.sh and awk '{{print $7}}'. Cost $5 or $ARGUMENTSX.",
+                skill_dir.display()
+            ),
+            "the args were not appended again"
+        );
+
+        // Flat skills too; with no args the slot empties and nothing is appended.
+        write(&claude.join("greet.md"), "Say hi to $ARGUMENTS.");
+        let loaded = load(dir.path()).await;
+        assert_eq!(
+            loaded.skills["greet"].invoke("", &none).unwrap(),
+            "Say hi to ."
+        );
+        assert_eq!(
+            loaded.skills["greet"].invoke("Ana", &none).unwrap(),
+            "Say hi to Ana."
         );
     }
 
