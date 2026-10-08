@@ -45,10 +45,6 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
     render_with_base(text, WHITE)
 }
 
-pub fn render_dim(text: &str) -> Vec<Line<'static>> {
-    render_with_base(text, GRAY)
-}
-
 fn render_with_base(text: &str, base: Style) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_code_block = false;
@@ -946,6 +942,11 @@ fn inline_line(text: &str, base: Style) -> Line<'static> {
 
 /// Parse inline markdown in `text` and return styled Spans.
 /// Handles: **bold**, *italic*, `code`, [link](url)
+///
+/// A delimiter only opens a span that closes on the same line, and a `*`
+/// or `**` followed by whitespace is literal (CommonMark's flanking rule):
+/// otherwise `rm *.log` lost its `*` and `2 * 3 * 4` both, and the rest of
+/// the line was restyled.
 fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let chars: Vec<char> = text.chars().collect();
@@ -958,58 +959,70 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
             spans.push(Span::styled(std::mem::take(current), style));
         }
     };
+    // The next closer at or after each index (a `*`, or the first of `**`,
+    // not preceded by whitespace), so a line of unmatched `*`s stays linear.
+    let (mut next_one, mut next_two) = (Vec::new(), Vec::new());
+    if text.contains('*') {
+        next_one = vec![usize::MAX; len + 1];
+        next_two = vec![usize::MAX; len + 1];
+        for j in (1..len).rev() {
+            let closes = chars[j] == '*' && !chars[j - 1].is_whitespace();
+            next_one[j] = if closes { j } else { next_one[j + 1] };
+            next_two[j] = if closes && chars.get(j + 1) == Some(&'*') {
+                j
+            } else {
+                next_two[j + 1]
+            };
+        }
+    }
+    // The span a `*` (width 1) or `**` (width 2) at `open` opens: its
+    // content and the index past its closer.
+    let emphasis = |open: usize, width: usize| -> Option<(String, usize)> {
+        let from = open + width;
+        if chars.get(from).is_none_or(|c| c.is_whitespace()) {
+            return None;
+        }
+        let next = if width == 2 { &next_two } else { &next_one };
+        let close = *next.get(from + 1)?;
+        (close != usize::MAX).then(|| (chars[from..close].iter().collect(), close + width))
+    };
 
     while i < len {
         // **bold**
-        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+        if chars[i] == '*'
+            && chars.get(i + 1) == Some(&'*')
+            && let Some((inner, next)) = emphasis(i, 2)
+        {
             flush(&mut current, &mut spans, base);
-            i += 2;
-            let mut inner = String::new();
-            while i < len {
-                if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-                    i += 2;
-                    break;
-                }
-                inner.push(chars[i]);
-                i += 1;
-            }
             spans.push(Span::styled(inner, base.add_modifier(Modifier::BOLD)));
+            i = next;
             continue;
         }
 
         // *italic*
-        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
+        if chars[i] == '*'
+            && chars.get(i + 1) != Some(&'*')
+            && let Some((inner, next)) = emphasis(i, 1)
+        {
             flush(&mut current, &mut spans, base);
-            i += 1;
-            let mut inner = String::new();
-            while i < len && chars[i] != '*' {
-                inner.push(chars[i]);
-                i += 1;
-            }
-            if i < len {
-                i += 1;
-            }
             spans.push(Span::styled(inner, base.add_modifier(Modifier::ITALIC)));
+            i = next;
             continue;
         }
 
         // `inline code`
-        if chars[i] == '`' {
+        if chars[i] == '`'
+            && let Some(close) = chars[i + 1..].iter().position(|&c| c == '`')
+        {
             flush(&mut current, &mut spans, base);
-            i += 1;
-            let mut inner = String::new();
-            while i < len && chars[i] != '`' {
-                inner.push(chars[i]);
-                i += 1;
-            }
-            if i < len {
-                i += 1;
-            }
+            let inner: String = chars[i + 1..i + 1 + close].iter().collect();
             spans.push(Span::styled(inner, YELLOW));
+            i += close + 2;
             continue;
         }
 
-        // [link text](url) — show link text underlined
+        // [link text](url) — link text underlined, then the URL, which
+        // the terminal cannot otherwise show
         if chars[i] == '[' {
             let start = i + 1;
             if let Some(close) = chars[start..].iter().position(|&c| c == ']') {
@@ -1021,10 +1034,20 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
                 {
                     flush(&mut current, &mut spans, base);
                     let link_text: String = chars[start..start + close].iter().collect();
-                    spans.push(Span::styled(
-                        link_text,
-                        CYAN.add_modifier(Modifier::UNDERLINED),
-                    ));
+                    let url: String = chars[after_bracket + 1..after_bracket + 1 + close_paren]
+                        .iter()
+                        .collect();
+                    let url = url.trim();
+                    let shown = if link_text.trim().is_empty() {
+                        url.to_string()
+                    } else {
+                        link_text
+                    };
+                    let url_hidden = !url.is_empty() && shown.trim() != url;
+                    spans.push(Span::styled(shown, CYAN.add_modifier(Modifier::UNDERLINED)));
+                    if url_hidden {
+                        spans.push(Span::styled(format!(" ({url})"), base));
+                    }
                     i = after_bracket + 1 + close_paren + 1;
                     continue;
                 }
@@ -1062,7 +1085,7 @@ mod robustness_tests {
         }
     }
 
-    use super::{render, render_dim};
+    use super::render;
 
     /// Model output is adversarial by accident: unclosed fences, lone
     /// markers, huge lines, mixed scripts. The renderer is a parser and
@@ -1114,7 +1137,6 @@ mod robustness_tests {
         ];
         for (i, c) in cases.iter().enumerate() {
             let _ = render(c);
-            let _ = render_dim(c);
             let _ = i;
         }
     }
@@ -1158,5 +1180,78 @@ mod table_tests {
             .collect();
         assert_eq!(cols.len(), 5, "{lines:?}");
         assert!(cols.iter().all(|c| c == &cols[0]), "misaligned: {cols:?}");
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    fn spans(text: &str) -> Vec<(String, Modifier)> {
+        inline_spans(text, WHITE)
+            .into_iter()
+            .map(|s| (s.content.into_owned(), s.style.add_modifier))
+            .collect()
+    }
+
+    fn shown(text: &str) -> String {
+        spans(text).into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// A lone `*` or backtick opened a span to the end of the line and
+    /// was deleted: `rm *.log` showed as `rm .log` in italics.
+    #[test]
+    fn unmatched_or_spaced_delimiters_stay_literal() {
+        for text in [
+            "run rm *.log",
+            "2 * 3 * 4",
+            "a ** b",
+            "x **y",
+            "unclosed `code",
+            "glob *",
+        ] {
+            assert_eq!(shown(text), text);
+            assert!(
+                spans(text).iter().all(|(_, m)| m.is_empty()),
+                "{text}: {:?}",
+                spans(text)
+            );
+        }
+    }
+
+    #[test]
+    fn closed_emphasis_and_code_still_render() {
+        assert_eq!(
+            spans("a **b** *c* `d`"),
+            vec![
+                ("a ".into(), Modifier::empty()),
+                ("b".into(), Modifier::BOLD),
+                (" ".into(), Modifier::empty()),
+                ("c".into(), Modifier::ITALIC),
+                (" ".into(), Modifier::empty()),
+                ("d".into(), Modifier::empty()),
+            ]
+        );
+    }
+
+    /// The URL was dropped, with no way to see where a link went.
+    #[test]
+    fn links_show_their_url() {
+        assert_eq!(
+            shown("see [docs](https://example.com/d) now"),
+            "see docs (https://example.com/d) now"
+        );
+        assert_eq!(
+            shown("[https://example.com](https://example.com)"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn many_unmatched_stars_render_quickly() {
+        let line = "*a ".repeat(100_000);
+        let started = std::time::Instant::now();
+        assert_eq!(shown(&line), line);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

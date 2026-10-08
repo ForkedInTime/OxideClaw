@@ -510,15 +510,15 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, tc: ThemeColors) {
                 } else {
                     &entry.text
                 };
-                let md_lines = markdown::render_dim(visible_text);
-                let mut first = true;
-                for md_line in md_lines {
-                    let prefix = if first { "  └ " } else { "    " };
-                    first = false;
-                    let mut spans =
-                        vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
-                    spans.extend(md_line.spans);
-                    lines.push(Line::from(spans));
+                // Plain text, not markdown: a script's `# comment` became a
+                // header and `*.log` lost its `*`.
+                for (i, text) in visible_text.lines().enumerate() {
+                    let prefix = if i == 0 { "  └ " } else { "    " };
+                    let dim = Style::default().fg(Color::DarkGray);
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, dim),
+                        Span::styled(text.to_string(), dim),
+                    ]));
                 }
                 if total > MAX_LINES {
                     lines.push(Line::from(Span::styled(
@@ -1720,6 +1720,30 @@ mod permission_popup_tests {
         assert!(screen.contains("err-line-5"), "{screen}");
         assert!(!screen.contains("err-line-6"), "{screen}");
         assert!(screen.contains("[▸ 494 more lines]"), "{screen}");
+    }
+
+    /// Tool output went through the markdown renderer: a script's
+    /// `# comment` lost its `# ` as a header and `*.log` lost its `*`.
+    #[test]
+    fn tool_result_preview_is_plain_text() {
+        let mut app = crate::tui::app::App::new("claude-sonnet-5", std::path::Path::new("/tmp"));
+        app.show_welcome = false;
+        app.entries.push(crate::tui::app::ChatEntry::tool_result(
+            "# Deploy to prod\nrm *.log - **x",
+        ));
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("└ # Deploy to prod"), "{screen}");
+        assert!(screen.contains("    rm *.log - **x"), "{screen}");
     }
 
     /// Only tool failures collapse: a non-tool error such as a model switch
