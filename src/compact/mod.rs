@@ -93,6 +93,27 @@ pub fn compaction_window(
     w
 }
 
+/// The model to summarise the history with: the usable router tier with
+/// the largest window when that beats `config.model`'s. With the router on,
+/// [`compaction_window`] lets the history grow past the session model's
+/// window, so a summary sent there could only fail, or on Ollama be cut
+/// silently.
+pub fn compaction_model(config: &Config, router: Option<&crate::router::RouterConfig>) -> String {
+    let window = crate::api::context_window_for_model;
+    router
+        .filter(|r| r.enabled)
+        .and_then(|r| {
+            crate::router::Complexity::ALL
+                .iter()
+                .filter(|&&t| r.may_route_to(config, t))
+                .map(|&t| r.model_for(t))
+                .max_by_key(|m| window(m))
+        })
+        .filter(|m| window(m) > window(&config.model))
+        .unwrap_or(&config.model)
+        .to_string()
+}
+
 /// The window to compact against inside a turn, whose tier is fixed:
 /// [`compaction_window`], capped at the window of `config.model`, the model
 /// the next request goes to.
@@ -608,6 +629,43 @@ mod tests {
         );
         // Headless and SDK sessions never phase-route.
         assert_eq!(compaction_window(&phased, None, None), 1_000_000);
+    }
+
+    /// Auto-compact waits for the largest tier's window, so the summary
+    /// must go to that tier: claude-opus-4-5 (200k) could not take a 900k
+    /// history.
+    #[test]
+    fn the_summary_goes_to_the_largest_usable_tier() {
+        let cfg = Config {
+            model: "claude-opus-4-5".into(),
+            api_key: "sk-ant-test".into(),
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&cfg.model);
+        assert_eq!(compaction_model(&cfg, None), "claude-opus-4-5");
+        assert_eq!(
+            compaction_model(&cfg, Some(&router)),
+            "claude-opus-4-5",
+            "router off"
+        );
+        router.enabled = true;
+        let model = compaction_model(&cfg, Some(&router));
+        assert_eq!(crate::api::context_window_for_model(&model), 1_000_000);
+        assert_eq!(
+            compaction_window(&cfg, Some(&router), None),
+            1_000_000,
+            "measured against the same window"
+        );
+
+        // A tier with no credential never takes the summary.
+        let ollama = Config {
+            model: "ollama:llama3".into(),
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&ollama.model);
+        router.enabled = true;
+        router.super_high_model = "claude-opus-5".into();
+        assert_eq!(compaction_model(&ollama, Some(&router)), "ollama:llama3");
     }
 
     /// Inside a turn the tier is fixed: a prompt routed to a 128k Ollama

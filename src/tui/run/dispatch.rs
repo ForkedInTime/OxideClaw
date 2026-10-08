@@ -138,13 +138,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     hooks::run_pre_compact_hooks(hook_cfg, &session.id, &config.cwd).await;
                 }
                 app.compacting = true;
-                let c2 = client.clone();
+                // Routed turns let the history outgrow the session model.
+                let (c2, cfg) = compaction_backend(config, client, Some(&app.router));
                 // Snip only what is summarised: a failed summary must leave
                 // the live history as it was.
                 let base = messages.clone();
                 let mut msgs = base.clone();
-                snip_compact(&mut msgs, &config.model);
-                let cfg = config.clone();
+                snip_compact(&mut msgs, &cfg.model);
                 let tx2 = tx.clone();
                 let sid = session.id.clone();
                 tokio::spawn(async move {
@@ -286,6 +286,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let sid3 = session.id.clone();
             let turn_history = TurnHistory::default();
             app.turn_history = Some(turn_history.clone());
+            // Earlier routed turns may have grown the history past this
+            // model's window; an overflow is summarised on the router's
+            // largest tier.
+            let compact_router = Some(app.router.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -301,6 +305,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     session_id: sid3,
                     history: turn_history,
                     router: None,
+                    compact_router,
                 })
                 .await;
             });
@@ -1367,6 +1372,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let sid3 = session.id.clone();
                 let turn_history = TurnHistory::default();
                 app.turn_history = Some(turn_history.clone());
+                // Earlier routed turns may have grown the history past this
+                // model's window; an overflow is summarised on the router's
+                // largest tier.
+                let compact_router = Some(app.router.clone());
                 let handle = tokio::spawn(async move {
                     run_api_task(ApiTask {
                         client: c2,
@@ -1382,6 +1391,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         session_id: sid3,
                         history: turn_history,
                         router: None,
+                        compact_router,
                     })
                     .await;
                 });
@@ -2283,6 +2293,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let sid3 = session.id.clone();
             let turn_history = TurnHistory::default();
             app.turn_history = Some(turn_history.clone());
+            // Earlier routed turns may have grown the history past this
+            // model's window; an overflow is summarised on the router's
+            // largest tier.
+            let compact_router = Some(app.router.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -2298,6 +2312,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     session_id: sid3,
                     history: turn_history,
                     router: None,
+                    compact_router,
                 })
                 .await;
             });
@@ -2322,6 +2337,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let sid3 = session.id.clone();
             let turn_history = TurnHistory::default();
             app.turn_history = Some(turn_history.clone());
+            // Earlier routed turns may have grown the history past this
+            // model's window; an overflow is summarised on the router's
+            // largest tier.
+            let compact_router = Some(app.router.clone());
             let handle = tokio::spawn(async move {
                 run_api_task(ApiTask {
                     client: c2,
@@ -2337,6 +2356,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     session_id: sid3,
                     history: turn_history,
                     router: None,
+                    compact_router,
                 })
                 .await;
             });
@@ -2543,6 +2563,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 let sid4 = session.id.clone();
                 let turn_history = TurnHistory::default();
                 app.turn_history = Some(turn_history.clone());
+                // Earlier routed turns may have grown the history past this
+                // model's window; an overflow is summarised on the router's
+                // largest tier.
+                let compact_router = Some(app.router.clone());
                 let handle = tokio::spawn(async move {
                     run_api_task(ApiTask {
                         client: c2,
@@ -2558,6 +2582,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         session_id: sid4,
                         history: turn_history,
                         router: None,
+                        compact_router,
                     })
                     .await;
                 });

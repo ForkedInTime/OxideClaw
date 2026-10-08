@@ -573,6 +573,31 @@ fn routed_client(config: &Config, client: &ApiBackend, routed: &str) -> Result<A
     backend_for_model(config, routed)
 }
 
+/// Client and config to summarise the history with (auto-compact,
+/// /compact, an overflowing turn): the largest usable router tier when its
+/// window beats `config.model`'s, else the current client and model.
+fn compaction_backend(
+    config: &Config,
+    client: &ApiBackend,
+    router: Option<&crate::router::RouterConfig>,
+) -> (ApiBackend, Config) {
+    let mut cfg = config.clone();
+    let model = crate::compact::compaction_model(config, router);
+    if model == config.model {
+        return (client.clone(), cfg);
+    }
+    match routed_client(config, client, &model) {
+        Ok(c) => {
+            cfg.model = model;
+            (c, cfg)
+        }
+        Err(e) => {
+            tracing::warn!("summarising on {} instead of {model}: {e}", config.model);
+            (client.clone(), cfg)
+        }
+    }
+}
+
 async fn run_loop(
     mut config: Config,
     resume_id: Option<String>,
@@ -1695,13 +1720,14 @@ async fn run_loop(
                                     .await;
                             }
                             app.compacting = true;
-                            let c2 = client.clone();
+                            // The history was let grow to the largest
+                            // tier's window, so the summary goes there.
+                            let (c2, cfg) = compaction_backend(&config, &client, Some(&app.router));
                             // Snip only the copy being summarised, so a
                             // failed summary leaves the live history intact.
                             let base = messages.clone();
                             let mut msgs = base.clone();
-                            snip_compact(&mut msgs, &config.model);
-                            let cfg = config.clone();
+                            snip_compact(&mut msgs, &cfg.model);
                             let tx2 = tx.clone();
                             let sid = session.id.clone();
                             let cwd = config.cwd.clone();

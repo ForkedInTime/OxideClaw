@@ -665,6 +665,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     session_id: sid2,
                     history: turn_history,
                     router,
+                    // A routed turn summarises through its route; with
+                    // phase routing on, the complexity router never ran.
+                    compact_router: None,
                 })
                 .await;
             });

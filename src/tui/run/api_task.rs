@@ -54,6 +54,10 @@ pub(super) struct ApiTask {
     /// The model router, when it routes this turn: the task picks the tier
     /// from the last user message and moves up a tier on failure.
     pub(super) router: Option<crate::router::RouterConfig>,
+    /// The session router for a turn it does not route (/review, skills,
+    /// plugin commands): an overflowing history is summarised on its
+    /// largest tier, since routed turns may have grown it past this model.
+    pub(super) compact_router: Option<crate::router::RouterConfig>,
 }
 
 /// Show `client`'s retry backoff in the transcript. Without this a
@@ -345,6 +349,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
         budget_remaining_usd,
         history,
         router,
+        compact_router,
     } = task;
     let session_id = session_id.as_str();
     notify_retries(&mut client, &tx);
@@ -646,9 +651,18 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 "Prompt too long — auto-compacting context…".into(),
             ));
             // The history already overflows the window as sent; summarise a
-            // snipped copy so the summary request has a chance to fit.
+            // snipped copy so the summary request has a chance to fit, on
+            // the router's largest tier when this model's window is smaller.
+            let (sum_client, sum_config) = compaction_backend(
+                &config,
+                &client,
+                routing
+                    .as_ref()
+                    .map(|r| &r.router)
+                    .or(compact_router.as_ref()),
+            );
             let mut snipped = messages.clone();
-            crate::compact::snip_compact(&mut snipped, &config.model);
+            crate::compact::snip_compact(&mut snipped, &sum_config.model);
             if let Some(hook_cfg) = &config.hooks
                 && !config.disable_all_hooks
             {
@@ -656,15 +670,16 @@ pub(super) async fn run_api_task(task: ApiTask) {
             }
             let bill = |u: &Usage| {
                 task_cost.record_with_cache(
-                    &config.model,
+                    &sum_config.model,
                     u.input_tokens,
                     u.output_tokens,
                     u.cache_read_input_tokens,
                     u.cache_creation_input_tokens,
                 );
-                let _ = tx.send(AppEvent::usage(&config.model, u));
+                let _ = tx.send(AppEvent::usage(&sum_config.model, u));
             };
-            match crate::compact::summarize_compact(&client, &snipped, &config, bill).await {
+            match crate::compact::summarize_compact(&sum_client, &snipped, &sum_config, bill).await
+            {
                 Ok(replacement) => {
                     let summary_len = replacement
                         .first()
@@ -1686,6 +1701,7 @@ mod loop_guard_tests {
             budget_remaining_usd: None,
             history: TurnHistory::default(),
             router: None,
+            compact_router: None,
         })
         .await;
 
@@ -1738,6 +1754,7 @@ mod loop_guard_tests {
             budget_remaining_usd: budget,
             history: TurnHistory::default(),
             router: None,
+            compact_router: None,
         };
         (task, rx)
     }
@@ -2263,6 +2280,7 @@ mod router_tests {
             budget_remaining_usd: None,
             history: TurnHistory::default(),
             router: Some(router),
+            compact_router: None,
         };
         (task, rx, seen)
     }
@@ -2390,6 +2408,45 @@ mod router_tests {
         assert!(!oldest.contains("OLD FILE BODY"), "old tool result kept");
         let newest = serde_json::to_string(&messages[23]).unwrap();
         assert!(newest.contains("OLD FILE BODY"), "recent results stay");
+    }
+
+    /// A turn the router does not route (/review, a skill) on a model whose
+    /// window the history outgrew: the summary went to that same model and
+    /// failed. It goes to the router's largest tier.
+    #[tokio::test]
+    async fn an_unrouted_overflow_is_summarised_on_the_largest_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut task, mut rx, seen) = routed_task(
+            |model, n| match (model, n) {
+                ("gemma3:1b", 0) => Reply::Status(400, r#"{"error":"context_length_exceeded"}"#),
+                ("mid", _) => Reply::Text("summary"),
+                _ => Reply::Text("answer"),
+            },
+            dir.path(),
+        )
+        .await;
+        task.config.model = "ollama:gemma3:1b".into();
+        task.client = task.config.backend_for(&task.config.model).unwrap();
+        let mut router = task.router.take().unwrap();
+        router.low_model = "ollama:gemma3:1b".into();
+        router.high_model = "ollama:gemma3:1b".into();
+        router.super_high_model = "ollama:gemma3:1b".into();
+        task.compact_router = Some(router);
+        run_api_task(task).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["gemma3:1b", "mid", "gemma3:1b"]);
+        let (mut compacted, mut done, mut failed) = (false, None, None);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Compacted { .. } => compacted = true,
+                AppEvent::Done { model_used, .. } => done = Some(model_used),
+                AppEvent::TurnFailed(e) => failed = Some(e),
+                _ => {}
+            }
+        }
+        assert_eq!(failed, None);
+        assert!(compacted);
+        assert_eq!(done.as_deref(), Some("ollama:gemma3:1b"));
     }
 
     /// The loop detector on the cheap tier: the turn continues one tier up
