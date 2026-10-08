@@ -139,6 +139,19 @@ async fn rewrite_session_history(
     Ok(())
 }
 
+/// A new session for this run. `--no-session-persistence` promises nothing
+/// on disk, and the `.meta` alone listed an empty session in /resume and
+/// failed the launch on a read-only data directory.
+async fn new_session(config: &Config, id: Option<String>) -> Result<Session> {
+    if config.no_session_persistence {
+        return Ok(Session::in_memory(id));
+    }
+    match id {
+        Some(id) => Session::new_with_id(id).await,
+        None => Session::new().await,
+    }
+}
+
 /// Add a prompt to the history and put its turn on the undo timeline.
 /// Every prompt the agent runs (typed, slash command, skill, plugin) goes
 /// through here before its task is spawned, so /undo n always takes off the
@@ -902,6 +915,9 @@ async fn run_loop(
         Some(ref id) => {
             match Session::resume(id).await {
                 Ok((mut s, loaded_messages)) => {
+                    if config.no_session_persistence {
+                        s.keep_in_memory();
+                    }
                     // --fork-session: continue in a copy; the original is untouched.
                     if config.fork_session
                         && let Err(e) = s.fork(&loaded_messages).await
@@ -936,17 +952,14 @@ async fn run_loop(
                 Err(e) => {
                     app.entries
                         .push(ChatEntry::error(format!("Could not resume session: {e}")));
-                    let s = Session::new().await?;
+                    let s = new_session(&config, None).await?;
                     app.session_name = s.meta.name.clone();
                     s
                 }
             }
         }
         None => {
-            let s = match config.new_session_id.clone() {
-                Some(id) => Session::new_with_id(id).await?,
-                None => Session::new().await?,
-            };
+            let s = new_session(&config, config.new_session_id.clone()).await?;
             app.session_name = s.meta.name.clone();
             s
         }
@@ -1219,7 +1232,10 @@ async fn run_loop(
         // Handle pending session resume from interactive session picker
         if let Some(id) = app.pending_resume.take() {
             match Session::resume(&id).await {
-                Ok((new_session, loaded_messages)) => {
+                Ok((mut new_session, loaded_messages)) => {
+                    if config.no_session_persistence {
+                        new_session.keep_in_memory();
+                    }
                     let display = entries_from_messages(&loaded_messages);
                     saved_count = loaded_messages.len();
                     messages = loaded_messages;

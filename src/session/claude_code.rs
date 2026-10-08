@@ -969,6 +969,7 @@ async fn write_session(dir: &Path, t: &Transcript) -> Result<String> {
         },
         dir: dir.to_path_buf(),
         path: Session::jsonl_path(dir, &id),
+        in_memory: false,
     };
     session.overwrite(&t.messages).await?;
     if let Some(updated) = t.updated_at {

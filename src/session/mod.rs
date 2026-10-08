@@ -138,6 +138,9 @@ pub struct Session {
     /// The sessions directory this session's files live in.
     dir: PathBuf,
     path: PathBuf,
+    /// `--no-session-persistence`: every write below is skipped, the
+    /// `.meta` included, so the run leaves no session behind to resume.
+    in_memory: bool,
 }
 
 impl Session {
@@ -159,6 +162,27 @@ impl Session {
     /// `new_with_id` in the sessions directory `dir`.
     pub async fn create_in(dir: &Path, id: String) -> Result<Self> {
         create_private_dir(dir).await?;
+        let session = Self::unsaved(dir, id);
+        session.meta.save_in(dir).await?;
+        Ok(session)
+    }
+
+    /// A new session that is never written to disk. `id` as for
+    /// `new_with_id`, or a fresh one.
+    pub fn in_memory(id: Option<String>) -> Self {
+        let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut session = Self::unsaved(&crate::config::Config::sessions_dir(), id);
+        session.in_memory = true;
+        session
+    }
+
+    /// Stop writing this (resumed) session: later turns, renames and undo
+    /// state stay in memory.
+    pub fn keep_in_memory(&mut self) {
+        self.in_memory = true;
+    }
+
+    fn unsaved(dir: &Path, id: String) -> Self {
         let meta = SessionMeta {
             id: id.clone(),
             name: human_session_name(),
@@ -175,13 +199,13 @@ impl Session {
             imported_at: None,
             redo: Vec::new(),
         };
-        meta.save_in(dir).await?;
-        Ok(Self {
-            id: id.clone(),
+        Self {
+            path: Self::jsonl_path(dir, &id),
+            id,
             meta,
             dir: dir.to_path_buf(),
-            path: Self::jsonl_path(dir, &id),
-        })
+            in_memory: false,
+        }
     }
 
     /// A session whose transcript lives at `path`, so tests never touch the
@@ -208,6 +232,7 @@ impl Session {
             },
             dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             path,
+            in_memory: false,
         }
     }
 
@@ -272,6 +297,7 @@ impl Session {
             meta,
             dir: dir.to_path_buf(),
             path: Self::jsonl_path(dir, id),
+            in_memory: false,
         };
         let messages = s.load_and_heal().await?;
         Ok((s, messages))
@@ -330,13 +356,16 @@ impl Session {
         self.meta.imported_at = None;
         self.path = Self::jsonl_path(&self.dir, &id);
         self.id = id;
+        if self.in_memory {
+            return Ok(());
+        }
         self.meta.save_in(&self.dir).await?;
         self.overwrite(messages).await
     }
 
     /// Append new messages to the session file.
     pub async fn append(&mut self, new_messages: &[Message]) -> Result<()> {
-        if new_messages.is_empty() {
+        if new_messages.is_empty() || self.in_memory {
             return Ok(());
         }
 
@@ -385,6 +414,9 @@ impl Session {
     /// Overwrite the session file with a completely new set of messages.
     /// Used after compaction to keep the on-disk file consistent.
     pub async fn overwrite(&self, messages: &[Message]) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
         // Pre-allocate ~256 bytes per message to reduce re-allocs
         let mut content = String::with_capacity(messages.len() * 256);
         for msg in messages {
@@ -397,13 +429,16 @@ impl Session {
     /// Rename the session.
     pub async fn rename(&mut self, name: &str) -> Result<()> {
         self.meta.name = name.to_string();
-        self.meta.save_in(&self.dir).await
+        self.save_meta().await
     }
 
     /// Save the /redo turns to `<id>.redo`, or remove that file when there
     /// are none or the session is not persisted (`persist` false): the
     /// undone turns' messages then stay in memory only.
     pub async fn save_redo(&self, persist: bool) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
         let path = redo_path(&self.dir, &self.id);
         if persist && !self.meta.redo.is_empty() {
             let body = serde_json::to_string(&self.meta.redo)?;
@@ -434,6 +469,9 @@ impl Session {
     /// Persist the current `SessionMeta` to disk. Used by the auto-commit loop
     /// to checkpoint updated `auto_commits` / `undo_position` after each turn.
     pub async fn save_meta(&self) -> anyhow::Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
         self.meta.save_in(&self.dir).await
     }
 
@@ -1627,5 +1665,77 @@ mod fork_tests {
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("orig.meta")).unwrap())
                 .unwrap();
         assert_eq!(orig.claude_code_session.as_deref(), Some("cc-1234"));
+    }
+}
+
+#[cfg(test)]
+mod in_memory_tests {
+    use super::*;
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// `--no-session-persistence` still wrote `<id>.meta` at launch and on
+    /// every prompt, so each run left an empty session in /resume.
+    #[tokio::test]
+    async fn an_in_memory_session_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::unsaved(dir.path(), "new".into());
+        s.in_memory = true;
+        s.save_meta().await.unwrap();
+        s.append(&[user("hi")]).await.unwrap();
+        s.overwrite(&[user("hi")]).await.unwrap();
+        s.rename("named").await.unwrap();
+        s.save_redo(true).await.unwrap();
+        s.fork(&[user("hi")]).await.unwrap();
+        assert!(files(dir.path()).is_empty(), "{:?}", files(dir.path()));
+        assert_eq!(s.meta.name, "fork-of-new");
+    }
+
+    /// A session resumed under the flag stops writing, and its files on
+    /// disk stay as they were.
+    #[tokio::test]
+    async fn a_resumed_session_kept_in_memory_leaves_its_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut orig = Session::create_in(dir.path(), "s1".into()).await.unwrap();
+        orig.append(&[user("first")]).await.unwrap();
+        std::fs::write(redo_path(dir.path(), "s1"), "[]").unwrap();
+        let before: Vec<(String, Vec<u8>)> = files(dir.path())
+            .into_iter()
+            .map(|f| {
+                let body = std::fs::read(dir.path().join(&f)).unwrap();
+                (f, body)
+            })
+            .collect();
+
+        let (mut s, history) = Session::resume_in(dir.path(), "s1").await.unwrap();
+        s.keep_in_memory();
+        s.append(&[user("second")]).await.unwrap();
+        s.overwrite(&history).await.unwrap();
+        s.meta.name = "renamed".into();
+        s.save_meta().await.unwrap();
+        s.save_redo(true).await.unwrap();
+
+        let after: Vec<(String, Vec<u8>)> = files(dir.path())
+            .into_iter()
+            .map(|f| {
+                let body = std::fs::read(dir.path().join(&f)).unwrap();
+                (f, body)
+            })
+            .collect();
+        assert_eq!(before, after);
     }
 }
