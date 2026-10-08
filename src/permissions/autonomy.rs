@@ -41,9 +41,14 @@ pub const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// Directories whose contents a pre-approved edit must not touch: VCS and
 /// agent state, CI, git hook managers, and what auto-fix's runners execute
 /// or load (`.cargo/config.toml` runners, the `.venv` ruff/pytest, the
-/// `node_modules` eslint and the packages `npm test` loads).
+/// `node_modules` eslint and the packages `npm test` loads). Mercurial,
+/// Sapling and Jujutsu keep repo config that runs hooks or commands, like
+/// `.git/config`.
 const PROTECTED_DIRS: &[&str] = &[
     ".git",
+    ".hg",
+    ".sl",
+    ".jj",
     ".claude",
     ".oxideclaw",
     ".agents",
@@ -412,6 +417,10 @@ mod tests {
         for p in [
             ".git/hooks/pre-commit",
             "sub/.git/config",
+            ".hg/hgrc",
+            ".HG/hgrc",
+            ".sl/config",
+            ".jj/repo/config.toml",
             ".claude/settings.json",
             ".oxideclaw/x",
             ".agents/skills/a/SKILL.md",
