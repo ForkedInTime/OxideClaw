@@ -1716,10 +1716,29 @@ async fn run_loop(
                                     Err(_) => break,
                                 }
                             }
+                            // Hooked like a typed /browse; a stop puts it in
+                            // the input box to edit and send, unless the user
+                            // was typing there meanwhile.
+                            let typed = format!("/browse {goal_str}");
+                            let draft = (app.input.clone(), app.cursor);
+                            let Some((gated_goal, hook_note)) = user_prompt_gate(
+                                &mut app, &config, &session.id, &typed, &typed, goal_str.clone(),
+                            ).await else {
+                                if !draft.0.is_empty() {
+                                    (app.input, app.cursor) = draft;
+                                }
+                                match rx.try_recv() {
+                                    Ok(next) => { ev = next; continue; }
+                                    Err(_) => break,
+                                }
+                            };
                             let max = config.browse_max_steps;
                             app.entries.push(ChatEntry::system(format!(
                                 "🌐 /browse (voice) — goal: {goal_str} (max {max} steps, policy: Pattern)"
                             )));
+                            if let Some(msg) = hook_note {
+                                app.entries.push(ChatEntry::system(msg));
+                            }
                             app.scroll_to_bottom();
                             app.start_loading();
                             begin_agent_turn(&mut session, &config, &tools).await;
@@ -1737,7 +1756,7 @@ async fn run_loop(
                             let usage_sink = Some(crate::tui::events::forward_usage(tx.clone()));
                             let err_tx = tx.clone();
                             let browse_req = crate::browser::browse_loop::BrowseRequest {
-                                goal: goal_str,
+                                goal: gated_goal,
                                 policy: crate::browser::browse_loop::BrowsePolicy::Pattern,
                                 max_steps: max,
                                 voice: true,

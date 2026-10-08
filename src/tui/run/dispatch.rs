@@ -45,6 +45,24 @@ fn refresh_trust(
     config.router_fingerprint() != router_before && resync_router(app, config, &router_before)
 }
 
+/// The userPromptSubmit gate for a slash command that sends `prompt` as a
+/// turn, as typed messages get; then `input` is shown as the user's
+/// message. None when a hook stopped it.
+async fn gate_slash_prompt(
+    app: &mut App,
+    config: &Config,
+    session_id: &str,
+    input: &str,
+    prompt: String,
+) -> Option<String> {
+    let (prompt, note) = user_prompt_gate(app, config, session_id, input, input, prompt).await?;
+    app.entries.push(ChatEntry::user(input.to_string()));
+    if let Some(msg) = note {
+        app.entries.push(ChatEntry::system(msg));
+    }
+    Some(prompt)
+}
+
 fn skill_turn_tools(tools: &[DynTool], disable_shell: bool) -> Vec<DynTool> {
     tools
         .iter()
@@ -314,7 +332,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::SendPrompt(prompt) => {
             // Command prompts (/review, /init, /commit, ...) are real turns:
             // Done hands back the full history with the prompt in it.
-            app.entries.push(ChatEntry::user(input.clone()));
+            let Some(prompt) = gate_slash_prompt(app, config, &session.id, &input, prompt).await
+            else {
+                return Ok(());
+            };
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config, tools).await;
@@ -1454,7 +1475,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // the matching MCP tool (e.g. ctx_doctor → mcp__…__ctx_doctor).
             if let Some(server) = plugin_server(mcp_statuses, &plugin) {
                 let prompt = plugin_command_prompt(&server.name, &command, &args);
-                app.entries.push(ChatEntry::user(input.clone()));
+                let Some(prompt) =
+                    gate_slash_prompt(app, config, &session.id, &input, prompt).await
+                else {
+                    return Ok(());
+                };
                 app.scroll_to_bottom();
                 app.start_loading();
                 begin_agent_turn(session, config, tools).await;
@@ -2010,8 +2035,23 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 app.scroll_to_bottom();
                 return Ok(());
             }
+            // The task is the spawned agent's first prompt. The hooks'
+            // context (the gate's result for an empty prompt) goes to its
+            // system prompt: the task also names its branch and commit.
+            let Some((hook_context, hook_note)) =
+                user_prompt_gate(app, config, &session.id, &input, &input, String::new()).await
+            else {
+                return Ok(());
+            };
+            if let Some(msg) = hook_note {
+                app.entries.push(ChatEntry::system(msg));
+            }
             let tx2 = tx.clone();
-            let cfg = config.clone();
+            let mut cfg = config.clone();
+            if !hook_context.is_empty() {
+                cfg.append_system_prompt =
+                    Some(cfg.append_system_prompt.unwrap_or_default() + &hook_context);
+            }
             let reg = spawn_registry.clone();
             let task2 = task.clone();
             let budget_left = app.cost_tracker.remaining();
@@ -2325,9 +2365,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 policy
             };
             let max = max_steps.unwrap_or(config.browse_max_steps);
+            // The goal is a prompt for the browse agent's model.
+            let Some((gated_goal, hook_note)) =
+                user_prompt_gate(app, config, &session.id, &input, &input, goal.clone()).await
+            else {
+                return Ok(());
+            };
             app.entries.push(ChatEntry::system(format!(
                 "🌐 /browse started — goal: {goal} (max {max} steps, policy: {policy:?})"
             )));
+            if let Some(msg) = hook_note {
+                app.entries.push(ChatEntry::system(msg));
+            }
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config, tools).await;
@@ -2351,7 +2400,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let err_tx = tx.clone();
 
             let browse_req = crate::browser::browse_loop::BrowseRequest {
-                goal,
+                goal: gated_goal,
                 policy,
                 max_steps: max,
                 voice: false,
@@ -2391,7 +2440,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     "Navigate the browser to {url} and take an accessibility snapshot. Describe what you see on the page."
                 )
             };
-            app.entries.push(ChatEntry::user(input.clone()));
+            let Some(prompt) = gate_slash_prompt(app, config, &session.id, &input, prompt).await
+            else {
+                return Ok(());
+            };
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config, tools).await;
@@ -2435,7 +2487,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::BrowserScreenshot => {
             let prompt = "Take a screenshot of the current browser page (use the browser_screenshot tool) and tell me what is visible.".to_string();
-            app.entries.push(ChatEntry::user(input.clone()));
+            let Some(prompt) = gate_slash_prompt(app, config, &session.id, &input, prompt).await
+            else {
+                return Ok(());
+            };
             app.scroll_to_bottom();
             app.start_loading();
             begin_agent_turn(session, config, tools).await;
@@ -2655,11 +2710,20 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 if config.disable_skill_shell_execution {
                     prompt.push_str("\n\nNote: shell command execution (Bash tool) is disabled for skill invocations.");
                 }
+                // Gated before anything is shown, so a stop leaves no trace.
+                let Some((prompt, hook_note)) =
+                    user_prompt_gate(app, config, &session.id, &input, &input, prompt).await
+                else {
+                    return Ok(());
+                };
                 app.entries.push(ChatEntry::system(format!(
                     "Skill: {} — {}",
                     skill.name, skill.description
                 )));
                 app.entries.push(ChatEntry::user(input));
+                if let Some(msg) = hook_note {
+                    app.entries.push(ChatEntry::system(msg));
+                }
                 app.scroll_to_bottom();
                 app.start_loading();
                 begin_agent_turn(session, config, tools).await;
@@ -3549,5 +3613,100 @@ mod slash_tests {
         trust(false);
         run_with(&mut app, &mut config, &skills, &perm_state, "/reload").await;
         assert!(bash_allowed(&perm_state));
+    }
+
+    /// Only typed messages ran userPromptSubmit hooks: a skill, /review,
+    /// /browse or /spawn went to the model past a guard hook's exit 2.
+    #[tokio::test]
+    async fn prompt_hook_stops_slash_commands_that_send_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = crate::settings::HookEntry {
+            matcher: String::new(),
+            command: r#"printf '%s\n' "$CLAUDE_MESSAGE" >> seen.txt; echo 'has a token'; exit 2"#
+                .into(),
+        };
+        let mut config = Config {
+            cwd: dir.path().to_path_buf(),
+            hooks: Some(crate::settings::HooksConfig {
+                user_prompt_submit: vec![hook],
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut skills = std::collections::HashMap::new();
+        skills.insert(
+            "deploy".to_string(),
+            crate::skills::Skill {
+                name: "deploy".into(),
+                description: "ship it".into(),
+                prompt_template: "deploy {{ARGS}}".into(),
+                category: None,
+                params: Vec::new(),
+                skill_file: None,
+            },
+        );
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        let typed = [
+            "/deploy prod tok_123",
+            "/review",
+            "/browse find the docs",
+            "/spawn refactor auth",
+        ];
+        for input in typed {
+            let before = app.entries.len();
+            run(&mut app, &mut config, &skills, input).await;
+            assert_eq!(
+                app.input.iter().collect::<String>(),
+                input,
+                "input restored"
+            );
+            assert!(
+                !app.is_loading && app.api_task.is_none(),
+                "{input} started a turn"
+            );
+            assert!(app.browse_progress_rx.is_none(), "{input} started a browse");
+            let added: Vec<_> = app.entries[before..]
+                .iter()
+                .map(|e| e.text.clone())
+                .collect();
+            assert_eq!(added.len(), 1, "{input}: {added:?}");
+            assert!(added[0].contains("blocked by a userPromptSubmit hook: has a token"));
+            app.input.clear();
+        }
+        let seen = std::fs::read_to_string(dir.path().join("seen.txt")).unwrap();
+        assert_eq!(seen.lines().collect::<Vec<_>>(), typed);
+    }
+
+    /// A passing hook's stdout reaches the expanded prompt, not the text
+    /// the hook was shown.
+    #[tokio::test]
+    async fn prompt_hook_context_is_added_to_the_expanded_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cwd: dir.path().to_path_buf(),
+            hooks: Some(crate::settings::HooksConfig {
+                user_prompt_submit: vec![crate::settings::HookEntry {
+                    matcher: String::new(),
+                    command: "echo branch-main".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        let (prompt, _) = user_prompt_gate(
+            &mut app,
+            &config,
+            "s",
+            "/deploy",
+            "/deploy",
+            "deploy it".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prompt,
+            "deploy it\n\n<additional_context>branch-main</additional_context>"
+        );
     }
 }

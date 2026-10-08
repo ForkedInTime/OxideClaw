@@ -512,54 +512,31 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             if budget_blocks(app, &raw) {
                 return Ok(());
             }
-            app.show_welcome = false;
-            app.entries.push(ChatEntry::user(input.clone()));
-            app.scroll_to_bottom();
-            app.start_loading();
-
             // btw note and image are only taken once the prompt is allowed, so
             // a hook that stops the turn leaves them in place for the retry.
             let final_text = match app.btw_note.as_deref() {
                 Some(note) => format!("(btw: {note})\n\n{input}"),
-                None => input,
+                None => input.clone(),
             };
-            // UserPromptSubmit hooks: stdout adds context, exit 2 or
-            // `continue: false` stops the prompt before it reaches the model.
-            let mut hook_system_message = None;
-            let final_text = match &config.hooks {
-                Some(hook_cfg) if !config.disable_all_hooks => {
-                    let r = hooks::run_user_prompt_hooks(
-                        hook_cfg,
-                        &final_text,
-                        &session.id,
-                        &config.cwd,
-                    )
-                    .await;
-                    if !r.should_continue {
-                        app.entries.pop();
-                        app.finish_loading();
-                        app.input = raw.chars().collect();
-                        app.cursor = app.input.len();
-                        app.entries.push(ChatEntry::error(format!(
-                            "Prompt not sent — blocked by a userPromptSubmit hook: {}",
-                            r.stop_reason.unwrap_or_default()
-                        )));
-                        app.scroll_to_bottom();
-                        return Ok(());
-                    }
-                    hook_system_message = r.system_message;
-                    match r.additional_context {
-                        Some(extra_ctx) => format!(
-                            "{final_text}\n\n<additional_context>{extra_ctx}</additional_context>"
-                        ),
-                        None => final_text,
-                    }
-                }
-                _ => final_text,
+            let Some((final_text, hook_note)) = user_prompt_gate(
+                app,
+                config,
+                &session.id,
+                &raw,
+                &final_text,
+                final_text.clone(),
+            )
+            .await
+            else {
+                return Ok(());
             };
-            if let Some(msg) = hook_system_message {
+            app.show_welcome = false;
+            app.entries.push(ChatEntry::user(input));
+            if let Some(msg) = hook_note {
                 app.entries.push(ChatEntry::system(msg));
             }
+            app.scroll_to_bottom();
+            app.start_loading();
             app.btw_note = None;
             begin_agent_turn(session, config, tools).await;
 
@@ -917,6 +894,43 @@ fn answer_browse_approval(app: &mut App, approved: bool, label: &str) {
 /// Refuse a model call once /budget is spent, putting `unsent` back in the
 /// input. The Usage-event abort only fires after the first call is billed,
 /// so without this every turn past the cap still cost one full request.
+/// UserPromptSubmit hooks for a prompt about to start a turn: a typed
+/// message, or a slash command, skill or plugin command that sends one.
+/// `hook_text` is what the hook sees (what the user typed), `prompt` what
+/// goes to the model. Exit 2 or `continue: false` stops it: `raw` goes back
+/// into the input box and None is returned, so run it before anything of
+/// the turn is shown. Otherwise returns `prompt` with the hooks' context
+/// and the systemMessage to show.
+pub(super) async fn user_prompt_gate(
+    app: &mut App,
+    config: &Config,
+    session_id: &str,
+    raw: &str,
+    hook_text: &str,
+    prompt: String,
+) -> Option<(String, Option<String>)> {
+    let hook_cfg = match &config.hooks {
+        Some(h) if !config.disable_all_hooks => h,
+        _ => return Some((prompt, None)),
+    };
+    let r = hooks::run_user_prompt_hooks(hook_cfg, hook_text, session_id, &config.cwd).await;
+    if !r.should_continue {
+        app.input = raw.chars().collect();
+        app.cursor = app.input.len();
+        app.entries.push(ChatEntry::error(format!(
+            "Prompt not sent — blocked by a userPromptSubmit hook: {}",
+            r.stop_reason.unwrap_or_default()
+        )));
+        app.scroll_to_bottom();
+        return None;
+    }
+    let prompt = match r.additional_context {
+        Some(extra) => format!("{prompt}\n\n<additional_context>{extra}</additional_context>"),
+        None => prompt,
+    };
+    Some((prompt, r.system_message))
+}
+
 pub(super) fn budget_blocks(app: &mut App, unsent: &str) -> bool {
     if !app.cost_tracker.over_budget() {
         return false;
