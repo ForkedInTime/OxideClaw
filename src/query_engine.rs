@@ -3,7 +3,9 @@
 use crate::api::types::*;
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::browser::middleware::MiddlewareVerdict;
-use crate::compact::{CompactNeeded, compact_needed, snip_compact, summarize_compact, turn_window};
+use crate::compact::{
+    CompactNeeded, compact_needed, compaction_window, snip_compact, summarize_compact, turn_window,
+};
 use crate::config::Config;
 use crate::rag;
 use crate::tools::{DynTool, ToolContext};
@@ -587,10 +589,18 @@ impl QueryEngine {
                 break;
             }
 
-            // Context compaction check, against the tier this turn runs on:
-            // the router picks once per prompt, and Ollama truncates an
-            // overflow silently instead of failing over to a larger tier.
-            let window = turn_window(&self.config, routing.as_ref().map(|r| &r.router));
+            // Context compaction check. While tools run, against the tier
+            // this turn runs on: the router picks once per prompt, and Ollama
+            // truncates an overflow silently instead of failing over to a
+            // larger tier. Once the turn ends, a snip or summary outlasts it
+            // and the next prompt is routed afresh, so against the largest
+            // usable tier.
+            let router = routing.as_ref().map(|r| &r.router);
+            let window = if response.stop_reason == Some(StopReason::ToolUse) {
+                turn_window(&self.config, router)
+            } else {
+                compaction_window(&self.config, router, None)
+            };
             let mut summarise_after_tools = false;
             let context_tokens = response.usage.context_tokens();
             match compact_needed(context_tokens, window) {
@@ -2548,6 +2558,46 @@ mod tests {
 mod router_tests {
     use super::*;
     use crate::router::fake_chat::{self, Reply};
+
+    /// `-p --resume` routed to Haiku: a final response near Haiku's window
+    /// must not summarise the saved history, which the 1M tiers hold.
+    #[tokio::test]
+    async fn a_full_low_tier_turn_compacts_against_the_largest_tier() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let text = [serde_json::json!({"type":"text","text":"done"})];
+        let full =
+            sse(&text, "end_turn").replace(r#""input_tokens":1,"#, r#""input_tokens":185000,"#);
+        let summary = sse(
+            &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
+            "end_turn",
+        );
+        let (url, seen) = serve(vec![full, summary]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.path().to_path_buf(),
+            auto_compact_enabled: true,
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&config.model);
+        router.enabled = true;
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        e.set_router(router);
+        e.resume_history("s".into(), Vec::new());
+
+        e.query("yes").await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(body["model"], "claude-haiku-4-5", "routed to the low tier");
+        assert_eq!(seen.len(), 1, "summarised against Haiku's window");
+        assert_eq!(e.messages.len(), 2, "{:?}", e.messages);
+    }
 
     /// `-p` with a router whose tiers all live on one fake Ollama host:
     /// "yes" is a low-tier prompt.

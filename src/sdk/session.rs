@@ -595,9 +595,15 @@ impl SdkSession {
             // tools), prompt-cache hits included, is the real measure of
             // how full the context window is.
             let context_tok = response.usage.context_tokens();
-            // The tier is fixed for the rest of this prompt: measure against it.
-            let window =
-                crate::compact::turn_window(&self.config, routing.as_ref().map(|r| &r.router));
+            // While tools run the tier is fixed: measure against it. Once the
+            // turn ends, a snip or summary outlasts it and the next prompt is
+            // routed afresh, so measure against the largest usable tier.
+            let router = routing.as_ref().map(|r| &r.router);
+            let window = if response.stop_reason == Some(StopReason::ToolUse) {
+                crate::compact::turn_window(&self.config, router)
+            } else {
+                crate::compact::compaction_window(&self.config, router, None)
+            };
             let used_pct = ((context_tok as f64 / window as f64) * 100.0).min(100.0) as u8;
             self.send_notif(SdkNotification::ContextHealth {
                 session_id: self.session_id.clone(),
@@ -2487,5 +2493,53 @@ mod router_tests {
         assert_eq!(completed.as_deref(), Some("ollama:mid"));
         // Back on the session model for the next turn.
         assert_eq!(s.config_model(), "ollama:big");
+    }
+
+    /// A turn routed to Haiku that ends near Haiku's window must not queue
+    /// a summary: the next prompt can go to a 1M tier, which holds it.
+    #[tokio::test]
+    async fn a_full_low_tier_turn_compacts_against_the_largest_tier() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let text = [serde_json::json!({"type":"text","text":"done"})];
+        let full =
+            sse(&text, "end_turn").replace(r#""input_tokens":1,"#, r#""input_tokens":185000,"#);
+        let (url, seen) = serve(vec![full]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            auto_compact_enabled: true,
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut router = crate::router::RouterConfig::new(&cfg.model);
+        router.enabled = true;
+        let (ntx, _nrx) = mpsc::unbounded_channel();
+        let (atx, _arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let mut s = SdkSession::new(
+            cfg,
+            Vec::new(),
+            Policy::default(),
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        client.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(client);
+        s.set_router(router);
+
+        s.execute_turn("yes".into()).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        assert_eq!(body["model"], "claude-haiku-4-5", "routed to the low tier");
+        assert!(
+            !s.summarise_pending,
+            "summary queued against Haiku's window"
+        );
+        assert!(!s.take_history_rewritten());
     }
 }
