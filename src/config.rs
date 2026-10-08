@@ -1145,8 +1145,12 @@ impl Config {
         // → --settings. Env vars applied after (higher priority than settings).
         let mut settings = self.load_settings();
         self.apply_browser_settings(&settings);
-        if let Some(model) = settings.model {
-            self.model = crate::commands::resolve_model_alias(&model);
+        if let Some(model) = settings
+            .model
+            .as_deref()
+            .and_then(crate::commands::settings_model)
+        {
+            self.model = model;
             self.settings_model = Some(self.model.clone());
         }
         if let Some(mt) = settings.max_tokens {
@@ -3638,6 +3642,22 @@ mod retarget_cwd_tests {
         cfg.model = "cli-model".into();
         cfg.retarget_cwd(b.path().to_path_buf());
         assert_eq!(cfg.model, "cli-model");
+    }
+
+    /// Claude Code's `"model": "default"` is no choice: the default model
+    /// applies, and so does the keyless start on a local Ollama model.
+    #[test]
+    fn a_default_settings_model_is_no_choice() {
+        let a = tempfile::tempdir().unwrap();
+        project(a.path(), "A", r#"{"model": "default"}"#);
+        let cfg = launched_in(a.path());
+        assert_eq!(cfg.model, Config::default().model);
+        assert_eq!(cfg.settings_model, None);
+
+        project(a.path(), "A", r#"{"model": "sonnet[1m]"}"#);
+        let cfg = launched_in(a.path());
+        assert_eq!(cfg.model, "claude-sonnet-5");
+        assert_eq!(cfg.settings_model.as_deref(), Some("claude-sonnet-5"));
     }
 }
 

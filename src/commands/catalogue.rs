@@ -97,9 +97,24 @@ pub(super) fn cmd_model(args: &str, _ctx: &CommandContext) -> CommandAction {
 /// Resolve common model shorthands to full Anthropic model IDs.
 /// e.g. "opus" → "claude-opus-5", "sonnet" → "claude-sonnet-5"
 pub fn resolve_model_alias(model: &str) -> String {
+    // Claude Code's settings (which the first run migrates) also hold its
+    // own spellings, which the API rejects: a `[1m]` long-context suffix
+    // (Claude 4.6 and later have the 1M window without it), `opusplan` and
+    // `default`.
+    let model = match model.len().checked_sub(4).and_then(|i| model.get(i..)) {
+        Some(tail)
+            if tail.eq_ignore_ascii_case("[1m]")
+                && !crate::api::is_ollama_model(model)
+                && !crate::api::is_openai_compat_model(model) =>
+        {
+            &model[..model.len() - 4]
+        }
+        _ => model,
+    };
     match model.to_ascii_lowercase().as_str() {
+        "default" => crate::api::default_model().into(),
         // Bare family names mean the current generation.
-        "opus" => "claude-opus-5".into(),
+        "opus" | "opusplan" => "claude-opus-5".into(),
         "sonnet" => "claude-sonnet-5".into(),
         "haiku" => "claude-haiku-4-5".into(),
         "fable" => "claude-fable-5-1".into(),
@@ -109,6 +124,14 @@ pub fn resolve_model_alias(model: &str) -> String {
         "sonnet-4-5" | "sonnet4.5" => "claude-sonnet-4-5".into(),
         _ => model.to_string(),
     }
+}
+
+/// A settings file's `model`, or `None` when it picks no model: blank, or
+/// Claude Code's `default`. Unset keeps the default model and, without an
+/// Anthropic key, the start on a local Ollama model.
+pub fn settings_model(raw: &str) -> Option<String> {
+    let m = raw.trim();
+    (!m.is_empty() && !m.eq_ignore_ascii_case("default")).then(|| resolve_model_alias(m))
 }
 
 pub(super) fn cmd_effort(args: &str) -> CommandAction {

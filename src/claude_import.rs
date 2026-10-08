@@ -124,6 +124,16 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
             let mut names: Vec<String> = Vec::new();
             for key in PREFERENCE_KEYS {
                 if let Some(v) = theirs.get(*key).filter(|v| !v.is_null()) {
+                    // Claude Code's `/model` writes `default` for "no choice";
+                    // copied, it would count as one and skip the keyless
+                    // start on a local Ollama model. Its other spellings
+                    // (`opusplan`, `sonnet[1m]`) resolve on load.
+                    if *key == "model"
+                        && v.as_str()
+                            .is_some_and(|m| crate::commands::settings_model(m).is_none())
+                    {
+                        continue;
+                    }
                     ours.insert(key.to_string(), v.clone());
                     names.push(key.to_string());
                 }
@@ -1564,5 +1574,44 @@ mod tests {
         let other = td.path().join("other");
         copy_dir_private(&data.join("sessions"), &other).unwrap();
         assert_eq!(mtime(&other.join("abc.jsonl")), old);
+    }
+
+    /// Claude Code's `/model` writes spellings the API rejects; `default`
+    /// is no choice at all and is left out, the rest resolve on load.
+    #[test]
+    fn claude_code_model_spellings_import_as_models() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join("claude");
+        let (config, data) = (td.path().join("config"), td.path().join("data"));
+        write(
+            &claude.join("settings.json"),
+            r#"{"model": "default", "theme": "dark"}"#,
+        );
+        migrate(&claude, &config, &data);
+        let settings = read(&config.join("settings.json"));
+        assert!(settings.get("model").is_none(), "{settings}");
+        assert_eq!(settings["theme"], "dark");
+
+        for (theirs, ours) in [
+            ("opusplan", "claude-opus-5"),
+            ("sonnet[1m]", "claude-sonnet-5"),
+            (
+                "claude-sonnet-4-5-20250929[1M]",
+                "claude-sonnet-4-5-20250929",
+            ),
+        ] {
+            let config = td.path().join(format!("config-{ours}"));
+            write(
+                &claude.join("settings.json"),
+                &format!(r#"{{"model": "{theirs}"}}"#),
+            );
+            migrate(&claude, &config, &data);
+            let model = read(&config.join("settings.json"))["model"].clone();
+            assert_eq!(
+                crate::commands::settings_model(model.as_str().unwrap()).as_deref(),
+                Some(ours),
+                "{theirs}"
+            );
+        }
     }
 }

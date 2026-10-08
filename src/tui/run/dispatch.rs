@@ -2789,7 +2789,7 @@ fn reloaded_model(
     last_seen: &mut Option<String>,
     current: &str,
 ) -> Option<String> {
-    let resolved = settings_model.map(crate::commands::resolve_model_alias);
+    let resolved = settings_model.and_then(crate::commands::settings_model);
     if resolved == *last_seen {
         return None;
     }

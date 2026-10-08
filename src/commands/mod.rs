@@ -795,6 +795,28 @@ mod model_catalogue_tests {
         assert_eq!(resolve_model_alias("ollama:llama3"), "ollama:llama3");
     }
 
+    /// Claude Code's own model spellings (its settings.json is migrated on
+    /// first run) were sent to the API verbatim and rejected.
+    #[test]
+    fn claude_code_model_spellings_resolve() {
+        assert_eq!(resolve_model_alias("opusplan"), "claude-opus-5");
+        assert_eq!(resolve_model_alias("sonnet[1m]"), "claude-sonnet-5");
+        assert_eq!(resolve_model_alias("OPUS[1M]"), "claude-opus-5");
+        assert_eq!(
+            resolve_model_alias("claude-sonnet-4-5-20250929[1m]"),
+            "claude-sonnet-4-5-20250929"
+        );
+        assert_eq!(resolve_model_alias("default"), crate::api::default_model());
+        // Another provider's name is its own business.
+        assert_eq!(resolve_model_alias("ollama:x[1m]"), "ollama:x[1m]");
+        assert_eq!(super::settings_model(" default "), None);
+        assert_eq!(super::settings_model(""), None);
+        assert_eq!(
+            super::settings_model("opusplan").as_deref(),
+            Some("claude-opus-5")
+        );
+    }
+
     #[test]
     fn the_picker_lists_current_models_without_date_suffixes() {
         let ids: Vec<&str> = KNOWN_MODELS.iter().map(|(id, _)| *id).collect();
