@@ -206,24 +206,45 @@ pub(super) fn cmd_router(args: &str) -> CommandAction {
 }
 
 pub(super) fn cmd_permissions(ctx: &CommandContext) -> CommandAction {
-    let _ = ctx; // permissions state lives in PermissionState, not config
-    CommandAction::Message(
-        concat!(
-            "Permission system\n",
-            "\n",
-            "When Claude wants to run a sensitive tool, a permission dialog appears:\n",
-            "  y — allow this call once\n",
-            "  a — always allow this tool (no more prompts for this tool)\n",
-            "  n — deny this call\n",
-            "\n",
-            "Tools that always require permission:\n",
-            "  Bash, Write, Edit\n",
-            "\n",
-            "Tools that never require permission:\n",
-            "  Read, Glob, Grep, WebFetch, WebSearch",
-        )
-        .into(),
-    )
+    let config = ctx.config;
+    let mode = config.effective_autonomy();
+    let mut out = format!("Permission system (autonomy: {mode}");
+    if mode != config.autonomy {
+        out.push_str(&format!(
+            ", set to {} but without its sandbox",
+            config.autonomy
+        ));
+    }
+    out.push_str(", see /autonomy)\n\n");
+    // Generated from the gate's own list, so it cannot drift from it.
+    out.push_str(&format!(
+        "These tools ask before they run: {}, every MCP tool (mcp__*), and\n\
+         ExitWorktree when it discards changes. They run without asking when a\n\
+         permissions.allow rule or an [a]lways answer covers them, or when the\n\
+         autonomy mode pre-approves them (auto-edit: edits inside the project;\n\
+         full-auto: sandboxed commands too). In suggest mode every edit asks, even\n\
+         after [a]lways. permissions.deny rules refuse a call in every mode.\n\n",
+        crate::permissions::SENSITIVE_TOOLS.join(", ")
+    ));
+    out.push_str(
+        "At a prompt:\n  \
+         y — allow this call once\n  \
+         a — always allow this tool for the rest of the session\n  \
+         n — deny this call\n\n\
+         Other tools (Read, Glob, Grep, WebFetch, WebSearch, ...) do not ask here.",
+    );
+    for (name, rules) in [
+        ("allow", &config.permissions_allow),
+        ("deny", &config.permissions_deny),
+    ] {
+        if !rules.is_empty() {
+            out.push_str(&format!("\n\npermissions.{name}:"));
+            for r in rules {
+                out.push_str(&format!("\n  {r}"));
+            }
+        }
+    }
+    CommandAction::Message(out)
 }
 
 pub(super) fn cmd_autonomy(args: &str, current: crate::permissions::Autonomy) -> CommandAction {
@@ -595,10 +616,14 @@ mod hooks_command_tests {
             hooks: Some(hooks),
             ..Config::default()
         };
+        run(&config, cmd_hooks)
+    }
+
+    fn run(config: &Config, cmd: fn(&CommandContext) -> CommandAction) -> String {
         let skills = HashMap::new();
         let todo = TodoState::default();
         let ctx = CommandContext {
-            config: &config,
+            config,
             tokens_in: 0,
             context_window: 0,
             tokens_out: 0,
@@ -617,10 +642,37 @@ mod hooks_command_tests {
             brief_mode: false,
             btw_note: None,
         };
-        match cmd_hooks(&ctx) {
+        match cmd(&ctx) {
             CommandAction::Message(m) => m,
-            _ => panic!("/hooks should print a message"),
+            _ => panic!("the command should print a message"),
         }
+    }
+
+    /// /permissions named three tools as always prompting, while auto-edit
+    /// and full-auto pre-approve them and PowerShell, MultiEdit and MCP
+    /// tools prompt too.
+    #[test]
+    fn permissions_lists_every_gated_tool_the_mode_and_the_rules() {
+        let config = Config {
+            autonomy: crate::permissions::Autonomy::AutoEdit,
+            permissions_allow: vec!["Bash(cargo test:*)".into()],
+            permissions_deny: vec!["Bash(git push:*)".into()],
+            ..Config::default()
+        };
+        let out = run(&config, cmd_permissions);
+        for tool in crate::permissions::SENSITIVE_TOOLS {
+            assert!(out.contains(tool), "{tool}: {out}");
+        }
+        for want in [
+            "mcp__",
+            "ExitWorktree",
+            "autonomy: auto-edit",
+            "Bash(cargo test:*)",
+            "Bash(git push:*)",
+        ] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        assert!(!out.contains("always require"), "{out}");
     }
 
     fn entry(command: &str) -> HookEntry {
