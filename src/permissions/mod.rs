@@ -124,17 +124,38 @@ impl PermissionState {
         tool_name: &str,
         input: Option<&serde_json::Value>,
     ) -> CheckResult {
+        self.check_with_input_in(tool_name, input, &self.cwd())
+    }
+
+    /// [`Self::check_with_input`] for a call whose relative paths the tool
+    /// resolves against `work_cwd`. After `EnterWorktree` that is a sibling
+    /// worktree outside the project, holding the same tracked files, so
+    /// project-relative rules (`Edit(./migrations/**)`) are matched with
+    /// both it and the project root as their anchor.
+    pub fn check_with_input_in(
+        &self,
+        tool_name: &str,
+        input: Option<&serde_json::Value>,
+        work_cwd: &Path,
+    ) -> CheckResult {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = inner
             .cwd
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
+        let resolved;
+        let (input, anchors) = if work_cwd == cwd {
+            (input, vec![cwd.as_path()])
+        } else {
+            resolved = input.map(|i| resolve_relative_paths(tool_name, i, work_cwd));
+            (resolved.as_ref(), vec![cwd.as_path(), work_cwd])
+        };
 
         // Deny list first — an explicit `permissions.deny` holds even under
         // `--dangerously-skip-permissions`; bypass skips *prompts*, it does
         // not override a rule the user wrote down.
-        if denied(&inner, tool_name, input, &cwd) {
+        if anchors.iter().any(|c| denied(&inner, tool_name, input, c)) {
             return CheckResult::Deny;
         }
 
@@ -160,7 +181,10 @@ impl PermissionState {
 
         // Check always-allowed — also supports prefix rules
         for rule in inner.always_allowed.iter().chain(&inner.rule_allowed) {
-            if rule_hits(rule, tool_name, input, &cwd, false) == RuleMatch::Match {
+            if anchors
+                .iter()
+                .any(|c| rule_hits(rule, tool_name, input, c, false) == RuleMatch::Match)
+            {
                 return CheckResult::Allow;
             }
         }
@@ -198,14 +222,22 @@ impl PermissionState {
     /// inside a directory it searches. The per-call check only sees the
     /// search root, so `Read(./secrets)` does not stop a project-wide Grep
     /// from printing `secrets/prod.yml`; the tool excludes these instead.
-    pub fn read_deny(&self, tool_name: &str) -> ReadDeny {
+    /// `work_cwd` is the session's directory (an entered worktree), which
+    /// project-relative rules cover as well as the project root.
+    pub fn read_deny(&self, tool_name: &str, work_cwd: &Path) -> ReadDeny {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = inner
             .cwd
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        let real_cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        let mut anchors = Vec::new();
+        for c in [cwd.as_path(), work_cwd] {
+            anchors.push(c.to_path_buf());
+            anchors.push(std::fs::canonicalize(c).unwrap_or_else(|_| c.to_path_buf()));
+        }
+        anchors.sort();
+        anchors.dedup();
         let home = dirs::home_dir().unwrap_or_default();
         let real_home = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
         let mut globs: Vec<String> = Vec::new();
@@ -217,7 +249,7 @@ impl PermissionState {
                 continue;
             }
             let inner_rule = rest.strip_suffix(')').unwrap_or(rest);
-            for c in [cwd.as_path(), real_cwd.as_path()] {
+            for c in &anchors {
                 for h in [home.as_path(), real_home.as_path()] {
                     let anchor = |base: &str| -> String {
                         let p = match base
@@ -350,6 +382,52 @@ fn path_field(tool_name: &str) -> Option<&'static str> {
         "NotebookRead" | "NotebookEdit" => Some("notebook_path"),
         _ => None,
     }
+}
+
+/// `input` with its relative paths joined to `base`, where the tool will
+/// resolve them, so rule matching no longer depends on the anchor it is
+/// given. `~` paths are left for the matcher to expand.
+fn resolve_relative_paths(
+    tool_name: &str,
+    input: &serde_json::Value,
+    base: &Path,
+) -> serde_json::Value {
+    let absolute = |raw: &str| -> Option<String> {
+        if matches!(crate::tools::file_read::expand_home(raw), Ok(Some(_)))
+            || Path::new(raw).is_absolute()
+        {
+            return None;
+        }
+        Some(base.join(raw).to_string_lossy().into_owned())
+    };
+    let mut out = input.clone();
+    if tool_name == "MultiEdit" {
+        if let Some(edits) = out.get_mut("edits").and_then(|e| e.as_array_mut()) {
+            for e in edits {
+                if let Some(abs) = e
+                    .get("file_path")
+                    .and_then(|p| p.as_str())
+                    .and_then(absolute)
+                {
+                    e["file_path"] = abs.into();
+                }
+            }
+        }
+        return out;
+    }
+    let Some(field) = path_field(tool_name) else {
+        return out;
+    };
+    // Grep and Glob search the working directory when no path is given.
+    let raw = match out.get(field) {
+        Some(serde_json::Value::String(p)) => p.clone(),
+        None if matches!(tool_name, "Grep" | "Glob") => String::new(),
+        _ => return out,
+    };
+    if let (Some(abs), Some(obj)) = (absolute(&raw), out.as_object_mut()) {
+        obj.insert(field.to_string(), abs.into());
+    }
+    out
 }
 
 /// Whether a rule for `rule_tool` speaks for `tool_name`.

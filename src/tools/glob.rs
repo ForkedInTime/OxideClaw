@@ -164,7 +164,7 @@ impl Tool for GlobTool {
         let deny = ctx
             .permission_gate
             .as_ref()
-            .map(|g| g.read_deny("Glob"))
+            .map(|g| g.read_deny("Glob", &ctx.cwd))
             .unwrap_or_default();
 
         // walkdir, not `glob::glob_with`: glob follows directory symlinks with

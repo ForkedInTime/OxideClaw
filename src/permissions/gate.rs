@@ -89,8 +89,8 @@ impl PermissionGate {
     }
 
     /// See [`PermissionState::read_deny`].
-    pub fn read_deny(&self, tool_name: &str) -> super::ReadDeny {
-        self.state.read_deny(tool_name)
+    pub fn read_deny(&self, tool_name: &str, work_cwd: &std::path::Path) -> super::ReadDeny {
+        self.state.read_deny(tool_name, work_cwd)
     }
 
     /// Put prompts to `asker` (a browse run's approval channel).
@@ -207,10 +207,13 @@ impl PermissionGate {
                 Some(cmd) => {
                     check_compound_command_as(&self.state, tool_name, cmd, self.bash_shell)
                 }
-                None => self.state.check_with_input(tool_name, Some(input)),
+                None => self
+                    .state
+                    .check_with_input_in(tool_name, Some(input), work_cwd),
             }
         } else {
-            self.state.check_with_input(tool_name, Some(input))
+            self.state
+                .check_with_input_in(tool_name, Some(input), work_cwd)
         };
         // The mode moves a call between Allow and Ask, never out of Deny: a
         // deny rule refuses outright in every mode instead of becoming one
@@ -887,6 +890,62 @@ mod tests {
         );
         // Judged in the launch project, where `out` is a plain directory.
         assert_eq!(asks(launch.path(), w("out/x.rs")).await, 0);
+    }
+
+    /// The entered worktree sits next to the project and holds the same
+    /// tracked files, so `Edit(./migrations/**)` must cover its copy too;
+    /// otherwise auto-edit pre-approved the edit the rule forbids.
+    #[tokio::test]
+    async fn project_rules_cover_the_entered_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let proj = root.path().join("proj");
+        let wt = root.path().join("proj-feat");
+        for d in ["migrations", "secrets", "src"] {
+            std::fs::create_dir_all(proj.join(d)).unwrap();
+            std::fs::create_dir_all(wt.join(d)).unwrap();
+        }
+        let deny = vec![
+            "Edit(./migrations/**)".to_string(),
+            "Read(./secrets/**)".to_string(),
+        ];
+        let state = PermissionState::new(false, &["Edit(./src/**)".into()], &deny).with_cwd(&proj);
+        let auto = PermissionGate::new(state.clone(), Autonomy::AutoEdit, None);
+        let edit = |p: &str| json!({"file_path": p, "old_string": "a", "new_string": "b"});
+        let abs = |p: &str| wt.join(p).to_string_lossy().into_owned();
+
+        for input in [edit(&abs("migrations/001.sql")), edit("migrations/001.sql")] {
+            let out = auto.decide_in("Edit", &input, &wt).await;
+            assert!(matches!(out, GateOutcome::Denied(_)), "{input}: {out:?}");
+        }
+        for p in [abs("secrets/prod.yml"), "secrets/prod.yml".into()] {
+            let out = auto
+                .decide_in("Read", &json!({ "file_path": p }), &wt)
+                .await;
+            assert!(matches!(out, GateOutcome::Denied(_)), "{p}: {out:?}");
+        }
+        // Still judged in the project as before.
+        let out = auto
+            .decide_in("Edit", &edit("migrations/001.sql"), &proj)
+            .await;
+        assert!(matches!(out, GateOutcome::Denied(_)), "{out:?}");
+
+        // An allow rule covers the relative worktree edit it covered before
+        // (no asker: anything not allowed is refused).
+        let ask = PermissionGate::new(state, Autonomy::Ask, None);
+        assert_eq!(
+            ask.decide_in("Edit", &edit("src/lib.rs"), &wt).await,
+            GateOutcome::Allowed
+        );
+        assert!(matches!(
+            ask.decide_in("Edit", &edit("docs/x.md"), &wt).await,
+            GateOutcome::Denied(_)
+        ));
+
+        // Grep/Glob exclude the worktree's copy of a denied directory.
+        let rd = ask.read_deny("Grep", &wt);
+        assert!(rd.denies(&wt.join("secrets/prod.yml")));
+        assert!(rd.denies(&proj.join("secrets/prod.yml")));
+        assert!(!rd.denies(&wt.join("src/lib.rs")));
     }
 
     /// `-p` has no one to ask: auto-edit runs in-project edits, commands are

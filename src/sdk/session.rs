@@ -895,7 +895,10 @@ impl SdkSession {
                     continue;
                 }
             }
-            if let crate::permissions::GateOutcome::Denied(reason) = gate.decide(name, input).await
+            // Rules see the entered worktree as well as the launch project.
+            let work_cwd = crate::tools::session_cwd(&self.tools, &self.config.cwd);
+            if let crate::permissions::GateOutcome::Denied(reason) =
+                gate.decide_in(name, input, &work_cwd).await
             {
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),

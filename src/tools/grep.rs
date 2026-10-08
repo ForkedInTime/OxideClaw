@@ -126,7 +126,7 @@ impl Tool for GrepTool {
 fn read_deny(ctx: &ToolContext) -> crate::permissions::ReadDeny {
     ctx.permission_gate
         .as_ref()
-        .map(|g| g.read_deny("Grep"))
+        .map(|g| g.read_deny("Grep", &ctx.cwd))
         .unwrap_or_default()
 }
 
