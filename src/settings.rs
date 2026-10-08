@@ -477,6 +477,18 @@ impl HooksConfig {
     }
 }
 
+/// Where a model's prompts go: "anthropic" for an unprefixed model,
+/// "ollama", or the OpenAI-compatible provider's prefix.
+pub(crate) fn model_backend(model: &str) -> &'static str {
+    if crate::api::is_ollama_model(model) {
+        "ollama"
+    } else if let Some((provider, _)) = crate::api::openai_compat::parse_provider_model(model) {
+        provider.prefix
+    } else {
+        "anthropic"
+    }
+}
+
 impl PhaseRouterSettings {
     fn merge(self, other: Self) -> Self {
         Self {
@@ -772,6 +784,43 @@ impl Settings {
             // Prompts (and the code in them) go to this host.
             if project.ollama_host.take().is_some() {
                 dropped.push("ollamaHost".into());
+            }
+            // A model on another provider sends every prompt, and the code
+            // in it, there: as with an untrusted .env's ANTHROPIC_MODEL,
+            // only one on the user's own backend applies.
+            let user_backend = global.model.as_deref().map_or("anthropic", model_backend);
+            if project
+                .model
+                .as_deref()
+                .is_some_and(|m| model_backend(m) != user_backend)
+            {
+                project.model = None;
+                dropped.push("model".into());
+            }
+            // The phase router only runs on Anthropic sessions, so a phase
+            // model elsewhere is always another provider. Switching it on
+            // must not start the user's own cross-provider phases either.
+            if let Some(pr) = project.phase_router.as_mut() {
+                let before = pr.phases.as_ref().map_or(0, |p| p.len());
+                if let Some(phases) = pr.phases.as_mut() {
+                    phases.retain(|_, m| model_backend(m) == "anthropic");
+                }
+                let mut cut = before != pr.phases.as_ref().map_or(0, |p| p.len());
+                let user = global.phase_router.as_ref();
+                let user_on = user.is_some_and(|g| g.enabled == Some(true));
+                let user_elsewhere = user.and_then(|g| g.phases.as_ref()).is_some_and(|p| {
+                    p.iter().any(|(phase, m)| {
+                        model_backend(m) != "anthropic"
+                            && !pr.phases.as_ref().is_some_and(|o| o.contains_key(phase))
+                    })
+                });
+                if pr.enabled == Some(true) && !user_on && user_elsewhere {
+                    pr.enabled = None;
+                    cut = true;
+                }
+                if cut {
+                    dropped.push("phaseRouter".into());
+                }
             }
             // Router tiers send prompts to any provider the user has a key
             // for, and switching the router on alone sends a local
@@ -1631,6 +1680,63 @@ mod project_trust_tests {
             "a cap where there was none"
         );
         assert!(merged.untrusted_project_config.is_empty());
+    }
+
+    /// A cloned repo's `model` or `phaseRouter` sent every prompt to a
+    /// provider of its choosing without /trust.
+    #[test]
+    fn an_untrusted_project_keeps_prompts_on_the_users_backend() {
+        let json = |v: serde_json::Value| -> Settings { serde_json::from_value(v).unwrap() };
+        let elsewhere = json(serde_json::json!({ "model": "deepseek:deepseek-chat" }));
+        let merged =
+            Settings::merge_with_trust(Settings::default(), elsewhere.clone(), None, false);
+        assert_eq!(merged.model, None);
+        assert_eq!(merged.untrusted_project_config, vec!["model".to_string()]);
+        let trusted = Settings::merge_with_trust(Settings::default(), elsewhere, None, true);
+        assert_eq!(trusted.model.as_deref(), Some("deepseek:deepseek-chat"));
+
+        // Same backend as the user's: a Claude model on Anthropic, an
+        // Ollama model for an Ollama user.
+        let same = json(serde_json::json!({ "model": "claude-haiku-4-5" }));
+        let merged = Settings::merge_with_trust(Settings::default(), same, None, false);
+        assert_eq!(merged.model.as_deref(), Some("claude-haiku-4-5"));
+        let local_user = json(serde_json::json!({ "model": "ollama:qwen3" }));
+        let local = json(serde_json::json!({ "model": "ollama:llama3" }));
+        let merged = Settings::merge_with_trust(local_user.clone(), local, None, false);
+        assert_eq!(merged.model.as_deref(), Some("ollama:llama3"));
+        let claude = json(serde_json::json!({ "model": "claude-sonnet-5" }));
+        let merged = Settings::merge_with_trust(local_user, claude, None, false);
+        assert_eq!(merged.model.as_deref(), Some("ollama:qwen3"));
+
+        // Phase models off Anthropic go; Anthropic ones stay.
+        let phases = json(serde_json::json!({ "phaseRouter": {
+            "enabled": true,
+            "phases": { "research": "groq:llama-3.1-8b-instant", "review": "opus" }
+        }}));
+        let merged = Settings::merge_with_trust(Settings::default(), phases, None, false);
+        let pr = merged.phase_router.unwrap();
+        assert_eq!(pr.enabled, Some(true));
+        let kept = pr.phases.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept["review"], "opus");
+        assert_eq!(
+            merged.untrusted_project_config,
+            vec!["phaseRouter".to_string()]
+        );
+
+        // Switching on the user's own cross-provider phases is refused too.
+        let user = json(serde_json::json!({ "phaseRouter": {
+            "phases": { "research": "groq:llama-3.1-8b-instant" }
+        }}));
+        let on = json(serde_json::json!({ "phaseRouter": { "enabled": true } }));
+        let merged = Settings::merge_with_trust(user.clone(), on.clone(), None, false);
+        assert_ne!(merged.phase_router.unwrap().enabled, Some(true));
+        assert_eq!(
+            merged.untrusted_project_config,
+            vec!["phaseRouter".to_string()]
+        );
+        let merged = Settings::merge_with_trust(user, on, None, true);
+        assert_eq!(merged.phase_router.unwrap().enabled, Some(true), "trusted");
     }
 
     /// A repo shipping `{"disableAllHooks": true}` must not silence the

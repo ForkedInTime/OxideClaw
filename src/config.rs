@@ -585,6 +585,15 @@ impl Default for Config {
     }
 }
 
+/// What a CLAUDE.md's phase-routing directives did: whether there was one,
+/// and how many picks were applied or refused.
+#[derive(Default)]
+struct PhaseDirective {
+    found: bool,
+    applied: usize,
+    skipped: usize,
+}
+
 /// Router switch, classifier and the four tiers (see `Config::router_fingerprint`).
 pub type RouterFingerprint = (
     bool,
@@ -1282,28 +1291,6 @@ impl Config {
         }
         self.memory_auto_capture = settings.memory_auto_capture.unwrap_or(false);
 
-        // Phase-declarative model router settings
-        if let Some(pr) = &settings.phase_router {
-            self.phase_router.enabled = pr.enabled.unwrap_or(false);
-            if let Some(phases) = &pr.phases {
-                if let Some(m) = phases.get("research") {
-                    self.phase_router.research_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("plan") {
-                    self.phase_router.plan_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("edit") {
-                    self.phase_router.edit_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("review") {
-                    self.phase_router.review_model = crate::commands::resolve_model_alias(m);
-                }
-                if let Some(m) = phases.get("default") {
-                    self.phase_router.default_model = crate::commands::resolve_model_alias(m);
-                }
-            }
-        }
-
         self.apply_auto_fix_settings(settings.auto_fix.as_ref());
 
         // Auto-commit settings → AutoCommitConfig
@@ -1361,11 +1348,82 @@ impl Config {
             self.geminimd = Self::load_instruction_files(&dirs, &self.cwd, "GEMINI.md");
         }
 
-        // ── CLAUDE.md phase-routing directive override
-        // Syntax: <!-- phase-routing: research=haiku, edit=opus -->
-        // CLAUDE.md merges on top of settings.json per-phase: a user can set
-        // base defaults in settings and override individual phases in CLAUDE.md.
-        Self::apply_phase_routing_from_claudemd(&self.claudemd, &mut self.phase_router);
+        self.apply_phase_router_settings(settings.phase_router.as_ref());
+    }
+
+    /// Phase routing from merged settings, with the CLAUDE.md directive
+    /// `<!-- phase-routing: research=haiku, edit=opus -->` on top per phase,
+    /// so settings can hold the defaults and CLAUDE.md override some. The
+    /// user's own CLAUDE.md applies as written. An untrusted project's may
+    /// pick only Anthropic models (the phase router runs on Anthropic
+    /// sessions, so any other model sends its prompts to a new provider),
+    /// and switches phase routing on only when one of its picks survives and
+    /// every phase stays on Anthropic.
+    fn apply_phase_router_settings(
+        &mut self,
+        settings: Option<&crate::settings::PhaseRouterSettings>,
+    ) {
+        self.phase_router = crate::router::PhaseRouterConfig::default();
+        if let Some(pr) = settings {
+            self.phase_router.enabled = pr.enabled.unwrap_or(false);
+            if let Some(phases) = &pr.phases {
+                if let Some(m) = phases.get("research") {
+                    self.phase_router.research_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("plan") {
+                    self.phase_router.plan_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("edit") {
+                    self.phase_router.edit_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("review") {
+                    self.phase_router.review_model = crate::commands::resolve_model_alias(m);
+                }
+                if let Some(m) = phases.get("default") {
+                    self.phase_router.default_model = crate::commands::resolve_model_alias(m);
+                }
+            }
+        }
+
+        if self.bare_mode {
+            return;
+        }
+        let user_md = self
+            .global_instruction_dirs()
+            .iter()
+            .map(|d| d.join("CLAUDE.md"))
+            .find(|p| p.exists())
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        if Self::apply_phase_routing_from_claudemd(&user_md, &mut self.phase_router, |_| true).found
+        {
+            self.phase_router.enabled = true;
+        }
+        let project_md = Self::load_instruction_files(&[], &self.cwd, "CLAUDE.md");
+        let trusted = self.project_trusted;
+        let on_anthropic = |m: &str| crate::settings::model_backend(m) == "anthropic";
+        let d = Self::apply_phase_routing_from_claudemd(&project_md, &mut self.phase_router, |m| {
+            trusted || on_anthropic(m)
+        });
+        if !d.found {
+            return;
+        }
+        let p = &self.phase_router;
+        let stays = [
+            &p.research_model,
+            &p.plan_model,
+            &p.edit_model,
+            &p.review_model,
+            &p.default_model,
+        ]
+        .iter()
+        .all(|m| on_anthropic(m));
+        if trusted || (d.applied > 0 && stays) {
+            self.phase_router.enabled = true;
+        } else if !self.phase_router.enabled || d.skipped > 0 {
+            self.untrusted_project_config
+                .push("phase-routing (CLAUDE.md)".into());
+        }
     }
 
     /// [`Config::config_dir`], or the override tests set.
@@ -1442,20 +1500,22 @@ impl Config {
         self.auto_fix = af;
     }
 
-    /// Re-read trust after /trust, together with the auto-fix block and
-    /// router tiers that trust gates. An unknown classifier was already
+    /// Re-read trust after /trust, together with the auto-fix block, router
+    /// tiers and phase routing that trust gates. An unknown classifier was already
     /// reported at startup.
     pub fn refresh_trust(&mut self) {
         let settings = self.load_settings();
         let _ = self.apply_trust_settings(&settings);
     }
 
-    /// Take trust, and the auto-fix block and router tiers it gates, from
-    /// freshly merged settings (/trust, /reload). Returns a notice for an
+    /// Take trust, and the auto-fix block, router tiers and phase routing it
+    /// gates, from freshly merged settings (/trust, /reload). Returns a notice for an
     /// unknown classifier.
     pub fn apply_trust_settings(&mut self, settings: &crate::settings::Settings) -> Option<String> {
         self.project_trusted = settings.project_trusted;
+        self.untrusted_project_config = settings.untrusted_project_config.clone();
         self.apply_auto_fix_settings(settings.auto_fix.as_ref());
+        self.apply_phase_router_settings(settings.phase_router.as_ref());
         self.apply_router_settings(settings)
     }
 
@@ -1600,12 +1660,15 @@ impl Config {
     }
 
     /// Parse `<!-- phase-routing: research=haiku, edit=opus -->` directives from
-    /// CLAUDE.md content and apply them to `phase_cfg`.  Only overrides models
-    /// that are explicitly listed; leaves others at their defaults.
+    /// CLAUDE.md content and apply the picks `allow` accepts to `phase_cfg`.
+    /// Only overrides models that are explicitly listed; leaves others at
+    /// their defaults. Switching phase routing on is the caller's call.
     fn apply_phase_routing_from_claudemd(
         claudemd: &str,
         phase_cfg: &mut crate::router::PhaseRouterConfig,
-    ) {
+        allow: impl Fn(&str) -> bool,
+    ) -> PhaseDirective {
+        let mut d = PhaseDirective::default();
         for line in claudemd.lines() {
             let trimmed = line.trim();
             // Match <!-- phase-routing: ... -->
@@ -1615,24 +1678,31 @@ impl Config {
             {
                 let inner = inner.trim();
                 if let Some(payload) = inner.strip_prefix("phase-routing:") {
-                    phase_cfg.enabled = true;
+                    d.found = true;
                     for pair in payload.split(',') {
                         let pair = pair.trim();
                         if let Some((k, v)) = pair.split_once('=') {
                             let model = crate::commands::resolve_model_alias(v.trim());
-                            match k.trim() {
-                                "research" => phase_cfg.research_model = model,
-                                "plan" => phase_cfg.plan_model = model,
-                                "edit" => phase_cfg.edit_model = model,
-                                "review" => phase_cfg.review_model = model,
-                                "default" => phase_cfg.default_model = model,
-                                _ => {}
+                            let slot = match k.trim() {
+                                "research" => &mut phase_cfg.research_model,
+                                "plan" => &mut phase_cfg.plan_model,
+                                "edit" => &mut phase_cfg.edit_model,
+                                "review" => &mut phase_cfg.review_model,
+                                "default" => &mut phase_cfg.default_model,
+                                _ => continue,
+                            };
+                            if allow(&model) {
+                                *slot = model;
+                                d.applied += 1;
+                            } else {
+                                d.skipped += 1;
                             }
                         }
                     }
                 }
             }
         }
+        d
     }
 
     /// Load and merge all CLAUDE.md files in priority order:
@@ -3821,6 +3891,67 @@ mod flag_settings_retarget_tests {
         assert!(bare.agentsmd.is_empty());
         assert!(bare.geminimd.is_empty());
         assert_ne!(bare.phase_router.research_model, "claude-bare-test-model");
+    }
+
+    /// The repo's own CLAUDE.md could turn phase routing on and point a
+    /// phase at any provider; the user's CLAUDE.md is their own choice.
+    #[test]
+    fn an_untrusted_claude_md_picks_only_anthropic_phase_models() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let directive = |dir: &std::path::Path, body: &str| {
+            std::fs::write(
+                dir.join("CLAUDE.md"),
+                format!("<!-- phase-routing: {body} -->"),
+            )
+            .unwrap();
+        };
+        let load = || {
+            let mut c = Config {
+                cwd: project.path().into(),
+                config_dir_override: Some(home.path().into()),
+                ..Config::default()
+            };
+            c.load_project();
+            c
+        };
+        directive(
+            project.path(),
+            "research=deepseek:deepseek-chat, default=deepseek:deepseek-chat",
+        );
+        let c = load();
+        assert!(!c.phase_router.enabled);
+        assert_ne!(c.phase_router.research_model, "deepseek:deepseek-chat");
+        assert!(
+            c.untrusted_project_config
+                .contains(&"phase-routing (CLAUDE.md)".to_string())
+        );
+
+        // An Anthropic pick is honoured and switches phase routing on.
+        directive(project.path(), "research=haiku, edit=groq:x");
+        let c = load();
+        assert!(c.phase_router.enabled);
+        assert_eq!(c.phase_router.research_model, "claude-haiku-4-5");
+        assert_ne!(c.phase_router.edit_model, "groq:x");
+
+        // The user's own directive applies as written.
+        std::fs::remove_file(project.path().join("CLAUDE.md")).unwrap();
+        directive(home.path(), "research=deepseek:deepseek-chat");
+        let c = load();
+        assert!(c.phase_router.enabled);
+        assert_eq!(c.phase_router.research_model, "deepseek:deepseek-chat");
+
+        // /trust lets the project's picks through without a restart.
+        std::fs::remove_file(home.path().join("CLAUDE.md")).unwrap();
+        directive(project.path(), "research=deepseek:deepseek-chat");
+        let mut c = load();
+        assert!(!c.phase_router.enabled);
+        let trust = serde_json::json!({ "trustedProjects": [project.path()] }).to_string();
+        std::fs::write(home.path().join("settings.json"), trust).unwrap();
+        c.refresh_trust();
+        assert!(c.phase_router.enabled);
+        assert_eq!(c.phase_router.research_model, "deepseek:deepseek-chat");
+        assert!(c.untrusted_project_config.is_empty());
     }
 
     /// GEMINI.md (Gemini CLI's instructions file) is found by the same rules
