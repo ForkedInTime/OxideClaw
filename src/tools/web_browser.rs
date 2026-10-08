@@ -10,6 +10,8 @@ use serde_json::json;
 pub struct WebBrowserTool {
     /// Which destinations this tool may reach. See `net_policy`.
     pub policy: NetPolicy,
+    /// `browserChromePath`, tried before the auto-detected browser.
+    pub chrome_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,7 +96,14 @@ impl Tool for WebBrowserTool {
         // Try headless Chromium first. It follows redirects, meta refresh and
         // JS navigation on its own, so every connection it makes goes through
         // a proxy that re-applies the policy.
-        if let Some(text) = try_chromium(url.as_str(), &self.policy, max_chars).await {
+        if let Some(text) = try_chromium(
+            url.as_str(),
+            &self.policy,
+            self.chrome_path.as_deref(),
+            max_chars,
+        )
+        .await
+        {
             return Ok(ToolOutput::success(text));
         }
 
@@ -108,7 +117,12 @@ impl Tool for WebBrowserTool {
 
 /// Try to fetch via `chromium --headless --dump-dom`, with all of its
 /// traffic forced through a policy-enforcing proxy.
-async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option<String> {
+async fn try_chromium(
+    url: &str,
+    policy: &NetPolicy,
+    chrome_path: Option<&str>,
+    max_chars: usize,
+) -> Option<String> {
     use tokio::process::Command;
     use tokio::time::{Duration, timeout};
 
@@ -134,13 +148,7 @@ async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option
     let profile = tempfile::tempdir().ok()?;
     let args = chromium_args(proxy.addr, profile.path(), url, no_sandbox);
 
-    // Try several common chromium executable names
-    for exe in &[
-        "chromium",
-        "chromium-browser",
-        "google-chrome",
-        "google-chrome-stable",
-    ] {
+    for exe in chromium_candidates(chrome_path, crate::browser::find_chrome()) {
         let result = timeout(
             Duration::from_secs(20),
             Command::new(exe)
@@ -171,6 +179,29 @@ async fn try_chromium(url: &str, policy: &NetPolicy, max_chars: usize) -> Option
         }
     }
     None
+}
+
+/// Browsers to try, in order: the configured one, the one /browse would
+/// find (macOS app bundles and Windows install dirs are not on PATH), then
+/// the common Linux names.
+fn chromium_candidates(
+    configured: Option<&str>,
+    found: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = configured.map(Into::into).into_iter().collect();
+    out.extend(found);
+    for name in [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ] {
+        let name = std::path::PathBuf::from(name);
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// Chromium's net-error interstitial (`chrome-error://chromewebdata/`).
@@ -292,7 +323,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     async fn run(policy: NetPolicy, url: &str) -> ToolOutput {
-        let tool = WebBrowserTool { policy };
+        let tool = WebBrowserTool {
+            policy,
+            chrome_path: None,
+        };
         let ctx = ToolContext::new(std::env::temp_dir());
         tool.execute(json!({"url": url}), &ctx)
             .await
@@ -306,6 +340,22 @@ mod tests {
                 ToolResultContent::Text { text } => text.as_str(),
             })
             .collect()
+    }
+
+    /// Only the four Linux names were tried, so Chrome in a macOS app bundle
+    /// or Windows' Program Files (and `browserChromePath`) went unused and
+    /// pages were fetched without JavaScript.
+    #[test]
+    fn chromium_candidates_put_the_configured_and_found_browser_first() {
+        let mac = std::path::PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        );
+        let got = chromium_candidates(Some("/opt/chrome/chrome"), Some(mac.clone()));
+        assert_eq!(got[0], std::path::PathBuf::from("/opt/chrome/chrome"));
+        assert_eq!(got[1], mac);
+        assert!(got.contains(&std::path::PathBuf::from("chromium")));
+        let got = chromium_candidates(None, None);
+        assert_eq!(got.len(), 4, "{got:?}");
     }
 
     /// Chromium used to run with no proxy, so a redirect it followed was

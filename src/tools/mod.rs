@@ -1087,7 +1087,10 @@ pub fn all_tools_with_state(config: &crate::config::Config) -> (Vec<DynTool>, Sh
     // Simple utilities
     tools.push(Arc::new(sleep::SleepTool));
     tools.push(Arc::new(powershell::PowerShellTool));
-    tools.push(Arc::new(web_browser::WebBrowserTool { policy: net }));
+    tools.push(Arc::new(web_browser::WebBrowserTool {
+        policy: net,
+        chrome_path: config.browser_chrome_path.clone(),
+    }));
 
     // Browser automation tools (shared session across all browser_* tools AND /browser commands).
     let browser_session_shared = if config.browser_enabled {
