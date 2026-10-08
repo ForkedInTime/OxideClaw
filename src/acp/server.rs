@@ -869,8 +869,11 @@ pub(crate) fn stop_reason(end: TurnEnd) -> &'static str {
     match end {
         TurnEnd::EndTurn => "end_turn",
         TurnEnd::MaxTokens => "max_tokens",
-        TurnEnd::MaxTurns => "max_turn_requests",
-        TurnEnd::BudgetExceeded => "refusal",
+        // The `/budget` cap ends a turn like the request cap does; `refusal`
+        // is the model declining, which an editor shows (and may roll back)
+        // as such.
+        TurnEnd::MaxTurns | TurnEnd::BudgetExceeded => "max_turn_requests",
+        TurnEnd::Refusal => "refusal",
         TurnEnd::Cancelled => "cancelled",
     }
 }
@@ -1058,7 +1061,8 @@ mod tests {
         assert_eq!(stop_reason(TurnEnd::EndTurn), "end_turn");
         assert_eq!(stop_reason(TurnEnd::MaxTokens), "max_tokens");
         assert_eq!(stop_reason(TurnEnd::MaxTurns), "max_turn_requests");
-        assert_eq!(stop_reason(TurnEnd::BudgetExceeded), "refusal");
+        assert_eq!(stop_reason(TurnEnd::BudgetExceeded), "max_turn_requests");
+        assert_eq!(stop_reason(TurnEnd::Refusal), "refusal");
         assert_eq!(stop_reason(TurnEnd::Cancelled), "cancelled");
     }
 
@@ -1403,6 +1407,33 @@ mod tests {
         })
         .await
         .0
+    }
+
+    /// A model that declines answers the prompt with `refusal`, not
+    /// `end_turn`: the client could only tell from the `[refusal]` chunk.
+    #[tokio::test]
+    async fn a_model_refusal_ends_the_prompt_with_stop_reason_refusal() {
+        let (model, _) = http_stub(|_| {
+            Some((
+                "text/event-stream",
+                sse(&[
+                    json!({"choices":[{"index":0,"delta":{"content":"no"},"finish_reason":"content_filter"}]}),
+                ]),
+            ))
+        })
+        .await;
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        cfg.ollama_host = model;
+        let mut c = Client::start(cfg, sessions_in(&dir));
+        c.init().await;
+        let (_, created) = c
+            .call(1, "session/new", json!({"cwd": dir.path(), "mcpServers": []}))
+            .await;
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        let (_, answer) = c.call(2, "session/prompt", prompt(&sid, "hi")).await;
+        assert_eq!(answer["result"]["stopReason"], json!("refusal"), "{answer}");
+        c.close().await;
     }
 
     /// The session task queues a turn's last updates and then its TurnDone

@@ -24,6 +24,8 @@ pub enum TurnEnd {
     MaxTokens,
     MaxTurns,
     BudgetExceeded,
+    /// The model declined the request (a `refusal` stop reason).
+    Refusal,
     Cancelled,
 }
 
@@ -739,6 +741,7 @@ impl SdkSession {
                         code: "refusal".into(),
                         message: "The model declined this request.".into(),
                     });
+                    end = TurnEnd::Refusal;
                     break;
                 }
                 Some(StopReason::MaxTokens) | Some(StopReason::ModelContextWindowExceeded) => {
