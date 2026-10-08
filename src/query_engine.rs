@@ -410,7 +410,7 @@ impl QueryEngine {
         self
     }
 
-    /// Output responses as JSON objects (one per turn).
+    /// Output one JSON result object per run.
     pub fn set_json_output(&mut self, enabled: bool) {
         self.json_output = enabled;
     }
@@ -519,6 +519,7 @@ impl QueryEngine {
         // request through first.
         if let Some(budget) = self.spent_budget() {
             self.note_budget_stop(budget);
+            self.print_json_result("error_max_budget_usd", "", &Usage::default(), 0);
             return Ok(());
         }
 
@@ -553,15 +554,21 @@ impl QueryEngine {
         let max_turns = self.turn_cap();
         let mut turn = 0u32;
         let mut overflow_retried = false;
+        // --output-format json prints one object for the whole run: the
+        // last turn's text and every turn's usage.
+        let mut last_text = String::new();
+        let mut run_usage = Usage::default();
+        let mut subtype = "success";
 
         loop {
             turn += 1;
             self.turns = turn;
             if turn > max_turns {
                 self.notice(format!("Stopped after {max_turns} turns.").yellow());
+                subtype = "error_max_turns";
                 // Otherwise the per-turn records of a cut-off run look the
                 // same as a finished one.
-                if self.json_output || self.stream_json_output {
+                if self.stream_json_output {
                     let result = serde_json::json!({
                         "type": "result",
                         "subtype": "error_max_turns",
@@ -647,11 +654,17 @@ impl QueryEngine {
             if human {
                 println!(); // newline after streamed text
             }
-            // JSON / stream-json mode: emit result object at end of turn
-            if (self.json_output || self.stream_json_output) && !full_text.is_empty() {
+            // stream-json reports every turn as it ends; json waits for the
+            // run to end, so stdout holds a single JSON document.
+            if self.stream_json_output && !full_text.is_empty() {
                 println!("{}", result_json(&full_text, &response.usage));
-                full_text.clear();
+            } else if self.json_output && !full_text.trim().is_empty() {
+                last_text = std::mem::take(&mut full_text);
             }
+            run_usage.input_tokens += response.usage.input_tokens;
+            run_usage.output_tokens += response.usage.output_tokens;
+            run_usage.cache_read_input_tokens += response.usage.cache_read_input_tokens;
+            run_usage.cache_creation_input_tokens += response.usage.cache_creation_input_tokens;
 
             // Collect assistant content into message history. An empty
             // assistant message (whitespace-only reply, refusal, a dropped
@@ -686,6 +699,7 @@ impl QueryEngine {
                 && self.cumulative_cost_usd >= budget
             {
                 self.note_budget_stop(budget);
+                subtype = "error_max_budget_usd";
                 break;
             }
 
@@ -749,6 +763,7 @@ impl QueryEngine {
                         && self.cumulative_cost_usd >= budget
                     {
                         self.note_budget_stop(budget);
+                        subtype = "error_max_budget_usd";
                         break;
                     }
                     if summarise_after_tools {
@@ -760,7 +775,20 @@ impl QueryEngine {
             }
         }
 
+        self.print_json_result(subtype, &last_text, &run_usage, turn.min(max_turns));
         Ok(())
+    }
+
+    /// The single `--output-format json` result of a run.
+    fn print_json_result(&self, subtype: &str, text: &str, usage: &Usage, num_turns: u32) {
+        if !self.json_output {
+            return;
+        }
+        let mut result = result_json(text, usage);
+        result["subtype"] = subtype.into();
+        result["is_error"] = (subtype != "success").into();
+        result["num_turns"] = num_turns.into();
+        println!("{result}");
     }
 
     /// Execute all tool_use blocks in the response content.

@@ -485,3 +485,38 @@ fn a_failed_print_run_still_saves_its_session() {
         bodies[0]
     );
 }
+
+/// `--output-format json` printed one object per turn with text, so a run
+/// whose model narrated before a tool call was not one JSON document, and
+/// a reader of the first object got the narration, not the answer.
+#[test]
+fn json_output_is_one_document_for_the_whole_run() {
+    let e = env();
+    let mut narrated_call = bash_call_reply("echo hi");
+    narrated_call["choices"][0]["delta"]["content"] = "Let me check.".into();
+    let (port, _) = serve_seq(vec![
+        sse_response(&narrated_call),
+        sse_response(&text_reply("final answer")),
+    ]);
+    let out = run(
+        &e,
+        &[
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "json",
+            "--model",
+            "openai-compat:test",
+            "go",
+        ],
+        &openai_env(port),
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(result["text"], "final answer");
+    assert_eq!(result["subtype"], "success");
+    assert_eq!(result["is_error"], false);
+    assert_eq!(result["num_turns"], 2);
+}
