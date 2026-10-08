@@ -428,6 +428,51 @@ fn retire_legacy_db_at(legacy: &Path, memory_db: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// The index holds copies of the source of every repo the user opens,
+/// tracked config with credentials included, so like sessions it is for
+/// the user's eyes only: the directory 0700, even one made 0755 before.
+/// Tightening an existing directory is best effort (a cache on FUSE or NFS
+/// may refuse it); the index still works.
+fn create_private_index_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            warn!("could not make {} private: {e}", dir.display());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    builder.create(dir)
+}
+
+/// The database file 0600 before SQLite opens it (an empty file is a new
+/// database); SQLite gives its -wal and -shm files the same mode. Best
+/// effort, as for the directory.
+fn create_private_db_file(db_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(db_path)
+            .and_then(|_| {
+                std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+            });
+        if let Err(e) = res {
+            warn!("could not make {} private: {e}", db_path.display());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = db_path;
+}
+
 /// The RAG database — owns a SQLite connection with FTS5 tables.
 pub struct RagDb {
     pub conn: Connection,
@@ -446,9 +491,10 @@ impl RagDb {
     /// Open (or create) the index database at `db_path`.
     pub fn open_at(db_path: &Path) -> Result<Self> {
         if let Some(dir) = db_path.parent() {
-            std::fs::create_dir_all(dir)
+            create_private_index_dir(dir)
                 .with_context(|| format!("Failed to create {}", dir.display()))?;
         }
+        create_private_db_file(db_path);
         let db_path = db_path.to_path_buf();
         let conn = Connection::open(&db_path).context("Failed to open RAG database")?;
 
@@ -866,6 +912,34 @@ mod tests {
         assert_eq!(read_schema_version(&db.conn).unwrap(), 2);
         assert_eq!(db.chunk_count().unwrap(), 1, "old rows stay searchable");
         assert_eq!(db.file_mtime("lib.rs").unwrap(), 0);
+    }
+
+    /// The index copies private source, so other local users must not be
+    /// able to read it: the dir 0700 and the database files 0600, also when
+    /// an older build left them 0755/0644.
+    #[cfg(unix)]
+    #[test]
+    fn index_dir_and_database_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("cache/oxideclaw/rag");
+        let path = dir.join("idx.db");
+        {
+            let db = RagDb::open_at(&path).unwrap();
+            db.conn
+                .execute("INSERT INTO rag_meta (key, value) VALUES ('k', 'v')", [])
+                .unwrap();
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&dir.join("idx.db-wal")), 0o600);
+        }
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(RagDb::open_at(&path).unwrap());
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
     }
 
     /// Re-opening an already-current DB must be idempotent — no duplicate
