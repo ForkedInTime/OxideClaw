@@ -1653,7 +1653,6 @@ async fn run_loop(
                             });
                         }
                         AppEvent::Compacted { ref replacement, summary_len, base: None } => {
-                            consecutive_compact_count = 0; // successful compact resets thrash counter
                             // Sent by the running turn: the summary stands in for its prompt.
                             let carried =
                                 timeline::carry_inflight_mark(&mut session, &messages, replacement);
@@ -1867,7 +1866,6 @@ async fn run_loop(
                 &config.model,
             ) {
                 Some(merged) => {
-                    consecutive_compact_count = 0;
                     messages = merged;
                     if !config.no_session_persistence {
                         saved_count = messages.len();
@@ -1895,7 +1893,14 @@ async fn run_loop(
         // Auto-compact after API turn completes. Not while a compaction is
         // already running: its result is about to replace this history.
         if !app.is_loading && !app.compacting && last_tokens_in > 0 {
-            match compact_needed(last_tokens_in, app.context_window) {
+            let level = compact_needed(last_tokens_in, app.context_window);
+            // Thrash is a summary that does not get the next turn back under
+            // the summarise line, so only such a turn ends the streak. A
+            // reset on every successful compaction kept it from ever firing.
+            if !matches!(level, CompactNeeded::Summarise) {
+                consecutive_compact_count = 0;
+            }
+            match level {
                 CompactNeeded::None => {}
                 CompactNeeded::Warn => {
                     let pct = last_tokens_in * 100 / app.context_window.max(1);
