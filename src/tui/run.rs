@@ -1357,11 +1357,7 @@ async fn run_loop(
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         app.entries
                             .push(ChatEntry::system("⚠ /browse ended without a result."));
-                        app.scroll_to_bottom();
-                        app.finish_loading();
-                        app.browse_approval_rx = None;
-                        app.browse_approval = None;
-                        app.browse_cancel = None;
+                        app.finish_browse();
                         done = true;
                         break;
                     }
@@ -1389,12 +1385,9 @@ async fn run_loop(
                             "{icon} /browse done ({:?}): {}",
                             result.reason, result.summary
                         )));
-                        app.scroll_to_bottom();
-                        app.finish_loading();
-                        // Clean up approval channel and any prompt the run
-                        // stopped waiting on.
-                        app.browse_approval_rx = None;
-                        app.browse_approval = None;
+                        // Also drops any approval prompt the run stopped
+                        // waiting on.
+                        app.finish_browse();
                         done = true;
                         break;
                     }

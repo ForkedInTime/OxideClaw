@@ -957,6 +957,19 @@ impl App {
         self.scroll_to_bottom();
     }
 
+    /// The /browse run ended (Completed or a dropped channel). Its spinner
+    /// may already belong to a prompt sent after Esc, whose turn the late
+    /// Completed must not end: the cancel flag is only polled every 200 ms.
+    pub fn finish_browse(&mut self) {
+        self.browse_approval_rx = None;
+        self.browse_approval = None;
+        self.browse_cancel = None;
+        if self.api_task.is_none() && self.side_task.is_none() {
+            self.finish_loading();
+        }
+        self.scroll_to_bottom();
+    }
+
     pub fn transcription_pending(&self) -> bool {
         self.voice_transcribe_task
             .as_ref()
@@ -1912,6 +1925,23 @@ mod trim_entries_tests {
 #[cfg(test)]
 mod background_event_tests {
     use super::*;
+
+    /// Esc during /browse, then a new prompt: the browse's late Completed
+    /// cleared the spinner mid-turn and unlocked input for a second turn.
+    #[tokio::test]
+    async fn late_browse_completion_keeps_the_next_turns_spinner() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let turn = tokio::spawn(std::future::pending::<()>());
+        app.api_task = Some(turn.abort_handle());
+        app.start_loading();
+        app.finish_browse();
+        assert!(app.is_loading);
+        turn.abort();
+
+        app.api_task = None;
+        app.finish_browse();
+        assert!(!app.is_loading);
+    }
 
     /// The count came from a 500-byte tail of the output, so 5,000 lines
     /// showed as about 17.
