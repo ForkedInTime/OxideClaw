@@ -933,15 +933,79 @@ async fn spawn_policy_proxy_with(
     grants: LoopbackGrants,
     upstream: Option<Upstream>,
 ) -> Result<PolicyProxy> {
-    spawn_policy_proxy_dns(policy, grants, upstream, lookup_system_boxed).await
+    spawn_policy_proxy_dns(
+        policy,
+        grants,
+        upstream,
+        lookup_system_boxed,
+        peer_is_same_user,
+    )
+    .await
 }
 
-/// [`spawn_policy_proxy_with`] resolving names with `lookup`.
+/// Whether the client at `peer`, connected to the listener at `local`,
+/// runs as this user.
+type PeerCheck = fn(SocketAddr, SocketAddr) -> bool;
+
+/// [`PeerCheck`] from the kernel's socket table: the client's row
+/// (local = `peer`, remote = `local`) carries its owner's uid. Any failure
+/// (row gone, /proc unreadable) is a no.
+#[cfg(target_os = "linux")]
+fn peer_is_same_user(peer: SocketAddr, local: SocketAddr) -> bool {
+    let me = unsafe { libc::geteuid() };
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|table| socket_owner(&table, peer, local))
+            == Some(me)
+    })
+}
+
+/// No portable way to find the owner of a loopback connection here, and
+/// refusing would leave every authenticated-proxy session offline.
+#[cfg(not(target_os = "linux"))]
+fn peer_is_same_user(_peer: SocketAddr, _local: SocketAddr) -> bool {
+    true
+}
+
+/// The uid of the socket in a `/proc/net/tcp{,6}` table whose local end is
+/// `from` and remote end is `to`.
+#[cfg(any(target_os = "linux", test))]
+fn socket_owner(table: &str, from: SocketAddr, to: SocketAddr) -> Option<u32> {
+    // Addresses are the raw network-order words printed as native-endian
+    // hex (`0100007F` for 127.0.0.1 on x86); ports are plain hex.
+    fn addr(field: &str) -> Option<SocketAddr> {
+        let (ip, port) = field.split_once(':')?;
+        let port = u16::from_str_radix(port, 16).ok()?;
+        let mut bytes = Vec::with_capacity(16);
+        for word in ip.as_bytes().chunks(8) {
+            let w = u32::from_str_radix(std::str::from_utf8(word).ok()?, 16).ok()?;
+            bytes.extend_from_slice(&w.to_ne_bytes());
+        }
+        let ip = match bytes.len() {
+            4 => IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?),
+            16 => IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?),
+            _ => return None,
+        };
+        Some(canonical(SocketAddr::new(ip, port)))
+    }
+    let (from, to) = (canonical(from), canonical(to));
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.len() > 7 && addr(f[1])? == from && addr(f[2])? == to)
+            .then(|| f[7].parse().ok())
+            .flatten()
+    })
+}
+
+/// [`spawn_policy_proxy_with`] resolving names with `lookup` and telling
+/// our own clients from other users' with `peer_check`.
 async fn spawn_policy_proxy_dns(
     policy: NetPolicy,
     grants: LoopbackGrants,
     upstream: Option<Upstream>,
     lookup: Lookup,
+    peer_check: PeerCheck,
 ) -> Result<PolicyProxy> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
@@ -951,14 +1015,34 @@ async fn spawn_policy_proxy_dns(
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((sock, _)) => {
-                        conns.spawn(proxy_one(
-                            sock,
-                            policy,
-                            grants.clone(),
-                            upstream.clone(),
-                            lookup,
-                        ));
+                    Ok((sock, peer)) => {
+                        let (grants, upstream) = (grants.clone(), upstream.clone());
+                        conns.spawn(async move {
+                            // Any local user can reach this port. Only a
+                            // client running as us may spend the credentials
+                            // in our proxy URL; others still get the policy
+                            // and the chain, unauthenticated.
+                            let upstream = match upstream {
+                                Some(up) if up.auth.is_some() => {
+                                    let ours = tokio::task::spawn_blocking(move || {
+                                        peer_check(peer, addr)
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+                                    if !ours {
+                                        tracing::debug!(
+                                            "policy proxy: {peer} is not ours; no proxy credentials"
+                                        );
+                                    }
+                                    Some(Upstream {
+                                        auth: up.auth.filter(|_| ours),
+                                        ..up
+                                    })
+                                }
+                                up => up,
+                            };
+                            proxy_one(sock, policy, grants, upstream, lookup).await
+                        });
                     }
                     // Accept errors are transient (EMFILE/ENFILE, or a client
                     // that reset before accept); ending the loop dropped the
@@ -1706,6 +1790,93 @@ mod tests {
         );
     }
 
+    /// The proxy listens on loopback with no authentication, so any local
+    /// user could use it as an egress proxy logged in as us. A client that
+    /// is not ours (or whose owner cannot be found) still gets the policy
+    /// and the chain, but never our upstream credentials.
+    #[tokio::test]
+    async fn other_users_clients_get_no_upstream_credentials() {
+        let (up, seen) =
+            fake_upstream("HTTP/1.1 200 Connection established\r\n\r\ntunnel-data").await;
+        let proxy = spawn_policy_proxy_dns(
+            NetPolicy::STRICT,
+            LoopbackGrants::default(),
+            Some(up),
+            lookup_system_boxed,
+            |_, _| false,
+        )
+        .await
+        .unwrap();
+        let got = via_proxy(&proxy, "CONNECT 93.184.215.14:443 HTTP/1.1\r\n\r\n").await;
+        assert!(got.ends_with("tunnel-data"), "{got}");
+        let got = via_proxy(
+            &proxy,
+            "GET http://93.184.215.14/ HTTP/1.1\r\nHost: 93.184.215.14\r\n\r\n",
+        )
+        .await;
+        assert!(got.contains("tunnel-data"), "{got}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for head in &seen {
+            assert!(!head.contains("Proxy-Authorization"), "{head}");
+        }
+    }
+
+    #[test]
+    fn socket_owner_reads_the_clients_row() {
+        // The kernel prints each address word native-endian.
+        let word = |b: [u8; 4]| format!("{:08X}", u32::from_ne_bytes(b));
+        let v4 = |ip: [u8; 4], port: u16| format!("{}:{port:04X}", word(ip));
+        let table = format!(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             \x20  0: {} {} 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1\n\
+             \x20  1: {} {} 01 00000000:00000000 00:00000000 00000000  1001        0 2 1\n",
+            v4([127, 0, 0, 1], 5000),
+            v4([0, 0, 0, 0], 0),
+            v4([127, 0, 0, 1], 40000),
+            v4([127, 0, 0, 1], 5000),
+        );
+        let listener: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        assert_eq!(socket_owner(&table, client, listener), Some(1001));
+        // The listener's own row is not the client's.
+        assert_eq!(
+            socket_owner(&table, "127.0.0.1:40001".parse().unwrap(), listener),
+            None
+        );
+        // tcp6: a v4-mapped client of the same listener.
+        let mapped = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1];
+        let v6 = |port: u16| {
+            let ip: String = mapped
+                .chunks(4)
+                .map(|c| word([c[0], c[1], c[2], c[3]]))
+                .collect();
+            format!("{ip}:{port:04X}")
+        };
+        let table6 = format!(
+            "  sl  local_address rem_address st\n\
+             \x20  0: {} {} 01 00000000:00000000 00:00000000 00000000  1002        0 3 1\n",
+            v6(40000),
+            v6(5000),
+        );
+        assert_eq!(socket_owner(&table6, client, listener), Some(1002));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn our_own_loopback_client_is_recognised() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(local).await.unwrap();
+        let (_server, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer, client.local_addr().unwrap());
+        assert!(peer_is_same_user(peer, local));
+        assert!(!peer_is_same_user(
+            SocketAddr::new(peer.ip(), peer.port().wrapping_add(1)),
+            local
+        ));
+    }
+
     /// reqwest applied HTTP(S)_PROXY on its own, so `fetch` sent pinned
     /// hosts to the proxy anyway, and a name only the proxy can resolve
     /// failed the local lookup. Public and locally unresolvable hosts now go
@@ -2201,9 +2372,15 @@ mod tests {
             &Url::parse(&format!("http://localhost:{port}/")).unwrap(),
             &[SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)],
         );
-        let proxy = spawn_policy_proxy_dns(NetPolicy::STRICT, grants.clone(), None, rebinding_dns)
-            .await
-            .unwrap();
+        let proxy = spawn_policy_proxy_dns(
+            NetPolicy::STRICT,
+            grants.clone(),
+            None,
+            rebinding_dns,
+            peer_is_same_user,
+        )
+        .await
+        .unwrap();
         let get = |host: &str| format!("GET http://{host}:{port}/ HTTP/1.1\r\nHost: x\r\n\r\n");
 
         let got = via_proxy(&proxy, &get("attacker.example")).await;
