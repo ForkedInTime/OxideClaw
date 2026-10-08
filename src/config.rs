@@ -450,6 +450,12 @@ pub struct Config {
     /// without its sandbox into `ask`.
     pub autonomy: crate::permissions::Autonomy,
 
+    /// settings.json's `autonomy` as last read. /reload applies it only
+    /// when this changes, so an `/autonomy` choice survives a reload of
+    /// other settings.
+    #[serde(skip)]
+    pub settings_autonomy: Option<String>,
+
     /// Auto-capture notable decisions/preferences from assistant responses into memory.
     pub memory_auto_capture: bool,
 
@@ -575,6 +581,7 @@ impl Default for Config {
             router_high_model: None,
             router_super_high_model: None,
             autonomy: crate::permissions::Autonomy::Ask,
+            settings_autonomy: None,
             memory_auto_capture: false,
             phase_router: crate::router::PhaseRouterConfig::default(),
             auto_fix: crate::autofix::AutoFixConfig::default(),
@@ -913,6 +920,7 @@ impl Config {
             router_high_model: new.router_high_model,
             router_super_high_model: new.router_super_high_model,
             autonomy: new.autonomy,
+            settings_autonomy: new.settings_autonomy,
             memory_auto_capture: new.memory_auto_capture,
             phase_router: new.phase_router,
             auto_fix: new.auto_fix,
@@ -1117,6 +1125,40 @@ impl Config {
         changed
     }
 
+    /// /reload: apply settings.json's `autonomy` when it changed since it
+    /// was last read (removed means the default, `ask`). Returns whether the
+    /// mode moved, and a line for an unknown value. Call
+    /// [`Config::fall_back_from_full_auto`] after it, as startup does.
+    pub fn reload_autonomy(
+        &mut self,
+        settings: &crate::settings::Settings,
+    ) -> (bool, Option<String>) {
+        use crate::permissions::Autonomy;
+        if settings.autonomy == self.settings_autonomy {
+            return (false, None);
+        }
+        self.settings_autonomy = settings.autonomy.clone();
+        let mode = match settings.autonomy.as_deref() {
+            None => Autonomy::default(),
+            Some(a) => match Autonomy::parse(a) {
+                Some(mode) => mode,
+                None => {
+                    return (
+                        false,
+                        Some(format!(
+                            "Unknown autonomy \"{a}\" in settings.json, keeping \"{}\". Valid \
+                             modes: suggest, ask, auto-edit, full-auto.",
+                            self.autonomy
+                        )),
+                    );
+                }
+            },
+        };
+        let moved = mode != self.autonomy;
+        self.autonomy = mode;
+        (moved, None)
+    }
+
     /// A default config for `cwd` (the process's when None) with
     /// `load_project` applied.
     fn for_project(
@@ -1267,6 +1309,7 @@ impl Config {
         if let Some(why) = self.apply_router_settings(&router) {
             self.settings_notices.push(why);
         }
+        self.settings_autonomy = settings.autonomy.clone();
         if let Some(a) = settings.autonomy {
             match crate::permissions::Autonomy::parse(&a) {
                 Some(mode) => self.autonomy = mode,
@@ -4607,6 +4650,46 @@ mod autonomy_migration_tests {
         let c = load(r#"{"autonomy": "yolo"}"#);
         assert_eq!(c.autonomy, Autonomy::Ask);
         assert!(c.settings_notices[0].contains("yolo"));
+    }
+
+    /// /reload never read `autonomy`, so a mode tightened in settings.json
+    /// did nothing until a restart. It applies a changed value, keeps an
+    /// `/autonomy` choice when the file's value did not change, and goes
+    /// back to `ask` when the key is removed.
+    #[test]
+    fn reload_applies_a_changed_settings_autonomy_only() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let write = |settings: &str| {
+            std::fs::write(home.path().join("settings.json"), settings).unwrap();
+        };
+        write(r#"{"autonomy": "auto-edit"}"#);
+        let mut c = Config {
+            cwd: project.path().into(),
+            config_dir_override: Some(home.path().into()),
+            ..Config::default()
+        };
+        c.load_project();
+        assert_eq!(c.autonomy, Autonomy::AutoEdit);
+
+        write(r#"{"autonomy": "suggest"}"#);
+        assert_eq!(c.reload_autonomy(&c.load_settings()), (true, None));
+        assert_eq!(c.autonomy, Autonomy::Suggest);
+
+        // An /autonomy choice outlives a reload that leaves the key alone.
+        c.autonomy = Autonomy::Ask;
+        assert_eq!(c.reload_autonomy(&c.load_settings()), (false, None));
+        assert_eq!(c.autonomy, Autonomy::Ask);
+
+        write(r#"{"autonomy": "yolo"}"#);
+        let (moved, notice) = c.reload_autonomy(&c.load_settings());
+        assert!(!moved && notice.unwrap().contains("yolo"));
+        assert_eq!(c.autonomy, Autonomy::Ask);
+
+        c.autonomy = Autonomy::AutoEdit;
+        write("{}");
+        assert_eq!(c.reload_autonomy(&c.load_settings()), (true, None));
+        assert_eq!(c.autonomy, Autonomy::Ask);
     }
 
     /// Turning the sandbox off under full-auto drops to ask; the gates

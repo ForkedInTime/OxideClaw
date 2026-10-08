@@ -1191,7 +1191,21 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 config.sandbox_mode = mode;
                 reloaded.push("sandboxMode");
             }
+            // full-auto needs the network off, so it is read with the mode.
+            if let Some(net) = settings.sandbox_allow_network {
+                config.sandbox_allow_network = net;
+                reloaded.push("sandboxAllowNetwork");
+            }
+            // Read once at startup before, so a tightened mode in
+            // settings.json did nothing until a restart.
+            let (autonomy_moved, autonomy_notice) = config.reload_autonomy(&settings);
             let autonomy_fallback = config.fall_back_from_full_auto();
+            if autonomy_moved {
+                reloaded.push("autonomy");
+            }
+            let home_notice = autonomy_moved
+                .then(|| crate::permissions::autonomy::home_notice(config.autonomy, &config.cwd))
+                .flatten();
 
             // Reload CLAUDE.md + AGENTS.md + GEMINI.md; --bare never loads them.
             if !config.bare_mode {
@@ -1212,9 +1226,15 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     reloaded.join(", ")
                 )
             };
-            if let Some(why) = autonomy_fallback {
+            if autonomy_moved {
+                msg.push_str(&format!("\nAutonomy: {}", config.autonomy));
+            }
+            for line in [autonomy_notice, autonomy_fallback, home_notice]
+                .into_iter()
+                .flatten()
+            {
                 msg.push('\n');
-                msg.push_str(&why);
+                msg.push_str(&line);
             }
             for line in [
                 router_notice,
