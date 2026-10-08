@@ -937,16 +937,16 @@ fn esc_disarms_clone(app: &App) -> bool {
     app.pending_clone_tier.is_some() && !app.voice_recording && !app.is_loading
 }
 
-/// Whether vim mode gets this key before the main match. Esc while a turn or
-/// TTS is running and Ctrl+S must reach their cancel/stop arms: vim would eat
-/// them as a mode switch, and while loading every other key is blocked, so
-/// Ctrl+C (quit) was the only way out.
 /// The sender outlives playback (nothing clears it when `speak` returns),
 /// but its receiver is dropped then, so a closed sender means no TTS.
 fn tts_playing(app: &App) -> bool {
     app.tts_stop_tx.as_ref().is_some_and(|t| !t.is_closed())
 }
 
+/// Whether vim mode gets this key before the main match. Esc while a turn or
+/// TTS is running and Ctrl+S must reach their cancel/stop arms: vim would eat
+/// them as a mode switch, and while loading every other key is blocked, so
+/// Ctrl+C (quit) was the only way out.
 fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
     if !app.vim_enabled {
         return false;
