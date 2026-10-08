@@ -6,8 +6,15 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::process::Command;
 use uuid::Uuid;
+
+/// Host git with hooks and fsmonitor off. A sandboxed Bash call can write
+/// `.git/` (cwd is bound read-write), and these tools never prompt, so a
+/// planted post-checkout hook or fsmonitor would otherwise run outside the
+/// sandbox. The `-c` overrides reach git's own child checkout and status.
+fn git(dir: &std::path::Path) -> tokio::process::Command {
+    tokio::process::Command::from(crate::autocommit::git_cmd(dir))
+}
 
 /// Shared worktree session state (current worktree path if inside one)
 pub type WorktreeState = Arc<Mutex<Option<WorktreeSession>>>;
@@ -89,10 +96,8 @@ impl Tool for EnterWorktreeTool {
         }
 
         // Validate we're in a git repo
-        let git_check = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        let git_check = git(&ctx.cwd)
             .args(["rev-parse", "--git-dir"])
-            .current_dir(&ctx.cwd)
             .output()
             .await?;
 
@@ -119,10 +124,8 @@ impl Tool for EnterWorktreeTool {
 
         // Find git root
         let git_root = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(crate::sandbox::GIT_NO_REPO_CODE)
+            &git(&ctx.cwd)
                 .args(["rev-parse", "--show-toplevel"])
-                .current_dir(&ctx.cwd)
                 .output()
                 .await?
                 .stdout,
@@ -140,9 +143,13 @@ impl Tool for EnterWorktreeTool {
                 slug
             ));
 
+        // The checkout runs repo-local smudge filters on the host.
+        if let Err(e) = crate::autocommit::check_no_untrusted_filters(&ctx.cwd, &ctx.cwd) {
+            return Ok(ToolOutput::error(format!("Not creating a worktree: {e}")));
+        }
+
         // Create worktree + branch
-        let output = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        let output = git(&ctx.cwd)
             .args([
                 "worktree",
                 "add",
@@ -151,7 +158,6 @@ impl Tool for EnterWorktreeTool {
                 worktree_path.to_str().unwrap_or("/tmp/wt"),
                 "HEAD",
             ])
-            .current_dir(&ctx.cwd)
             .output()
             .await?;
 
@@ -239,12 +245,16 @@ impl Tool for ExitWorktreeTool {
             args.push("--force");
         }
         args.push(s.path.to_str().unwrap_or(""));
-        let output = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
-            .args(&args)
-            .current_dir(&s.original_cwd)
-            .output()
-            .await?;
+        // Remove's clean check runs `git status` in the worktree, and with it
+        // the clean filters of the shared config and the worktree's own.
+        let gate = crate::autocommit::check_no_untrusted_filters(&s.original_cwd, &s.original_cwd)
+            .and_then(|()| crate::autocommit::check_no_untrusted_filters(&s.path, &s.original_cwd));
+        if let Err(e) = gate {
+            return Ok(ToolOutput::error(format!(
+                "Not removing the worktree: {e}\nThe worktree is still open."
+            )));
+        }
+        let output = git(&s.original_cwd).args(&args).output().await?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -294,10 +304,6 @@ mod tests {
         let root = outer.path().join("repo");
         std::fs::create_dir(&root).unwrap();
         git(&root, &["init", "-q"]);
-        // The tools' own git calls do not get the helper's env isolation;
-        // local config overrides the user's global hooks and fsmonitor.
-        git(&root, &["config", "core.hooksPath", "/dev/null"]);
-        git(&root, &["config", "core.fsmonitor", "false"]);
         git(
             &root,
             &[
@@ -315,6 +321,25 @@ mod tests {
         (outer, root)
     }
 
+    /// An executable script that appends `tag` to `log` when git runs it.
+    /// A filter must pass its input through; a hook or fsmonitor must not
+    /// read stdin, which git may never close.
+    #[cfg(unix)]
+    fn marker_script(path: &std::path::Path, log: &std::path::Path, tag: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let rest = if tag == "filter" {
+            "exec cat"
+        } else {
+            "exit 0"
+        };
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\necho {tag} >> '{}'\n{rest}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     async fn enter(state: &WorktreeState, root: &std::path::Path) -> PathBuf {
         let out = EnterWorktreeTool {
             state: state.clone(),
@@ -322,7 +347,7 @@ mod tests {
         .execute(json!({"name": "wt"}), &ToolContext::new(root.to_path_buf()))
         .await
         .unwrap();
-        assert!(!out.is_error);
+        assert!(!out.is_error, "{:?}", out.content);
         state.lock().unwrap().as_ref().unwrap().path.clone()
     }
 
@@ -367,5 +392,104 @@ mod tests {
         assert!(!out.is_error);
         assert!(!wt.exists());
         assert!(state.lock().unwrap().is_none());
+    }
+
+    /// EnterWorktree and ExitWorktree never prompt, and a sandboxed Bash call
+    /// can write `.git/`: hooks and fsmonitor planted there ran on the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_hooks_and_fsmonitor_do_not_run_on_the_host() {
+        let (outer, root) = repo();
+        let log = outer.path().join("ran.log");
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for hook in ["post-checkout", "reference-transaction"] {
+            marker_script(&hooks.join(hook), &log, hook);
+        }
+        let monitor = outer.path().join("fsmonitor.sh");
+        marker_script(&monitor, &log, "fsmonitor");
+        git(
+            &root,
+            &["config", "core.fsmonitor", monitor.to_str().unwrap()],
+        );
+
+        let state = new_worktree_state();
+        let wt = enter(&state, &root).await;
+        let out = ExitWorktreeTool {
+            state: state.clone(),
+        }
+        .execute(json!({}), &ToolContext::new(root))
+        .await
+        .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert!(!wt.exists());
+        let ran = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(ran.is_empty(), "repo scripts ran on the host: {ran}");
+    }
+
+    /// The checkout and remove's clean check run repo-local filter drivers,
+    /// which the sandbox can write as easily as a hook.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repo_local_filters_run_only_when_pinned_and_unchanged() {
+        let (outer, root) = repo();
+        let log = outer.path().join("ran.log");
+        let filter = outer.path().join("filter.sh");
+        marker_script(&filter, &log, "filter");
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=x\n").unwrap();
+        std::fs::write(root.join("a.txt"), "hi\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "f",
+            ],
+        );
+        let ctx = ToolContext::new(root.clone());
+        git(
+            &root,
+            &["config", "filter.x.smudge", filter.to_str().unwrap()],
+        );
+        git(
+            &root,
+            &["config", "filter.x.clean", filter.to_str().unwrap()],
+        );
+
+        // Not pinned at startup (headless, or planted mid-session): refused.
+        let state = new_worktree_state();
+        let out = EnterWorktreeTool {
+            state: state.clone(),
+        }
+        .execute(json!({"name": "wt"}), &ctx)
+        .await
+        .unwrap();
+        assert!(out.is_error, "unpinned filters must be refused");
+        assert!(state.lock().unwrap().is_none());
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("filter")
+        );
+
+        // Pinned (the TUI pins its folder at startup): the user's filter runs.
+        crate::autocommit::pin_filters(&root).unwrap();
+        enter(&state, &root).await;
+
+        // Rewritten after the pin: remove would run it, so it is refused.
+        git(&root, &["config", "filter.x.clean", "cat"]);
+        let out = ExitWorktreeTool {
+            state: state.clone(),
+        }
+        .execute(json!({}), &ctx)
+        .await
+        .unwrap();
+        assert!(out.is_error, "a changed filter must be refused");
+        assert!(state.lock().unwrap().is_some(), "session must stay open");
     }
 }

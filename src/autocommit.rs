@@ -112,7 +112,7 @@ impl RestoreReport {
 /// Build a `std::process::Command` for `git` rooted at `cwd` with a clean,
 /// locale-agnostic environment and sourcing no user git config that might
 /// break plumbing output parsing.
-pub(crate) fn git_cmd(cwd: &Path) -> std::process::Command {
+pub fn git_cmd(cwd: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(cwd);
     // Deterministic output: no localised messages, no terminal prompting,
@@ -234,6 +234,32 @@ pub fn check_filters_unchanged(cwd: &Path) -> anyhow::Result<RepoPin> {
         );
     }
     Ok(now)
+}
+
+/// Gate for host git commands outside snapshots that check out or stage
+/// files (worktree add/remove, /checkpoint, /spawn): those run `filter.*`
+/// drivers too. A repo with no repo-local filter or `core.worktree` config
+/// (`git init` writes only `core.bare false`) has nothing to run and needs no
+/// pin, so headless runs work in it. Otherwise `cwd`'s must match what
+/// [`pin_filters`] recorded for `trusted`, the session directory, and that pin
+/// must still hold. `cwd` may be a linked worktree of `trusted`: it shares the
+/// repo config but can carry its own `config.worktree`.
+pub fn check_no_untrusted_filters(cwd: &Path, trusted: &Path) -> anyhow::Result<()> {
+    let config = repo_state(cwd)?.config;
+    if config.lines().all(|l| l == "core.bare false") {
+        return Ok(());
+    }
+    let pin = check_filters_unchanged(trusted)?;
+    if pin.config != config {
+        anyhow::bail!(
+            "{} has git filter/core.worktree configuration that OxideClaw did not \
+             see when it started, so it will not run it (it could have been written \
+             from inside the sandbox). Review the filter.* and core.worktree entries \
+             in its git config.",
+            cwd.display()
+        );
+    }
+    Ok(())
 }
 
 /// Return true if `cwd` is inside a git work tree. Uses

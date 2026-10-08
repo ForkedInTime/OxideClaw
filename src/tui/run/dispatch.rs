@@ -2645,24 +2645,25 @@ async fn uncommitted_diff(
     cwd: &std::path::Path,
     path: Option<&str>,
 ) -> anyhow::Result<(String, Vec<String>)> {
+    // Diffing the work tree runs clean filters on the host, and the sandbox
+    // can write `.git/config`.
+    oxideclaw::autocommit::check_no_untrusted_filters(cwd, cwd)?;
     // Separate args, never `sh -c` with a formatted path (shell injection).
+    // Hooks and fsmonitor off, for the same reason.
     let git = |args: &[&str]| {
-        let mut cmd = tokio::process::Command::new("git");
-        // A planted fsmonitor would run on the host for /diff.
-        cmd.args(crate::sandbox::GIT_NO_REPO_CODE)
-            .args(args)
-            .current_dir(cwd);
+        let mut cmd = tokio::process::Command::from(oxideclaw::autocommit::git_cmd(cwd));
+        cmd.args(args);
         if let Some(p) = path {
             cmd.arg("--").arg(p);
         }
         cmd.output()
     };
-    // --no-ext-diff: /diff wants a parseable unified diff, not whatever a
-    // configured diff.external tool prints.
-    let mut out = git(&["diff", "--no-ext-diff", "HEAD"]).await?;
+    // --no-ext-diff/--no-textconv: /diff wants a parseable unified diff, not
+    // whatever a configured diff.external or textconv tool prints (or runs).
+    let mut out = git(&["diff", "--no-ext-diff", "--no-textconv", "HEAD"]).await?;
     if !out.status.success() {
         // No HEAD yet: everything is staged against the empty tree.
-        let cached = git(&["diff", "--no-ext-diff", "--cached"]).await?;
+        let cached = git(&["diff", "--no-ext-diff", "--no-textconv", "--cached"]).await?;
         if !cached.status.success() {
             anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }

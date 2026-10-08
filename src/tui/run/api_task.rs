@@ -1396,13 +1396,13 @@ pub(super) fn git_checkpoint(
     cwd: &std::path::Path,
     message: Option<&str>,
 ) -> anyhow::Result<String> {
-    use std::process::Command;
+    // Hooks and fsmonitor off: the sandbox can write `.git/`, and this runs
+    // on the host.
+    let git = || oxideclaw::autocommit::git_cmd(cwd);
 
     // Check if we're in a git repo
-    let in_repo = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let in_repo = git()
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(cwd)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -1410,33 +1410,26 @@ pub(super) fn git_checkpoint(
         anyhow::bail!("Not inside a git repository");
     }
 
+    // Staging runs clean filters on the host, so only trusted ones.
+    oxideclaw::autocommit::check_no_untrusted_filters(cwd, cwd)?;
+
     // Check for changes
-    let status = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
-        .args(["status", "--porcelain"])
-        .current_dir(cwd)
-        .output()?;
+    let status = git().args(["status", "--porcelain"]).output()?;
     let status_text = String::from_utf8_lossy(&status.stdout);
     if status_text.trim().is_empty() {
         return Ok("No changes to checkpoint.".into());
     }
 
     // Stage all changes
-    Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
-        .args(["add", "-A"])
-        .current_dir(cwd)
-        .output()?;
+    git().args(["add", "-A"]).output()?;
 
     // Create commit
     let ts = chrono_free_timestamp();
     let msg = message.unwrap_or("oxideclaw checkpoint");
     let full_msg = format!("[checkpoint] {msg} ({ts})");
 
-    let commit = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let commit = git()
         .args(["commit", "-m", &full_msg, "--no-verify"])
-        .current_dir(cwd)
         .output()?;
 
     if !commit.status.success() {
@@ -1445,11 +1438,7 @@ pub(super) fn git_checkpoint(
     }
 
     // Get the short hash
-    let hash = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(cwd)
-        .output()?;
+    let hash = git().args(["rev-parse", "--short", "HEAD"]).output()?;
     let short = String::from_utf8_lossy(&hash.stdout).trim().to_string();
 
     let changed: usize = status_text.lines().count();

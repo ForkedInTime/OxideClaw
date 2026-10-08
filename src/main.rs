@@ -32,6 +32,11 @@ mod update_check;
 mod voice;
 mod watch;
 
+// Library-only: its filter pins are process state, and the TUI pins through
+// the library, so a second binary copy would never see them. Imported so
+// modules compiled into both crates can name it as `crate::autocommit`.
+use oxideclaw::autocommit;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;

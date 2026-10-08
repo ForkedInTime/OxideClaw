@@ -13,6 +13,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+
+/// Host git with hooks and fsmonitor off: the session's sandboxed Bash can
+/// write `.git/`, and these commands (worktree add, commit, merge) would run
+/// what it planted outside the sandbox.
+fn git_at(dir: &std::path::Path) -> Command {
+    Command::from(oxideclaw::autocommit::git_cmd(dir))
+}
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -144,10 +151,8 @@ pub async fn spawn_agent(
     let max_budget_usd = spawn_budget(config.max_budget_usd, budget_left)?;
 
     // Validate git repo
-    let git_check = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let git_check = git_at(&cwd)
         .args(["rev-parse", "--git-dir"])
-        .current_dir(&cwd)
         .output()
         .await?;
     if !git_check.status.success() {
@@ -159,10 +164,8 @@ pub async fn spawn_agent(
 
     // Find git root
     let git_root = String::from_utf8_lossy(
-        &Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        &git_at(&cwd)
             .args(["rev-parse", "--show-toplevel"])
-            .current_dir(&cwd)
             .output()
             .await?
             .stdout,
@@ -177,13 +180,14 @@ pub async fn spawn_agent(
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("{repo_name}-{slug}"));
 
+    // The checkout runs repo-local smudge filters on the host.
+    oxideclaw::autocommit::check_no_untrusted_filters(&cwd, &cwd)?;
+
     // Create worktree + branch
-    let output = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let output = git_at(&cwd)
         .args(["worktree", "add", "-b", &slug])
         .arg(&worktree_path)
         .arg("HEAD")
-        .current_dir(&cwd)
         .output()
         .await?;
 
@@ -194,10 +198,8 @@ pub async fn spawn_agent(
 
     // Capture the base commit for diffing later
     let base_sha = String::from_utf8_lossy(
-        &Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        &git_at(&worktree_path)
             .args(["rev-parse", "HEAD"])
-            .current_dir(&worktree_path)
             .output()
             .await?
             .stdout,
@@ -258,7 +260,7 @@ pub async fn spawn_agent(
     tokio::spawn(async move {
         let result = run_spawned_agent(agent_config, &desc, cancel_rx, usage_sink).await;
 
-        let (diff, stat) = collect_agent_diff(&wt_path, &base_sha).await;
+        let (diff, stat) = collect_agent_diff(&wt_path, &orig_cwd, &base_sha).await;
 
         let status = finalize(&reg, &agent_id, &result, diff);
         match (&status, &result) {
@@ -282,11 +284,9 @@ pub async fn spawn_agent(
 
         // Clean up worktree on failure/cancel (keep on success for review)
         if matches!(status, SpawnStatus::Failed | SpawnStatus::Cancelled) {
-            let _ = Command::new("git")
-                .args(crate::sandbox::GIT_NO_REPO_CODE)
+            let _ = git_at(&orig_cwd)
                 .args(["worktree", "remove", "--force"])
                 .arg(&wt_path)
-                .current_dir(&orig_cwd)
                 .output()
                 .await;
         }
@@ -314,18 +314,21 @@ fn spawn_budget(engine_cap: Option<f64>, budget_left: Option<f64>) -> Result<Opt
 /// `git diff <commit>` skips untracked paths, so stage first: otherwise new
 /// files are missing from `/spawn review` yet still land on `/spawn merge`,
 /// which stages everything with `git add -A` anyway.
-async fn collect_agent_diff(wt_path: &std::path::Path, base_sha: &str) -> (String, String) {
-    let _ = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
-        .args(["add", "-A"])
-        .current_dir(wt_path)
-        .output()
-        .await;
+///
+/// Staging runs clean filters on the host, and the agent's sandbox can
+/// rewrite the worktree's `.git` file to point at a git dir of its own.
+async fn collect_agent_diff(
+    wt_path: &std::path::Path,
+    main_cwd: &std::path::Path,
+    base_sha: &str,
+) -> (String, String) {
+    if let Err(e) = oxideclaw::autocommit::check_no_untrusted_filters(wt_path, main_cwd) {
+        return (String::new(), format!("Changes not collected: {e}"));
+    }
+    let _ = git_at(wt_path).args(["add", "-A"]).output().await;
     async fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-        Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        git_at(dir)
             .args(args)
-            .current_dir(dir)
             .output()
             .await
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -390,10 +393,8 @@ async fn run_spawned_agent(
 /// Spawn worktrees still on disk with no registry to track them — what a
 /// crash (no shutdown path) leaves behind. `(branch, path)` pairs.
 pub async fn leftover_spawn_worktrees(main_cwd: &std::path::Path) -> Vec<(String, PathBuf)> {
-    let Ok(out) = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let Ok(out) = git_at(main_cwd)
         .args(["worktree", "list", "--porcelain"])
-        .current_dir(main_cwd)
         .output()
         .await
     else {
@@ -424,7 +425,10 @@ pub async fn leftover_spawn_worktrees(main_cwd: &std::path::Path) -> Vec<(String
 /// branch — an in-flight agent's half-done tree is worthless once the
 /// registry that tracks it is gone. Completed (unmerged) work is kept and
 /// listed so the user can merge it by hand. Returns the message to show.
-pub async fn cleanup_on_exit(registry: &SpawnRegistry, main_cwd: &PathBuf) -> Option<String> {
+pub async fn cleanup_on_exit(
+    registry: &SpawnRegistry,
+    main_cwd: &std::path::Path,
+) -> Option<String> {
     // Take what we need out of the lock; the git calls below must not hold it.
     let (to_remove, kept) = {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -451,17 +455,13 @@ pub async fn cleanup_on_exit(registry: &SpawnRegistry, main_cwd: &PathBuf) -> Op
     }
 
     for (branch, path) in &to_remove {
-        let _ = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        let _ = git_at(main_cwd)
             .args(["worktree", "remove", "--force"])
             .arg(path)
-            .current_dir(main_cwd)
             .output()
             .await;
-        let _ = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        let _ = git_at(main_cwd)
             .args(["branch", "-D", branch])
-            .current_dir(main_cwd)
             .output()
             .await;
     }
@@ -599,7 +599,11 @@ pub fn kill_agent(registry: &SpawnRegistry, id: &str) -> Result<String> {
 }
 
 /// Merge a completed agent's worktree changes into the current branch.
-pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf) -> Result<String> {
+pub async fn merge_agent(
+    registry: &SpawnRegistry,
+    id: &str,
+    main_cwd: &std::path::Path,
+) -> Result<String> {
     // `id` may be a prefix; the registry is keyed by the full id, so the
     // commit message and the final remove must use the resolved one.
     let (id, desc, branch, wt_path) = {
@@ -620,28 +624,24 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
         )
     };
 
+    // Committing and merging run clean/smudge filters on the host.
+    oxideclaw::autocommit::check_no_untrusted_filters(&wt_path, main_cwd)?;
+    oxideclaw::autocommit::check_no_untrusted_filters(main_cwd, main_cwd)?;
+
     // Commit all changes in the worktree first
-    let status = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let status = git_at(&wt_path)
         .args(["status", "--porcelain"])
-        .current_dir(&wt_path)
         .output()
         .await?;
     let has_changes = !status.stdout.is_empty();
 
     if has_changes {
-        let _ = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
-            .args(["add", "-A"])
-            .current_dir(&wt_path)
-            .output()
-            .await?;
+        let _ = git_at(&wt_path).args(["add", "-A"]).output().await?;
 
         let commit_msg = format!("spawn: {desc}");
 
-        let commit = Command::new("git")
+        let commit = git_at(&wt_path)
             .args(["commit", "-m", &commit_msg])
-            .current_dir(&wt_path)
             .output()
             .await?;
 
@@ -652,21 +652,15 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
     }
 
     // Merge the worktree branch into the current branch
-    let merge = Command::new("git")
+    let merge = git_at(main_cwd)
         .args(["merge", &branch, "--no-edit"])
-        .current_dir(main_cwd)
         .output()
         .await?;
 
     if !merge.status.success() {
         // Leave the user's checkout as it was, and keep the worktree, branch
         // and registry entry so the work can be reviewed and merged by hand.
-        let _ = Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
-            .args(["merge", "--abort"])
-            .current_dir(main_cwd)
-            .output()
-            .await;
+        let _ = git_at(main_cwd).args(["merge", "--abort"]).output().await;
         let err = String::from_utf8_lossy(&merge.stderr);
         let out = String::from_utf8_lossy(&merge.stdout);
         anyhow::bail!(
@@ -676,19 +670,15 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
     }
 
     // Clean up worktree
-    let _ = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let _ = git_at(main_cwd)
         .args(["worktree", "remove", "--force"])
         .arg(&wt_path)
-        .current_dir(main_cwd)
         .output()
         .await;
 
     // Delete the branch
-    let _ = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let _ = git_at(main_cwd)
         .args(["branch", "-d", &branch])
-        .current_dir(main_cwd)
         .output()
         .await;
 
@@ -706,7 +696,7 @@ pub async fn merge_agent(registry: &SpawnRegistry, id: &str, main_cwd: &PathBuf)
 pub async fn discard_agent(
     registry: &SpawnRegistry,
     id: &str,
-    main_cwd: &PathBuf,
+    main_cwd: &std::path::Path,
 ) -> Result<String> {
     let (id, branch, wt_path, desc) = {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -727,19 +717,15 @@ pub async fn discard_agent(
     };
 
     // Remove worktree
-    let _ = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let _ = git_at(main_cwd)
         .args(["worktree", "remove", "--force"])
         .arg(&wt_path)
-        .current_dir(main_cwd)
         .output()
         .await;
 
     // Delete the branch
-    let _ = Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
+    let _ = git_at(main_cwd)
         .args(["branch", "-D", &branch])
-        .current_dir(main_cwd)
         .output()
         .await;
 
@@ -1126,7 +1112,7 @@ mod tests {
         std::fs::write(wt.join("a.txt"), "edited\n").unwrap();
         std::fs::write(wt.join("new.txt"), "brand new\n").unwrap();
 
-        let (diff, stat) = collect_agent_diff(wt, &base).await;
+        let (diff, stat) = collect_agent_diff(wt, wt, &base).await;
         assert!(diff.contains("+brand new"), "{diff}");
         assert!(diff.contains("+edited"), "{diff}");
         assert!(stat.contains("new.txt"), "{stat}");

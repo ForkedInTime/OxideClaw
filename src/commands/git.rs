@@ -145,11 +145,11 @@ fn lint_checks(cwd: &std::path::Path) -> Vec<&'static str> {
 }
 
 pub(super) fn cmd_branch(ctx: &CommandContext) -> CommandAction {
+    // Hooks and fsmonitor off: the sandbox can write `.git/`, and this runs
+    // on the host.
     let run = |args: &[&str]| -> Option<String> {
-        std::process::Command::new("git")
-            .args(crate::sandbox::GIT_NO_REPO_CODE)
+        crate::autocommit::git_cmd(&ctx.config.cwd)
             .args(args)
-            .current_dir(&ctx.config.cwd)
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -175,16 +175,20 @@ pub(super) fn cmd_branch(ctx: &CommandContext) -> CommandAction {
 
     // Not through `run`: its trim() ate the leading space of the first
     // XY code (" M" read as staged "M"), and its empty filter hid the
-    // clean-tree line.
-    let status = std::process::Command::new("git")
-        .args(crate::sandbox::GIT_NO_REPO_CODE)
-        .args(["status", "--short"])
-        .current_dir(&ctx.config.cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string());
-    if let Some(status) = status {
+    // clean-tree line. Status runs clean filters on the host, so only
+    // trusted ones.
+    let gate = crate::autocommit::check_no_untrusted_filters(&ctx.config.cwd, &ctx.config.cwd);
+    let status = gate.as_ref().ok().and_then(|()| {
+        crate::autocommit::git_cmd(&ctx.config.cwd)
+            .args(["status", "--short"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+    });
+    if let Err(e) = gate {
+        lines.push(format!("Working tree: not checked: {e}"));
+    } else if let Some(status) = status {
         if !status.is_empty() {
             lines.push("Working tree changes:".into());
             for l in status.lines().take(15) {
