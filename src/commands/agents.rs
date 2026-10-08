@@ -120,25 +120,7 @@ pub(super) fn cmd_agents(ctx: &CommandContext) -> CommandAction {
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_string();
-                // Read description from AGENT.md if present
-                let agent_md = path.join("AGENT.md");
-                let description = if agent_md.exists() {
-                    std::fs::read_to_string(&agent_md)
-                        .ok()
-                        .and_then(|content| {
-                            content
-                                .lines()
-                                .find(|l| {
-                                    !l.trim().is_empty()
-                                        && !l.starts_with("---")
-                                        && !l.starts_with('#')
-                                })
-                                .map(|l| l.trim().to_string())
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
+                let description = agent_description(&path.join("AGENT.md"));
                 if description.is_empty() {
                     lines.push(format!("  {name}"));
                 } else {
@@ -182,6 +164,23 @@ pub(super) fn cmd_agents(ctx: &CommandContext) -> CommandAction {
     );
 
     CommandAction::Message(lines.join("\n"))
+}
+
+/// The first plain line of an agent's `AGENT.md`, or empty. A cloned repo
+/// controls this file and /agents reads it on the event loop: a link to
+/// /dev/zero read until out of memory and one to /dev/tty froze the TUI,
+/// so only a regular file under the config-file size cap is read.
+fn agent_description(agent_md: &std::path::Path) -> String {
+    crate::settings::read_config_file(agent_md)
+        .ok()
+        .flatten()
+        .and_then(|content| {
+            content
+                .lines()
+                .find(|l| !l.trim().is_empty() && !l.starts_with("---") && !l.starts_with('#'))
+                .map(|l| l.trim().to_string())
+        })
+        .unwrap_or_default()
 }
 
 pub(super) fn cmd_spawn(args: &str) -> CommandAction {
@@ -322,5 +321,34 @@ mod spawn_parse_tests {
             cmd_spawn("discard dead"),
             CommandAction::DiscardSpawn(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod agent_description_tests {
+    use super::agent_description;
+
+    #[test]
+    fn reads_the_first_plain_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("AGENT.md");
+        std::fs::write(&md, "---\n# Reviewer\n\n  Reviews diffs  \nmore").unwrap();
+        assert_eq!(agent_description(&md), "Reviews diffs");
+        assert_eq!(agent_description(&dir.path().join("missing.md")), "");
+    }
+
+    /// A repo's AGENT.md linked to /dev/zero was read until out of memory.
+    #[cfg(unix)]
+    #[test]
+    fn a_special_file_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("AGENT.md");
+        std::os::unix::fs::symlink("/dev/zero", &md).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(agent_description(&md)).unwrap());
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading AGENT.md must not block or run away");
+        assert_eq!(got, "");
     }
 }
