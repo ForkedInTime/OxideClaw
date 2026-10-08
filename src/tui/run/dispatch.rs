@@ -1123,6 +1123,11 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if openai_api_changed {
                 config.openai_api = openai_api;
                 reloaded.push("openaiApi");
+                // Router tiers keep the OpenAI-compatible clients built for
+                // the old API (the session model's tier included); forget
+                // them so each is rebuilt on the new one.
+                app.router.health.reset();
+                app.routed_model = None;
             }
             if let Some(model) = reloaded_model(
                 settings.model.as_deref(),
@@ -2933,7 +2938,63 @@ mod editor_tests {
 
 #[cfg(test)]
 mod reload_tests {
-    use super::reloaded_model;
+    use super::*;
+
+    /// /reload of openaiApi rebuilt only the session client; routed prompts
+    /// kept going to the router's cached tier clients on the old API.
+    #[tokio::test]
+    async fn reloading_openai_api_drops_cached_router_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("config");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("settings.json"), r#"{"openaiApi": "chat"}"#).unwrap();
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        app.router.health.set("oai:gpt-5", Err("old API".into()));
+        app.routed_model = Some("oai:gpt-5".into());
+        let mut config = Config {
+            cwd: dir.path().to_path_buf(),
+            config_dir_override: Some(home),
+            bare_mode: true,
+            ..Config::default()
+        };
+        let mut client =
+            ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
+        let perm_state = PermissionState::new(false, &[], &[]);
+        let skills = std::collections::HashMap::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let todo_state = TodoState::default();
+        let mut session = Session::at_path("current", dir.path().join("current.jsonl"));
+        let spawn_registry = crate::spawn::new_registry();
+        run_slash_command(
+            "/reload".into(),
+            KeyCtx {
+                key: crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                app: &mut app,
+                messages: &mut Vec::new(),
+                client: &mut client,
+                tools: &[],
+                config: &mut config,
+                perm_state: &perm_state,
+                skills: &skills,
+                system_prompt: &mut String::new(),
+                tx: &tx,
+                todo_state: &todo_state,
+                session: &mut session,
+                saved_count: &mut 0,
+                mcp_statuses: &[],
+                spawn_registry: &spawn_registry,
+            },
+        )
+        .await
+        .unwrap();
+        if crate::config::app_env("OPENAI_API").is_some() {
+            // The environment pins the API, so the file change is ignored.
+            return;
+        }
+        assert_eq!(config.openai_api, crate::api::OpenAiApi::Chat);
+        assert!(app.router.health.skipped().is_empty());
+        assert_eq!(app.routed_model, None);
+    }
 
     /// Started with `--model ollama:qwen` while settings say a Claude model:
     /// a reload that leaves settings.json's model alone keeps the CLI model
