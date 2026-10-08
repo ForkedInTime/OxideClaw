@@ -24,7 +24,39 @@ use std::sync::{
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::Duration;
 
+/// Deadline for the probe, the handshake and list calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default deadline for `tools/call` and `resources/read`, which do the
+/// server's real work (a test suite, a browser flow, a long query) and so
+/// may well outlast `REQUEST_TIMEOUT`. Esc still cancels one sooner.
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// `MCP_TOOL_TIMEOUT` (milliseconds, as in Claude Code) or the default.
+fn tool_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| parse_tool_timeout(std::env::var("MCP_TOOL_TIMEOUT").ok().as_deref()))
+}
+
+fn parse_tool_timeout(value: Option<&str>) -> Duration {
+    match value.map(|v| v.trim().parse::<u64>()) {
+        Some(Ok(ms)) if ms > 0 => Duration::from_millis(ms),
+        Some(_) => {
+            tracing::warn!("MCP_TOOL_TIMEOUT is not a positive number of milliseconds; ignored");
+            DEFAULT_TOOL_TIMEOUT
+        }
+        None => DEFAULT_TOOL_TIMEOUT,
+    }
+}
+
+/// The deadline for one request: `tool` for the calls that run a tool or
+/// read a resource, `base` for everything else.
+fn deadline(method: &str, base: Duration, tool: Duration) -> Duration {
+    if matches!(method, "tools/call" | "resources/read") {
+        tool
+    } else {
+        base
+    }
+}
 /// Default ceiling on what one tool call or resource read hands the model.
 const DEFAULT_MAX_RESULT_CHARS: usize = 25_000;
 
@@ -224,6 +256,8 @@ pub(crate) struct StdioTransport {
     /// A request registered after the reader's final drain would otherwise
     /// wait out the full timeout for a reply that can never come.
     closed: Arc<AtomicBool>,
+    timeout: Duration,
+    tool_timeout: Duration,
 }
 
 impl StdioTransport {
@@ -360,6 +394,8 @@ impl StdioTransport {
             stdin_tx,
             pending,
             closed,
+            timeout: REQUEST_TIMEOUT,
+            tool_timeout: tool_timeout(),
         })
     }
 }
@@ -459,7 +495,8 @@ impl McpTransport for StdioTransport {
             method,
             armed: true,
         };
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        let limit = deadline(method, self.timeout, self.tool_timeout);
+        match tokio::time::timeout(limit, rx).await {
             Ok(reply) => {
                 cancel.armed = false;
                 reply.map_err(|_| anyhow!("MCP server disconnected"))?
@@ -511,6 +548,7 @@ pub(crate) struct HttpTransport {
     /// the headers, so a server that then stalls would otherwise hang the
     /// tool call forever; reqwest has no default read timeout.
     timeout: Duration,
+    tool_timeout: Duration,
 }
 
 impl HttpTransport {
@@ -526,13 +564,33 @@ impl HttpTransport {
             session_id: std::sync::Mutex::new(None),
             protocol_version: std::sync::Mutex::new(None),
             timeout: REQUEST_TIMEOUT,
+            tool_timeout: tool_timeout(),
         })
     }
 }
 
 /// An HTTP client that sends `headers` (static auth) on every request.
+///
+/// Redirects are followed only within the server's origin. On a cross-host
+/// redirect reqwest strips `Authorization` and cookies but not keys in
+/// custom headers (`X-API-Key`), a 307/308 resends the JSON-RPC body, and
+/// nothing stops https → http. Anything else surfaces as an error naming
+/// the target (`redirect_refused`).
 fn client_with_headers(headers: &HashMap<String, String>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.origin() == attempt.url().origin());
+            if attempt.previous().len() > 5 {
+                attempt.error("too many redirects")
+            } else if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }));
     if !headers.is_empty() {
         let mut header_map = reqwest::header::HeaderMap::new();
         for (k, v) in headers {
@@ -545,6 +603,22 @@ fn client_with_headers(headers: &HashMap<String, String>) -> Result<reqwest::Cli
         builder = builder.default_headers(header_map);
     }
     Ok(builder.build()?)
+}
+
+/// For a 3xx the client did not follow: where it pointed, and why not.
+fn redirect_refused(resp: &reqwest::Response) -> Option<String> {
+    if !resp.status().is_redirection() {
+        return None;
+    }
+    let to = resp
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    Some(format!(
+        "redirect to {to} not followed: it leaves the server's origin (put that URL in the \
+         server's config if you trust it)"
+    ))
 }
 
 /// Largest HTTP MCP response body we will buffer. Resources and tool
@@ -848,6 +922,9 @@ impl HttpTransport {
                     "HTTP MCP {method} failed: session expired — restart oxideclaw to reconnect"
                 ));
             }
+            if let Some(why) = redirect_refused(&resp) {
+                return Err(anyhow!("HTTP MCP {method} failed: {status} {why}"));
+            }
             let body = Self::bounded_body(resp, method).await.unwrap_or_default();
             // Modern servers explain a 4xx with a JSON-RPC error; keep it
             // typed, since its code tells the eras apart.
@@ -912,7 +989,8 @@ impl McpTransport for HttpTransport {
         params: Value,
         headers: &[(String, String)],
     ) -> Result<Value> {
-        tokio::time::timeout(self.timeout, self.call_inner(id, method, params, headers))
+        let limit = deadline(method, self.timeout, self.tool_timeout);
+        tokio::time::timeout(limit, self.call_inner(id, method, params, headers))
             .await
             .map_err(|_| anyhow!("HTTP MCP request timed out ({method})"))?
     }
@@ -949,6 +1027,7 @@ pub(crate) struct SseTransport {
     closed: Arc<AtomicBool>,
     reader: tokio::task::JoinHandle<()>,
     timeout: Duration,
+    tool_timeout: Duration,
 }
 
 impl Drop for SseTransport {
@@ -977,7 +1056,10 @@ impl SseTransport {
                 .send()
                 .await?;
             if !resp.status().is_success() {
-                return Err(anyhow!("SSE MCP stream failed: {}", resp.status()));
+                let why = redirect_refused(&resp)
+                    .map(|why| format!(" {why}"))
+                    .unwrap_or_default();
+                return Err(anyhow!("SSE MCP stream failed: {}{why}", resp.status()));
             }
             let mut stream = Box::pin(resp.bytes_stream());
             let mut buf: Vec<u8> = Vec::new();
@@ -1060,6 +1142,7 @@ impl SseTransport {
             closed,
             reader,
             timeout,
+            tool_timeout: tool_timeout(),
         })
     }
 
@@ -1110,6 +1193,9 @@ impl SseTransport {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
+            if let Some(why) = redirect_refused(&resp) {
+                return Err(anyhow!("SSE MCP {method} failed: {status} {why}"));
+            }
             let body = HttpTransport::bounded_body(resp, method)
                 .await
                 .unwrap_or_default();
@@ -1139,7 +1225,8 @@ impl McpTransport for SseTransport {
             rx.await
                 .map_err(|_| anyhow!("SSE MCP stream closed before the {method} response"))?
         };
-        let out = match tokio::time::timeout(self.timeout, exchange).await {
+        let limit = deadline(method, self.timeout, self.tool_timeout);
+        let out = match tokio::time::timeout(limit, exchange).await {
             Ok(r) => r,
             Err(_) => Err(anyhow!("SSE MCP request timed out ({method})")),
         };
@@ -2190,11 +2277,47 @@ mod hardening_tests {
         });
         let mut t = HttpTransport::new(&base, &HashMap::new()).unwrap();
         t.timeout = Duration::from_millis(300);
+        t.tool_timeout = Duration::from_millis(300);
         let err = tokio::time::timeout(Duration::from_secs(10), t.call(1, "tools/call", json!({})))
             .await
             .expect("the transport's own deadline must fire")
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// A redirect off the server's origin resent the JSON-RPC body and any
+    /// custom auth header (`X-API-Key`) to the new host, even over plain
+    /// http. One within the origin (`/mcp` → `/mcp/`) is still followed.
+    #[tokio::test]
+    async fn http_redirects_are_followed_only_within_the_origin() {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                  content-length: 36\r\nconnection: close\r\n\r\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+        let (elsewhere, elsewhere_seen) = recording_server(vec![ok.to_string()]).await;
+        let to_elsewhere = format!(
+            "HTTP/1.1 308 Permanent Redirect\r\nlocation: {elsewhere}/mcp\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let (base, _) = recording_server(vec![to_elsewhere]).await;
+        let headers = HashMap::from([("X-API-Key".to_string(), "k-secret".to_string())]);
+        let t = HttpTransport::new(&format!("{base}/mcp"), &headers).unwrap();
+        let err = t.call(1, "tools/list", json!({})).await.unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains("308") && err.contains(&format!("{elsewhere}/mcp")),
+            "{err}"
+        );
+        assert!(err.contains("not followed"), "{err}");
+        assert!(elsewhere_seen.lock().unwrap().is_empty());
+
+        let slash = "HTTP/1.1 307 Temporary Redirect\r\nlocation: /mcp/\r\n\
+                     content-length: 0\r\nconnection: close\r\n\r\n";
+        let (base, seen) = recording_server(vec![slash.to_string(), ok.to_string()]).await;
+        let t = HttpTransport::new(&format!("{base}/mcp"), &headers).unwrap();
+        assert_eq!(t.call(1, "tools/list", json!({})).await.unwrap(), json!({}));
+        let seen = seen.lock().unwrap();
+        assert!(seen[1].starts_with("post /mcp/ "), "{seen:?}");
+        assert!(seen[1].contains("x-api-key: k-secret"), "{seen:?}");
     }
 
     /// A server answering with a multi-gigabyte body must be refused, not
@@ -2319,6 +2442,53 @@ cat >/dev/null"#,
         assert_eq!(out["cancel"]["method"], "notifications/cancelled");
         assert_eq!(out["cancel"]["params"]["requestId"], json!(1));
         assert!(out["cancel"].get("id").is_none(), "{out}");
+    }
+
+    /// Every request, `tools/call` included, was cut off at the 60 s that
+    /// bounds the handshake and list calls, so a tool that runs a test suite
+    /// or a browser flow always failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_tool_calls_outlast_the_request_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cmd, args) = sh_server(
+            r#"while IFS= read -r l; do
+id=$(printf '%s\n' "$l" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),.*/\1/p')
+sleep 1
+printf '{"jsonrpc":"2.0","id":%s,"result":{"done":true}}\n' "$id"
+done"#,
+        );
+        let mut t = StdioTransport::connect(&cmd, &args, &HashMap::new(), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(t.tool_timeout, tool_timeout());
+        // Explicit, so a MCP_TOOL_TIMEOUT in the environment cannot matter.
+        t.timeout = Duration::from_millis(300);
+        t.tool_timeout = Duration::from_secs(20);
+
+        let out = t.call(1, "tools/call", json!({ "name": "slow" })).await;
+        assert_eq!(out.unwrap()["done"], json!(true));
+        let out = t.call(2, "resources/read", json!({ "uri": "x" })).await;
+        assert_eq!(out.unwrap()["done"], json!(true));
+        let err = t.call(3, "tools/list", json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("timed out (tools/list)"), "{err}");
+    }
+
+    #[test]
+    fn tool_timeout_comes_from_mcp_tool_timeout_in_milliseconds() {
+        assert_eq!(parse_tool_timeout(None), DEFAULT_TOOL_TIMEOUT);
+        assert_eq!(parse_tool_timeout(Some("90000")), Duration::from_secs(90));
+        for bad in ["", "0", "-5", "1h", "1.5"] {
+            assert_eq!(parse_tool_timeout(Some(bad)), DEFAULT_TOOL_TIMEOUT, "{bad}");
+        }
+        assert_eq!(
+            deadline("tools/call", REQUEST_TIMEOUT, Duration::from_secs(7)),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            deadline("initialize", REQUEST_TIMEOUT, Duration::from_secs(7)),
+            REQUEST_TIMEOUT
+        );
     }
 
     /// A stray non-UTF-8 line (a print() under a cp1252 locale) ended the

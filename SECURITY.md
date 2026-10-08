@@ -35,7 +35,7 @@ OxideClaw executes shell commands and modifies files as part of its core functio
 - **API keys** — stored in `.env` files. Never commit these to version control.
 - **Tool execution** — the AI agent can run Bash commands. Use an isolating sandbox (`bwrap` or `firejail`, Linux only) for untrusted workloads; `strict` mode is a pattern denylist and provides no containment.
 - **MCP plugins** — third-party plugins execute with the same permissions as OxideClaw. Project-scoped plugins (`.claude/settings.json`, `.mcp.json`), project hooks and a project `apiKeyHelper` are ignored until you run `/trust` in that folder — a cloned repository cannot run commands on your machine by itself.
-- **HTTP MCP servers use static headers.** The bearer token in `mcpServers.<name>.headers` (or in the `headers` an ACP client passes with an `http` or `sse` server) is sent as-is; OxideClaw has no OAuth refresh flow. When a token expires the server returns 401, the failure is reported, and you replace the token and restart.
+- **HTTP MCP servers use static headers.** The bearer token in `mcpServers.<name>.headers` (or in the `headers` an ACP client passes with an `http` or `sse` server) is sent as-is; OxideClaw has no OAuth refresh flow. When a token expires the server returns 401, the failure is reported, and you replace the token and restart. The headers go only to the server's own origin: a redirect to another host, port or scheme (https to http included) is not followed, and the error names its target.
 - **SDK / Headless mode** — the NDJSON server accepts commands on stdin. Secure the transport layer in production deployments.
 
 ## Network access from WebFetch and WebBrowser
