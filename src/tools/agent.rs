@@ -67,9 +67,9 @@ impl AgentTool {
         sub_config.sandbox_allow_network = ctx.sandbox_allow_network;
         // `/untrust` changes trust after the snapshot was taken.
         sub_config.project_trusted = ctx.project_trusted;
-        if ctx.default_shell.is_some() {
-            sub_config.default_shell = ctx.default_shell.clone();
-        }
+        // Every executor sets it, and None is a value: after /trust revoke
+        // the snapshot still holds the revoked project's shell.
+        sub_config.default_shell = ctx.default_shell.clone();
         sub_config.env = ctx.env.clone();
         sub_config
     }

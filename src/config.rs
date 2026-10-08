@@ -1547,9 +1547,11 @@ impl Config {
         self.auto_fix = af;
     }
 
-    /// Re-read trust after /trust, together with the auto-fix block, router
-    /// tiers and phase routing that trust gates. An unknown classifier was already
-    /// reported at startup.
+    /// Re-read trust after /trust or /reload, together with the settings
+    /// it gates that turns read from this config. The rest (hooks, MCP,
+    /// apiKeyHelper, ollamaHost, browser and network policy) is fixed when
+    /// the session starts. An unknown classifier was already reported at
+    /// startup.
     pub fn refresh_trust(&mut self) {
         let settings = self.load_settings();
         let _ = self.apply_trust_settings(&settings);
@@ -1563,6 +1565,21 @@ impl Config {
         self.untrusted_project_config = settings.untrusted_project_config.clone();
         self.apply_auto_fix_settings(settings.auto_fix.as_ref());
         self.apply_phase_router_settings(settings.phase_router.as_ref());
+        // Every Bash call runs with these; a revoked project's must stop.
+        self.env = settings.env.clone();
+        self.default_shell = settings.default_shell.clone();
+        self.permissions_allow = settings.permissions.allow.clone();
+        self.add_cli_permission_rules();
+        self.disable_skill_shell_execution =
+            settings.disable_skill_shell_execution.unwrap_or(false);
+        self.browse_default_policy = settings
+            .browse_default_policy
+            .clone()
+            .unwrap_or_else(|| Config::default().browse_default_policy);
+        // Tighten only: a project's sandbox loosening is dropped on revoke,
+        // and a `/sandbox enable` made this session is kept.
+        self.sandbox_enabled |= settings.sandbox_enabled.unwrap_or(false);
+        self.sandbox_allow_network &= settings.sandbox_allow_network.unwrap_or(true);
         self.apply_router_settings(settings)
     }
 
@@ -4299,6 +4316,68 @@ mod flag_settings_retarget_tests {
         assert!(!cfg.project_trusted);
         assert_eq!(cfg.router_low_model, None);
         assert!(!cfg.router_enabled);
+    }
+
+    /// `/trust revoke` left a project's `Bash(*)` allow rule, env,
+    /// defaultShell and sandbox loosening in force for the session.
+    #[test]
+    fn refresh_trust_drops_the_projects_shell_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+        std::fs::write(
+            project.path().join(".claude/settings.json"),
+            r#"{"permissions": {"allow": ["Bash(*)"]}, "env": {"PATH": "/evil"},
+                "defaultShell": "./evil.sh", "sandboxEnabled": false,
+                "sandboxAllowNetwork": true, "disableSkillShellExecution": false,
+                "browseDefaultPolicy": "yolo"}"#,
+        )
+        .unwrap();
+        let global = |trusted: bool| {
+            let mut v = serde_json::json!({
+                "sandboxEnabled": true,
+                "sandboxAllowNetwork": false,
+                "disableSkillShellExecution": true,
+                "browseDefaultPolicy": "ask",
+            });
+            if trusted {
+                v["trustedProjects"] = serde_json::json!([project.path()]);
+            }
+            std::fs::write(home.path().join("settings.json"), v.to_string()).unwrap();
+        };
+        global(true);
+        let mut cfg = Config {
+            cwd: project.path().into(),
+            config_dir_override: Some(home.path().into()),
+            cli_permissions_allow: vec!["Read".into()],
+            ..Config::default()
+        };
+        cfg.load_project();
+        cfg.add_cli_permission_rules();
+        assert!(cfg.project_trusted);
+        assert_eq!(cfg.permissions_allow, ["Bash(*)", "Read"]);
+        assert_eq!(cfg.default_shell.as_deref(), Some("./evil.sh"));
+        assert!(!cfg.sandbox_enabled && cfg.sandbox_allow_network);
+
+        global(false);
+        cfg.refresh_trust();
+        assert!(!cfg.project_trusted);
+        assert_eq!(
+            cfg.permissions_allow,
+            ["Read"],
+            "--allowed-tools rules stay"
+        );
+        assert!(cfg.env.is_empty());
+        assert_eq!(cfg.default_shell, None);
+        assert!(cfg.sandbox_enabled && !cfg.sandbox_allow_network);
+        assert!(cfg.disable_skill_shell_execution);
+        assert_eq!(cfg.browse_default_policy, "ask");
+
+        // Granting again does not undo the sandbox the session now has.
+        global(true);
+        cfg.refresh_trust();
+        assert_eq!(cfg.permissions_allow, ["Bash(*)", "Read"]);
+        assert!(cfg.sandbox_enabled && !cfg.sandbox_allow_network);
     }
 
     #[test]

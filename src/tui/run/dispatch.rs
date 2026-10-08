@@ -18,6 +18,33 @@ fn stop_language_servers(tools: &[DynTool]) {
     }
 }
 
+/// Re-read trust and what it gates after /trust. Returns whether this
+/// switched the router on (/reload does the same from its own settings).
+fn refresh_trust(
+    app: &mut App,
+    config: &mut Config,
+    perm_state: &PermissionState,
+    tools: &[DynTool],
+) -> bool {
+    let router_before = config.router_fingerprint();
+    let was_trusted = config.project_trusted;
+    config.refresh_trust();
+    // The permission state copied the allow rules at startup, so a revoked
+    // project's `Bash(*)` kept auto-approving every command. Session
+    // "always allow" answers are kept.
+    perm_state.replace_rules(&config.permissions_allow, &config.permissions_deny);
+    // Language servers run project code (build scripts, plugins): ones
+    // started while the project was trusted stop with it.
+    if was_trusted && !config.project_trusted {
+        stop_language_servers(tools);
+    }
+    // The project's router tiers are trust-gated: a revoked project's tiers
+    // must stop getting prompts now. Only the moved fields change, so
+    // `/router on|off` and `/router <tier>` made this session survive an
+    // unrelated /trust.
+    config.router_fingerprint() != router_before && resync_router(app, config, &router_before)
+}
+
 fn skill_turn_tools(tools: &[DynTool], disable_shell: bool) -> Vec<DynTool> {
     tools
         .iter()
@@ -1108,10 +1135,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let settings = config.load_settings();
             let mut reloaded = Vec::new();
             // Trust may have changed since startup, and it gates the
-            // project's autoFixLoop block and router tiers; rebuild them
-            // together, or a revoked project's tiers kept getting prompts.
+            // project's autoFixLoop block, router tiers, allow rules, env
+            // and shell; rebuild them together, or a revoked project's tiers
+            // kept getting prompts and its `Bash(*)` kept auto-approving.
             let was_trusted = config.project_trusted;
             let router_before = config.router_fingerprint();
+            let allow_before = config.permissions_allow.clone();
+            let shell_before = (config.env.clone(), config.default_shell.clone());
             let router_notice = config.apply_trust_settings(&settings);
             if was_trusted && !config.project_trusted {
                 stop_language_servers(tools);
@@ -1123,6 +1153,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let router_turned_on = router_moved && resync_router(app, config, &router_before);
             if router_moved {
                 reloaded.push("router");
+            }
+            if config.permissions_allow != allow_before {
+                reloaded.push("permissions.allow");
+            }
+            if (&config.env, &config.default_shell) != (&shell_before.0, &shell_before.1) {
+                reloaded.push("env/defaultShell");
             }
             // The TUI's PermissionState was built once at startup, so a new
             // deny rule or guard hook did nothing until a restart.
@@ -2186,12 +2222,18 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     } else {
                         match save(list) {
                             Ok(()) => format!(
-                                "Revoked trust for {canonical}. Its settings hooks, \
-                                 apiKeyHelper and MCP servers, a model on another provider, \
-                                 and OLLAMA_HOST / ANTHROPIC_MODEL from its .env, will be \
-                                 ignored — restart oxideclaw to apply. Auto-fix stops \
-                                 running its lint and test commands now, and its router \
-                                 tiers and phase routing stop getting prompts now."
+                                "Revoked trust for {canonical}. Its permissions.allow \
+                                 rules, env, defaultShell, browseDefaultPolicy and sandbox \
+                                 loosenings stop applying now, auto-fix stops running its \
+                                 lint and test commands, and its router tiers and phase \
+                                 routing stop getting prompts. Its settings hooks and \
+                                 disableAllHooks, apiKeyHelper, MCP servers, sandboxMode, \
+                                 allowPrivateNetworkFetch, browserEnabled / \
+                                 browserChromePath / browserCdpEndpoint, ollamaHost, \
+                                 voiceApiUrl, routerBudget and cleanupPeriodDays, a model \
+                                 on another provider, and OLLAMA_HOST / ANTHROPIC_MODEL \
+                                 from its .env, will be ignored — restart oxideclaw to \
+                                 apply."
                             ),
                             Err(e) => format!("Could not save trust: {e}"),
                         }
@@ -2202,12 +2244,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                     list.push(canonical.clone());
                     match save(list) {
                         Ok(()) => format!(
-                            "Trusted {canonical}. Its settings hooks, apiKeyHelper and MCP \
-                             servers will be honoured, and so will OLLAMA_HOST / ANTHROPIC_MODEL \
-                             from its .env — restart oxideclaw to apply; a model it sets on \
-                             another provider applies on /reload. Auto-fix runs its lint and \
-                             test commands from the next edit, and its router tiers and phase \
-                             routing apply from the next prompt."
+                            "Trusted {canonical}. Its permissions.allow rules, env, \
+                             defaultShell and browseDefaultPolicy apply now, auto-fix runs \
+                             its lint and test commands from the next edit, and its router \
+                             tiers and phase routing apply from the next prompt. Its \
+                             settings hooks and disableAllHooks, apiKeyHelper, MCP servers, \
+                             sandbox loosenings and sandboxMode, allowPrivateNetworkFetch, \
+                             browserEnabled / browserChromePath / browserCdpEndpoint, \
+                             ollamaHost, voiceApiUrl, routerBudget and cleanupPeriodDays, and \
+                             OLLAMA_HOST / ANTHROPIC_MODEL from its .env, will be honoured — \
+                             restart oxideclaw to apply; a model it sets on another provider \
+                             applies on /reload."
                         ),
                         Err(e) => format!("Could not save trust: {e}"),
                     }
@@ -2228,19 +2275,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             app.entries.push(ChatEntry::system(msg));
             // Auto-fix reads trust and its settings per edit, so a change
             // applies at once, including the project's own autoFixLoop block.
-            let router_before = config.router_fingerprint();
-            let was_trusted = config.project_trusted;
-            config.refresh_trust();
-            // Language servers run project code (build scripts, plugins):
-            // ones started while the project was trusted stop with it.
-            if was_trusted && !config.project_trusted {
-                stop_language_servers(tools);
-            }
-            // The project's router tiers are trust-gated: a revoked
-            // project's tiers must stop getting prompts now.
-            if config.router_fingerprint() != router_before
-                && resync_router(app, config, &router_before)
-            {
+            if refresh_trust(app, config, perm_state, tools) {
                 let line = router_on_notice(app);
                 app.entries.push(ChatEntry::system(line));
             }
@@ -3366,10 +3401,20 @@ mod slash_tests {
         skills: &std::collections::HashMap<String, crate::skills::Skill>,
         input: &str,
     ) {
+        let perm_state = PermissionState::new(false, &[], &[]);
+        run_with(app, config, skills, &perm_state, input).await;
+    }
+
+    async fn run_with(
+        app: &mut App,
+        config: &mut Config,
+        skills: &std::collections::HashMap<String, crate::skills::Skill>,
+        perm_state: &PermissionState,
+        input: &str,
+    ) {
         let mut messages = Vec::new();
         let mut client =
             ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
-        let perm_state = PermissionState::new(false, &[], &[]);
         let mut system_prompt = String::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let todo_state = TodoState::default();
@@ -3384,7 +3429,7 @@ mod slash_tests {
                 client: &mut client,
                 tools: &[],
                 config,
-                perm_state: &perm_state,
+                perm_state,
                 skills,
                 system_prompt: &mut system_prompt,
                 tx: &tx,
@@ -3436,5 +3481,73 @@ mod slash_tests {
         run(&mut app, &mut config, &skills, "/memory list").await;
         let last = &app.entries.last().unwrap().text;
         assert!(last.contains("use tabs"), "{last}");
+    }
+
+    /// After trust was revoked elsewhere, /reload kept the project's
+    /// router tiers getting prompts and its `Bash(*)` rule auto-approving;
+    /// edits to the router block never applied either.
+    #[tokio::test]
+    async fn reload_applies_trust_router_and_allow_rules() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+        std::fs::write(
+            project.path().join(".claude/settings.json"),
+            r#"{"router": {"low": "ollama:a", "high": "ollama:b"},
+                "permissions": {"allow": ["Bash(*)"]}}"#,
+        )
+        .unwrap();
+        let trust = |on: bool| {
+            let list = if on { vec![project.path()] } else { vec![] };
+            let v = serde_json::json!({ "trustedProjects": list });
+            std::fs::write(home.path().join("settings.json"), v.to_string()).unwrap();
+        };
+        let mut config = Config {
+            cwd: project.path().into(),
+            config_dir_override: Some(home.path().into()),
+            ..Config::default()
+        };
+        let mut app = App::new("claude-sonnet-4-6", project.path());
+        let skills = std::collections::HashMap::new();
+        let perm_state = PermissionState::new(false, &[], &[]).with_cwd(project.path());
+        let bash = serde_json::json!({ "command": "ls" });
+        let bash_allowed = |p: &PermissionState| {
+            matches!(
+                p.check_with_input("Bash", Some(&bash)),
+                crate::permissions::CheckResult::Allow
+            )
+        };
+
+        trust(true);
+        run_with(&mut app, &mut config, &skills, &perm_state, "/reload").await;
+        assert!(config.project_trusted);
+        assert!(app.router.enabled);
+        assert_eq!(app.router.low_model, "ollama:a");
+        assert!(bash_allowed(&perm_state));
+        let msg = app
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e.text.starts_with("Settings reloaded"))
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("router, ") && msg.contains("permissions.allow"),
+            "{msg}"
+        );
+
+        trust(false);
+        run_with(&mut app, &mut config, &skills, &perm_state, "/reload").await;
+        assert!(!config.project_trusted);
+        assert!(!app.router.enabled, "revoked tiers still routed");
+        assert!(!bash_allowed(&perm_state), "revoked Bash(*) still allowed");
+
+        // A session "always allow" survives the rebuild.
+        perm_state.record_always_allow("Bash");
+        trust(true);
+        run_with(&mut app, &mut config, &skills, &perm_state, "/reload").await;
+        trust(false);
+        run_with(&mut app, &mut config, &skills, &perm_state, "/reload").await;
+        assert!(bash_allowed(&perm_state));
     }
 }
