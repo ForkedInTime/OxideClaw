@@ -240,8 +240,12 @@ pub(super) fn cmd_autonomy(args: &str, current: crate::permissions::Autonomy) ->
              .claude/, .env*, .mcp.json, CI, hook and build/test config (package.json,\n              \
              Cargo.toml, Makefile, conftest.py, node_modules/, ...); never when\n              \
              started in $HOME; commands still prompt\n  \
-             full-auto — nothing prompts; needs /sandbox enable bwrap (not firejail)\n              \
-             and /sandbox network off, Linux only; never when started in $HOME\n\n\
+             full-auto — commands run without a prompt under the sandbox, and edits\n              \
+             follow auto-edit's rule; MCP tools, plan approval, a discarding\n              \
+             ExitWorktree and the browser's loopback question still prompt unless\n              \
+             permissions.allow covers them; needs /sandbox enable bwrap (not\n              \
+             firejail) and /sandbox network off, Linux only; never when started in\n              \
+             $HOME\n\n\
              permissions.deny rules hold in every mode. /autonomy lasts for this session;\n\
              set \"autonomy\" in settings.json to keep it.\n\n\
              Usage: /autonomy <mode>"
@@ -691,9 +695,12 @@ mod autonomy_command_tests {
             "$HOME",
             "bwrap",
             "permissions.deny",
+            "MCP tools",
         ] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
+        // full-auto still prompts for MCP tools, plan approval and more.
+        assert!(!text.contains("nothing prompts"), "{text}");
         for mode in Autonomy::ALL {
             assert!(matches!(
                 cmd_autonomy(&mode.as_str().to_uppercase(), Autonomy::Ask),

@@ -2255,7 +2255,8 @@ fn legacy_autonomy_notice(value: &str, source: &str) -> Option<String> {
     let now = match crate::permissions::Autonomy::parse(old)? {
         crate::permissions::Autonomy::AutoEdit => "runs edits inside the project without a prompt",
         crate::permissions::Autonomy::FullAuto => {
-            "runs every edit and command without a prompt (under the bwrap sandbox)"
+            "runs commands without a prompt under the bwrap sandbox and edits inside the \
+             project as auto-edit does"
         }
         _ => return None,
     };
@@ -4227,11 +4228,9 @@ mod autonomy_migration_tests {
                 c.settings_notices
             );
         }
-        assert!(
-            legacy_autonomy_notice(" Full-Auto ", "x")
-                .unwrap()
-                .contains("bwrap")
-        );
+        let full = legacy_autonomy_notice(" Full-Auto ", "x").unwrap();
+        assert!(full.contains("bwrap"), "{full}");
+        assert!(!full.contains("every edit and command"), "{full}");
         assert_eq!(legacy_autonomy_notice("suggest", "x"), None);
     }
 
