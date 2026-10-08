@@ -80,6 +80,7 @@ fn filter_skills_by_category() {
             category: Some("browser".into()),
             params: vec![],
             skill_file: None,
+            disable_model_invocation: false,
         },
         Skill {
             name: "b".into(),
@@ -88,6 +89,7 @@ fn filter_skills_by_category() {
             category: Some("code".into()),
             params: vec![],
             skill_file: None,
+            disable_model_invocation: false,
         },
         Skill {
             name: "c".into(),
@@ -96,6 +98,7 @@ fn filter_skills_by_category() {
             category: None,
             params: vec![],
             skill_file: None,
+            disable_model_invocation: false,
         },
     ];
     let _ = SkillParam {
