@@ -22,6 +22,9 @@ use tokio::sync::mpsc;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Longest inbound line we will buffer (embedded resources can be large).
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Idle sessions kept live (each holds its history and MCP server
+/// processes); older ones are dropped and reloaded from disk on use.
+const MAX_LIVE_SESSIONS: usize = 8;
 const ALLOW_ONCE: &str = "allow-once";
 const REJECT_ONCE: &str = "reject-once";
 
@@ -33,6 +36,10 @@ struct SessionHandle {
     /// JSON-RPC id of the in-flight `session/prompt`, if any.
     prompt_id: Option<Value>,
     cancel_requested: bool,
+    last_used: std::time::Instant,
+    /// The `session/new` or `session/load` params (`cwd`, `mcpServers`),
+    /// to start the session again after an eviction.
+    params: Value,
 }
 
 /// A `session/request_permission` we sent and are waiting on.
@@ -52,6 +59,10 @@ struct State {
     sessions_dir: PathBuf,
     initialized: bool,
     sessions: HashMap<String, SessionHandle>,
+    /// Sessions dropped to bound memory and MCP processes, with their start
+    /// params: a prompt for one reloads it from disk.
+    evicted: HashMap<String, Value>,
+    max_live: usize,
     pending: HashMap<String, PendingPermission>,
     next_id: i64,
     notif_tx: mpsc::UnboundedSender<SdkNotification>,
@@ -87,6 +98,8 @@ impl AcpServer {
             sessions_dir,
             initialized: false,
             sessions: HashMap::new(),
+            evicted: HashMap::new(),
+            max_live: MAX_LIVE_SESSIONS,
             pending: HashMap::new(),
             next_id: 1,
             notif_tx,
@@ -197,9 +210,10 @@ impl State {
                 self.load_session(id, params).await
             }
             "session/prompt" => {
-                self.start_prompt(id, params)?;
+                self.start_prompt(id, params).await?;
                 Ok(vec![]) // answered when the turn ends
             }
+            "session/close" => self.close_session(id, params),
             other => Err(RpcError::new(
                 rpc::METHOD_NOT_FOUND,
                 format!("{other} is not supported by this agent"),
@@ -324,6 +338,8 @@ impl State {
                 }
             }
         });
+        self.evict_idle_sessions(&session_id);
+        self.evicted.remove(&session_id);
         // On a load this drops any live copy, whose task then ends.
         self.sessions.insert(
             session_id.clone(),
@@ -333,17 +349,89 @@ impl State {
                 cancel,
                 prompt_id: None,
                 cancel_requested: false,
+                last_used: std::time::Instant::now(),
+                params: json!({"cwd": params.get("cwd"), "mcpServers": params.get("mcpServers")}),
             },
         );
         Ok((session_id, replay))
     }
 
-    fn start_prompt(&mut self, id: &Value, params: &Value) -> Result<(), RpcError> {
+    /// Make room for one more live session: an editor that keeps the agent
+    /// running opens a session per thread, and each kept its history and MCP
+    /// server processes until it quit. Only idle sessions already on disk
+    /// go, so a later prompt or `session/load` restores them whole; without
+    /// persistence nothing could restore them, so nothing is evicted.
+    fn evict_idle_sessions(&mut self, incoming: &str) {
+        if self.config.no_session_persistence {
+            return;
+        }
+        let live = self.sessions.len() - usize::from(self.sessions.contains_key(incoming));
+        let excess = (live + 1).saturating_sub(self.max_live);
+        if excess == 0 {
+            return;
+        }
+        let mut idle: Vec<(std::time::Instant, String)> = self
+            .sessions
+            .iter()
+            .filter(|(sid, h)| {
+                *sid != incoming
+                    && h.prompt_id.is_none()
+                    && Session::exists_in(&self.sessions_dir, sid)
+            })
+            .map(|(sid, h)| (h.last_used, sid.clone()))
+            .collect();
+        idle.sort();
+        for (_, sid) in idle.into_iter().take(excess) {
+            // Dropping the handle drops `turn_tx`, so the session task ends
+            // and its tools (and their MCP children) go with it.
+            if let Some(h) = self.sessions.remove(&sid) {
+                self.evicted.insert(sid, h.params);
+            }
+        }
+    }
+
+    /// `session/close`: drop a session the editor is done with, ending its
+    /// MCP servers. It stays on disk for a later `session/load`.
+    fn close_session(&mut self, id: &Value, params: &Value) -> Result<Vec<Value>, RpcError> {
+        let sid = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "sessionId is required"))?;
+        match self.sessions.get(sid) {
+            Some(h) if h.prompt_id.is_some() => {
+                return Err(RpcError::new(
+                    rpc::BUSY,
+                    "a prompt is in progress for this session",
+                ));
+            }
+            Some(_) => {
+                self.sessions.remove(sid);
+            }
+            None if self.evicted.remove(sid).is_some() => {}
+            None => {
+                return Err(RpcError::new(
+                    rpc::RESOURCE_NOT_FOUND,
+                    format!("no live session {sid}"),
+                ));
+            }
+        }
+        Ok(vec![rpc::response(id, json!({}))])
+    }
+
+    async fn start_prompt(&mut self, id: &Value, params: &Value) -> Result<(), RpcError> {
         let sid = params
             .get("sessionId")
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "sessionId is required"))?;
         let text = prompt_text(params.get("prompt").unwrap_or(&Value::Null))?;
+        if let Some(start) = self.evicted.get(sid).cloned() {
+            // The editor still shows the thread: reload it as it was, with
+            // no replay, since the client already has the conversation.
+            let (saved, history) = Session::resume_in(&self.sessions_dir, sid)
+                .await
+                .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
+            self.start_session(&start, Some((saved, history))).await?;
+        }
         let h = self
             .sessions
             .get_mut(sid)
@@ -357,6 +445,7 @@ impl State {
         h.cancel.reset();
         h.cancel_requested = false;
         h.prompt_id = Some(id.clone());
+        h.last_used = std::time::Instant::now();
         h.turn_tx
             .send(text)
             .map_err(|_| RpcError::new(rpc::INTERNAL_ERROR, "session task has ended"))?;
@@ -520,6 +609,7 @@ impl State {
         };
         let cancelled = std::mem::take(&mut h.cancel_requested);
         h.cancel.reset();
+        h.last_used = std::time::Instant::now();
         if cancelled {
             return vec![rpc::response(&id, json!({"stopReason": "cancelled"}))];
         }
@@ -1069,16 +1159,6 @@ mod tests {
         assert!(permission_outcome(&json!({})).is_some());
     }
 
-    #[test]
-    fn stop_reasons_use_the_acp_vocabulary() {
-        assert_eq!(stop_reason(TurnEnd::EndTurn), "end_turn");
-        assert_eq!(stop_reason(TurnEnd::MaxTokens), "max_tokens");
-        assert_eq!(stop_reason(TurnEnd::MaxTurns), "max_turn_requests");
-        assert_eq!(stop_reason(TurnEnd::BudgetExceeded), "max_turn_requests");
-        assert_eq!(stop_reason(TurnEnd::Refusal), "refusal");
-        assert_eq!(stop_reason(TurnEnd::Cancelled), "cancelled");
-    }
-
     /// A permission dialog the user takes over a minute on still decides
     /// the call: the SDK's 60 s default refused it underneath the dialog.
     #[tokio::test(start_paused = true)]
@@ -1096,6 +1176,16 @@ mod tests {
             wait.await.unwrap(),
             crate::sdk::session::ApprovalOutcome::Approved
         ));
+    }
+
+    #[test]
+    fn stop_reasons_use_the_acp_vocabulary() {
+        assert_eq!(stop_reason(TurnEnd::EndTurn), "end_turn");
+        assert_eq!(stop_reason(TurnEnd::MaxTokens), "max_tokens");
+        assert_eq!(stop_reason(TurnEnd::MaxTurns), "max_turn_requests");
+        assert_eq!(stop_reason(TurnEnd::BudgetExceeded), "max_turn_requests");
+        assert_eq!(stop_reason(TurnEnd::Refusal), "refusal");
+        assert_eq!(stop_reason(TurnEnd::Cancelled), "cancelled");
     }
 
     #[test]
@@ -1544,6 +1634,8 @@ mod tests {
             sessions_dir: PathBuf::from("/nonexistent"),
             initialized: true,
             sessions: HashMap::new(),
+            evicted: HashMap::new(),
+            max_live: MAX_LIVE_SESSIONS,
             pending: HashMap::new(),
             next_id: 1,
             notif_tx,
@@ -1589,6 +1681,8 @@ mod tests {
             sessions_dir: PathBuf::from("/nonexistent"),
             initialized: true,
             sessions: HashMap::new(),
+            evicted: HashMap::new(),
+            max_live: MAX_LIVE_SESSIONS,
             pending: HashMap::new(),
             next_id: 1,
             notif_tx,
@@ -1602,6 +1696,8 @@ mod tests {
                 cancel: Arc::new(CancelSignal::default()),
                 prompt_id: Some(json!(7)),
                 cancel_requested: false,
+                last_used: std::time::Instant::now(),
+                params: Value::Null,
             },
         );
         assert!(st.handle_cancel(&json!({"sessionId": "s1"})).is_empty());
@@ -2265,6 +2361,73 @@ mod tests {
         assert!(resumed.meta.timeline.is_empty());
         assert!(resumed.meta.redo.is_empty());
         assert!(!redo_file.exists());
+    }
+
+    /// Idle sessions past the cap are dropped (their task, and with it
+    /// their MCP servers, ends), and a prompt for one reloads it from disk
+    /// with its history. Without this every `session/new` lived until the
+    /// editor quit.
+    #[tokio::test]
+    async fn idle_sessions_past_the_cap_are_evicted_and_reload_on_their_next_prompt() {
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        let (host, seen) = text_model("ok").await;
+        cfg.ollama_host = host;
+        let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        let mut st = State {
+            config: cfg,
+            sessions_dir: sessions_in(&dir),
+            initialized: true,
+            sessions: HashMap::new(),
+            evicted: HashMap::new(),
+            max_live: 2,
+            pending: HashMap::new(),
+            next_id: 1,
+            notif_tx,
+            done_tx,
+        };
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut ids = Vec::new();
+        for (n, word) in ["kiwi", "fig", "plum"].into_iter().enumerate() {
+            let n = n as u64 * 10;
+            let out = st.handle_line(&new_session_line(n + 1, &cwd)).await;
+            let sid = out[0]["result"]["sessionId"].as_str().unwrap().to_string();
+            let line = json!({"jsonrpc":"2.0","id":n + 2,"method":"session/prompt","params":prompt(&sid, word)});
+            assert!(st.handle_line(&line.to_string()).await.is_empty());
+            let out = st.handle_turn_done(done_rx.recv().await.unwrap());
+            assert_eq!(out[0]["result"]["stopReason"], json!("end_turn"), "{out:?}");
+            ids.push(sid);
+        }
+        // The first, least recently used, made room for the third.
+        assert_eq!(st.sessions.len(), 2);
+        assert!(!st.sessions.contains_key(&ids[0]));
+        let second_task = st.sessions[&ids[1]].approval_in.clone();
+
+        // Its next prompt reloads it with its history, evicting the second.
+        let line = json!({"jsonrpc":"2.0","id":40,"method":"session/prompt","params":prompt(&ids[0], "again")});
+        assert!(st.handle_line(&line.to_string()).await.is_empty());
+        let out = st.handle_turn_done(done_rx.recv().await.unwrap());
+        assert_eq!(out[0]["result"]["stopReason"], json!("end_turn"), "{out:?}");
+        let last = chat_requests(&seen).pop().unwrap();
+        assert!(request_body(&last).contains("kiwi"), "{last}");
+        assert!(!st.sessions.contains_key(&ids[1]));
+        // The evicted session's task (which owns its tools) has ended.
+        tokio::time::timeout(std::time::Duration::from_secs(5), second_task.closed())
+            .await
+            .expect("the evicted session's task is still running");
+
+        // session/close drops a live or evicted session; an unknown id is
+        // not found.
+        for (n, sid) in [(50, &ids[2]), (51, &ids[1])] {
+            let close = json!({"jsonrpc":"2.0","id":n,"method":"session/close","params":{"sessionId":sid}});
+            let out = st.handle_line(&close.to_string()).await;
+            assert_eq!(out[0]["result"], json!({}), "{out:?}");
+            assert!(!st.sessions.contains_key(sid) && !st.evicted.contains_key(sid));
+        }
+        let close = json!({"jsonrpc":"2.0","id":52,"method":"session/close","params":{"sessionId":"ghost"}});
+        let out = st.handle_line(&close.to_string()).await;
+        assert_eq!(out[0]["error"]["code"], json!(rpc::RESOURCE_NOT_FOUND));
     }
 
     /// A session started over ACP is saved as it goes, so another agent
