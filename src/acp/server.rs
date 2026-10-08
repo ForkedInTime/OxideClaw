@@ -439,6 +439,29 @@ impl State {
             tool_use_id,
         } = n
         {
+            let call = json!({
+                "toolCallId": tool_use_id,
+                "title": tool_title(&tool, &args),
+                "kind": tool_kind(&tool),
+                "status": "pending",
+                "rawInput": args,
+            });
+            let mut announce = call.clone();
+            announce["sessionUpdate"] = json!("tool_call");
+            // Lines are read ahead of queued notifications, so a request
+            // can arrive after its turn was cancelled: answer it here
+            // rather than open a dialog the user already dismissed.
+            if let Some(h) = self
+                .sessions
+                .get(&session_id)
+                .filter(|h| h.cancel_requested)
+            {
+                let _ = h
+                    .approval_in
+                    .send((approval_id, Some("Cancelled by the client.".into())));
+                announce["status"] = json!("failed");
+                return vec![update(&session_id, announce)];
+            }
             let rpc_id = self.next_id;
             self.next_id += 1;
             self.pending.insert(
@@ -449,15 +472,6 @@ impl State {
                     tool_use_id: tool_use_id.clone(),
                 },
             );
-            let call = json!({
-                "toolCallId": tool_use_id,
-                "title": tool_title(&tool, &args),
-                "kind": tool_kind(&tool),
-                "status": "pending",
-                "rawInput": args,
-            });
-            let mut announce = call.clone();
-            announce["sessionUpdate"] = json!("tool_call");
             return vec![
                 update(&session_id, announce),
                 rpc::request(
@@ -1491,6 +1505,58 @@ mod tests {
             None,
         );
         assert!(late.is_empty(), "{late:?}");
+    }
+
+    /// A permission request still queued when `session/cancel` was read
+    /// went out as a dialog for a cancelled turn, which then waited for an
+    /// answer or the approval timeout.
+    #[test]
+    fn a_permission_request_after_a_cancel_is_denied_without_asking() {
+        let (cfg, _dir) = test_config();
+        let (notif_tx, _n) = mpsc::unbounded_channel();
+        let (done_tx, _d) = mpsc::unbounded_channel();
+        let (turn_tx, _t) = mpsc::unbounded_channel();
+        let (approval_in, mut answers) = mpsc::unbounded_channel();
+        let mut st = State {
+            config: cfg,
+            sessions_dir: PathBuf::from("/nonexistent"),
+            initialized: true,
+            sessions: HashMap::new(),
+            pending: HashMap::new(),
+            next_id: 1,
+            notif_tx,
+            done_tx,
+        };
+        st.sessions.insert(
+            "s1".into(),
+            SessionHandle {
+                turn_tx,
+                approval_in,
+                cancel: Arc::new(CancelSignal::default()),
+                prompt_id: Some(json!(7)),
+                cancel_requested: false,
+            },
+        );
+        assert!(st.handle_cancel(&json!({"sessionId": "s1"})).is_empty());
+
+        let frames = st.handle_sdk_notification(SdkNotification::ToolApprovalNeeded {
+            session_id: "s1".into(),
+            approval_id: "a1".into(),
+            tool: "Bash".into(),
+            args: json!({"command": "ls"}),
+            tool_use_id: "t1".into(),
+        });
+
+        assert!(
+            frames.iter().all(|f| f["method"] != json!("session/request_permission")),
+            "{frames:?}"
+        );
+        assert_eq!(frames[0]["params"]["update"]["status"], json!("failed"));
+        assert!(st.pending.is_empty());
+        assert_eq!(
+            answers.try_recv().unwrap(),
+            ("a1".to_string(), Some("Cancelled by the client.".to_string()))
+        );
     }
 
     /// One non-UTF-8 line used to end the whole ACP process.

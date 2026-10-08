@@ -976,6 +976,19 @@ impl SdkSession {
                         continue;
                     }
 
+                    // A cancel that landed while the preToolUse hooks ran
+                    // would otherwise open a dialog for a stopped turn.
+                    if self.cancel.is_cancelled() {
+                        results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: vec![ToolResultContent::text(
+                                "Cancelled by the client before this tool ran.",
+                            )],
+                            is_error: Some(true),
+                        });
+                        continue;
+                    }
+
                     let approval_id = uuid::Uuid::new_v4().to_string();
 
                     // Send approval request via the approval channel
@@ -992,12 +1005,22 @@ impl SdkSession {
                     let timeout_secs = self.policy_engine.timeout_seconds();
                     // The guard drops before the tool runs, so an Agent
                     // child can take the receiver for its own prompts.
-                    let outcome = await_approval(
-                        &mut *self.approval_rx.lock().await,
-                        &approval_id,
-                        std::time::Duration::from_secs(timeout_secs),
-                    )
-                    .await;
+                    let outcome = {
+                        let mut rx = self.approval_rx.lock().await;
+                        let cancel = Arc::clone(&self.cancel);
+                        // A host that never answers a prompt it saw after
+                        // the cancel must not hold the turn to the timeout.
+                        tokio::select! {
+                            o = await_approval(
+                                &mut rx,
+                                &approval_id,
+                                std::time::Duration::from_secs(timeout_secs),
+                            ) => o,
+                            _ = cancel.cancelled() => {
+                                ApprovalOutcome::Denied("Cancelled by the client.".into())
+                            }
+                        }
+                    };
                     let deny_text = match outcome {
                         ApprovalOutcome::Approved => None,
                         ApprovalOutcome::Denied(reason) => Some(if reason.is_empty() {
@@ -1952,6 +1975,59 @@ mod guard_tests {
         assert_eq!(tool_use_id, "t1");
         assert!(!success);
         assert!(summary.contains("timed out"), "{summary}");
+    }
+
+    /// A cancel while the host had a permission prompt open (or had not
+    /// seen it yet) left the turn waiting for an answer or the timeout.
+    #[tokio::test]
+    async fn a_cancel_ends_a_pending_approval_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let bash = Arc::new(FakeBash(AtomicUsize::new(0)));
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (_itx, irx) = mpsc::unbounded_channel();
+        let policy = Policy {
+            approval_timeout_seconds: 600,
+            ..Policy::default()
+        };
+        let mut s = SdkSession::new(
+            cfg(dir.path()),
+            vec![bash.clone()],
+            policy,
+            Capabilities::default(),
+            ntx,
+            atx,
+            irx,
+        )
+        .unwrap();
+        let cancel = s.cancel_signal();
+        tokio::spawn(async move {
+            if let Some(SdkNotification::ToolApprovalNeeded { .. }) = arx.recv().await {
+                cancel.cancel();
+            }
+        });
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            s.execute_tools_with_approval(&call("ls")),
+        )
+        .await
+        .expect("the cancel must end the wait")
+        .unwrap();
+
+        assert!(is_error(&r), "{r:?}");
+        assert_eq!(bash.0.load(Ordering::SeqCst), 0);
+        let completed = std::iter::from_fn(|| nrx.try_recv().ok()).find_map(|n| match n {
+            SdkNotification::ToolCompleted {
+                success,
+                output_summary,
+                ..
+            } => Some((success, output_summary)),
+            _ => None,
+        });
+        let (success, summary) = completed.expect("no tool/completed");
+        assert!(!success);
+        assert!(summary.contains("Cancelled"), "{summary}");
     }
 
     /// session/cancel was checked only before each tool, so a running Bash
