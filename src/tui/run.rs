@@ -1906,7 +1906,19 @@ async fn run_loop(
                 }
                 CompactNeeded::Snip => {
                     if config.auto_compact_enabled {
-                        snip_compact(&mut messages, &config.model);
+                        // Persisted like any other rewrite: later turns'
+                        // thinking is signed over the snipped history, and a
+                        // resumed transcript without the snip replays it
+                        // against the wrong one (a 400 on binding models).
+                        if snip_compact(&mut messages, &config.model) {
+                            let _ = rewrite_session_history(
+                                &session,
+                                &messages,
+                                !config.no_session_persistence,
+                                &mut saved_count,
+                            )
+                            .await;
+                        }
                         app.entries.push(ChatEntry::system(
                             "Auto-compacted (snip): stripped old tool results.",
                         ));
