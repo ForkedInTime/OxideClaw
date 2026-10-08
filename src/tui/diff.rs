@@ -39,10 +39,11 @@ pub struct FileDiff {
 
 /// Parse a unified diff string (output of `git diff`) into structured FileDiffs.
 ///
-/// Handles multi-file diffs. File path is taken from the `b/<path>` side of
-/// the `diff --git` header (the post-image path), matching how git describes
-/// the target tree. Lines between a `diff --git` header and its first `@@`
-/// (index / --- / +++ / mode lines) are skipped.
+/// Handles multi-file diffs. The path is the post-image one: the `+++` line's
+/// when there is one (it is unambiguous, and C-quoted paths are unquoted),
+/// else the `b/<path>` side of the `diff --git` header (binary, mode-only),
+/// else the `---` line's (a deletion without a parsable header). Lines
+/// between a `diff --git` header and its first `@@` are otherwise skipped.
 pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
     let mut files = Vec::new();
     let mut current_path = String::new();
@@ -54,30 +55,48 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
     // Inside a hunk `---x` is a removed `--x` line and `+++x` an added `++x`
     // line, so the file-header shapes only mean "header" before the first @@.
     let mut in_hunk = false;
+    // Whether the header carried git's `a/` `b/` prefixes (not with
+    // diff.noprefix), so the `---`/`+++` paths have them to strip.
+    let mut prefixed = false;
 
     for line in diff.lines() {
         if line.starts_with("diff --git") {
             in_hunk = false;
             // Flush any in-progress hunk, then the in-progress file.
+            if !current_lines.is_empty() {
+                current_hunks.push(DiffHunk {
+                    header: current_header.clone(),
+                    lines: std::mem::take(&mut current_lines),
+                });
+            }
+            let hunks = std::mem::take(&mut current_hunks);
+            // A file without a readable path is dropped, but its counts
+            // must not be added to the next file's.
             if !current_path.is_empty() {
-                if !current_lines.is_empty() {
-                    current_hunks.push(DiffHunk {
-                        header: current_header.clone(),
-                        lines: std::mem::take(&mut current_lines),
-                    });
-                }
                 files.push(FileDiff {
                     path: std::mem::take(&mut current_path),
-                    hunks: std::mem::take(&mut current_hunks),
+                    hunks,
                     additions,
                     deletions,
                 });
-                additions = 0;
-                deletions = 0;
             }
+            additions = 0;
+            deletions = 0;
+            prefixed = line.starts_with("diff --git a/") || line.starts_with("diff --git \"a/");
             // `diff --git a/path b/path` — take the b/ side.
             if let Some(b_part) = line.split(" b/").nth(1) {
                 current_path = b_part.to_string();
+            }
+        } else if !in_hunk && let Some(raw) = line.strip_prefix("+++ ") {
+            if let Some(path) = header_path(raw, prefixed.then_some("b/")) {
+                current_path = path;
+            }
+        } else if !in_hunk && let Some(raw) = line.strip_prefix("--- ") {
+            // Only a deletion's `+++` is /dev/null; this is its path.
+            if current_path.is_empty()
+                && let Some(path) = header_path(raw, prefixed.then_some("a/"))
+            {
+                current_path = path;
             }
         } else if line.starts_with("@@") {
             // New hunk — flush the previous one.
@@ -134,4 +153,62 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
     }
 
     files
+}
+
+/// The path in a `---`/`+++` header line, without its `a/`/`b/` prefix;
+/// None for /dev/null. git C-quotes a path with special characters
+/// (`"b/tab\there"`) and ends one that contains a space with a tab.
+fn header_path(raw: &str, prefix: Option<&str>) -> Option<String> {
+    let raw = raw.strip_suffix('\t').unwrap_or(raw);
+    if raw == "/dev/null" {
+        return None;
+    }
+    let path = match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(quoted) => unquote_c(quoted),
+        None => raw.to_string(),
+    };
+    let path = match prefix {
+        Some(p) => path.strip_prefix(p).map(str::to_string).unwrap_or(path),
+        None => path,
+    };
+    (!path.is_empty()).then_some(path)
+}
+
+/// Undo git's C-style path quoting: backslash escapes and octal bytes
+/// (non-ASCII under the default core.quotePath).
+fn unquote_c(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        i += 1;
+        if b != b'\\' || i == bytes.len() {
+            out.push(b);
+            continue;
+        }
+        let e = bytes[i];
+        i += 1;
+        match e {
+            b'0'..=b'7' => {
+                let mut v = u32::from(e - b'0');
+                for _ in 0..2 {
+                    if let Some(&d @ b'0'..=b'7') = bytes.get(i) {
+                        v = v * 8 + u32::from(d - b'0');
+                        i += 1;
+                    }
+                }
+                out.push(v as u8);
+            }
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

@@ -77,3 +77,48 @@ index 3333333..4444444 100644
     assert_eq!(added.kind, DiffLineKind::Added);
     assert_eq!(added.content, "++i;");
 }
+
+/// Without git's a/ b/ prefixes (diff.noprefix) the path came only from a
+/// " b/" split, so the file was dropped and its counts were added to the
+/// next one.
+#[test]
+fn noprefix_and_quoted_paths_are_read_from_the_file_headers() {
+    use oxideclaw::tui::diff::parse_unified_diff;
+
+    let diff = "\
+diff --git src/a.rs src/a.rs
+index 1..2 100644
+--- src/a.rs
++++ src/a.rs
+@@ -1 +1,2 @@
+ x
++y
+diff --git \"a/docs/\\346\\227\\245.md\" \"b/docs/\\346\\227\\245.md\"
+index 1..2 100644
+--- \"a/docs/\\346\\227\\245.md\"
++++ \"b/docs/\\346\\227\\245.md\"
+@@ -1 +1 @@
+-old
++new
+diff --git a/my file.txt b/my file.txt
+deleted file mode 100644
+index 1..0
+--- a/my file.txt\t
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+";
+    let files = parse_unified_diff(diff);
+    let summary: Vec<_> = files
+        .iter()
+        .map(|f| (f.path.as_str(), f.additions, f.deletions))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("src/a.rs", 1, 0),
+            ("docs/日.md", 1, 1),
+            ("my file.txt", 0, 1)
+        ]
+    );
+}

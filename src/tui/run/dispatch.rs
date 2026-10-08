@@ -2669,10 +2669,22 @@ async fn uncommitted_diff(
     };
     // --no-ext-diff/--no-textconv: /diff wants a parseable unified diff, not
     // whatever a configured diff.external or textconv tool prints (or runs).
-    let mut out = git(&["diff", "--no-ext-diff", "--no-textconv", "HEAD"]).await?;
+    // Fixed a/ b/ prefixes and unquoted paths whatever the user's
+    // diff.noprefix, diff.mnemonicPrefix and core.quotePath say: the
+    // summary reads paths out of the headers.
+    const DIFF: [&str; 7] = [
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
+    let mut out = git(&[&DIFF[..], &["HEAD"]].concat()).await?;
     if !out.status.success() {
         // No HEAD yet: everything is staged against the empty tree.
-        let cached = git(&["diff", "--no-ext-diff", "--no-textconv", "--cached"]).await?;
+        let cached = git(&[&DIFF[..], &["--cached"]].concat()).await?;
         if !cached.status.success() {
             anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -3246,5 +3258,45 @@ mod diff_tests {
             .unwrap();
         assert!(diff.is_empty(), "{diff}");
         assert_eq!(untracked, ["new-untracked.oxideclaw-test"]);
+    }
+
+    /// With diff.noprefix the summary listed no files, and a quoted
+    /// non-ASCII path's counts landed on the file after it.
+    #[tokio::test]
+    async fn diff_summary_ignores_prefix_and_quoting_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q"]);
+        git(d, &["config", "core.fsmonitor", "false"]);
+        git(d, &["config", "diff.external", "false"]);
+        std::fs::create_dir(d.join("docs")).unwrap();
+        std::fs::write(d.join("docs/日本.md"), "a\n").unwrap();
+        std::fs::write(d.join("z.txt"), "a\n").unwrap();
+        git(d, &["add", "."]);
+        git(
+            d,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        git(d, &["config", "diff.noprefix", "true"]);
+        git(d, &["config", "core.quotePath", "true"]);
+        std::fs::write(d.join("docs/日本.md"), "b\nc\n").unwrap();
+        std::fs::write(d.join("z.txt"), "a\nz\n").unwrap();
+
+        let (diff, _) = uncommitted_diff(d, None).await.unwrap();
+        let files = crate::tui::diff::parse_unified_diff(&diff);
+        let summary: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.additions, f.deletions))
+            .collect();
+        assert_eq!(summary, [("docs/日本.md", 2, 1), ("z.txt", 1, 0)], "{diff}");
     }
 }
