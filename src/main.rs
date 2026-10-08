@@ -1841,7 +1841,7 @@ async fn handle_mcp_subcommand(subcommand: &Option<McpSubcommand>) -> Result<()>
                     }
                 }
                 crate::mcp::types::McpServerConfig::Http(h) => {
-                    println!("  transport: http");
+                    println!("  transport: {}", if h.sse { "sse" } else { "http" });
                     println!("  url:       {}", h.url);
                     if !h.headers.is_empty() {
                         println!("  headers:   {:?}", h.headers);

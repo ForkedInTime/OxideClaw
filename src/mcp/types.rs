@@ -38,14 +38,29 @@ pub struct HttpServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
     /// Speak MCP's legacy HTTP+SSE transport instead of Streamable HTTP.
-    /// Only an ACP host's `type: "sse"` servers set it.
-    #[serde(skip)]
+    /// Kept in the entry's `type` ("sse" or "http"), Claude Code's format:
+    /// it rejects a whole `.mcp.json` when one URL server lacks the tag.
+    #[serde(rename = "type", default, with = "transport_tag")]
     pub sse: bool,
     /// Values arrived resolved (an ACP host's `mcpServers`), so `${VAR}`
     /// placeholders are not expanded against this process's environment.
     /// Never read from or written to a config file.
     #[serde(skip)]
     pub literal: bool,
+}
+
+/// `type` of a URL server: only "sse" selects the legacy transport; "http",
+/// no tag, or a kind this client does not speak is Streamable HTTP.
+mod transport_tag {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(sse: &bool, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(if *sse { "sse" } else { "http" })
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        Ok(Option::<String>::deserialize(d)?.as_deref() == Some("sse"))
+    }
 }
 
 impl McpServerConfig {

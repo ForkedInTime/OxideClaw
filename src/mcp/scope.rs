@@ -460,6 +460,82 @@ mod tests {
         assert!(!repo.path().join(".claude").exists());
     }
 
+    /// Claude Code requires `"type": "http"` on every URL server and drops
+    /// the whole `.mcp.json` when one entry lacks it, so a project HTTP
+    /// server written without the tag cost teammates every project server.
+    #[test]
+    fn http_servers_are_written_with_their_transport_type() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (r, h) = (repo.path(), home.path());
+        let http = |url: &str, sse| {
+            McpServerConfig::Http(HttpServerConfig {
+                url: url.into(),
+                headers: Default::default(),
+                disabled: false,
+                sse,
+                literal: false,
+            })
+        };
+        add(
+            "api",
+            http("https://h.test/mcp", false),
+            Scope::Project,
+            r,
+            h,
+            false,
+        )
+        .unwrap();
+        add(
+            "old",
+            http("https://h.test/sse", true),
+            Scope::Project,
+            r,
+            h,
+            false,
+        )
+        .unwrap();
+        add("gh", stdio(&[]), Scope::Project, r, h, false).unwrap();
+
+        let json = read_json_object(&r.join(".mcp.json")).unwrap();
+        assert_eq!(json["mcpServers"]["api"]["type"], "http");
+        assert_eq!(json["mcpServers"]["old"]["type"], "sse");
+        assert!(json["mcpServers"]["gh"].get("type").is_none());
+    }
+
+    /// `"type": "sse"` (Claude Code's legacy HTTP+SSE entries) was ignored
+    /// on load, so the server was spoken to over Streamable HTTP and failed.
+    #[test]
+    fn sse_type_in_a_config_file_selects_the_sse_transport() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (r, h) = (repo.path(), home.path());
+        std::fs::write(
+            r.join(".mcp.json"),
+            r#"{"mcpServers": {
+                "atl": {"type": "sse", "url": "https://h.test/v1/sse"},
+                "api": {"type": "http", "url": "https://h.test/mcp"},
+                "bare": {"url": "https://h.test/mcp"}
+            }}"#,
+        )
+        .unwrap();
+        let sse: Vec<(String, bool)> = list(r, h)
+            .into_iter()
+            .map(|s| match s.config {
+                McpServerConfig::Http(c) => (s.name, c.sse),
+                other => panic!("expected http: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sse,
+            vec![
+                ("api".into(), false),
+                ("atl".into(), true),
+                ("bare".into(), false)
+            ]
+        );
+    }
+
     #[test]
     fn reference_detection() {
         for ok in ["${T}", " ${GH_TOKEN} ", "Bearer ${T}", "token ${_X1}"] {
