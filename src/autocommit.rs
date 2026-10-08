@@ -983,6 +983,8 @@ fn restore(
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("git rev-parse --show-toplevel failed"))?;
     let prefix = format!("{}/", toplevel.display());
+    // Realpath, like the toplevel git reports.
+    let cwd_real = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     if !changed.is_empty() {
         // The path list goes in through a file: with stderr captured too, a
         // child blocked on a full stderr pipe would never drain stdin.
@@ -1020,9 +1022,13 @@ fn restore(
             tracing::warn!("[undo] could not remove {}: {e}", path.display());
             continue;
         }
-        // Drop directories the turn created; remove_dir refuses non-empty ones.
+        // Drop directories the turn created; remove_dir refuses non-empty
+        // ones. Never the session's cwd or a parent of it, empty or not:
+        // gone, every later git call failed and file undo stopped working.
         let mut dir = path.parent();
-        while let Some(d) = dir.filter(|d| *d != toplevel && d.starts_with(&toplevel)) {
+        while let Some(d) =
+            dir.filter(|d| *d != toplevel && d.starts_with(&toplevel) && !cwd_real.starts_with(d))
+        {
             if std::fs::remove_dir(d).is_err() {
                 break;
             }
@@ -1428,7 +1434,7 @@ mod snapshot_tests {
         fs::write(p, body).unwrap();
     }
 
-    fn initial_commit(repo: &Path) {
+    pub(super) fn initial_commit(repo: &Path) {
         write_file(repo, "README.md", "base\n");
         let s = git_cmd(repo).args(["add", "README.md"]).status().unwrap();
         assert!(s.success());
@@ -1832,7 +1838,7 @@ mod snapshot_tests {
 #[cfg(test)]
 mod restore_tests {
     use super::git_detection_tests::init_test_repo;
-    use super::snapshot_tests::write_file;
+    use super::snapshot_tests::{initial_commit, write_file};
     use super::*;
 
     #[test]
@@ -2096,6 +2102,37 @@ mod restore_tests {
         );
         assert!(!td.path().join("new.txt").exists());
         assert!(report.removed_note().contains("1 removed: new.txt"));
+    }
+
+    /// Launched from a new, empty `newproj/` that turn 1 scaffolded into,
+    /// /undo removed the file and then `newproj/` itself: the session's cwd
+    /// was gone and every later git call (snapshots, /redo) failed.
+    #[test]
+    fn undo_keeps_the_sessions_cwd_when_it_empties() {
+        let td = init_test_repo();
+        initial_commit(td.path());
+        let sub = td.path().join("newproj");
+        std::fs::create_dir(&sub).unwrap();
+        pin_filters(&sub).unwrap();
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        write_file(td.path(), "newproj/src/main.rs", "fn main() {}\n");
+        snapshot_turn(&sub, &cfg, "s", "add", 1, &mut commits, &mut pos, None).unwrap();
+
+        let report = restore_from(&sub, "s", &commits, 1, 0).unwrap();
+        assert_eq!(
+            report.orphaned_files,
+            vec![PathBuf::from("newproj/src/main.rs")]
+        );
+        assert!(
+            !sub.join("src").exists(),
+            "the directory the turn made goes"
+        );
+        assert!(sub.is_dir(), "the session's cwd stays");
+        assert!(is_git_repo(&sub));
+        restore_from(&sub, "s", &commits, 0, 1).unwrap();
+        assert!(sub.join("src/main.rs").exists(), "/redo still works");
     }
 
     /// /undo left files the undone turn created on disk, so the next turn's
