@@ -178,6 +178,13 @@ impl SdkSession {
     pub fn resume_history(&mut self, session_id: String, messages: Vec<Message>) {
         self.session_id = session_id;
         self.messages = messages;
+        // A saved session can be past this model's window (a routed TUI
+        // session compacts against its largest tier) or past the point
+        // where a summary was due: summarise before the first prompt.
+        let tokens = crate::router::estimate_context_tokens(&self.system_prompt, &self.messages);
+        let window = crate::compact::compaction_window(&self.config, self.router.as_ref(), None);
+        self.summarise_pending = self.config.auto_compact_enabled
+            && tokens >= crate::compact::thresholds(window).2;
     }
 
     /// The conversation so far, as sent to the model.
@@ -406,6 +413,7 @@ impl SdkSession {
         let mut final_text = String::new();
         let mut loop_turn = 0u32;
         let mut end = TurnEnd::EndTurn;
+        let mut overflow_compacted = false;
 
         loop {
             loop_turn += 1;
@@ -491,6 +499,31 @@ impl SdkSession {
                         && crate::router::escalates_on(&err)
                         && self.escalate(&mut routing, trigger).await
                     {
+                        continue;
+                    }
+                    // Nothing unrouted here ever sees the overflow coming (a
+                    // loaded session larger than this model's window, or a
+                    // reload that lost the pending summary), so without this
+                    // every later prompt failed the same way. Compact the
+                    // history before this turn and retry once, as the TUI does.
+                    if trigger == crate::router::Trigger::ContextOverflow
+                        && turn_text.is_empty()
+                        && !overflow_compacted
+                        && base > 0
+                    {
+                        overflow_compacted = true;
+                        let turn = self.messages.split_off(base);
+                        // The history already overflows as sent: snip first
+                        // so the summary request has a chance to fit.
+                        if crate::compact::snip_compact(&mut self.messages, &self.config.model) {
+                            self.history_rewritten = true;
+                            self.forget_reads();
+                        }
+                        let (i, o) = self.auto_summarise().await;
+                        turn_input_tokens += i;
+                        turn_output_tokens += o;
+                        base = self.messages.len();
+                        self.messages.extend(turn);
                         continue;
                     }
                     // ACP runs every prompt on this session. Keeping a turn
@@ -1746,6 +1779,74 @@ mod guard_tests {
 
         assert!(s.execute_turn("hi".into()).await.is_err());
         assert!(s.messages.is_empty(), "the rejected turn stayed in history");
+    }
+
+    fn text_message(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// A loaded session past this model's window was sent whole on every
+    /// prompt and rejected each time: nothing unrouted compacted it.
+    #[tokio::test]
+    async fn a_context_overflow_compacts_the_history_and_retries_once() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let (url, seen) = serve(vec![
+            format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            sse(&[serde_json::json!({"type":"text","text":"the summary"})], "end_turn"),
+            sse(&[serde_json::json!({"type":"text","text":"ok"})], "end_turn"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = session(cfg(dir.path()));
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(c);
+        s.resume_history(
+            "loaded".into(),
+            vec![
+                text_message(Role::User, "old question"),
+                text_message(Role::Assistant, "old answer"),
+            ],
+        );
+
+        s.execute_turn("next".into()).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().len(), 3, "overflow, summary, retry");
+        let texts: Vec<String> = s
+            .messages
+            .iter()
+            .map(|m| match &m.content[0] {
+                ContentBlock::Text { text } => text.clone(),
+                b => panic!("{b:?}"),
+            })
+            .collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(texts[0].contains("the summary"), "{texts:?}");
+        assert_eq!(texts[1], "next", "the turn's prompt survives");
+        assert_eq!(texts[2], "ok");
+        assert!(!seen.lock().unwrap()[2].contains("old question"));
+    }
+
+    /// A loaded session already past the summarise threshold is summarised
+    /// before its first prompt rather than sent whole.
+    #[test]
+    fn loading_an_oversized_history_summarises_before_the_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = session(cfg(dir.path()));
+        s.resume_history("small".into(), vec![text_message(Role::User, "hi")]);
+        assert!(!s.summarise_pending);
+
+        let window = crate::api::context_window_for_model(&s.config.model);
+        let big = "x".repeat(window as usize * 4);
+        s.resume_history("big".into(), vec![text_message(Role::User, &big)]);
+        assert!(s.summarise_pending);
     }
 
     /// A failed request drops the turn's Read results from the history; a
