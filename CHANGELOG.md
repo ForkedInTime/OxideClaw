@@ -291,8 +291,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rules, `env`, `defaultShell` and router at once, and revoking trust drops
   them along with its sandbox loosenings. `/spawn merge` no longer runs your
   git hooks on its commit and merge. Bash timeouts are capped at 10 minutes.
-  `-p --output-format json` prints one result object for the whole run, and
-  SIGHUP ends `-p`, `--headless` and `acp` with status 129. On Windows the
+  `-p --output-format json` prints one result object per prompt (with
+  `is_error`) instead of one per turn, also when the run fails partway, a
+  userPromptSubmit hook blocks it or a signal stops it, and SIGHUP ends
+  `-p`, `--headless` and `acp` with status 129 (not under `nohup`, which
+  ignores it). On Windows the
   Bash tool runs Git Bash, never WSL's `System32\bash.exe`.
 
 ### Fixed
