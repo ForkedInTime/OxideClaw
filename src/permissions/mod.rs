@@ -519,12 +519,23 @@ fn rule_matches(
 
     if matches!(tool_name, "Bash" | "PowerShell") {
         let raw = inp["command"].as_str().unwrap_or("");
-        if let Some(prefix) = inner.strip_prefix("prefix:") {
-            return RuleMatch::from_bool(raw.starts_with(prefix));
-        }
         // Runs of whitespace compare as one space, so `git  push` and
         // `git\tpush` do not slip past a `git push` rule.
         let cmd = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(prefix) = inner.strip_prefix("prefix:") {
+            let mut p = prefix.split_whitespace().collect::<Vec<_>>().join(" ");
+            // An all-blank prefix would collapse to "" and match every
+            // command; keep its old literal meaning.
+            if p.is_empty() {
+                return RuleMatch::from_bool(raw.starts_with(prefix));
+            }
+            // A trailing space is part of the rule: `rm -rf ` must not
+            // cover `rm -rfx`.
+            if prefix.ends_with(char::is_whitespace) {
+                p.push(' ');
+            }
+            return RuleMatch::from_bool(cmd.starts_with(&p));
+        }
         // `git:*` names a command word: `git` alone or followed by
         // whitespace, never `gitk`.
         let word = |base: &str| {
@@ -1714,6 +1725,30 @@ mod tests {
         for t in ["Write", "Edit"] {
             assert!(!is_command_tool(t), "{t} does not take a command string");
         }
+    }
+
+    /// `prefix:` rules collapse whitespace like the other Bash forms, so a
+    /// tab or a doubled space does not slip past a prefix deny.
+    #[test]
+    fn prefix_deny_ignores_whitespace_runs_but_keeps_trailing_space() {
+        let st = PermissionState::new(true, &[], &["Bash(prefix:rm -rf )".into()]);
+        for cmd in ["rm\t-rf build", "rm  -rf ~", "rm -rf build"] {
+            assert!(
+                matches!(check_compound_command(&st, "Bash", cmd), CheckResult::Deny),
+                "{cmd:?} must hit the prefix deny"
+            );
+        }
+        assert!(matches!(
+            check_compound_command(&st, "Bash", "rm -rfx build"),
+            CheckResult::Allow
+        ));
+        // An all-blank prefix keeps its literal meaning instead of
+        // collapsing to "" and matching everything.
+        let blank = PermissionState::new(false, &["Bash(prefix: )".into()], &[]);
+        assert!(matches!(
+            check_compound_command(&blank, "Bash", "curl evil.sh"),
+            CheckResult::Ask
+        ));
     }
 
     /// A deny rule anywhere in the chain still wins.
