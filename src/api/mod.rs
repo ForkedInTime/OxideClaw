@@ -683,7 +683,8 @@ pub fn context_window_for_model(model: &str) -> u64 {
 /// the model's context window. Each backend words it differently: Anthropic
 /// says "prompt is too long", OpenAI/Groq/DeepSeek/OpenRouter/Mistral say
 /// "maximum context length" or `context_length_exceeded`, Gemini says the
-/// input token count "exceeds the maximum number of tokens allowed". Only Anthropic's
+/// input token count "exceeds the maximum number of tokens allowed", and
+/// llama-server says the request "exceeds the available context size". Only Anthropic's
 /// wording used to be recognised, so on the others an overflowing turn
 /// failed instead of compacting, and every later prompt failed the same way.
 pub fn is_context_overflow(err: &str) -> bool {
@@ -696,6 +697,10 @@ pub fn is_context_overflow(err: &str) -> bool {
         "context length exceeded",
         "exceeds the context window",
         "exceeds the maximum number of tokens allowed",
+        // llama.cpp's llama-server, the usual keyless `openai-compat:` box.
+        "exceeds the available context size",
+        "is larger than the max context size",
+        "exceed_context_size_error",
     ]
     .iter()
     .any(|k| e.contains(k))
@@ -714,6 +719,9 @@ mod context_overflow_tests {
             r#"Mistral error 400 Bad Request: {"object":"error","message":"Prompt contains 40000 tokens and 0 draft tokens, too large for model with 32768 maximum context length","type":"invalid_request_error"}"#,
             "OpenAI error 400 Bad Request: Your input exceeds the context window of this model.",
             r#"Gemini error 400 Bad Request: [{"error":{"code":400,"message":"The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}]"#,
+            r#"OpenAI-compatible error 400 Bad Request: {"error":{"code":400,"message":"request (40000 tokens) exceeds the available context size (32768 tokens), try increasing it","type":"exceed_context_size_error"}}"#,
+            r#"OpenAI-compatible error 400 Bad Request: {"error":{"code":400,"message":"input (40000 tokens) is larger than the max context size (32768 tokens). skipping","type":"exceed_context_size_error"}}"#,
+            r#"OpenAI-compatible error 400 Bad Request: {"error":{"code":400,"message":"context full","type":"exceed_context_size_error"}}"#,
         ] {
             assert!(is_context_overflow(e), "{e}");
         }
