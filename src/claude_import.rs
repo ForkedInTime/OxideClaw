@@ -197,7 +197,9 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
                 opt_in.push(("apiKeyHelper".into(), "--api-key-helper"));
             }
             for key in LEFT_BEHIND_KEYS {
-                let Some(v) = theirs.get(*key) else { continue };
+                let Some(v) = theirs.get(*key).filter(|v| !v.is_null()) else {
+                    continue;
+                };
                 // `autoRollback` is the old name of `autoFixLoop`.
                 let name = if *key == "autoRollback" {
                     "autoFixLoop"
@@ -212,6 +214,17 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
                     Some(_) => {}
                     None => left_behind.push(key.to_string()),
                 }
+            }
+            // Without its voiceApiUrl, voice falls back to OpenAI's endpoint and
+            // sends the recording and WHISPER_API_KEY there. Even "" counts:
+            // an empty URL is not a reason to switch providers.
+            if theirs.get("voiceApiUrl").is_some_and(|v| !v.is_null())
+                && !ours.contains_key("voiceApiUrl")
+                && ours.get("voiceEnabled") == Some(&Value::Bool(true))
+            {
+                ours.remove("voiceEnabled");
+                names.retain(|n| n != "voiceEnabled");
+                left_behind.push("voiceEnabled (its voiceApiUrl was left behind)".into());
             }
             if !ours.is_empty() {
                 let target = config.join("settings.json");
@@ -994,6 +1007,51 @@ mod tests {
         assert!(left.contains("defaultShell"), "{left}");
         for key in ["sandbox", "autonomy", "autoFixLoop", "browse", "Private"] {
             assert!(!left.contains(key), "{key} was imported: {left}");
+        }
+    }
+
+    /// Voice without its custom voiceApiUrl would upload recordings and
+    /// WHISPER_API_KEY to OpenAI, so voiceEnabled stays behind with it.
+    #[test]
+    fn voice_is_not_enabled_without_its_endpoint() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join(".claude");
+        write(
+            &claude.join("settings.json"),
+            r#"{"voiceEnabled": true, "voiceApiUrl": "https://api.groq.com/openai/v1/audio/transcriptions", "theme": "dark"}"#,
+        );
+        let config = td.path().join("config");
+        let lines = migrate(&claude, &config, &td.path().join("data"));
+        let json = read(&config.join("settings.json"));
+        assert!(json.get("voiceEnabled").is_none(), "{json}");
+        assert!(json.get("voiceApiUrl").is_none(), "{json}");
+        let text = lines.join("\n");
+        assert!(!text.contains("settings (theme, voiceEnabled"), "{text}");
+        let left = lines
+            .iter()
+            .find(|l| l.starts_with("Left behind"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(
+            left.contains("voiceApiUrl") && left.contains("voiceEnabled"),
+            "{left}"
+        );
+
+        // No custom endpoint (absent or null): voice keeps the default and
+        // stays on; a null URL is not reported as left behind.
+        for extra in ["", r#", "voiceApiUrl": null"#] {
+            let td = tempfile::tempdir().unwrap();
+            let claude = td.path().join(".claude");
+            write(
+                &claude.join("settings.json"),
+                &format!(r#"{{"voiceEnabled": true{extra}}}"#),
+            );
+            let config = td.path().join("config");
+            let lines = migrate(&claude, &config, &td.path().join("data"));
+            assert_eq!(read(&config.join("settings.json"))["voiceEnabled"], true);
+            assert!(
+                !lines.iter().any(|l| l.starts_with("Left behind")),
+                "{lines:?}"
+            );
         }
     }
 
