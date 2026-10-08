@@ -1117,7 +1117,11 @@ mod tests {
         h.undo(2).await;
 
         assert!(h.messages.is_empty());
-        assert!(user_entries(&h.app).is_empty(), "{:?}", user_entries(&h.app));
+        assert!(
+            user_entries(&h.app).is_empty(),
+            "{:?}",
+            user_entries(&h.app)
+        );
     }
 
     /// A redone turn is drawn from its messages, where auto-fix feedback in
@@ -1159,7 +1163,11 @@ mod tests {
             },
         );
         h.redo(1).await;
-        assert_eq!(user_entries(&h.app).len(), 4, "feedback shows as a User entry");
+        assert_eq!(
+            user_entries(&h.app).len(),
+            4,
+            "feedback shows as a User entry"
+        );
 
         h.undo(1).await;
 

@@ -1548,14 +1548,19 @@ mod tests {
         });
 
         assert!(
-            frames.iter().all(|f| f["method"] != json!("session/request_permission")),
+            frames
+                .iter()
+                .all(|f| f["method"] != json!("session/request_permission")),
             "{frames:?}"
         );
         assert_eq!(frames[0]["params"]["update"]["status"], json!("failed"));
         assert!(st.pending.is_empty());
         assert_eq!(
             answers.try_recv().unwrap(),
-            ("a1".to_string(), Some("Cancelled by the client.".to_string()))
+            (
+                "a1".to_string(),
+                Some("Cancelled by the client.".to_string())
+            )
         );
     }
 

@@ -183,8 +183,8 @@ impl SdkSession {
         // where a summary was due: summarise before the first prompt.
         let tokens = crate::router::estimate_context_tokens(&self.system_prompt, &self.messages);
         let window = crate::compact::compaction_window(&self.config, self.router.as_ref(), None);
-        self.summarise_pending = self.config.auto_compact_enabled
-            && tokens >= crate::compact::thresholds(window).2;
+        self.summarise_pending =
+            self.config.auto_compact_enabled && tokens >= crate::compact::thresholds(window).2;
     }
 
     /// The conversation so far, as sent to the model.
@@ -1878,7 +1878,8 @@ mod guard_tests {
     #[tokio::test]
     async fn a_failed_request_forgets_the_turns_reads() {
         use crate::query_engine::scripted_api_tests::serve;
-        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#;
+        let body =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#;
         let (url, _) = serve(vec![format!(
             "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
