@@ -27,6 +27,9 @@ pub struct Task {
     pub status: TaskStatus,
     pub output: Option<String>,
     pub active_form: Option<String>,
+    /// Insertion order, so a full registry evicts its oldest finished task.
+    #[serde(skip)]
+    pub seq: u64,
 }
 
 /// Shared task registry — passed to all task tools at construction time.
@@ -40,12 +43,34 @@ pub fn new_registry() -> TaskRegistry {
 /// session (or a looping model) grows it without bound.
 pub const MAX_TASKS: usize = 1000;
 
-/// Insert a task, refusing once the registry is full.
-fn insert_task(registry: &TaskRegistry, task: Task) -> Result<()> {
+/// Insert a task. A full registry makes room by dropping its oldest
+/// completed, failed or stopped task: no tool deletes tasks, so refusing
+/// outright left TaskCreate failing for the rest of the session. Refuses
+/// only when every task is still pending or in progress.
+fn insert_task(registry: &TaskRegistry, mut task: Task) -> Result<()> {
+    static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     if reg.len() >= MAX_TASKS {
-        anyhow::bail!("Task registry is full ({MAX_TASKS} tasks). Complete or delete tasks first.");
+        let oldest_done = reg
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Stopped
+                )
+            })
+            .min_by_key(|t| t.seq)
+            .map(|t| t.id.clone());
+        let Some(id) = oldest_done else {
+            anyhow::bail!(
+                "Task registry is full ({MAX_TASKS} tasks, all pending or in progress). \
+                 Mark finished ones completed, failed or stopped (TaskUpdate or TaskStop) \
+                 to make room."
+            );
+        };
+        reg.remove(&id);
     }
+    task.seq = NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     reg.insert(task.id.clone(), task);
     Ok(())
 }
@@ -72,7 +97,7 @@ impl Tool for TaskCreateTool {
 
     fn description(&self) -> &str {
         "Create a new task in the task list. Returns the task id. \
-        Use TaskUpdate to set status/output, TaskStop to cancel."
+        Use TaskUpdate to set status/output, TaskStop to mark it stopped."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -97,6 +122,7 @@ impl Tool for TaskCreateTool {
             status: TaskStatus::Pending,
             output: None,
             active_form: input.active_form,
+            seq: 0,
         };
         if let Err(e) = insert_task(&self.registry, task) {
             return Ok(ToolOutput::error(e.to_string()));
@@ -263,7 +289,7 @@ impl Tool for TaskStopTool {
     }
 
     fn description(&self) -> &str {
-        "Stop/cancel a running task."
+        "Mark a task as stopped."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -374,6 +400,7 @@ mod tests {
             status: TaskStatus::Pending,
             output: None,
             active_form: None,
+            seq: 0,
         }
     }
 
@@ -386,5 +413,25 @@ mod tests {
         let err = insert_task(&reg, task("one-too-many")).unwrap_err();
         assert!(err.to_string().contains("full"), "{err}");
         assert_eq!(reg.lock().unwrap().len(), MAX_TASKS);
+    }
+
+    /// Finishing tasks did not free a slot and no tool deletes one, so after
+    /// MAX_TASKS creations TaskCreate failed for the rest of the session.
+    #[test]
+    fn a_full_registry_drops_its_oldest_finished_task() {
+        let reg = new_registry();
+        for i in 0..MAX_TASKS {
+            insert_task(&reg, task(&i.to_string())).unwrap();
+        }
+        for id in ["7", "3", "900"] {
+            reg.lock().unwrap().get_mut(id).unwrap().status = TaskStatus::Completed;
+        }
+        reg.lock().unwrap().get_mut("5").unwrap().status = TaskStatus::Stopped;
+
+        insert_task(&reg, task("new")).unwrap();
+        let r = reg.lock().unwrap();
+        assert_eq!(r.len(), MAX_TASKS);
+        assert!(!r.contains_key("3"), "the oldest finished task goes first");
+        assert!(r.contains_key("0") && r.contains_key("5") && r.contains_key("new"));
     }
 }
