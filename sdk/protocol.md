@@ -335,7 +335,7 @@ Context window usage after each API call.
 }
 ```
 
-`tokens_max` is the session model's context window (1,000,000 on Opus/Sonnet 4.6+, Claude 5 and Fable; 200,000 on Haiku 4.5 and older models). In a routed session it is the largest tier's window, since each turn goes to a tier whose window holds the history. `compaction_imminent` is `true` when `used_pct >= 85`.
+`tokens_max` is the session model's context window (1,000,000 on Opus/Sonnet 4.6+, Claude 5 and Fable; 200,000 on Haiku 4.5 and older models). In a routed session it is the window of the tier the current turn runs on (never more than the largest tier's), and `used_pct` and `compaction_imminent` are measured against that same window. `compaction_imminent` is `true` when `used_pct >= 85`.
 
 ---
 
