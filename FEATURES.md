@@ -567,7 +567,7 @@ Earlier versions accepted `auto-edit` (then the default) and `full-auto` but pro
 | `autonomy` | `suggest` / `ask` / `auto-edit` / `full-auto` | `ask` | What runs without a permission prompt; see [Autonomy Modes](#autonomy-modes) |
 | `router` | `{ "low", "mid", "high", "superHigh", "enabled", "classifier" }` | unset | The [smart model router](#smart-model-router): a model per tier (any provider), `enabled` (unset: on once two tiers are set) and `classifier` (`heuristic` or `model`) |
 | `routerEnabled` | `true` / `false` | unset | Older form of `router.enabled` |
-| `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`); an untrusted project's may only lower yours |
+| `routerBudget` | USD amount | unset | Session spend limit applied at startup (same as `/budget`), in the TUI, `-p` and SDK sessions; `--max-budget-usd` or a `session/start` `max_budget_usd` may lower it, not raise it, and an untrusted project's may only lower yours |
 | `routerLowModel` | any model name | `claude-haiku-4-5` (your `model` on a non-Claude session) | Older form of `router.low` |
 | `routerMediumModel` | any model name | `claude-sonnet-5` (your `model` on a non-Claude session) | Older form of `router.mid` |
 | `routerHighModel` | any model name | your `model` | Older form of `router.high` |

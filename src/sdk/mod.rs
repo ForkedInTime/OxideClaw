@@ -184,6 +184,9 @@ impl SdkServer {
                 if let Some(budget) = max_budget_usd {
                     cfg.max_budget_usd = Some(budget);
                 }
+                // A host's cap may tighten routerBudget, never lift it; the
+                // session reads only max_budget_usd.
+                cfg.max_budget_usd = cfg.session_budget();
 
                 let tools = crate::mcp::tools_for_config(&cfg).await;
                 let session_policy = policy.unwrap_or_default();

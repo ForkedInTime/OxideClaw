@@ -266,7 +266,8 @@ struct Cli {
     #[arg(long, hide = true)]
     allow_dangerously_skip_permissions: bool,
 
-    /// Maximum USD to spend on API calls (--print mode only)
+    /// Maximum USD to spend on API calls (--print mode only; a lower
+    /// routerBudget in settings.json wins)
     #[arg(long)]
     max_budget_usd: Option<f64>,
 
@@ -1399,6 +1400,9 @@ async fn run() -> Result<()> {
             vec![cli.prompt.join(" ")]
         };
 
+        // routerBudget caps -p like the TUI's starting /budget; the
+        // engine reads only max_budget_usd.
+        config.max_budget_usd = config.session_budget();
         let mut tools = crate::mcp::tools_for_config(&config).await;
 
         // --json-schema: add a SyntheticOutputTool named "result" with the user's schema

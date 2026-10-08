@@ -305,7 +305,8 @@ pub struct Config {
     /// Fallback model to use on HTTP 529 (overloaded).
     pub fallback_model: Option<String>,
 
-    /// Maximum USD to spend on API calls (--print mode only).
+    /// Maximum USD to spend on API calls in -p and SDK sessions; see
+    /// [`Config::session_budget`].
     pub max_budget_usd: Option<f64>,
 
     /// Input format for --print mode: "text" (default) or "stream-json".
@@ -1505,6 +1506,16 @@ impl Config {
             self.router_high_model.clone(),
             self.router_super_high_model.clone(),
         )
+    }
+
+    /// The spend cap a `-p` or SDK session runs under: the tighter of an
+    /// explicit cap (`--max-budget-usd`, `session/start`) and `routerBudget`,
+    /// which the TUI applies as its starting `/budget`.
+    pub fn session_budget(&self) -> Option<f64> {
+        match (self.max_budget_usd, self.router_budget) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The autonomy mode the permission gates apply.
@@ -4010,6 +4021,30 @@ mod flag_settings_retarget_tests {
         cfg.retarget_cwd(project.path().to_path_buf());
         assert!(cfg.disable_all_hooks);
         assert!(cfg.claudemd.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod session_budget_tests {
+    use super::Config;
+
+    /// routerBudget capped only the TUI: `-p` and SDK sessions, which are
+    /// routed and escalate too, ran with no cap at all.
+    #[test]
+    fn router_budget_caps_print_and_sdk_sessions() {
+        let budget = |explicit, router| {
+            Config {
+                max_budget_usd: explicit,
+                router_budget: router,
+                ..Config::default()
+            }
+            .session_budget()
+        };
+        assert_eq!(budget(None, None), None);
+        assert_eq!(budget(None, Some(2.0)), Some(2.0));
+        assert_eq!(budget(Some(5.0), None), Some(5.0));
+        assert_eq!(budget(Some(5.0), Some(2.0)), Some(2.0));
+        assert_eq!(budget(Some(1.0), Some(2.0)), Some(1.0));
     }
 }
 
