@@ -960,7 +960,14 @@ async fn spawn_policy_proxy_dns(
                             lookup,
                         ));
                     }
-                    Err(_) => break,
+                    // Accept errors are transient (EMFILE/ENFILE, or a client
+                    // that reset before accept); ending the loop dropped the
+                    // listener and left Chrome offline for the session. The
+                    // pause keeps fd exhaustion from spinning the loop.
+                    Err(e) => {
+                        tracing::debug!("policy proxy: accept failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                 },
                 Some(_) = conns.join_next(), if !conns.is_empty() => {}
             }
