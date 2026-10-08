@@ -173,6 +173,18 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
         }
     } else if m.contains("mistral:") {
         rough(2.0, 6.0)
+    } else if let Some(id) = model
+        .to_ascii_lowercase()
+        .strip_prefix("openrouter:openai/")
+    {
+        // OpenRouter passes OpenAI's list prices through. The Sonnet-tier
+        // fallback billed o1-pro or gpt-5-pro at a fortieth of that, so a
+        // /budget cap stopped far too late on the dearest models. Flagged:
+        // OpenRouter's own rate may differ.
+        ModelPrice {
+            estimated: true,
+            ..openai_price(id)
+        }
     } else if let Some(id) = ["oai:", "openai:"].iter().find_map(|p| {
         model
             .to_ascii_lowercase()
@@ -673,6 +685,24 @@ mod tests {
         assert!(s.contains("not recognised"), "{s}");
     }
 
+    /// OpenRouter-hosted OpenAI models fell to the $3/$15 fallback, so
+    /// /budget let o1-pro ($150/$600) run about 40x past the cap.
+    #[test]
+    fn openrouter_openai_models_use_openai_rates() {
+        for (model, input, output) in [
+            ("openrouter:openai/o1-pro", 150.0, 600.0),
+            ("openrouter:openai/gpt-5-pro", 15.0, 120.0),
+            ("openrouter:openai/o3-pro", 20.0, 80.0),
+            ("openrouter:openai/gpt-5.4-mini", 0.75, 4.50),
+            ("OpenRouter:OpenAI/GPT-4.1", 2.0, 8.0),
+        ] {
+            let p = model_price(model);
+            assert!(p.estimated, "{model}");
+            assert!(!p.fallback, "{model}");
+            assert_eq!((p.input, p.output), (input, output), "{model}");
+        }
+    }
+
     /// Gemini fell through to the Sonnet-tier fallback, so a `/budget` cap
     /// on gemini-2.5-flash ($0.30/$2.50) tripped about 6-10x early and `/cost`
     /// called the model unrecognised.
@@ -969,6 +999,7 @@ mod price_table_tests {
             ("gemini:gemini-2.5-flash", 0.075),
             ("gemini:gemini-2.5-pro", 0.3125),
             ("gemini:gemini-3-pro-preview", 0.5),
+            ("openrouter:openai/gpt-4o", 1.25),
         ] {
             let got = model_price(model).cost(0, 0, tenth, 0);
             assert!((got - cached_per_m / 10.0).abs() < 1e-9, "{model}: {got}");
@@ -979,7 +1010,7 @@ mod price_table_tests {
             "mistral:mistral-large",
             "venice:llama-3.3-70b",
             "openai-compat:my-model",
-            "openrouter:openai/gpt-4o",
+            "openrouter:openai/o1-pro",
             "gemini:learnlm-1.5-pro-experimental",
             "gemini:gemini-1.5-pro",
         ] {
