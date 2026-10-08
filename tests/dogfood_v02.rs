@@ -399,9 +399,10 @@ fn dogfood_undo_to_session_base_keeps_pre_session_uncommitted_work() {
         "the file the undone turn created is gone"
     );
 
-    // A clean tree needs no base commit: HEAD already is the base.
+    // A clean tree needs no base commit of its own: HEAD is the base.
     git(td.path(), &["checkout", "-q", "--", "README.md"]);
-    assert_eq!(snapshot_base(td.path()).unwrap(), None);
+    let head = git(td.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(snapshot_base(td.path()).unwrap(), Some(head));
 }
 
 /// Edits made after the last snapshot are not in any commit; /undo used to

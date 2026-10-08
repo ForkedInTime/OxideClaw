@@ -520,9 +520,12 @@ fn commit_tree(cwd: &Path, tree: &str, parents: &[&str], msg: &str) -> anyhow::R
 
 /// Snapshot the working tree as it is before the session's first recorded
 /// turn, so `/undo` to the session base returns the user's uncommitted work
-/// instead of HEAD. Returns `None` when the tree equals HEAD's (HEAD already
-/// is the base) or `cwd` is not in a git repo. The commit is not put on any
-/// ref: the first turn's snapshot takes it as parent, which keeps it alive.
+/// instead of HEAD. When the tree equals HEAD's, HEAD itself is the base:
+/// pinned now, before the turn runs, so a commit the turn makes (or a pull)
+/// is undone like any other edit instead of becoming the base. Returns
+/// `None` for an unborn HEAD with a clean tree, or when `cwd` is not in a
+/// git repo. The commit is not put on any ref: the first turn's snapshot
+/// takes it as parent, which keeps it alive.
 pub fn snapshot_base(cwd: &Path) -> anyhow::Result<Option<String>> {
     if !is_git_repo(cwd) {
         return Ok(None);
@@ -535,7 +538,7 @@ pub fn snapshot_base(cwd: &Path) -> anyhow::Result<Option<String>> {
     let td = tempfile::TempDir::new()?;
     let tree = stage_worktree(cwd, head_tree.as_deref(), &td.path().join("base.index"))?;
     if head_tree.as_deref() == Some(tree.as_str()) {
-        return Ok(None);
+        return Ok(head);
     }
     let parents: Vec<&str> = head.as_deref().into_iter().collect();
     commit_tree(
@@ -572,9 +575,9 @@ fn subject_from_prompt(prompt: &str) -> String {
 /// without a lockfile of ours to leak. A concurrent write now fails loudly
 /// ([`SnapshotOutcome::Conflict`]) instead of destroying data quietly.
 ///
-/// `base_commit` (from [`snapshot_base`]) is the parent at position 0; without
-/// it HEAD is, and `/undo` to the session base would drop whatever was
-/// uncommitted when the session started.
+/// `base_commit` (from [`snapshot_base`], taken before the turn) is the
+/// parent at position 0; without it HEAD now is, which misses whatever was
+/// uncommitted when the session started and takes in a commit the turn made.
 #[allow(clippy::too_many_arguments)]
 pub fn snapshot_turn(
     cwd: &Path,
@@ -2200,6 +2203,51 @@ mod restore_tests {
             assert!(!td.path().join(n).exists(), "{n} left behind");
         }
         assert!(td.path().join("README.md").exists());
+    }
+
+    /// On a clean tree the first turn parented on HEAD as it was after the
+    /// turn, so a commit the turn made became the session base: /undo kept
+    /// its changes and reverted only what it left uncommitted.
+    #[test]
+    fn undo_of_the_first_turn_reverts_a_commit_it_made() {
+        let td = init_test_repo();
+        initial_commit(td.path());
+        write_file(td.path(), "b.txt", "b0\n");
+        git_cmd(td.path()).args(["add", "-A"]).status().unwrap();
+        git_cmd(td.path())
+            .args(["commit", "-q", "-m", "b"])
+            .status()
+            .unwrap();
+        let base = snapshot_base(td.path()).unwrap();
+        assert!(base.is_some(), "a clean tree's base is HEAD");
+
+        write_file(td.path(), "README.md", "fixed\n");
+        write_file(td.path(), "b.txt", "b1\n");
+        let s = git_cmd(td.path())
+            .args(["commit", "-q", "-m", "turn", "README.md"])
+            .status()
+            .unwrap();
+        assert!(s.success());
+        let cfg = AutoCommitConfig::default();
+        let mut commits = Vec::new();
+        let mut pos = 0usize;
+        let out = snapshot_turn(
+            td.path(),
+            &cfg,
+            "s",
+            "fix",
+            1,
+            &mut commits,
+            &mut pos,
+            base.as_deref(),
+        )
+        .unwrap();
+        assert!(matches!(out, SnapshotOutcome::Committed { .. }), "{out:?}");
+
+        restore_from(td.path(), "s", &commits, 1, 0).unwrap();
+        let read = |p: &str| std::fs::read_to_string(td.path().join(p)).unwrap();
+        assert_eq!(read("README.md"), "base\n", "the committed edit is undone");
+        assert_eq!(read("b.txt"), "b0\n");
     }
 
     /// /undo left files the undone turn created on disk, so the next turn's

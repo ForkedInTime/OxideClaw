@@ -168,9 +168,11 @@ async fn push_prompt_turn(
 /// touch them, so the turn's mark (`TurnMark.before`) is exactly what /undo
 /// of it returns to.
 ///
-/// At position 0 that is the session base: without it turn 1 parents on
-/// HEAD and `/undo` to the base wipes whatever was uncommitted, including
-/// edits made since startup or since an earlier `/undo` to the base.
+/// At position 0 that is the session base (HEAD itself when the tree is
+/// clean): without it turn 1 parents on HEAD as it is after the turn, so
+/// `/undo` to the base wipes whatever was uncommitted, including edits made
+/// since startup or since an earlier `/undo` to the base, and keeps a commit
+/// the turn made.
 ///
 /// Further on, anything that changed since the last snapshot (hand edits,
 /// new files, a pull or branch switch, a `-p` run, days of work before a
