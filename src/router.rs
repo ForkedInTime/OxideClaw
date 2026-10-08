@@ -1279,6 +1279,8 @@ pub(crate) mod fake_chat {
         Text(&'static str),
         /// One tool call: name and JSON arguments.
         Tool(&'static str, &'static str),
+        /// A tool call whose usage reports this many prompt tokens.
+        ToolAt(&'static str, &'static str, u64),
         /// An HTTP error with this status and body.
         Status(u16, &'static str),
         /// Accept and never answer.
@@ -1296,13 +1298,17 @@ pub(crate) mod fake_chat {
     }
 
     fn render(reply: &Reply) -> Option<String> {
-        let usage = serde_json::json!({"prompt_tokens": 100, "completion_tokens": 2});
+        let prompt_tokens = match reply {
+            Reply::ToolAt(_, _, n) => *n,
+            _ => 100,
+        };
+        let usage = serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": 2});
         Some(match reply {
             Reply::Text(t) => sse(&[
                 serde_json::json!({"choices":[{"delta":{"content":t},"finish_reason":null}]}),
                 serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":usage}),
             ]),
-            Reply::Tool(name, args) => sse(&[
+            Reply::Tool(name, args) | Reply::ToolAt(name, args, _) => sse(&[
                 serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":name,"arguments":args}}]},"finish_reason":null}]}),
                 serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":usage}),
             ]),

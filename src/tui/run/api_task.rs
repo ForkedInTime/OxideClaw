@@ -752,6 +752,42 @@ pub(super) async fn run_api_task(task: ApiTask) {
             publish_history(&history, &messages, &[]);
         }
 
+        // The tier is fixed for the rest of this prompt and Ollama truncates
+        // an overflow silently instead of failing, so measure each response
+        // against the turn's window; the auto-compact after the turn only
+        // measures against the largest tier's.
+        if response.stop_reason == Some(StopReason::ToolUse) {
+            use crate::compact::CompactNeeded;
+            let window = crate::compact::turn_window(&config, routing.as_ref().map(|r| &r.router));
+            let context_tokens = response.usage.context_tokens();
+            let need = crate::compact::compact_needed(context_tokens, window);
+            let moved = need == CompactNeeded::Summarise
+                && escalate(
+                    &mut routing,
+                    crate::router::Trigger::ContextOverflow,
+                    &mut client,
+                    &mut config,
+                    context_tokens,
+                    task_cost.remaining(),
+                    &tx,
+                )
+                .await;
+            if !moved
+                && matches!(need, CompactNeeded::Snip | CompactNeeded::Summarise)
+                && config.auto_compact_enabled
+                && crate::compact::snip_compact(&mut messages, &config.model)
+            {
+                let _ = tx.send(AppEvent::SystemMessage(format!(
+                    "Context is {}% of {}'s window: stripped old tool results (snipCompact).",
+                    context_tokens * 100 / window.max(1),
+                    config.model
+                )));
+                publish_history(&history, &messages, &[]);
+                // A re-read must return the file, not "unchanged".
+                read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+        }
+
         if response.stop_reason == Some(StopReason::Refusal) {
             let _ = tx.send(AppEvent::SystemMessage(
                 "The model declined this request (stop_reason: refusal).".into(),
@@ -2267,6 +2303,93 @@ mod router_tests {
             "{}",
             routed[1].1
         );
+    }
+
+    /// Inside a turn the TUI never measured the context against the tier's
+    /// window, so an Ollama tier truncated the history silently. A response
+    /// at 90% of the low tier's 32k window goes one tier up (128k) for the
+    /// rest of the turn.
+    #[tokio::test]
+    async fn a_low_tier_filling_its_window_mid_turn_goes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut task, mut rx, seen) = routed_task(
+            |model, _| match model {
+                "gemma3:1b" => Reply::ToolAt("Glob", r#"{"pattern":"*.rs"}"#, 30_000),
+                _ => Reply::Text("done"),
+            },
+            dir.path(),
+        )
+        .await;
+        let router = task.router.as_mut().unwrap();
+        router.low_model = "ollama:gemma3:1b".into();
+        router.medium_model = "ollama:mid".into();
+        task.tools = vec![std::sync::Arc::new(crate::tools::glob::GlobTool) as DynTool];
+        run_api_task(task).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["gemma3:1b", "mid"]);
+        let mut done = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Done { model_used, .. } = ev {
+                done = Some(model_used);
+            }
+        }
+        assert_eq!(done.as_deref(), Some("ollama:mid"));
+    }
+
+    /// With no larger tier to go to, old tool results are stripped before
+    /// the next request instead of letting Ollama cut the history.
+    #[tokio::test]
+    async fn a_full_window_mid_turn_snips_without_a_larger_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut task, mut rx, seen) = routed_task(
+            |model, n| match (model, n) {
+                ("gemma3:1b", 0) => Reply::ToolAt("Glob", r#"{"pattern":"*.rs"}"#, 28_000),
+                _ => Reply::Text("done"),
+            },
+            dir.path(),
+        )
+        .await;
+        task.config.model = "ollama:gemma3:1b".into();
+        task.client = task.config.backend_for(&task.config.model).unwrap();
+        task.router = None;
+        let mut history = Vec::new();
+        for i in 0..12 {
+            history.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("old{i}"),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "a.rs"}),
+                }],
+            });
+            history.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("old{i}"),
+                    content: vec![ToolResultContent::Text {
+                        text: "OLD FILE BODY".into(),
+                    }],
+                    is_error: None,
+                }],
+            });
+        }
+        history.extend(task.messages.drain(..));
+        task.messages = history;
+        task.tools = vec![std::sync::Arc::new(crate::tools::glob::GlobTool) as DynTool];
+        run_api_task(task).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["gemma3:1b", "gemma3:1b"]);
+        let mut done = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Done { messages, .. } = ev {
+                done = Some(messages);
+            }
+        }
+        let messages = done.expect("turn finished");
+        let oldest = serde_json::to_string(&messages[1]).unwrap();
+        assert!(!oldest.contains("OLD FILE BODY"), "old tool result kept");
+        let newest = serde_json::to_string(&messages[23]).unwrap();
+        assert!(newest.contains("OLD FILE BODY"), "recent results stay");
     }
 
     /// The loop detector on the cheap tier: the turn continues one tier up
