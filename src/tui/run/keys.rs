@@ -89,13 +89,15 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
                     .and_then(|o| o.selectable_ids.get(selected_index).cloned());
                 app.overlay = None;
                 if title == "rewind" {
-                    let n = app
-                        .pending_rewind
-                        .take()
-                        .and_then(|counts| counts.get(selected_index).copied());
-                    if let Some(n) = n.filter(|&n| n > 0) {
-                        timeline::undo(app, messages, session, saved_count, config, n).await;
-                    }
+                    timeline::pick_rewind(
+                        app,
+                        messages,
+                        session,
+                        saved_count,
+                        config,
+                        selected_index,
+                    )
+                    .await;
                 } else if let Some(val) = selected_val {
                     if title == "models" {
                         app.pending_model = Some(val);
@@ -1184,7 +1186,7 @@ mod overlay_key_tests {
         let (app, _dir) = press(
             Overlay::with_items("rewind", "x", labels),
             KeyCode::Char('2'),
-            |app| app.pending_rewind = Some(vec![0, 1]),
+            |app| app.pending_rewind = Some((vec![0, 1], Vec::new())),
         )
         .await;
         assert_eq!(app.pending_resume, None);

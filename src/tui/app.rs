@@ -712,8 +712,9 @@ pub struct App {
     pub pending_clone_tier: Option<crate::voice::CloneTier>,
 
     /// When the /rewind picker is open, maps overlay row index → how many
-    /// turns to undo.
-    pub pending_rewind: Option<Vec<usize>>,
+    /// turns to undo, with the prompt fingerprints the rows were built from
+    /// (a compaction can land while the picker is open).
+    pub pending_rewind: Option<(Vec<usize>, Vec<String>)>,
 
     /// Smart model router configuration.
     pub router: crate::router::RouterConfig,

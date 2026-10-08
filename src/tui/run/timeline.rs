@@ -485,7 +485,41 @@ pub(super) fn open_rewind_picker(app: &mut App, messages: &[Message]) {
     .collect::<Vec<_>>()
     .join("\n");
     app.overlay = Some(Overlay::with_items("rewind", body, labels));
-    app.pending_rewind = Some(undo_counts);
+    app.pending_rewind = Some((undo_counts, prompt_fingerprints(messages)));
+}
+
+fn prompt_fingerprints(messages: &[Message]) -> Vec<String> {
+    prompt_indices(messages)
+        .into_iter()
+        .map(|i| prompt_fingerprint(&messages[i]))
+        .collect()
+}
+
+/// Row `row` of the /rewind picker was chosen. Its count was worked out for
+/// the conversation as it was when the picker opened; if the conversation
+/// changed since (a background compaction merged in), the count would undo
+/// other turns, the summary included, so nothing is undone.
+pub(super) async fn pick_rewind(
+    app: &mut App,
+    messages: &mut Vec<Message>,
+    session: &mut Session,
+    saved_count: &mut usize,
+    config: &Config,
+    row: usize,
+) {
+    let Some((counts, prompts)) = app.pending_rewind.take() else {
+        return;
+    };
+    if prompts != prompt_fingerprints(messages) {
+        app.entries.push(ChatEntry::system(
+            "[undo] The conversation changed while the picker was open (a compaction finished); \
+             nothing was undone. Open /rewind again.",
+        ));
+        return;
+    }
+    if let Some(n) = counts.get(row).copied().filter(|&n| n > 0) {
+        undo(app, messages, session, saved_count, config, n).await;
+    }
 }
 
 #[cfg(test)]
@@ -828,7 +862,7 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("turn 1 "))
             .unwrap();
-        let n = picked.app.pending_rewind.as_ref().unwrap()[row];
+        let n = picked.app.pending_rewind.as_ref().unwrap().0[row];
         picked.app.overlay = None;
         picked.undo(n).await;
 
@@ -881,6 +915,30 @@ mod tests {
         assert!(h.app.pending_rewind.is_none());
         assert_eq!(h.prompts().await, vec!["one"]);
         assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+    }
+
+    /// A background compaction that lands while the picker is open makes
+    /// its counts stale: the chosen row undoes nothing, rather than the
+    /// summary and with it the whole conversation.
+    #[tokio::test]
+    async fn rewind_picker_refuses_after_a_compaction_lands() {
+        let mut h = Harness::new(true).await;
+        h.three_turns().await;
+        open_rewind_picker(&mut h.app, &h.messages);
+        h.compact(true).await;
+
+        h.key(KeyCode::Char('3')).await;
+
+        assert!(h.app.pending_rewind.is_none());
+        assert!(h.app.overlay.is_none());
+        let note = h.last_note();
+        assert!(note.contains("Open /rewind again"), "{note}");
+        assert_eq!(
+            h.prompts().await,
+            vec!["summary of the conversation so far"]
+        );
+        assert_eq!(h.read("a.txt").as_deref(), Some("a3\n"));
+        assert!(h.session.meta.redo.is_empty());
     }
 
     /// A file edited by hand after the turns being undone is never
