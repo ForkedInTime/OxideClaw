@@ -135,6 +135,13 @@ impl QueryEngine {
     /// Serve `model` with `client` from the next request on, with this
     /// engine's retry notices.
     fn use_client(&mut self, mut client: ApiBackend, model: String) {
+        self.notify_retries(&mut client);
+        client.set_retry_overloaded(retry_overloads(&self.config, &model));
+        self.client = client;
+        self.config.model = model;
+    }
+
+    fn notify_retries(&self, client: &mut ApiBackend) {
         if self.quiet {
             client.set_retry_notifier(std::sync::Arc::new(|n: &crate::api::retry::RetryNotice| {
                 tracing::warn!("{}", n.message());
@@ -144,9 +151,6 @@ impl QueryEngine {
                 eprintln!("{}", n.message().yellow());
             }));
         }
-        client.set_retry_overloaded(retry_overloads(&self.config, &model));
-        self.client = client;
-        self.config.model = model;
     }
 
     /// Pick this prompt's tier and switch to it. `--verbose` names it on
@@ -408,11 +412,17 @@ impl QueryEngine {
         else {
             return Err(err);
         };
+        // A routed tier's client can be another provider's (Groq, Ollama):
+        // the fallback needs a client for its own backend.
+        let Ok(mut fb_client) = crate::router::client_for(&self.config, &self.client, fb) else {
+            return Err(err);
+        };
+        self.notify_retries(&mut fb_client);
         self.notice(format!("Model overloaded — retrying with {fb}").yellow());
         // Thinking shape, effort and max_tokens are per model: Opus 5
         // settings can be a 400 on an older fallback.
         let fb_req = self.request_for(fb, request.tools);
-        let r = self.client.messages_stream(fb_req, on_text).await?;
+        let r = fb_client.messages_stream(fb_req, on_text).await?;
         Ok((r, fb.to_string()))
     }
 
@@ -1195,13 +1205,17 @@ fn result_json(text: &str, usage: &Usage) -> serde_json::Value {
     })
 }
 
-/// Per-call cost in USD, from the same price table as `/cost`.
 /// Whether the client backs off on an overload itself: not when a distinct
-/// `--fallback-model` takes over at the first one.
+/// `--fallback-model` takes over at the first one, which it cannot without
+/// a credential for its provider.
 fn retry_overloads(config: &Config, model: &str) -> bool {
-    config.fallback_model.as_ref().is_none_or(|fb| fb == model)
+    config
+        .fallback_model
+        .as_ref()
+        .is_none_or(|fb| fb == model || !config.has_credential_for(fb))
 }
 
+/// Per-call cost in USD, from the same price table as `/cost`.
 fn estimate_cost_usd(model: &str, usage: &crate::api::types::Usage) -> f64 {
     crate::cost::model_price(model).cost(
         usage.input_tokens,
@@ -1604,6 +1618,50 @@ pub(crate) mod scripted_api_tests {
         let mut e = fallback_engine(url, dir.path());
         assert!(e.query("hi").await.is_err());
         assert_eq!(seen.lock().unwrap().len(), 1, "a 400 is not an overload");
+    }
+
+    /// A routed tier's client can be another provider's: the fallback was
+    /// POSTed to it under the fallback's model name and rejected there.
+    #[tokio::test]
+    async fn the_fallback_goes_to_its_own_provider() {
+        use crate::router::fake_chat::{self, Reply};
+        let dir = tempfile::tempdir().unwrap();
+        let overloaded = http_error(
+            "529 Overloaded",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let (url, seen) = serve(vec![overloaded]).await;
+        let (host, fb_seen) = fake_chat::start(|_, _| Reply::Text("from fallback")).await;
+        let config = Config {
+            model: "claude-opus-5".into(),
+            fallback_model: Some("ollama:fb".into()),
+            api_key: "sk-ant-test".into(),
+            ollama_host: host,
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        assert!(!retry_overloads(&config, "claude-opus-5"));
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        c.set_retry_overloaded(false);
+        e.client = ApiBackend::Anthropic(c);
+
+        e.query("hi").await.unwrap();
+        assert_eq!(e.last_assistant_text().as_deref(), Some("from fallback"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(*fb_seen.lock().unwrap(), vec!["fb"]);
+
+        // With no credential for the fallback's provider the model's own
+        // client keeps backing off instead.
+        let no_key = Config {
+            model: "ollama:big".into(),
+            fallback_model: Some("claude-sonnet-5".into()),
+            api_key: String::new(),
+            ..Config::default()
+        };
+        assert!(retry_overloads(&no_key, "ollama:big"));
     }
 
     /// `-c -p` ran a fresh conversation: the resumed turns must be sent
