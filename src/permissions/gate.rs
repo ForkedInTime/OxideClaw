@@ -177,7 +177,10 @@ impl PermissionGate {
         )
     }
 
-    /// [`Self::decide_in`] the gate's own project directory.
+    /// [`Self::decide_in`] the gate's own project directory. Test-only:
+    /// every caller now passes the session's directory, which
+    /// `EnterWorktree` can move.
+    #[cfg(test)]
     pub async fn decide(&self, tool_name: &str, input: &serde_json::Value) -> GateOutcome {
         self.decide_in(tool_name, input, &self.state.cwd()).await
     }
