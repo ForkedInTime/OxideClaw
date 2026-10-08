@@ -596,6 +596,12 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// a String until OOM, and `-> /dev/tty` or a FIFO would hang startup. The
 /// type is checked before opening because opening a FIFO already blocks.
 pub fn read_config_file(path: &Path) -> Result<Option<String>, String> {
+    read_config_file_capped(path, MAX_CONFIG_BYTES)
+}
+
+/// [`read_config_file`] with another size cap, for the user's own files
+/// that legitimately grow past it (Claude Code's `~/.claude.json`).
+pub fn read_config_file_capped(path: &Path, max: u64) -> Result<Option<String>, String> {
     use std::io::Read;
     let md = match std::fs::metadata(path) {
         Ok(md) => md,
@@ -607,10 +613,10 @@ pub fn read_config_file(path: &Path) -> Result<Option<String>, String> {
     }
     let mut buf = Vec::new();
     std::fs::File::open(path)
-        .and_then(|f| f.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut buf))
+        .and_then(|f| f.take(max + 1).read_to_end(&mut buf))
         .map_err(|e| e.to_string())?;
-    if buf.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(format!("larger than {} KiB", MAX_CONFIG_BYTES / 1024));
+    if buf.len() as u64 > max {
+        return Err(format!("larger than {} KiB", max / 1024));
     }
     // Windows PowerShell 5.1's `Out-File -Encoding utf8` (and Notepad) prefix
     // a BOM; left in, it glues onto the first `.env` key or frontmatter marker.

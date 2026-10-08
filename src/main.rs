@@ -367,9 +367,10 @@ enum Commands {
 #[derive(Subcommand)]
 enum ConfigSubcommand {
     /// Copy hooks, permission rules, apiKeyHelper or MCP servers from Claude
-    /// Code's ~/.claude/settings.json into OxideClaw's settings, or this
-    /// project's Claude Code sessions into OxideClaw's. With no options, lists
-    /// the settings and changes nothing. ~/.claude is only read.
+    /// Code's ~/.claude/settings.json (and its MCP servers from ~/.claude.json)
+    /// into OxideClaw's settings, or this project's Claude Code sessions into
+    /// OxideClaw's. With no options, lists the settings and changes nothing.
+    /// Claude Code's files are only read.
     ImportClaude {
         /// Import hooks (Claude Code's format is converted)
         #[arg(long)]
@@ -380,7 +381,9 @@ enum ConfigSubcommand {
         /// Import apiKeyHelper (kept as is when OxideClaw already has one)
         #[arg(long)]
         api_key_helper: bool,
-        /// Import MCP servers OxideClaw does not have yet
+        /// Import MCP servers OxideClaw does not have yet: user-scope ones
+        /// into settings.json, this project's local-scope ones into its
+        /// private local MCP file
         #[arg(long)]
         mcp: bool,
         /// Import the current directory's Claude Code sessions that are not
@@ -994,8 +997,21 @@ async fn run() -> Result<()> {
                     let Some(claude) = Config::claude_code_dir() else {
                         anyhow::bail!("no home directory, so no ~/.claude to import from");
                     };
-                    for line in claude_import::import_claude(&claude, &Config::config_dir(), opts)?
-                    {
+                    // Claude Code keeps its `claude mcp add` servers in
+                    // ~/.claude.json, or in $CLAUDE_CONFIG_DIR when that is set.
+                    let state = std::env::var_os("CLAUDE_CONFIG_DIR")
+                        .map(std::path::PathBuf::from)
+                        .filter(|d| d.is_absolute())
+                        .map(|d| d.join(".claude.json"))
+                        .or_else(|| dirs::home_dir().map(|h| h.join(".claude.json")));
+                    let cwd = std::env::current_dir()?;
+                    for line in claude_import::import_claude(
+                        &claude,
+                        state.as_deref(),
+                        &cwd,
+                        &Config::config_dir(),
+                        opts,
+                    )? {
                         println!("{line}");
                     }
                 }

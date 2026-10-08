@@ -406,13 +406,53 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostCompact", "postCompact"),
 ];
 
+/// Claude Code's state file (`~/.claude.json`, or `.claude.json` in
+/// `$CLAUDE_CONFIG_DIR`) is where `claude mcp add` keeps servers. It also
+/// holds per-project history, so it may outgrow the settings cap.
+const MAX_CLAUDE_STATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The MCP servers `claude mcp add` wrote to Claude Code's state file
+/// `state`: user scope (top-level `mcpServers`) and local scope for `cwd`
+/// (`projects[<dir>].mcpServers`). A missing file has none.
+fn claude_code_mcp_servers(
+    state: &Path,
+    cwd: &Path,
+) -> anyhow::Result<(Map<String, Value>, Map<String, Value>)> {
+    let text = crate::settings::read_config_file_capped(state, MAX_CLAUDE_STATE_BYTES)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", state.display()))?
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok(Default::default());
+    }
+    let json: Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e})", state.display()))?;
+    let servers = |v: Option<&Value>| {
+        v.and_then(|v| v.get("mcpServers"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let projects = json.get("projects").and_then(Value::as_object);
+    // Keyed by the directory Claude Code was started in, as it spelled it.
+    let local = [Some(cwd.to_path_buf()), cwd.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+        .find_map(|dir| projects?.get(dir.to_str()?));
+    Ok((servers(Some(&json)), servers(local)))
+}
+
 /// `oxideclaw config import-claude`: merge the chosen executable settings
-/// from `claude/settings.json` into `config/settings.json`. Without any
-/// option, lists what could be imported and changes nothing. Existing
+/// from `claude/settings.json` into `config/settings.json`. MCP servers also
+/// come from Claude Code's state file `claude_state` (`~/.claude.json`):
+/// user-scope ones join `config/settings.json`, and the local-scope ones of
+/// `cwd` its local MCP file, so they stay private to that project. Without
+/// any option, lists what could be imported and changes nothing. Existing
 /// OxideClaw entries win; `claude` is only read, so a config dir that is
 /// `claude` itself (an override, or a symlink to it) is refused.
 pub fn import_claude(
     claude: &Path,
+    claude_state: Option<&Path>,
+    cwd: &Path,
     config: &Path,
     opts: ImportOptions,
 ) -> anyhow::Result<Vec<String>> {
@@ -432,10 +472,32 @@ pub fn import_claude(
     let hooks = theirs.get("hooks").map(convert_hooks).unwrap_or_default();
     let permissions = theirs.get("permissions").and_then(Value::as_object);
     let helper = theirs.get("apiKeyHelper").and_then(Value::as_str);
-    let servers = theirs.get("mcpServers").and_then(Value::as_object);
+    // settings.json first: older OxideClaw versions wrote their servers there.
+    let mut servers = theirs
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut local_servers = Map::new();
+    let state = claude_state.filter(|p| p.is_file());
+    if let Some(state) = state {
+        let (user, local) = claude_code_mcp_servers(state, cwd)?;
+        for (name, cfg) in user {
+            servers.entry(name).or_insert(cfg);
+        }
+        local_servers = local;
+    }
+    let local_path = crate::settings::Settings::local_mcp_path(config, cwd);
+    let read_only = match state {
+        Some(state) => format!("{} and {} are", src.display(), state.display()),
+        None => format!("{} is", src.display()),
+    };
 
     if !opts.any() {
-        lines.push(format!("In {}:", src.display()));
+        match state {
+            Some(state) => lines.push(format!("In {} and {}:", src.display(), state.display())),
+            None => lines.push(format!("In {}:", src.display())),
+        }
         let count: usize = hooks.entries.values().map(Vec::len).sum();
         lines.push(format!("  --hooks           {count} hook(s)"));
         let rules = |k: &str| {
@@ -461,17 +523,23 @@ pub fn import_claude(
             "  --api-key-helper  {}",
             helper.map_or("none".to_string(), |h| format!("`{h}`"))
         ));
-        lines.push(format!(
-            "  --mcp             {}",
-            servers
-                .filter(|s| !s.is_empty())
-                .map_or("none".to_string(), |s| join_keys(s.keys()))
-        ));
+        let mut mcp = if servers.is_empty() {
+            "none".to_string()
+        } else {
+            join_keys(servers.keys())
+        };
+        if !local_servers.is_empty() {
+            mcp.push_str(&format!(
+                "; for {} only: {}",
+                cwd.display(),
+                join_keys(local_servers.keys())
+            ));
+        }
+        lines.push(format!("  --mcp             {mcp}"));
         lines.push(format!(
             "Each runs code or changes permissions. Pass the options you want to copy them \
-             into {}; {} is not changed.",
+             into {}; {read_only} not changed.",
             dst.display(),
-            src.display()
         ));
         lines.push(
             "`--sessions` imports the current directory's Claude Code sessions; \
@@ -641,7 +709,7 @@ pub fn import_claude(
             );
         };
         let mut added = Vec::new();
-        for (name, cfg) in servers.into_iter().flatten() {
+        for (name, cfg) in &servers {
             if !target.contains_key(name) {
                 target.insert(name.clone(), cfg.clone());
                 added.push(name);
@@ -656,12 +724,40 @@ pub fn import_claude(
             }
         ));
     }
+    // Claude Code's local scope is one project's, often with a token in
+    // `env`: it goes to that project's private file, not every project's.
+    let mut local_json = None;
+    if opts.mcp && !local_servers.is_empty() {
+        let mut json = read_json_object(&local_path)?;
+        if !json.get("mcpServers").is_some_and(Value::is_object) {
+            json["mcpServers"] = Value::Object(Map::new());
+        }
+        let target = json["mcpServers"].as_object_mut().expect("set above");
+        let mut added = Vec::new();
+        for (name, cfg) in &local_servers {
+            if !target.contains_key(name) {
+                target.insert(name.clone(), cfg.clone());
+                added.push(name);
+            }
+        }
+        lines.push(format!(
+            "mcpServers for {} only: {}",
+            cwd.display(),
+            if added.is_empty() {
+                "none added".to_string()
+            } else {
+                join_keys(added)
+            }
+        ));
+        local_json = Some(json);
+    }
     write_json_atomic(&dst, &serde_json::to_string_pretty(&ours)?)?;
-    lines.push(format!(
-        "Wrote {}; {} was not changed.",
-        dst.display(),
-        src.display()
-    ));
+    let mut wrote = dst.display().to_string();
+    if let Some(json) = local_json {
+        write_json_atomic(&local_path, &serde_json::to_string_pretty(&json)?)?;
+        wrote = format!("{wrote} and {}", local_path.display());
+    }
+    lines.push(format!("Wrote {wrote}; {read_only} not changed."));
     Ok(lines)
 }
 
@@ -1311,14 +1407,16 @@ mod tests {
             mcp: true,
         };
         let before = snapshot(&claude);
-        let err = import_claude(&claude, &claude, all).unwrap_err();
+        let err = import_claude(&claude, None, &claude, &claude, all).unwrap_err();
         assert!(err.to_string().contains("nothing to import"), "{err}");
         #[cfg(unix)]
         {
             let link = td.path().join("oxideclaw-link");
             std::os::unix::fs::symlink(&claude, &link).unwrap();
-            assert!(import_claude(&claude, &link, all).is_err());
-            assert!(import_claude(&claude, &link, ImportOptions::default()).is_err());
+            assert!(import_claude(&claude, None, &claude, &link, all).is_err());
+            assert!(
+                import_claude(&claude, None, &claude, &link, ImportOptions::default()).is_err()
+            );
         }
         assert_eq!(snapshot(&claude), before, "byte-identical");
     }
@@ -1328,7 +1426,8 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let claude = fake_claude(td.path());
         let config = td.path().join("config");
-        let lines = import_claude(&claude, &config, ImportOptions::default()).unwrap();
+        let lines =
+            import_claude(&claude, None, &claude, &config, ImportOptions::default()).unwrap();
         let text = lines.join("\n");
         assert!(
             text.contains("1 hook(s)") && text.contains("1 allow, 1 deny"),
@@ -1358,9 +1457,9 @@ mod tests {
             api_key_helper: true,
             mcp: true,
         };
-        import_claude(&claude, &config, all).unwrap();
+        import_claude(&claude, None, &claude, &config, all).unwrap();
         // Twice: nothing is duplicated.
-        let lines = import_claude(&claude, &config, all).unwrap();
+        let lines = import_claude(&claude, None, &claude, &config, all).unwrap();
         assert_eq!(snapshot(&claude), before);
         assert!(lines.iter().any(|l| l == "hooks: 0 added"), "{lines:?}");
 
@@ -1401,7 +1500,7 @@ mod tests {
             hooks: true,
             ..Default::default()
         };
-        let lines = import_claude(&claude, &config, opts).unwrap();
+        let lines = import_claude(&claude, None, &claude, &config, opts).unwrap();
         let note = lines
             .iter()
             .find(|l| l.contains("updatedInput"))
@@ -1423,7 +1522,7 @@ mod tests {
             }}"#,
         );
         let config = td.path().join("config");
-        let listing = import_claude(&claude, &config, ImportOptions::default())
+        let listing = import_claude(&claude, None, &claude, &config, ImportOptions::default())
             .unwrap()
             .join("\n");
         assert!(listing.contains("4 allow, 0 deny, 2 ask"), "{listing}");
@@ -1433,7 +1532,7 @@ mod tests {
             permissions: true,
             ..Default::default()
         };
-        let lines = import_claude(&claude, &config, opts).unwrap();
+        let lines = import_claude(&claude, None, &claude, &config, opts).unwrap();
         let s = read(&config.join("settings.json"));
         assert_eq!(
             s["permissions"]["allow"],
@@ -1613,5 +1712,78 @@ mod tests {
                 "{theirs}"
             );
         }
+    }
+
+    /// `claude mcp add` writes to `~/.claude.json`, not settings.json: user
+    /// scope at the top level, local scope under the project's directory.
+    /// The listing showed `--mcp none` and `--mcp` imported nothing.
+    #[test]
+    fn import_claude_reads_mcp_servers_from_claude_json() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join("claude");
+        let project = td.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        write(
+            &claude.join("settings.json"),
+            r#"{"mcpServers": {"github": {"command": "from-settings"}}}"#,
+        );
+        let state = td.path().join(".claude.json");
+        let body = serde_json::json!({
+            "numStartups": 3,
+            "mcpServers": {
+                "github": {"command": "from-state"},
+                "fs": {"type": "stdio", "command": "npx", "args": ["fs-mcp"]}
+            },
+            "projects": {
+                project.to_str().unwrap(): {
+                    "mcpServers": {"db": {"command": "pg-mcp", "env": {"TOKEN": "t"}}}
+                },
+                "/elsewhere": {"mcpServers": {"other": {"command": "x"}}}
+            }
+        });
+        write(&state, &body.to_string());
+        let before = std::fs::read(&state).unwrap();
+        let config = td.path().join("config");
+
+        let listing = import_claude(
+            &claude,
+            Some(&state),
+            &project,
+            &config,
+            ImportOptions::default(),
+        )
+        .unwrap()
+        .join("\n");
+        assert!(listing.contains("fs, github"), "{listing}");
+        assert!(listing.contains("only: db"), "{listing}");
+        assert!(!listing.contains("other"), "{listing}");
+        assert!(!config.exists(), "the listing changes nothing");
+
+        let opts = ImportOptions {
+            mcp: true,
+            ..Default::default()
+        };
+        let lines = import_claude(&claude, Some(&state), &project, &config, opts).unwrap();
+        let s = read(&config.join("settings.json"));
+        assert_eq!(s["mcpServers"]["github"]["command"], "from-settings");
+        assert_eq!(s["mcpServers"]["fs"]["command"], "npx");
+        assert!(s["mcpServers"].get("db").is_none(), "one project's only");
+        assert!(s["mcpServers"].get("other").is_none());
+        let local = read(&crate::settings::Settings::local_mcp_path(
+            &config, &project,
+        ));
+        assert_eq!(local["mcpServers"]["db"]["env"]["TOKEN"], "t");
+        assert_eq!(std::fs::read(&state).unwrap(), before, "never written");
+        let text = lines.join("\n");
+        assert!(text.contains(".claude.json are not changed"), "{text}");
+
+        // A missing state file is no servers, not an error.
+        let missing = td.path().join("none.json");
+        let config = td.path().join("config2");
+        import_claude(&claude, Some(&missing), &project, &config, opts).unwrap();
+        assert_eq!(
+            read(&config.join("settings.json"))["mcpServers"],
+            serde_json::json!({"github": {"command": "from-settings"}})
+        );
     }
 }
