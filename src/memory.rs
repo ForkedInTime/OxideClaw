@@ -257,15 +257,21 @@ impl MemoryStore {
         }
 
         // Generate a collision-resistant key: first 4 words + 8-char content hash.
-        let prefix = text
-            .split_whitespace()
-            .take(4)
-            .collect::<Vec<_>>()
-            .join("_")
-            .to_lowercase();
-        let hash8 = fnv32(text);
-        let raw_key = format!("{}_{:08x}", prefix, hash8);
-        let key = sanitize_key(&raw_key);
+        // The words are cut to fit the 64-char key, never the hash: cutting
+        // the whole key gave two notes opening with the same URL one key,
+        // and the second overwrote the first.
+        let prefix: String = sanitize_key(
+            &text
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("_")
+                .to_lowercase(),
+        )
+        .chars()
+        .take(55)
+        .collect();
+        let key = format!("{prefix}_{:08x}", fnv32(text));
 
         let cat = auto_categorize(text);
         self.add(&key, text, cat, source)?;

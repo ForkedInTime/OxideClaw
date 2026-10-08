@@ -289,6 +289,31 @@ fn test_add_auto_allows_distinct_entries() {
     assert_eq!(store.count().unwrap(), 2);
 }
 
+/// Notes whose first four words make a key longer than 64 chars (a URL)
+/// lost their hash suffix to the cut, so the second overwrote the first.
+#[test]
+fn test_add_auto_long_openings_keep_distinct_keys() {
+    let (_tmp, store) = make_store();
+    let opening = "We decided to use https://github.com/acme/very-long-internal-service-name";
+    store
+        .add_auto(
+            &format!("{opening} for authentication of every public request"),
+            "user",
+        )
+        .unwrap();
+    let added = store
+        .add_auto(
+            &format!("{opening} as the billing backend once invoices move off Stripe"),
+            "user",
+        )
+        .unwrap();
+    assert!(added, "distinct entry should be added");
+    assert_eq!(store.count().unwrap(), 2);
+    for m in store.list(None).unwrap() {
+        assert!(m.key.chars().count() <= 64, "{}", m.key);
+    }
+}
+
 // ── build_context ─────────────────────────────────────────────────────────────
 
 #[test]
