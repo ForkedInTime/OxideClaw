@@ -411,6 +411,7 @@ pub fn run_command(
         c.args(["/D", "/S", "/C"]).raw_arg(format!("\"{cmd}\""));
         c
     };
+    crate::tools::scrub_dotenv_keys(&mut command);
     if sandboxed {
         crate::sandbox::scrub_credentials(&mut command);
     }

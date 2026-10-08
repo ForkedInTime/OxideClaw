@@ -626,6 +626,8 @@ Auto-loaded from (in order):
 
 Only oxideclaw's own keys (provider API keys, `ANTHROPIC_MODEL`, `OLLAMA_HOST`, ...) are read; `OPENAI_BASE_URL` and `LM_STUDIO_HOST` are not, so export those in your shell. `OLLAMA_HOST` and `ANTHROPIC_MODEL` decide where your prompts are sent, so `$CWD/.env` may set them only in a folder you have `/trust`ed; otherwise they are ignored with a note.
 
+Keys loaded from a `.env` file are removed from the environment of the commands the model runs (Bash, PowerShell, language servers, the auto-fix loop's checks), sandboxed or not, so `env` or a planted `curl` cannot read your API key. Hooks, MCP servers and `!` shell commands keep them. A key you export in your shell, or set under `env` in settings.json, reaches tool commands as before.
+
 ### Where files live
 
 | Purpose | Default | Override |

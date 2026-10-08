@@ -287,6 +287,30 @@ fn has_component_ignore_case(path: &std::path::Path, name: &str) -> bool {
     })
 }
 
+/// Keys startup loaded from `.env` files into this process's environment
+/// (API keys, mostly). Children inherit the environment, sandbox wrappers
+/// included, so a model-run `env` or `curl -d "$OPENAI_API_KEY"` would see
+/// them. Keys the user exported in their own shell are not listed: their
+/// test suites may need them, and that is a choice the user made.
+static DOTENV_KEYS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Record that startup set `key` from a `.env` file.
+pub fn note_dotenv_key(key: &'static str) {
+    let mut keys = DOTENV_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+/// Unset the `.env`-loaded keys in a model-driven child (Bash, PowerShell,
+/// language servers, auto-fix checks). Call before `.envs(&ctx.env)`, so a
+/// key the user put in settings.json `env` on purpose still reaches it.
+pub fn scrub_dotenv_keys(cmd: &mut std::process::Command) {
+    for key in DOTENV_KEYS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        cmd.env_remove(key);
+    }
+}
+
 /// Returns Some(error ToolOutput) if `path` is inside a protected directory.
 /// The resolved path is checked too: a repo can commit `gl -> .git`, and a
 /// write to `gl/config` adding `core.fsmonitor` runs code on the next git

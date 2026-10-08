@@ -735,6 +735,7 @@ impl LspClient {
                 c
             }
         };
+        crate::tools::scrub_dotenv_keys(cmd.as_std_mut());
         let mut child = cmd
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())

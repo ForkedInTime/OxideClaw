@@ -502,6 +502,7 @@ impl Tool for BashTool {
 
         let fut = async move {
             let mut cmd = Command::new(&shell);
+            crate::tools::scrub_dotenv_keys(cmd.as_std_mut());
             if sandboxed {
                 crate::sandbox::scrub_credentials(cmd.as_std_mut());
             }
@@ -680,6 +681,46 @@ mod tests {
             })
             .collect();
         assert!(text.contains("v=from-settings"), "{text}");
+    }
+
+    /// API keys startup loaded from `.env` were inherited by every Bash
+    /// child, so a model-run `env` put them in the transcript.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dotenv_keys_do_not_reach_the_command() {
+        const KEY: &str = "OXIDECLAW_TEST_DOTENV_SCRUB_KEY";
+        // SAFETY: a name no other test reads or writes.
+        unsafe { std::env::set_var(KEY, "leaked") };
+        crate::tools::note_dotenv_key(KEY);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.default_shell = Some("sh".into());
+        let out = BashTool
+            .execute(
+                serde_json::json!({ "command": format!("echo \"v=${KEY}.\"") }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text: String = out
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::api::types::ToolResultContent::Text { text } => text.as_str(),
+            })
+            .collect();
+        assert!(text.contains("v=."), "{text}");
+
+        // A key the user also set in settings.json `env` is deliberate.
+        ctx.env.insert(KEY.into(), "from-settings".into());
+        let out = BashTool
+            .execute(
+                serde_json::json!({ "command": format!("echo \"v=${KEY}.\"") }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(format!("{:?}", out.content).contains("v=from-settings."));
     }
 
     /// The shell must lead its own session: as a mere background process

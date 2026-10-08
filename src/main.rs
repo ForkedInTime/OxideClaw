@@ -637,15 +637,15 @@ fn load_dotenv(path: &std::path::Path, deny: &[&'static str]) -> Vec<&'static st
             }
             // A blank value would claim the key and keep a later .env (say
             // ~/.env behind a project's `ANTHROPIC_API_KEY=`) from filling it.
-            if !key.is_empty()
+            if let Some(&key) = SAFE_ENV_KEYS.iter().find(|k| **k == key)
                 && !val.is_empty()
-                && SAFE_ENV_KEYS.contains(&key)
                 && std::env::var(key).is_err()
             {
                 // SAFETY: single-threaded at this point — called before tokio runtime starts
                 unsafe {
                     std::env::set_var(key, val);
                 }
+                tools::note_dotenv_key(key);
             }
         }
     }
@@ -663,13 +663,16 @@ fn load_dotenv_auto() {
             // CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME / HOME, none of which a .env may set.
             let deny = project_dotenv_deny(&settings::Settings::load_global(), &cwd);
             let skipped = load_dotenv(&env_path, deny);
-            // Its other variables never reach tool subprocesses; the loaded keys
-            // do, unless a sandbox strips them (`sandbox::scrub_credentials`).
+            // Its other variables never reach tool subprocesses, and the keys it
+            // loads are removed from them (`tools::scrub_dotenv_keys`); with a
+            // sandbox on, shell-exported provider keys are removed too
+            // (`sandbox::scrub_credentials`).
             eprintln!(
                 "Note: .env detected in project root. Only oxideclaw-specific keys \
                  (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.; API keys only in trusted \
-                 folders) are loaded; other project vars are not. Shell commands inherit \
-                 those keys unless /sandbox is enabled."
+                 folders) are loaded; other project vars are not. Keys loaded from .env \
+                 files are removed from tool subprocesses (Bash, PowerShell, LSP, \
+                 auto-fix checks)."
             );
             if !skipped.is_empty() {
                 eprintln!(
