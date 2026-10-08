@@ -2,9 +2,7 @@
 use crate::api::types::*;
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::commands::{CommandAction, CommandContext, dispatch};
-use crate::compact::{
-    CompactNeeded, compact_needed, compaction_window, snip_compact, summarize_compact,
-};
+use crate::compact::{CompactNeeded, compaction_window, snip_compact, summarize_compact};
 use crate::config::Config;
 use crate::hooks;
 use crate::mcp::{McpManager, mcp_dyn_tools};
@@ -458,13 +456,11 @@ use tokio::sync::{mpsc, oneshot};
 /// flags, so the child-process handoffs know to pop and re-push them.
 static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Hand the terminal to a child (sudo, $EDITOR). With the flags still pushed,
-/// kitty-protocol terminals send Ctrl+C as `ESC[99;5u`, so the child cannot
-/// be interrupted and an editor receives garbage.
 /// A signal the TUI has to answer itself. It does not die on the default
 /// action: tools and hooks run in their own sessions (setsid), so a closed
 /// terminal or `kill <pid>` never reaches them, and only the quit path's
 /// drops and cleanup stop them, adopt the turn and restore the terminal.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum StopSignal {
     /// The terminal went away (tab closed, SSH dropped).
     Hangup,
@@ -485,7 +481,9 @@ struct StopSignals {
 struct StopSignals;
 
 impl StopSignals {
-    /// None if registration failed; the default actions then still apply.
+    /// None if registration failed. A signal registered before the failure
+    /// stays caught (tokio never unregisters), so it is then ignored rather
+    /// than taking its default action.
     fn register() -> Option<Self> {
         #[cfg(unix)]
         {
@@ -518,6 +516,9 @@ impl StopSignals {
     }
 }
 
+/// Hand the terminal to a child (sudo, $EDITOR). With the flags still pushed,
+/// kitty-protocol terminals send Ctrl+C as `ESC[99;5u`, so the child cannot
+/// be interrupted and an editor receives garbage.
 fn suspend_tty() {
     release_input_modes(&mut io::stdout());
     let _ = disable_raw_mode();
@@ -914,11 +915,8 @@ async fn run_loop(
     // Session — create new or resume existing
     let mut session = match resume_id.clone() {
         Some(ref id) => {
-            match Session::resume(id).await {
+            match Session::resume_with(id, !config.no_session_persistence).await {
                 Ok((mut s, loaded_messages)) => {
-                    if config.no_session_persistence {
-                        s.keep_in_memory();
-                    }
                     // --fork-session: continue in a copy; the original is untouched.
                     if config.fork_session
                         && let Err(e) = s.fork(&loaded_messages).await
@@ -1024,6 +1022,9 @@ async fn run_loop(
     let mut stop_signals = StopSignals::register();
     // Set once the terminal is gone: nothing more can be drawn or read.
     let mut tty_gone = false;
+    // The first terminal write error: a hangup quits quietly, anything else
+    // is reported once cleanup has run.
+    let mut tty_err: Option<io::Error> = None;
 
     // Daily update notice. Runs detached; the first frame never waits on it.
     crate::update_check::spawn(&config, tx.clone());
@@ -1232,11 +1233,8 @@ async fn run_loop(
 
         // Handle pending session resume from interactive session picker
         if let Some(id) = app.pending_resume.take() {
-            match Session::resume(&id).await {
-                Ok((mut new_session, loaded_messages)) => {
-                    if config.no_session_persistence {
-                        new_session.keep_in_memory();
-                    }
+            match Session::resume_with(&id, !config.no_session_persistence).await {
+                Ok((new_session, loaded_messages)) => {
                     let display = entries_from_messages(&loaded_messages);
                     saved_count = loaded_messages.len();
                     messages = loaded_messages;
@@ -1462,17 +1460,19 @@ async fn run_loop(
                 let old_bottom = terminal.get_frame().area().bottom();
                 drop(terminal);
                 if frame_drawn
-                    && scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom).is_err()
+                    && let Err(e) = scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom)
                 {
                     tty_gone = true;
+                    tty_err.get_or_insert(e);
                 }
                 terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
                 current_vp_h = needed;
             }
         }
         if !tty_gone {
-            if terminal.draw(|f| draw(f, &mut app)).is_err() {
+            if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
                 tty_gone = true;
+                tty_err.get_or_insert(e);
             } else {
                 frame_drawn = true;
             }
@@ -1962,7 +1962,11 @@ async fn run_loop(
         // Auto-compact after API turn completes. Not while a compaction is
         // already running: its result is about to replace this history.
         if !app.is_loading && !app.compacting && last_tokens_in > 0 {
-            let level = compact_needed(last_tokens_in, app.context_window);
+            let overhead = || {
+                let defs: Vec<_> = tools.iter().map(|t| t.definition()).collect();
+                crate::compact::fixed_overhead(&system_prompt, &defs)
+            };
+            let level = crate::compact::compactable(last_tokens_in, overhead, app.context_window);
             // Thrash is a summary that does not get the next turn back under
             // the summarise line, so only such a turn ends the streak. A
             // reset on every successful compaction kept it from ever firing.
@@ -2165,7 +2169,26 @@ async fn run_loop(
             break;
         }
     }
-    Ok(())
+    match tty_err {
+        Some(e) if !is_hangup_error(&e) => {
+            tracing::warn!("terminal write failed: {e}");
+            Err(e.into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A write to a terminal that hung up fails with EIO (or ENXIO / EPIPE):
+/// that is the user leaving, not an error to report.
+fn is_hangup_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(libc::EIO) | Some(libc::ENXIO)) {
+        return true;
+    }
+    false
 }
 
 // ── Key handler ───────────────────────────────────────────────────────────────
@@ -2279,6 +2302,26 @@ mod viewport_recreate_tests {
         scroll_off_screen(&mut out, 24, 20).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert_eq!(out, format!("\x1b[24;1H{}\x1b[1;1H", "\n".repeat(20)));
+    }
+
+    /// A hung-up tty quits quietly; any other write failure is reported.
+    #[test]
+    fn only_hangup_write_errors_are_quiet() {
+        assert!(is_hangup_error(&io::Error::from(io::ErrorKind::BrokenPipe)));
+        #[cfg(unix)]
+        {
+            assert!(is_hangup_error(&io::Error::from_raw_os_error(libc::EIO)));
+            assert!(is_hangup_error(&io::Error::from_raw_os_error(libc::ENXIO)));
+            assert!(!is_hangup_error(&io::Error::from_raw_os_error(
+                libc::EAGAIN
+            )));
+        }
+        assert!(!is_hangup_error(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_hangup_error(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
     }
 }
 

@@ -145,9 +145,11 @@ fn pin_key(cwd: &Path) -> PathBuf {
 }
 
 /// Repo-local config a sandboxed command could write that would act on the
-/// host: `filter.*` drivers (run by `add -A` and `checkout-index`) and
+/// host: `filter.*` drivers (run by `add -A` and `checkout-index`), commit
+/// signing programs (`gpg.*`, `commit.gpgSign`, `tag.gpgSign`, run by `git
+/// commit`), merge drivers (`merge.<driver>.driver`, run by `git merge`) and
 /// `core.worktree`/`core.bare` (which move what is staged and restored, e.g.
-/// to `$HOME`). Read per scope rather than with `--show-scope` (git 2.26+):
+/// to `$HOME`). `--get-regexp` matches canonical, lowercased names. Read per scope rather than with `--show-scope` (git 2.26+):
 /// `--local`, `--includes` and `--worktree` work on every supported git.
 fn local_sensitive_config(cwd: &Path, git_dir: &str) -> anyhow::Result<String> {
     let read = |scope: &str| -> anyhow::Result<String> {
@@ -157,7 +159,7 @@ fn local_sensitive_config(cwd: &Path, git_dir: &str) -> anyhow::Result<String> {
                 scope,
                 "--includes",
                 "--get-regexp",
-                r"^(filter\.|core\.worktree$|core\.bare$)",
+                r"^(filter\.|merge\..*\.driver$|gpg\.|commit\.gpgsign$|tag\.gpgsign$|core\.worktree$|core\.bare$)",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -194,7 +196,8 @@ fn repo_state(cwd: &Path) -> anyhow::Result<RepoPin> {
 
 /// Record the repository at `cwd` as trusted: call at startup, before any
 /// (possibly sandboxed) tool runs. Snapshots and /undo then refuse to run if
-/// its git dir, work tree or filter/work-tree config differ from this.
+/// its git dir, work tree or command-running config (filter.*, gpg, merge
+/// drivers, core.worktree) differ from this.
 /// Filters are not simply disabled: that would store LFS/git-crypt files raw
 /// and /undo would write pointers or ciphertext over them.
 pub fn pin_filters(cwd: &Path) -> anyhow::Result<()> {
@@ -226,35 +229,46 @@ pub fn check_filters_unchanged(cwd: &Path) -> anyhow::Result<RepoPin> {
     };
     if *pinned != now {
         anyhow::bail!(
-            "the repository's git filter/core.worktree configuration (or its git \
-             directory) changed during this session, so OxideClaw will not run it (it \
-             could have been written from inside the sandbox). Review .git and the \
-             filter.* and core.worktree entries in .git/config, then restart OxideClaw \
-             to resume auto-commit and /undo."
+            "the repository's git filter, signing, merge driver or core.worktree \
+             configuration (or its git directory) changed during this session, so \
+             OxideClaw will not run it (it could have been written from inside the \
+             sandbox). Review .git and the filter.*, gpg.*, commit.gpgSign, \
+             merge.*.driver and core.worktree entries in .git/config, then \
+             restart OxideClaw to resume auto-commit and /undo."
         );
     }
     Ok(now)
 }
 
-/// Gate for host git commands outside snapshots that check out or stage
-/// files (worktree add/remove, /checkpoint, /spawn): those run `filter.*`
-/// drivers too. A repo with no repo-local filter or `core.worktree` config
-/// (`git init` writes only `core.bare false`) has nothing to run and needs no
-/// pin, so headless runs work in it. Otherwise `cwd`'s must match what
+/// Gate for host git commands outside snapshots that check out, stage,
+/// commit or merge files (worktree add/remove, /checkpoint, /spawn): those
+/// run `filter.*` drivers, signing programs (`gpg.*` with `commit.gpgSign`)
+/// and merge drivers (diffs pass `--no-ext-diff --no-textconv`). A repo with
+/// none of that config and no `core.worktree` (`git init` writes only
+/// `core.bare false`) has nothing to run and needs no pin, so headless runs
+/// work in it. Otherwise `cwd`'s must match what
 /// [`pin_filters`] recorded for `trusted`, the session directory, and that pin
 /// must still hold. `cwd` may be a linked worktree of `trusted`: it shares the
 /// repo config but can carry its own `config.worktree`.
 pub fn check_no_untrusted_filters(cwd: &Path, trusted: &Path) -> anyhow::Result<()> {
     let config = repo_state(cwd)?.config;
-    if config.lines().all(|l| l == "core.bare false") {
+    // Values that run nothing: what `git init` writes, and signing turned off.
+    let inert = |l: &str| {
+        matches!(
+            l,
+            "core.bare false" | "commit.gpgsign false" | "tag.gpgsign false"
+        )
+    };
+    if config.lines().all(inert) {
         return Ok(());
     }
     let pin = check_filters_unchanged(trusted)?;
     if pin.config != config {
         anyhow::bail!(
-            "{} has git filter/core.worktree configuration that OxideClaw did not \
-             see when it started, so it will not run it (it could have been written \
-             from inside the sandbox). Review the filter.* and core.worktree entries \
+            "{} has git filter, signing, merge driver or core.worktree \
+             configuration that OxideClaw did not see when it started, so it will not \
+             run it (it could have been written from inside the sandbox). Review the \
+             filter.*, gpg.*, commit.gpgSign, merge.*.driver and core.worktree entries \
              in its git config.",
             cwd.display()
         );
@@ -759,17 +773,18 @@ fn recorded_paths(cwd: &Path, auto_commits: &[String], paths: Vec<String>) -> Ve
         .rev()
         .map(|c| format!("{c}^{{tree}}"))
         .collect();
-    if let Some(first) = auto_commits.first() {
-        revs.push(format!("{first}^^{{tree}}")); // absent for a root first commit
-    }
+    // Absent for a root first commit, so its failure is expected.
+    let base = auto_commits
+        .first()
+        .map(|first| format!("{first}^^{{tree}}"));
+    revs.extend(base.clone());
     for rev in &revs {
         if unseen.is_empty() {
             break;
         }
         let wanted: Vec<&str> = unseen.iter().copied().collect();
         let mut found = Vec::new();
-        // Chunked to stay well under the argument-length limit.
-        for chunk in wanted.chunks(500) {
+        for chunk in argv_chunks(&wanted) {
             let out = git_cmd(cwd)
                 // The names are file names, not patterns.
                 .env("GIT_LITERAL_PATHSPECS", "1")
@@ -782,14 +797,17 @@ fn recorded_paths(cwd: &Path, auto_commits: &[String], paths: Vec<String>) -> Ve
                     rev,
                     "--",
                 ])
-                .args(chunk)
+                .args(&chunk)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .output();
-            if let Ok(o) = out
-                && o.status.success()
-            {
-                found.extend(nul_paths(&o.stdout));
+            match out {
+                Ok(o) if o.status.success() => found.extend(nul_paths(&o.stdout)),
+                _ if base.as_ref() == Some(rev) => {}
+                _ => tracing::warn!(
+                    "git ls-tree {rev} failed for {} paths; they will not be removed",
+                    chunk.len()
+                ),
             }
         }
         for p in &found {
@@ -799,6 +817,31 @@ fn recorded_paths(cwd: &Path, auto_commits: &[String], paths: Vec<String>) -> Ve
     let unseen: std::collections::HashSet<String> =
         unseen.into_iter().map(str::to_string).collect();
     paths.into_iter().filter(|p| !unseen.contains(p)).collect()
+}
+
+/// `paths` split for git's argv: at most 500 per call and about 16 KiB of
+/// names, to stay under Windows' 32K-character command line (CreateProcess
+/// fails past it). A longer single path gets a chunk of its own.
+fn argv_chunks<'a>(paths: &[&'a str]) -> Vec<Vec<&'a str>> {
+    const MAX_BYTES: usize = 16 * 1024;
+    const MAX_PATHS: usize = 500;
+    let mut chunks: Vec<Vec<&str>> = Vec::new();
+    let mut bytes = 0;
+    for &p in paths {
+        // A separator and possible quotes.
+        let cost = p.len() + 3;
+        match chunks.last_mut() {
+            Some(c) if c.len() < MAX_PATHS && bytes + cost <= MAX_BYTES => {
+                c.push(p);
+                bytes += cost;
+            }
+            _ => {
+                chunks.push(vec![p]);
+                bytes = cost;
+            }
+        }
+    }
+    chunks
 }
 
 /// The tree the chain holds at `position`: 0 is the session base (the
@@ -1085,10 +1128,14 @@ fn restore(
         // Drop directories the turn created; remove_dir refuses non-empty
         // ones. Never the session's cwd or a parent of it, empty or not:
         // gone, every later git call failed and file undo stopped working.
+        // Each side canonicalized: on Windows `canonicalize` gives a
+        // `\\?\C:\` prefix that git's `C:/` toplevel never starts with.
         let mut dir = path.parent();
-        while let Some(d) =
-            dir.filter(|d| *d != toplevel && d.starts_with(&toplevel) && !cwd_real.starts_with(d))
-        {
+        while let Some(d) = dir.filter(|d| {
+            *d != toplevel
+                && d.starts_with(&toplevel)
+                && std::fs::canonicalize(d).map_or(true, |dr| !cwd_real.starts_with(&dr))
+        }) {
             if std::fs::remove_dir(d).is_err() {
                 break;
             }
@@ -2660,6 +2707,62 @@ mod sandbox_escape_tests {
         );
         assert!(restore_to(td.path(), "test", &commits, 0).is_err());
         assert!(!marker.exists(), "a planted filter ran on the host");
+    }
+
+    /// 500 paths of ~100 chars made one git argv past Windows' 32K limit:
+    /// the call failed and the paths counted as never recorded.
+    #[test]
+    fn ls_tree_chunks_stay_under_the_windows_command_line() {
+        let long: Vec<String> = (0..1200)
+            .map(|i| format!("{}/{i}", "d".repeat(100)))
+            .collect();
+        let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+        let chunks = argv_chunks(&refs);
+        assert_eq!(chunks.concat(), refs);
+        for c in &chunks {
+            assert!(c.iter().map(|p| p.len() + 3).sum::<usize>() <= 16 * 1024);
+        }
+        let short: Vec<String> = (0..1200).map(|i| i.to_string()).collect();
+        let refs: Vec<&str> = short.iter().map(String::as_str).collect();
+        assert!(argv_chunks(&refs).iter().all(|c| c.len() <= 500));
+        let huge = "x".repeat(20_000);
+        assert_eq!(
+            argv_chunks(&[&huge, "a"]),
+            vec![vec![huge.as_str()], vec!["a"]]
+        );
+        assert!(argv_chunks(&[]).is_empty());
+    }
+
+    /// /checkpoint and spawn's commit and merge run signing programs and
+    /// merge drivers; the gate looked only at filters and core.worktree.
+    #[test]
+    fn signing_programs_and_merge_drivers_added_mid_session_are_refused() {
+        for (key, value) in [
+            ("commit.gpgSign", "true"),
+            ("gpg.program", "./evil.sh"),
+            ("gpg.ssh.program", "./evil.sh"),
+            ("tag.gpgSign", "true"),
+            ("merge.evil.driver", "./evil.sh %O %A %B"),
+        ] {
+            let td = init_test_repo();
+            pin_filters(td.path()).unwrap();
+            check_no_untrusted_filters(td.path(), td.path()).unwrap();
+            // Signing turned off runs nothing, pinned or not.
+            git_config(td.path(), "commit.gpgSign", "false");
+            check_no_untrusted_filters(td.path(), Path::new("/not-pinned")).unwrap();
+            git_config(td.path(), key, value);
+            let err = check_no_untrusted_filters(td.path(), td.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("changed during this session"),
+                "{key}: {err}"
+            );
+        }
+
+        // Signing set up before the session keeps working.
+        let td = init_test_repo();
+        git_config(td.path(), "commit.gpgSign", "true");
+        pin_filters(td.path()).unwrap();
+        check_no_untrusted_filters(td.path(), td.path()).unwrap();
     }
 
     /// `mv .git evil; echo 'gitdir: evil' > .git` gave a git dir never seen

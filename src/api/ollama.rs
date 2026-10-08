@@ -44,27 +44,59 @@ pub fn strip_ollama_prefix(model: &str) -> &str {
 /// nor the model's Modelfile sets one.
 const OLLAMA_DEFAULT_NUM_CTX: u64 = 4096;
 
-/// The context each Ollama model (bare name) is served with, once a reply
-/// from it has been seen; `None` when the server would not say. The
-/// OpenAI-compatible endpoint cannot set `num_ctx`, so the server's choice
-/// is the window: a longer prompt loses its oldest messages, silently.
-fn served_windows() -> &'static Mutex<HashMap<String, Option<u64>>> {
-    static W: OnceLock<Mutex<HashMap<String, Option<u64>>>> = OnceLock::new();
+/// How long a served window is trusted before it is asked for again: a
+/// restarted Ollama may serve the model with a smaller context.
+const SERVED_WINDOW_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A window an Ollama host reported, and when.
+#[derive(Clone, Copy)]
+struct ServedWindow {
+    window: u64,
+    at: std::time::Instant,
+}
+
+/// The context each Ollama model is served with, keyed by host and bare
+/// model name, once a reply from it has been seen. The OpenAI-compatible
+/// endpoint cannot set `num_ctx`, so the server's choice is the window: a
+/// longer prompt loses its oldest messages, silently. A lookup that failed
+/// is not stored, so the next request asks again.
+fn served_windows() -> &'static Mutex<HashMap<(String, String), ServedWindow>> {
+    static W: OnceLock<Mutex<HashMap<(String, String), ServedWindow>>> = OnceLock::new();
     W.get_or_init(Default::default)
 }
 
 /// The context window Ollama serves `model` (with or without `ollama:`)
-/// with, when known.
+/// with, when known: the host that reported it most recently wins.
 pub fn served_context_window(model: &str) -> Option<u64> {
+    let model = strip_ollama_prefix(model);
     let w = served_windows().lock().unwrap_or_else(|e| e.into_inner());
-    w.get(strip_ollama_prefix(model)).copied().flatten()
+    w.iter()
+        .filter(|((_, m), _)| m == model)
+        .max_by_key(|(_, e)| e.at)
+        .map(|(_, e)| e.window)
 }
 
-fn record_served_window(model: &str, window: Option<u64>) {
+pub(crate) fn record_served_window(base_url: &str, model: &str, window: u64) {
     served_windows()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(strip_ollama_prefix(model).to_string(), window);
+        .insert(
+            (base_url.to_string(), strip_ollama_prefix(model).to_string()),
+            ServedWindow {
+                window,
+                at: std::time::Instant::now(),
+            },
+        );
+}
+
+/// Whether `base_url`'s window for `model` has to be asked for (again):
+/// never asked, asked too long ago, or a reply's prompt was larger than it.
+/// Ollama truncates prompts to the window, so a larger count proves the
+/// window grew (OLLAMA_CONTEXT_LENGTH raised and the server restarted).
+fn served_window_stale(base_url: &str, model: &str, prompt_tokens: u64) -> bool {
+    let w = served_windows().lock().unwrap_or_else(|e| e.into_inner());
+    w.get(&(base_url.to_string(), strip_ollama_prefix(model).to_string()))
+        .is_none_or(|e| prompt_tokens > e.window || e.at.elapsed() >= SERVED_WINDOW_TTL)
 }
 
 /// Whether Ollama's `name` (always tagged, `qwen3:latest`) is `model`.
@@ -542,7 +574,12 @@ impl OllamaClient {
 
         // Ollama keeps the newest messages that fit and drops the rest
         // without an error, so the user hears it from here or not at all.
-        if let Some(window) = served_context_window(&model) {
+        let served = served_windows()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(self.base_url.clone(), model.clone()))
+            .map(|e| e.window);
+        if let Some(window) = served {
             let tools: usize = request
                 .tools
                 .iter()
@@ -639,13 +676,10 @@ impl OllamaClient {
         // Asked once the model is loaded, so `/api/ps` reports the context
         // its runner was started with. Compaction and the context meter
         // measure against it from the next request on.
-        let known = served_windows()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&model);
-        if !known {
-            let window = ask_served_window(&self.client, &self.base_url, &model).await;
-            record_served_window(&model, window);
+        if served_window_stale(&self.base_url, &model, result.usage.input_tokens)
+            && let Some(window) = ask_served_window(&self.client, &self.base_url, &model).await
+        {
+            record_served_window(&self.base_url, &model, window);
         }
         Ok(result)
     }
@@ -1152,6 +1186,16 @@ mod served_window_tests {
     /// An Ollama whose chat answers "hi", and whose `/api/ps` and
     /// `/api/show` answer with `ps` and `show` (`None`: 404).
     async fn ollama(ps: Option<serde_json::Value>, show: Option<serde_json::Value>) -> String {
+        ollama_with(Arc::new(Mutex::new(ps)), show, 10).await
+    }
+
+    /// Like `ollama`, with an `/api/ps` answer the test can change and the
+    /// prompt size every chat reply reports.
+    async fn ollama_with(
+        ps: Arc<Mutex<Option<serde_json::Value>>>,
+        show: Option<serde_json::Value>,
+        prompt_tokens: u64,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1161,14 +1205,15 @@ mod served_window_tests {
                 let (ctype, body) = if line.contains("/chat/completions") {
                     let chunk = serde_json::json!({
                         "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1}
                     });
                     (
                         "text/event-stream",
                         Some(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
                     )
                 } else if line.starts_with("GET /api/ps") {
-                    ("application/json", ps.as_ref().map(|v| v.to_string()))
+                    let ps = ps.lock().unwrap().clone();
+                    ("application/json", ps.map(|v| v.to_string()))
                 } else if line.starts_with("POST /api/show") {
                     ("application/json", show.as_ref().map(|v| v.to_string()))
                 } else {
@@ -1267,9 +1312,14 @@ mod served_window_tests {
         chat(&url, "ollama:wnd-param", "hi").await;
         assert_eq!(served_context_window("ollama:wnd-param"), Some(16384));
 
+        // num_ctx above the trained length, so the test environment's
+        // OLLAMA_CONTEXT_LENGTH is never consulted.
         let url = ollama(
             None,
-            Some(serde_json::json!({"model_info": {"llama.context_length": 2048}})),
+            Some(serde_json::json!({
+                "parameters": "num_ctx 4096",
+                "model_info": {"llama.context_length": 2048}
+            })),
         )
         .await;
         chat(&url, "ollama:wnd-trained", "hi").await;
@@ -1283,5 +1333,57 @@ mod served_window_tests {
             crate::api::context_window_for_model("ollama:wnd-llama-none"),
             128_000
         );
+    }
+
+    fn ps(model: &str, window: u64) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"models": [{"name": model, "context_length": window}]}))
+    }
+
+    /// The window was cached once per model name for the life of the
+    /// process: a failed lookup stuck as "unknown", and a window the user
+    /// raised (as the notice tells them to) was never seen.
+    #[tokio::test]
+    async fn the_served_window_is_asked_again_when_it_is_missing_or_outgrown() {
+        let model = "ollama:wnd-refresh";
+        let answer = Arc::new(Mutex::new(None));
+        let url = ollama_with(answer.clone(), None, 3000).await;
+        let c = chat(&url, model, "hi").await;
+        assert_eq!(served_context_window(model), None);
+
+        // The failure was not cached: the next reply asks again.
+        *answer.lock().unwrap() = ps("wnd-refresh:latest", 2048);
+        c.messages_stream(request(model, "hi"), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(served_context_window(model), Some(2048));
+
+        // A 3000-token prompt cannot fit 2048: the window grew.
+        *answer.lock().unwrap() = ps("wnd-refresh:latest", 32768);
+        c.messages_stream(request(model, "hi"), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(served_context_window(model), Some(32768));
+
+        // Within the window and fresh: not asked again.
+        *answer.lock().unwrap() = ps("wnd-refresh:latest", 4096);
+        c.messages_stream(request(model, "hi"), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(served_context_window(model), Some(32768));
+    }
+
+    /// The same model name on another host has its own window.
+    #[tokio::test]
+    async fn each_host_keeps_its_own_window() {
+        let model = "ollama:wnd-hosts";
+        let a = ollama(ps("wnd-hosts:latest", 8192), None).await;
+        let b = ollama(ps("wnd-hosts:latest", 4096), None).await;
+        chat(&a, model, "hi").await;
+        assert_eq!(served_context_window(model), Some(8192));
+        chat(&b, model, "hi").await;
+        assert_eq!(served_context_window(model), Some(4096));
+        let w = served_windows().lock().unwrap();
+        assert_eq!(w[&(a, "wnd-hosts".to_string())].window, 8192);
+        assert_eq!(w[&(b, "wnd-hosts".to_string())].window, 4096);
     }
 }

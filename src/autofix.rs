@@ -101,9 +101,24 @@ impl Containment {
     /// `cmd` as the shell should run it: wrapped by the active sandbox, or
     /// unchanged without one. `Err` when the sandbox refuses it (a strict
     /// pattern, a missing backend, an unknown mode): never run it bare then.
-    pub fn wrap(&self, cmd: &str, cwd: &Path) -> Result<String, String> {
+    /// Keep the guard until the command has exited (see `apply_sandbox`).
+    pub fn wrap(
+        &self,
+        cmd: &str,
+        cwd: &Path,
+    ) -> Result<(String, crate::sandbox::Placeholders), String> {
         match &self.sandbox_mode {
             Some(mode) => crate::sandbox::apply_sandbox(cmd, mode, cwd, self.sandbox_allow_network),
+            None => Ok((cmd.to_string(), Default::default())),
+        }
+    }
+
+    /// `wrap` for a process that lives for the session (a language server).
+    pub fn wrap_long_lived(&self, cmd: &str, cwd: &Path) -> Result<String, String> {
+        match &self.sandbox_mode {
+            Some(mode) => {
+                crate::sandbox::apply_sandbox_long_lived(cmd, mode, cwd, self.sandbox_allow_network)
+            }
             None => Ok(cmd.to_string()),
         }
     }
@@ -249,7 +264,7 @@ fn runnable_detected(
         #[cfg(windows)]
         let resolved = format!("\"{resolved}\"");
         let probe = format!("{resolved} clippy --version");
-        let wrapped = containment.wrap(&probe, cwd).ok()?;
+        let (wrapped, _held) = containment.wrap(&probe, cwd).ok()?;
         if !matches!(
             run_command(
                 cwd,
@@ -896,9 +911,14 @@ pub fn run_auto_fix_check(
     }
 
     // The feedback names the plain commands; the shell gets the wrapped ones.
+    // The placeholder guards live until the checks are done.
     let wrap = |cmd: &Option<String>| cmd.as_deref().map(|c| containment.wrap(c, cwd)).transpose();
-    let (lint_run, test_run) = match (wrap(&lint_cmd), wrap(&test_cmd)) {
-        (Ok(lint), Ok(test)) => (lint, test),
+    let (lint_run, test_run, _held) = match (wrap(&lint_cmd), wrap(&test_cmd)) {
+        (Ok(lint), Ok(test)) => {
+            let (lint, lint_held) = lint.unzip();
+            let (test, test_held) = test.unzip();
+            (lint, test, (lint_held, test_held))
+        }
         (Err(reason), _) | (_, Err(reason)) => {
             return AutoFixAction::Continue {
                 status: Some(format!("[auto-fix] skipped: {reason}")),
@@ -1309,8 +1329,12 @@ impl LspDiagnostics {
             }
         }
         if !pre.is_empty() {
+            // Half the time at most: a cold-starting server, or one that
+            // publishes only on change, says nothing about the old text, and
+            // the edited text still needs its turn.
+            let pre_deadline = deadline.min(tokio::time::Instant::now() + config.timeout / 2);
             let published = client
-                .wait_for_diagnostics(&pre, config.settle, deadline, cancel)
+                .wait_for_diagnostics(&pre, config.settle, pre_deadline, cancel)
                 .await;
             for ((i, text), r) in pre_files.into_iter().zip(published) {
                 if let Some(r) = r {
@@ -1325,6 +1349,9 @@ impl LspDiagnostics {
             return ServerReport::default();
         }
 
+        // The writes get their own cap: a shared deadline that the waits
+        // above used up does not make a live server a hung one.
+        let write_cap = tokio::time::Instant::now() + config.timeout;
         let mut synced = Vec::new();
         let mut files = Vec::new();
         for (file, baseline) in group.files.iter().zip(baselines) {
@@ -1332,7 +1359,7 @@ impl LspDiagnostics {
                 return ServerReport::default();
             }
             let sync = client.sync_document(&file.0);
-            match send(&client, deadline, config.timeout, sync).await {
+            match send(&client, write_cap, config.timeout, sync).await {
                 Ok(Some(s)) => {
                     synced.push(s);
                     files.push((&file.0, baseline));
@@ -2702,7 +2729,11 @@ mod tests {
     fn namespace_sandboxes_wrap_the_check_command() {
         let cwd = std::path::Path::new("/work/proj");
         let no_sandbox = trusted();
-        assert_eq!(no_sandbox.wrap("make test", cwd).unwrap(), "make test");
+        assert_eq!(no_sandbox.wrap("make test", cwd).unwrap().0, "make test");
+        assert_eq!(
+            no_sandbox.wrap_long_lived("make test", cwd).unwrap(),
+            "make test"
+        );
         for (mode, binary, no_net) in [
             ("bwrap", "bwrap ", "--unshare-net"),
             ("firejail", "firejail ", "--net=none"),
@@ -2712,7 +2743,7 @@ mod tests {
                 sandbox_mode: Some(mode.to_string()),
                 sandbox_allow_network: false,
             };
-            match c.wrap("make test", cwd) {
+            match c.wrap("make test", cwd).map(|(cmd, _)| cmd) {
                 Ok(cmd) => {
                     assert!(cmd.starts_with(binary), "{cmd}");
                     assert!(cmd.contains(no_net), "{cmd}");
@@ -2720,6 +2751,7 @@ mod tests {
                     assert_eq!(
                         Ok(cmd),
                         crate::sandbox::apply_sandbox("make test", mode, cwd, false)
+                            .map(|(cmd, _)| cmd)
                     );
                 }
                 Err(e) => assert!(e.contains(&format!("{mode} not found")), "{e}"),
@@ -3460,6 +3492,30 @@ y = 2
         let log = f.log();
         assert_eq!(log.matches("didOpen").count(), 1, "{log}");
         assert_eq!(log.matches("didChange").count(), 1, "{log}");
+    }
+
+    /// The first check of a session sends the pre-edit text and waited for
+    /// it until the shared deadline; the edited file's write then had no
+    /// time left, and a merely silent server was killed for the session.
+    #[test]
+    fn a_silent_server_is_kept_after_the_pre_edit_wait() {
+        let f = fixture("silent");
+        let file = f.file("app.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        let b = f.baseline(&file);
+        assert!(b.content.is_some() && b.diagnostics.is_none(), "{b:?}");
+        std::fs::write(&file, "x = ERR\n").unwrap();
+        let mut cfg = config();
+        cfg.lsp.timeout = Duration::from_secs(1);
+        let action = f.check(vec![(file.clone(), Some(b))], &cfg, &trusted());
+        let AutoFixAction::Continue {
+            status: Some(status),
+        } = &action
+        else {
+            panic!("expected a note: {action:?}");
+        };
+        assert!(!status.contains("off for this session"), "{status}");
+        assert!(status.contains("reported nothing"), "{status}");
     }
 
     /// A server that stops reading its input cannot hold the turn past the

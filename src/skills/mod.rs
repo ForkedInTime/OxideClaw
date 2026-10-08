@@ -1131,7 +1131,7 @@ mod tests {
         let cfg = dir.path().join("cfg");
         let none = ReadDeny::default();
 
-        let loaded = load_skills_at(&sub, &cfg, None, &none).await;
+        let loaded = load_skills_at(&sub, &cfg, Some(dir.path()), &none).await;
         assert_eq!(loaded.skills["release"].description, "root release");
         assert_eq!(loaded.skills["shared"].description, "nearest");
         assert!(!loaded.skills.contains_key("outside"));
@@ -1143,7 +1143,9 @@ mod tests {
             &skill_md("up", "u", "b"),
         );
         std::fs::create_dir_all(&plain).unwrap();
-        let loaded = load_skills_at(&plain, &cfg, None, &none).await;
+        // Bounded at the tempdir: a TMPDIR inside a git checkout must not
+        // turn `plain` into part of that repo.
+        let loaded = load_skills_at(&plain, &cfg, Some(dir.path()), &none).await;
         assert!(!loaded.skills.contains_key("up"));
         assert!(!loaded.skills.contains_key("outside"));
     }

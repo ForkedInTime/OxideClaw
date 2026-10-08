@@ -1011,6 +1011,10 @@ pub(super) async fn user_prompt_gate(
             let task = tokio::spawn(async move {
                 hooks::run_user_prompt_hooks(&hooks, &text, &sid, &cwd).await
             });
+            // A replaced run must not finish detached and see the prompt twice.
+            if let Some(old) = app.prompt_hooks.take() {
+                old.task.abort();
+            }
             app.prompt_hooks = Some(crate::tui::app::PendingPromptHooks {
                 task,
                 hook_text: hook_text.to_string(),
@@ -1774,6 +1778,8 @@ mod prompt_hook_tests {
     /// Enter awaited the hooks inside the key handler, so a slow hook froze
     /// the screen and Esc for up to a minute per hook. Esc now cancels them,
     /// including what the hook started in the background.
+    /// Unix only: Windows has no process-group kill for hooks.
+    #[cfg(unix)]
     #[tokio::test]
     async fn slow_prompt_hook_leaves_the_ui_running_and_esc_kills_it() {
         let dir = tempfile::tempdir().unwrap();

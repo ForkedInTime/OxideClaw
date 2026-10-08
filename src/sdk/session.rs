@@ -555,6 +555,11 @@ impl SdkSession {
                         let (i, o) = self.auto_summarise().await;
                         turn_input_tokens += i;
                         turn_output_tokens += o;
+                        // A later failed request must not cut the summarised
+                        // (shorter) history mid-round. Clamped, not reset: a
+                        // summary that failed leaves the history as it was,
+                        // and the rejected prompt must still go.
+                        base = base.min(self.messages.len());
                         continue;
                     }
                     // ACP runs every prompt on this session. Keeping a turn
@@ -657,7 +662,12 @@ impl SdkSession {
             });
             let mut summarise_after_tools = false;
             if self.config.auto_compact_enabled {
-                match crate::compact::compact_needed(context_tok, window) {
+                let overhead = || {
+                    let defs: Vec<ToolDefinition> =
+                        self.tools.iter().map(|t| t.definition()).collect();
+                    crate::compact::fixed_overhead(&self.system_prompt, &defs)
+                };
+                match crate::compact::compactable(context_tok, overhead, window) {
                     crate::compact::CompactNeeded::Snip => {
                         if crate::compact::snip_compact(&mut self.messages, &self.config.model) {
                             self.history_rewritten = true;

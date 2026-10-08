@@ -206,13 +206,19 @@ pub(crate) const GIT_NO_REPO_CODE: [&str; 4] = [
 ///     default `dev.tty.legacy_tiocsti=0`, but that is a host setting we do not
 ///     control, so bwrap's own guard is the right place to rely on.
 ///   - Uses --die-with-parent so cleanup is automatic
-pub fn bwrap_wrap(command: &str, cwd: &std::path::Path, allow_network: bool) -> String {
-    bwrap_wrap_with_home(
+pub fn bwrap_wrap(
+    command: &str,
+    cwd: &std::path::Path,
+    allow_network: bool,
+    placeholders: bool,
+) -> (String, Placeholders) {
+    bwrap_line(
         command,
         cwd,
         allow_network,
         dirs::home_dir().as_deref(),
         &|name| std::env::var_os(name),
+        placeholders,
     )
 }
 
@@ -259,6 +265,7 @@ fn toolchain_dirs(
     dirs
 }
 
+#[cfg(test)]
 fn bwrap_wrap_with_home(
     command: &str,
     cwd: &std::path::Path,
@@ -266,6 +273,17 @@ fn bwrap_wrap_with_home(
     home: Option<&std::path::Path>,
     var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> String {
+    bwrap_line(command, cwd, allow_network, home, var, true).0
+}
+
+fn bwrap_line(
+    command: &str,
+    cwd: &std::path::Path,
+    allow_network: bool,
+    home: Option<&std::path::Path>,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    placeholders: bool,
+) -> (String, Placeholders) {
     let cwd_quoted = shell_quote(&cwd.display().to_string());
     let net_flag = if allow_network { "" } else { "--unshare-net " };
     let home_binds: String = toolchain_dirs(home, var)
@@ -276,7 +294,8 @@ fn bwrap_wrap_with_home(
         })
         .collect();
 
-    format!(
+    let (host_run_binds, placeholders) = host_run_binds(cwd, placeholders);
+    let line = format!(
         "bwrap \
          --ro-bind /usr /usr \
          --ro-bind /lib /lib \
@@ -310,10 +329,11 @@ fn bwrap_wrap_with_home(
         shell = sandbox_shell(),
         cwd = cwd_quoted,
         home_binds = home_binds,
-        host_run_binds = host_run_binds(cwd),
+        host_run_binds = host_run_binds,
         net_flag = net_flag,
         shell_quoted = shell_quote(command),
-    )
+    );
+    (line, placeholders)
 }
 
 /// Read-only binds, after the project's read-write one, over the files in
@@ -322,25 +342,129 @@ fn bwrap_wrap_with_home(
 /// cannot plant a hook or fsmonitor that the user's next `git commit` runs
 /// unsandboxed. `.git` itself is bound first: a mount point cannot be
 /// renamed or replaced, so the protected files cannot be swapped out from
-/// above. A symlink is skipped: bwrap would mount over its target.
-fn host_run_binds(cwd: &std::path::Path) -> String {
-    let real = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_symlink());
+/// above. A `.git` gitfile (a linked worktree, a submodule) is bound
+/// read-only, or the command could point it at a git dir of its own. A
+/// symlink is skipped: bwrap would mount over its target.
+///
+/// With `placeholders`, a protected path that does not exist yet gets
+/// /dev/null mounted read-only over it, so the command can create neither
+/// a file nor a directory there (`.claude/settings.json` hooks, a `.mcp.json`
+/// server, `.git/modules/x/hooks`); so does `cwd/.git` when cwd is inside a
+/// repo without being its root, where a new `.git` would shadow the real
+/// one. bwrap creates the empty mount points on the host; the returned
+/// guard removes them once the command is done. Long-lived processes (the
+/// language servers) go without: the placeholders would block OxideClaw's
+/// own `.claude` and git for the rest of the session.
+fn host_run_binds(cwd: &std::path::Path, placeholders: bool) -> (String, Placeholders) {
+    use std::path::Path;
+    let real = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_symlink());
+    let missing = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let mut out = String::new();
+    let mut guard = Placeholders::default();
+    let mut placeholder = |p: &Path, out: &mut String| {
+        let q = shell_quote(&p.display().to_string());
+        out.push_str(&format!("--ro-bind /dev/null {q} "));
+        guard.hold(p);
+    };
+    // Another command's placeholder: held again, or (without placeholders)
+    // left alone like the missing path it stands for, so a long-lived
+    // process's line does not depend on what else is running.
     let git = cwd.join(".git");
-    if real(&git) && git.is_dir() {
+    if Placeholders::ours(&git) {
+        if placeholders {
+            placeholder(&git, &mut out);
+        }
+    } else if real(&git) {
         let q = shell_quote(&git.display().to_string());
-        out.push_str(&format!("--bind {q} {q} "));
+        if git.is_dir() {
+            out.push_str(&format!("--bind {q} {q} "));
+        } else if git.is_file() {
+            out.push_str(&format!("--ro-bind {q} {q} "));
+        }
+    } else if placeholders
+        && missing(&git)
+        && cwd.ancestors().skip(1).any(|d| d.join(".git").exists())
+    {
+        placeholder(&git, &mut out);
     }
     for rel in crate::permissions::autonomy::HOST_RUN_PATHS {
         let p = cwd.join(rel);
-        // A parent symlink (`.git/hooks` under a linked `.git`) as well.
-        let parent_real = p.parent().is_none_or(|d| d == cwd || real(d));
-        if real(&p) && parent_real {
+        // A parent symlink (`.git/hooks` under a linked `.git`) as well, and
+        // a parent that is a file (a gitfile `.git`): nothing is under it.
+        let parent_dir = p
+            .parent()
+            .is_none_or(|d| d == cwd || (real(d) && d.is_dir()));
+        if !parent_dir {
+            continue;
+        }
+        if Placeholders::ours(&p) {
+            if placeholders {
+                placeholder(&p, &mut out);
+            }
+        } else if placeholders && missing(&p) {
+            placeholder(&p, &mut out);
+        } else if real(&p) {
             let q = shell_quote(&p.display().to_string());
             out.push_str(&format!("--ro-bind-try {q} {q} "));
         }
     }
-    out
+    (out, guard)
+}
+
+/// The empty files bwrap creates on the host as mount points for
+/// `host_run_binds`' placeholders. Counted across concurrent commands: the
+/// last one done removes a placeholder that is still an empty regular file.
+#[derive(Debug, Default)]
+pub struct Placeholders(Vec<std::path::PathBuf>);
+
+impl Placeholders {
+    fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>
+    {
+        static R: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+        > = std::sync::OnceLock::new();
+        R.get_or_init(Default::default)
+    }
+
+    /// Whether `p` is a placeholder a running command still holds.
+    fn ours(p: &std::path::Path) -> bool {
+        Self::registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(p)
+    }
+
+    fn hold(&mut self, p: &std::path::Path) {
+        *Self::registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(p.to_path_buf())
+            .or_default() += 1;
+        self.0.push(p.to_path_buf());
+    }
+
+    /// The paths this command holds a placeholder at.
+    #[cfg(test)]
+    pub fn paths(&self) -> &[std::path::PathBuf] {
+        &self.0
+    }
+}
+
+impl Drop for Placeholders {
+    fn drop(&mut self) {
+        let mut reg = Self::registry().lock().unwrap_or_else(|e| e.into_inner());
+        for p in self.0.drain(..) {
+            let Some(n) = reg.get_mut(&p) else { continue };
+            *n -= 1;
+            if *n > 0 {
+                continue;
+            }
+            reg.remove(&p);
+            if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() && m.len() == 0) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
 }
 
 /// The shell inside the namespace sandboxes: bash, the Bash tool's
@@ -381,18 +505,43 @@ pub fn wraps_in_shell(mode: &str) -> bool {
 
 /// Apply sandboxing to a command string based on the active mode.
 /// Returns (final_command, error_message_if_blocked).
+///
+/// Keep the returned guard until the command has exited: it removes the
+/// placeholders bwrap mounted over missing protected paths.
 pub fn apply_sandbox(
     command: &str,
     mode: &str,
     cwd: &std::path::Path,
     allow_network: bool,
+) -> Result<(String, Placeholders), String> {
+    apply_sandbox_with(command, mode, cwd, allow_network, true)
+}
+
+/// `apply_sandbox` for a process that runs for the rest of the session (a
+/// language server): no placeholders, which would block OxideClaw's own
+/// `.claude` and git for that long.
+pub fn apply_sandbox_long_lived(
+    command: &str,
+    mode: &str,
+    cwd: &std::path::Path,
+    allow_network: bool,
 ) -> Result<String, String> {
+    apply_sandbox_with(command, mode, cwd, allow_network, false).map(|(line, _)| line)
+}
+
+fn apply_sandbox_with(
+    command: &str,
+    mode: &str,
+    cwd: &std::path::Path,
+    allow_network: bool,
+    placeholders: bool,
+) -> Result<(String, Placeholders), String> {
     match mode {
         "strict" => {
             if let Some(reason) = strict_check(command) {
                 return Err(reason);
             }
-            Ok(command.to_string())
+            Ok((command.to_string(), Placeholders::default()))
         }
         "bwrap" => {
             if let Some(reason) = strict_check(command) {
@@ -411,7 +560,7 @@ pub fn apply_sandbox(
             if git.is_dir() && !git.is_symlink() {
                 let _ = std::fs::create_dir(git.join("hooks"));
             }
-            Ok(bwrap_wrap(command, cwd, allow_network))
+            Ok(bwrap_wrap(command, cwd, allow_network, placeholders))
         }
         "firejail" => {
             if let Some(reason) = strict_check(command) {
@@ -424,7 +573,10 @@ pub fn apply_sandbox(
                         .into(),
                 );
             }
-            Ok(firejail_wrap(command, cwd, allow_network))
+            Ok((
+                firejail_wrap(command, cwd, allow_network),
+                Placeholders::default(),
+            ))
         }
         // Fail CLOSED on an unrecognised mode. `ctx.sandbox_mode` is only `Some`
         // when the sandbox is enabled, so reaching this arm means the configured
@@ -618,9 +770,10 @@ mod tests {
 
     #[test]
     fn known_modes_still_pass_through() {
-        let out = apply_sandbox("echo hi", "strict", Path::new("/tmp"), false)
+        let (out, held) = apply_sandbox("echo hi", "strict", Path::new("/tmp"), false)
             .expect("strict mode is valid");
         assert_eq!(out, "echo hi");
+        assert!(held.paths().is_empty());
     }
 
     #[test]
@@ -650,7 +803,7 @@ mod tests {
     /// where `source` and `[[ ]]` exit 127 inside the sandbox.
     #[test]
     fn namespace_wrappers_run_commands_with_bash() {
-        let bw = bwrap_wrap("echo hi", Path::new("/tmp"), true);
+        let bw = bwrap_wrap("echo hi", Path::new("/tmp"), true, false).0;
         let fj = firejail_wrap("echo hi", Path::new("/tmp"), true);
         let want = if crate::tools::bash::has_bash() {
             "-- bash -c 'echo hi'"
@@ -664,7 +817,7 @@ mod tests {
 
     #[test]
     fn bwrap_and_firejail_agree_on_network_policy() {
-        let bw = bwrap_wrap("echo hi", Path::new("/tmp"), false);
+        let bw = bwrap_wrap("echo hi", Path::new("/tmp"), false, false).0;
         let fj = firejail_wrap("echo hi", Path::new("/tmp"), false);
         assert!(bw.contains("--unshare-net"));
         assert!(fj.contains("--net=none"));
@@ -728,9 +881,55 @@ mod tests {
                 "{rel}: {cmd}"
             );
         }
-        // Missing paths and symlinks get no bind.
-        assert!(!cmd.contains(".githooks"), "{cmd}");
+        // Missing paths get a read-only placeholder, so a command cannot
+        // create them; a symlink gets nothing (bwrap would mount over its
+        // target).
+        for rel in [".githooks", ".oxideclaw", ".git/modules"] {
+            assert!(
+                git < at(&format!("--ro-bind /dev/null {p} ", p = q(rel))),
+                "{rel}: {cmd}"
+            );
+        }
         assert!(!cmd.contains(".husky"), "{cmd}");
+        // Under a missing parent there is nothing to cover.
+        assert!(!cmd.contains(".hg/hgrc"), "{cmd}");
+        // cwd is a repo root: its own `.git` is not a placeholder.
+        assert!(!cmd.contains(&format!("/dev/null {} ", q(".git"))), "{cmd}");
+
+        // A language server's line has no placeholders: they would block
+        // OxideClaw's own `.claude` and git for the whole session.
+        let (line, held) = bwrap_wrap("ls", root, false, false);
+        assert!(!line.contains("/dev/null"), "{line}");
+        assert!(held.paths().is_empty());
+    }
+
+    /// A linked worktree's or submodule's `.git` is a gitfile. Only a
+    /// `.git` directory was protected, so a command could point the file at
+    /// a git dir of its own whose config the user's next `git status` ran.
+    #[test]
+    fn a_gitfile_is_bound_read_only_and_a_subdirectory_gets_a_git_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let cmd = bwrap_wrap_with_home("ls", &wt, false, None, &no_env);
+        let g = shell_quote(&wt.join(".git").display().to_string());
+        assert!(cmd.contains(&format!("--ro-bind {g} {g} ")), "{cmd}");
+        // Nothing lives under a gitfile.
+        assert!(!cmd.contains(".git/"), "{cmd}");
+
+        // A subdirectory of a repo: a new `.git` there would shadow the
+        // real one for the user's next git command.
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir(repo.join("sub")).unwrap();
+        let (line, held) = bwrap_wrap("ls", &repo.join("sub"), false, true);
+        let g = shell_quote(&repo.join("sub/.git").display().to_string());
+        assert!(
+            line.contains(&format!("--ro-bind /dev/null {g} ")),
+            "{line}"
+        );
+        assert!(held.paths().contains(&repo.join("sub/.git")));
     }
 
     /// Run in a real bwrap where one works: the planted hook, the rewritten
@@ -753,11 +952,12 @@ mod tests {
                       printf '[core]\\nfsmonitor=evil\\n' > .git/config; \
                       mv .git .git.old; \
                       printf ok > notes.txt";
-        let wrapped = apply_sandbox(script, "bwrap", root, false).unwrap();
+        let (wrapped, held) = apply_sandbox(script, "bwrap", root, false).unwrap();
         let out = std::process::Command::new("sh")
             .args(["-c", &wrapped])
             .output()
             .unwrap();
+        drop(held);
         let log = String::from_utf8_lossy(&out.stderr);
         assert_eq!(
             std::fs::read_to_string(root.join("notes.txt")).unwrap(),
@@ -773,6 +973,62 @@ mod tests {
             root.join(".git").is_dir() && !root.join(".git.old").exists(),
             "{log}"
         );
+
+        // Paths that did not exist: no project hooks or MCP servers, and
+        // nothing left behind once the command is done.
+        let script =
+            "mkdir .claude; echo x > .mcp.json; mkdir -p .oxideclaw/x; printf ok > done.txt";
+        let (wrapped, held) = apply_sandbox(script, "bwrap", root, false).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            std::fs::read_to_string(root.join("done.txt")).unwrap(),
+            "ok",
+            "{log}"
+        );
+        drop(held);
+        for rel in [".claude", ".mcp.json", ".oxideclaw", ".husky", ".githooks"] {
+            assert!(
+                std::fs::symlink_metadata(root.join(rel)).is_err(),
+                "{rel} left behind: {log}"
+            );
+        }
+    }
+
+    /// In a real bwrap: a gitfile can be neither rewritten nor swapped.
+    #[test]
+    fn a_bwrap_command_cannot_redirect_a_gitfile() {
+        let usable = bwrap_available()
+            && std::process::Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "true"])
+                .status()
+                .is_ok_and(|s| s.success());
+        if !usable {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let script = "printf 'gitdir: x' > .git; rm -f .git; mv .git .g; printf ok > done.txt";
+        let (wrapped, _held) = apply_sandbox(script, "bwrap", root, false).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            std::fs::read_to_string(root.join("done.txt")).unwrap(),
+            "ok",
+            "{log}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git")).unwrap(),
+            "gitdir: /elsewhere\n"
+        );
+        assert!(!root.join(".g").exists(), "{log}");
     }
 
     /// Debian routes awk/cc/java through /etc/alternatives and Fedora keeps the

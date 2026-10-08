@@ -66,7 +66,7 @@ impl Launch {
             .map(|a| crate::sandbox::shell_quote(&a))
             .collect::<Vec<_>>()
             .join(" ");
-        Ok(match containment.wrap(&plain, root)? {
+        Ok(match containment.wrap_long_lived(&plain, root)? {
             line if line == plain => Launch::Program(exe.to_path_buf()),
             line => Launch::Shell(line),
         })

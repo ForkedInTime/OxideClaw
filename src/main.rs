@@ -744,20 +744,35 @@ async fn until_signal<F: std::future::Future>(fut: F) -> Option<F::Output> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
+        // nohup / `trap '' HUP` asked for the hangup to be ignored, and a
+        // handler would replace that SIG_IGN: the run must survive the
+        // terminal closing.
+        let hup_ignored = sighup_ignored();
         // Registered before `fut` is first polled, so no tool can start
         // while the default action is still in place.
-        let (Ok(mut int), Ok(mut term), Ok(mut hup)) = (
+        let (Ok(mut int), Ok(mut term)) = (
             signal(SignalKind::interrupt()),
             signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
         ) else {
             return Some(fut.await);
+        };
+        let mut hup = if hup_ignored {
+            None
+        } else {
+            signal(SignalKind::hangup()).ok()
         };
         let code = tokio::select! {
             out = fut => return Some(out),
             _ = int.recv() => 130,
             _ = term.recv() => 143,
-            _ = hup.recv() => 129,
+            _ = async {
+                match hup.as_mut() {
+                    Some(h) => {
+                        h.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => 129,
         };
         let _ = SIGNAL_EXIT.set(code);
         None
@@ -771,6 +786,32 @@ async fn until_signal<F: std::future::Future>(fut: F) -> Option<F::Output> {
                 None
             }
         }
+    }
+}
+
+/// `-p --output-format json`'s result object for a prompt that never ran
+/// to an answer (a blocked hook, a signal): a script reading stdout still
+/// gets one object with `is_error`.
+fn print_json_failure(error: &str) {
+    use std::io::Write;
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "error": error,
+    });
+    // println! panics on a closed stdout.
+    let _ = writeln!(std::io::stdout(), "{result}");
+}
+
+/// Whether this process inherited SIGHUP as ignored (nohup, `trap '' HUP`).
+#[cfg(unix)]
+fn sighup_ignored() -> bool {
+    // SAFETY: a null `act` only reads the current disposition into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
     }
 }
 
@@ -856,8 +897,9 @@ async fn run() -> Result<()> {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(p)
+            .open(&p)
             .ok()
+            .map(|f| (f, p))
     };
     #[cfg(unix)]
     let per_user = format!("oxideclaw-{}.log", unsafe { libc::getuid() });
@@ -865,7 +907,11 @@ async fn run() -> Result<()> {
     let per_user = "oxideclaw-user.log".to_string();
     let log_writer: Box<dyn std::io::Write + Send> =
         match open(tmp.join("oxideclaw.log")).or_else(|| open(tmp.join(per_user))) {
-            Some(f) => Box::new(f),
+            Some((f, p)) => {
+                // Named by the MCP failure notice.
+                let _ = mcp::LOG_PATH.set(p);
+                Box::new(f)
+            }
             None => Box::new(std::io::sink()),
         };
     tracing_subscriber::fmt()
@@ -1465,7 +1511,8 @@ async fn run() -> Result<()> {
         // -p used to ignore the resume flags and run a fresh conversation.
         let mut resumed = None;
         if let Some(id) = &resume_id {
-            let (mut s, history) = session::Session::resume(id).await?;
+            let (mut s, history) =
+                session::Session::resume_with(id, !config.no_session_persistence).await?;
             if config.fork_session && !config.no_session_persistence {
                 s.fork(&history).await?;
             }
@@ -1503,10 +1550,14 @@ async fn run() -> Result<()> {
                         crate::hooks::run_user_prompt_hooks(h, &prompt, "print-mode", &config.cwd)
                             .await;
                     if !r.should_continue {
-                        outcome = Err(anyhow::anyhow!(
+                        let e = anyhow::anyhow!(
                             "Prompt not sent — blocked by a userPromptSubmit hook: {}",
                             r.stop_reason.unwrap_or_default()
-                        ));
+                        );
+                        if matches!(cli.output_format, OutputFormat::Json) {
+                            print_json_failure(&format!("{e:#}"));
+                        }
+                        outcome = Err(e);
                         break;
                     }
                     match r.additional_context {
@@ -1529,7 +1580,12 @@ async fn run() -> Result<()> {
                     break;
                 }
                 // SIGNAL_EXIT already holds the exit status.
-                None => break,
+                None => {
+                    if matches!(cli.output_format, OutputFormat::Json) {
+                        print_json_failure("stopped by a signal");
+                    }
+                    break;
+                }
             }
             // A script must be able to tell a cut-off run from a finished one.
             if engine.hit_turn_cap() {
@@ -2151,6 +2207,30 @@ fn find_claude_desktop_config() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(test, unix))]
+mod sighup_tests {
+    /// `nohup oxideclaw -p ... &` died when the terminal closed: the hangup
+    /// handler replaced the SIG_IGN nohup set up.
+    #[test]
+    fn an_inherited_sig_ign_is_seen() {
+        // SAFETY: swaps SIGHUP's disposition and puts the old one back.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            let mut ign: libc::sigaction = std::mem::zeroed();
+            ign.sa_sigaction = libc::SIG_IGN;
+            assert_eq!(libc::sigaction(libc::SIGHUP, &ign, &mut old), 0);
+            let ignored = super::sighup_ignored();
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            assert_eq!(libc::sigaction(libc::SIGHUP, &dfl, std::ptr::null_mut()), 0);
+            let default = super::sighup_ignored();
+            libc::sigaction(libc::SIGHUP, &old, std::ptr::null_mut());
+            assert!(ignored);
+            assert!(!default);
+        }
+    }
 }
 
 #[cfg(test)]

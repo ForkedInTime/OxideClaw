@@ -479,8 +479,10 @@ where
     E: std::fmt::Display,
 {
     let mut stream = crate::api::idle_bounded(bytes, idle).eventsource();
-    // A reasoning item has started; see the stall handling below.
-    let mut reasoning_started = false;
+    // A reasoning item is open (added, not yet done); see the stall
+    // handling below. Items arrive one after another, so any other item
+    // closes it.
+    let mut reasoning_open = false;
     let mut result = StreamedResponse::default();
     let mut text_buf = String::new();
     // output_index → that message item's text; a new item starts a new
@@ -505,7 +507,7 @@ where
             // not a dropped connection. The stall error names the
             // connection, which the TUI retries; re-sending would pay for
             // the same reasoning again and none of it reaches /cost.
-            Err(e) if reasoning_started && e.to_string().contains("stalled") => {
+            Err(e) if reasoning_open && e.to_string().contains("stalled") => {
                 return Err(anyhow!(
                     "the model's reasoning produced no output for {}s and the turn was \
                      abandoned. The reasoning may still be billed by the provider, but it is \
@@ -559,7 +561,7 @@ where
             t @ ("response.output_item.added" | "response.output_item.done") => {
                 let done = t == "response.output_item.done";
                 let item = &v["item"];
-                reasoning_started |= item["type"] == "reasoning";
+                reasoning_open = !done && item["type"] == "reasoning";
                 match item["type"].as_str() {
                     Some("function_call") => {
                         let entry = calls.entry(idx).or_default();
@@ -1834,6 +1836,25 @@ mod tests {
             .to_string();
         assert!(err.contains("reasoning produced no output"), "{err}");
         assert!(!err.contains("connection"), "{err}");
+
+        // The reasoning item finished: a stall after it is the connection,
+        // not the model thinking, and is retried as such.
+        let finished = format!(
+            "{started}data: {}\n\n",
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": []}})
+        );
+        let err = parse_responses_bytes(
+            futures_util::stream::iter([Ok::<_, std::convert::Infallible>(finished.into_bytes())])
+                .chain(futures_util::stream::pending()),
+            REASONING_IDLE_TIMEOUT,
+            |_| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("connection"), "{err}");
+        assert!(!err.contains("reasoning produced no output"), "{err}");
 
         // A stall before any reasoning still reads as a dropped connection.
         let err = parse_responses_bytes(

@@ -322,6 +322,9 @@ async fn collect_agent_diff(
     main_cwd: &std::path::Path,
     base_sha: &str,
 ) -> (String, String) {
+    if let Err(e) = check_worktree_git_dir(wt_path, main_cwd).await {
+        return (String::new(), format!("Changes not collected: {e}"));
+    }
     if let Err(e) = oxideclaw::autocommit::check_no_untrusted_filters(wt_path, main_cwd) {
         return (String::new(), format!("Changes not collected: {e}"));
     }
@@ -334,9 +337,56 @@ async fn collect_agent_diff(
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default()
     }
-    let diff = git_out(wt_path, &["diff", base_sha]).await;
-    let stat = git_out(wt_path, &["diff", "--stat", base_sha]).await;
+    // External diff and textconv commands only change how the diff reads.
+    let diff = git_out(
+        wt_path,
+        &["diff", "--no-ext-diff", "--no-textconv", base_sha],
+    )
+    .await;
+    let stat = git_out(
+        wt_path,
+        &["diff", "--no-ext-diff", "--no-textconv", "--stat", base_sha],
+    )
+    .await;
     (diff, stat)
+}
+
+/// Refuse host git in an agent's worktree whose git dir is not the one git
+/// made for it. A linked worktree's `.git` is a file the agent's sandbox
+/// can rewrite to point at a git dir of its own, whose config (an external
+/// diff, a signing program, a merge driver) host git would run. The real
+/// per-worktree dir lives under the main repository's git dir, out of the
+/// sandbox's reach, so once this passes only trusted config is loaded.
+async fn check_worktree_git_dir(wt: &std::path::Path, main_cwd: &std::path::Path) -> Result<()> {
+    async fn out(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+        let o = git_at(dir).args(args).output().await?;
+        anyhow::ensure!(
+            o.status.success(),
+            "git {} failed in {}",
+            args.join(" "),
+            dir.display()
+        );
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p);
+    let git_dir = canon(std::path::Path::new(
+        &out(wt, &["rev-parse", "--absolute-git-dir"]).await?,
+    ))?;
+    // Relative to main_cwd on git < 2.31, which lacks --path-format.
+    let common = canon(&main_cwd.join(out(main_cwd, &["rev-parse", "--git-common-dir"]).await?))?;
+    let same_dir = canon(wt)
+        .ok()
+        .is_some_and(|w| canon(main_cwd).ok() == Some(w));
+    if git_dir.parent() == Some(common.join("worktrees").as_path())
+        || (same_dir && git_dir == common)
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{}'s .git was redirected to {}; not running git there",
+        wt.display(),
+        git_dir.display()
+    )
 }
 
 /// The spawned agent's tools: the default set, narrowed by `--allowed-tools`
@@ -625,6 +675,7 @@ pub async fn merge_agent(
     };
 
     // Committing and merging run clean/smudge filters on the host.
+    check_worktree_git_dir(&wt_path, main_cwd).await?;
     oxideclaw::autocommit::check_no_untrusted_filters(&wt_path, main_cwd)?;
     oxideclaw::autocommit::check_no_untrusted_filters(main_cwd, main_cwd)?;
 
@@ -1157,6 +1208,55 @@ mod tests {
         .await;
         std::fs::write(wt.join("new.txt"), "agent\n").unwrap();
         (main, wt)
+    }
+
+    /// The agent's sandbox rewrote the worktree's `.git` file to point at a
+    /// git dir of its own; host `git diff` then ran its `diff.external` as
+    /// soon as the agent finished, and `/spawn merge` its signing program.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_redirected_worktree_git_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = repo_with_agent_worktree(tmp.path(), "spawn-r1").await;
+        let base = git(&main, &["rev-parse", "HEAD"]).await;
+        let (diff, stat) = collect_agent_diff(&wt, &main, base.trim()).await;
+        assert!(diff.contains("+agent"), "{stat}");
+
+        let rogue = tmp.path().join("rogue");
+        std::fs::create_dir(&rogue).unwrap();
+        git(&rogue, &["init", "-q"]).await;
+        let marker = tmp.path().join("pwned");
+        let evil = tmp.path().join("evil.sh");
+        std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let evil_s = evil.to_str().unwrap();
+        git(&rogue, &["config", "diff.external", evil_s]).await;
+        git(&rogue, &["config", "commit.gpgsign", "true"]).await;
+        git(&rogue, &["config", "gpg.program", evil_s]).await;
+        let alternates = rogue.join(".git/objects/info/alternates");
+        std::fs::write(&alternates, main.join(".git/objects").display().to_string()).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", rogue.join(".git").display()),
+        )
+        .unwrap();
+
+        let (diff, stat) = collect_agent_diff(&wt, &main, base.trim()).await;
+        assert!(diff.is_empty(), "{diff}");
+        assert!(stat.contains("redirected"), "{stat}");
+
+        let mut agent = entry("r1", SpawnStatus::Completed);
+        agent.branch = "spawn-r1".into();
+        agent.worktree_path = wt;
+        agent.original_cwd = main.clone();
+        let reg = registry_with(vec![agent]);
+        let err = merge_agent(&reg, "r1", &main).await.unwrap_err();
+        assert!(err.to_string().contains("redirected"), "{err}");
+        assert!(
+            !marker.exists(),
+            "the rogue git dir's program ran on the host"
+        );
     }
 
     /// `/spawn merge a1b2` (an id prefix) committed as "spawn: " and left

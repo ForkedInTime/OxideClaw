@@ -404,11 +404,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             };
 
             if let Some(id) = full_id {
-                match Session::resume(&id).await {
-                    Ok((mut new_session, loaded_messages)) => {
-                        if config.no_session_persistence {
-                            new_session.keep_in_memory();
-                        }
+                match Session::resume_with(&id, !config.no_session_persistence).await {
+                    Ok((new_session, loaded_messages)) => {
                         let display = entries_from_messages(&loaded_messages);
                         *saved_count = loaded_messages.len();
                         *messages = loaded_messages;

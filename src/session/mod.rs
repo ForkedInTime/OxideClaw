@@ -176,12 +176,6 @@ impl Session {
         session
     }
 
-    /// Stop writing this (resumed) session: later turns, renames and undo
-    /// state stay in memory.
-    pub fn keep_in_memory(&mut self) {
-        self.in_memory = true;
-    }
-
     fn unsaved(dir: &Path, id: String) -> Self {
         let meta = SessionMeta {
             id: id.clone(),
@@ -281,13 +275,26 @@ impl Session {
         }
     }
 
-    /// Resume an existing session by ID — loads meta, returns Session + messages.
-    pub async fn resume(id: &str) -> Result<(Self, Vec<Message>)> {
-        Self::resume_in(&crate::config::Config::sessions_dir(), id).await
+    /// Resume an existing session by ID — loads meta, returns Session +
+    /// messages. With `persist` false (`--no-session-persistence`) nothing
+    /// is written, not even the repair of a torn or unanswered tail, which
+    /// stays in memory.
+    pub async fn resume_with(id: &str, persist: bool) -> Result<(Self, Vec<Message>)> {
+        Self::resume_in_with(&crate::config::Config::sessions_dir(), id, persist).await
     }
 
-    /// `resume` from the sessions directory `dir`.
+    /// `resume_with(id, true)` from the sessions directory `dir`.
     pub async fn resume_in(dir: &Path, id: &str) -> Result<(Self, Vec<Message>)> {
+        Self::resume_in_with(dir, id, true).await
+    }
+
+    /// `resume_with` from the sessions directory `dir`. Decided before the
+    /// load, which may rewrite the file to repair it.
+    pub async fn resume_in_with(
+        dir: &Path,
+        id: &str,
+        persist: bool,
+    ) -> Result<(Self, Vec<Message>)> {
         anyhow::ensure!(is_safe_session_id(id), "invalid session id: {id:?}");
         let meta = SessionMeta::load_in(dir, id)
             .await
@@ -297,7 +304,7 @@ impl Session {
             meta,
             dir: dir.to_path_buf(),
             path: Self::jsonl_path(dir, id),
-            in_memory: false,
+            in_memory: !persist,
         };
         let messages = s.load_and_heal().await?;
         Ok((s, messages))
@@ -1706,12 +1713,23 @@ mod in_memory_tests {
     }
 
     /// A session resumed under the flag stops writing, and its files on
-    /// disk stay as they were.
+    /// disk stay as they were, even when its tail needed repair (an
+    /// unanswered tool_use, as a signal mid-tool leaves it).
     #[tokio::test]
     async fn a_resumed_session_kept_in_memory_leaves_its_files_alone() {
         let dir = tempfile::tempdir().unwrap();
         let mut orig = Session::create_in(dir.path(), "s1".into()).await.unwrap();
         orig.append(&[user("first")]).await.unwrap();
+        orig.append(&[Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "sleep 9"}),
+            }],
+        }])
+        .await
+        .unwrap();
         std::fs::write(redo_path(dir.path(), "s1"), "[]").unwrap();
         let before: Vec<(String, Vec<u8>)> = files(dir.path())
             .into_iter()
@@ -1721,8 +1739,10 @@ mod in_memory_tests {
             })
             .collect();
 
-        let (mut s, history) = Session::resume_in(dir.path(), "s1").await.unwrap();
-        s.keep_in_memory();
+        let (mut s, history) = Session::resume_in_with(dir.path(), "s1", false)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 3, "repaired in memory: {history:?}");
         s.append(&[user("second")]).await.unwrap();
         s.overwrite(&history).await.unwrap();
         s.meta.name = "renamed".into();

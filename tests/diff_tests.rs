@@ -100,10 +100,10 @@ index 1..2 100644
 @@ -1 +1 @@
 -old
 +new
-diff --git a/my file.txt b/my file.txt
+diff --git my file.txt my file.txt
 deleted file mode 100644
 index 1..0
---- a/my file.txt\t
+--- my file.txt\t
 +++ /dev/null
 @@ -1 +0,0 @@
 -gone

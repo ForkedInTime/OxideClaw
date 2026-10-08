@@ -98,6 +98,9 @@ fn wait_for(total: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+/// Held from openpty until the fork: see `stopped_tui_kills_the_tool`.
+static PTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 enum Stop {
     /// Close the pty master, as a terminal emulator does when its tab
     /// closes: the tty hangs up and the kernel sends SIGHUP.
@@ -117,6 +120,10 @@ fn stopped_tui_kills_the_tool(stop: Stop) {
         pid_file.display()
     ));
 
+    // openpty makes the fds without FD_CLOEXEC; the other test's spawn
+    // forking before the fcntl below would hand our master to its
+    // oxideclaw, keeping this terminal open after we close it.
+    let pty_lock = PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut master, mut slave) = (-1, -1);
     let ws = libc::winsize {
         ws_row: 24,
@@ -174,6 +181,7 @@ fn stopped_tui_kills_the_tool(stop: Stop) {
         });
     }
     let mut child = cmd.spawn().unwrap();
+    drop(pty_lock);
     drop(slave);
 
     // Drain the screen so the TUI never blocks on a full pty buffer, and

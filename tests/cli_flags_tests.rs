@@ -525,3 +525,42 @@ fn json_output_is_one_document_for_the_whole_run() {
     assert_eq!(result["is_error"], false);
     assert_eq!(result["num_turns"], 2);
 }
+
+/// A run that failed partway printed nothing at all in json mode, so a
+/// script reading stdout got no document and no `is_error`.
+#[test]
+fn json_output_reports_a_run_that_failed_partway() {
+    let e = env();
+    let body = r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#;
+    let bad = format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut narrated_call = bash_call_reply("echo hi");
+    narrated_call["choices"][0]["delta"]["content"] = "Let me check.".into();
+    let (port, _) = serve_seq(vec![sse_response(&narrated_call), bad]);
+    let out = run(
+        &e,
+        &[
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "json",
+            "--model",
+            "openai-compat:test",
+            "go",
+        ],
+        &openai_env(port),
+        "",
+    );
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(result["subtype"], "error_during_execution");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(result["text"], "Let me check.");
+    assert!(
+        result["error"].as_str().unwrap().contains("bad request"),
+        "{result}"
+    );
+}

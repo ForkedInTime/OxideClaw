@@ -4,7 +4,7 @@ use crate::api::types::*;
 use crate::api::{ApiBackend, MessagesRequest};
 use crate::browser::middleware::MiddlewareVerdict;
 use crate::compact::{
-    CompactNeeded, compact_needed, compaction_window, snip_compact, summarize_compact, turn_window,
+    CompactNeeded, compaction_window, snip_compact, summarize_compact, turn_window,
 };
 use crate::config::Config;
 use crate::rag;
@@ -344,7 +344,11 @@ impl QueryEngine {
     /// whether to summarise once this round's tool results are in.
     async fn check_context(&mut self, response: &StreamedResponse, window: u64) -> bool {
         let context_tokens = response.usage.context_tokens();
-        match compact_needed(context_tokens, window) {
+        let overhead = || {
+            let defs: Vec<ToolDefinition> = self.tools.iter().map(|t| t.definition()).collect();
+            crate::compact::fixed_overhead(&self.system_prompt, &defs)
+        };
+        match crate::compact::compactable(context_tokens, overhead, window) {
             CompactNeeded::None => {}
             CompactNeeded::Warn => {
                 self.notice(
@@ -643,12 +647,16 @@ impl QueryEngine {
                             continue;
                         }
                     }
-                    if overflow && !self.config.auto_compact_enabled {
-                        return Err(e.context(
+                    let e = if overflow && !self.config.auto_compact_enabled {
+                        e.context(
                             "the conversation no longer fits the model's context window \
                              (autoCompact is off)",
-                        ));
-                    }
+                        )
+                    } else {
+                        e
+                    };
+                    // A script reading stdout still gets its one object.
+                    self.print_json_error(&last_text, &run_usage, turn.min(max_turns), &e);
                     return Err(e);
                 }
             };
@@ -659,7 +667,7 @@ impl QueryEngine {
                 self.notice(note.yellow());
             }
             // stream-json reports every turn as it ends; json waits for the
-            // run to end, so stdout holds a single JSON document.
+            // run to end, so stdout holds one JSON object per prompt.
             if self.stream_json_output && !full_text.is_empty() {
                 println!("{}", result_json(&full_text, &response.usage));
             } else if self.json_output && !full_text.trim().is_empty() {
@@ -744,7 +752,13 @@ impl QueryEngine {
                         }
                     }
                     // Execute all tool calls in this response
-                    let tool_results = self.execute_tools(&response.content).await?;
+                    let tool_results = match self.execute_tools(&response.content).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.print_json_error(&last_text, &run_usage, turn, &e);
+                            return Err(e);
+                        }
+                    };
                     let stop = self
                         .stop_after_tool
                         .is_some_and(|name| ran_ok(name, &response.content, &tool_results));
@@ -792,6 +806,20 @@ impl QueryEngine {
         result["subtype"] = subtype.into();
         result["is_error"] = (subtype != "success").into();
         result["num_turns"] = num_turns.into();
+        println!("{result}");
+    }
+
+    /// The `--output-format json` result of a run that failed partway: the
+    /// last turn's text and the usage so far, with the error beside them.
+    fn print_json_error(&self, text: &str, usage: &Usage, num_turns: u32, e: &anyhow::Error) {
+        if !self.json_output {
+            return;
+        }
+        let mut result = result_json(text, usage);
+        result["subtype"] = "error_during_execution".into();
+        result["is_error"] = true.into();
+        result["num_turns"] = num_turns.into();
+        result["error"] = format!("{e:#}").into();
         println!("{result}");
     }
 
@@ -1722,6 +1750,56 @@ pub(crate) mod scripted_api_tests {
         let bodies = bodies(&seen);
         assert_eq!(bodies.len(), 3, "turn, summary, turn");
         assert!(compacted(&bodies[2]), "{}", bodies[2]["messages"]);
+    }
+
+    /// With a 4096-token Ollama window the system prompt and tools alone
+    /// pass the summarise line, so every tool round summarised and replaced
+    /// the round's results with a summary of a summary.
+    #[tokio::test]
+    async fn a_window_the_fixed_part_fills_is_not_compacted_every_round() {
+        let oai = |delta: serde_json::Value, finish: &str| {
+            let chunk = serde_json::json!({
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 4000, "completion_tokens": 1}
+            });
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let call = |id: &str| {
+            oai(
+                serde_json::json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
+                    "function": {"name": "Nope", "arguments": "{}"}}]}),
+                "tool_calls",
+            )
+        };
+        let done = oai(serde_json::json!({"content": "done"}), "stop");
+        let (url, seen) = serve(vec![call("c1"), call("c2"), done]).await;
+        let model = "ollama:small-window-compact";
+        crate::api::ollama::record_served_window(&url, model, 4096);
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            model: model.into(),
+            ollama_host: url,
+            cwd: dir.path().to_path_buf(),
+            auto_compact_enabled: true,
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        // About 4000 tokens before any history: over the 3400-token snip line.
+        e.system_prompt = "x".repeat(16_000);
+
+        let out = e.query_and_collect("explore").await.unwrap();
+
+        assert_eq!(tool_text(&out), "done");
+        let b = bodies(&seen);
+        assert_eq!(b.len(), 3, "two tool rounds and the answer, no summary");
+        let last = b[2]["messages"].to_string();
+        assert!(last.contains("c1") && last.contains("c2"), "{last}");
+        assert!(!last.contains("automatically compacted"), "{last}");
     }
 
     /// A request rejected as too long was fatal in -p, sub-agents and the

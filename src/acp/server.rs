@@ -197,7 +197,7 @@ impl State {
             "authenticate" => Ok(vec![rpc::response(id, json!({}))]),
             "session/new" => {
                 self.require_initialized(method)?;
-                let (sid, _) = self.start_session(params, None).await?;
+                let (sid, _) = self.start_session(params, None, None).await?;
                 Ok(vec![rpc::response(id, json!({"sessionId": sid}))])
             }
             // Advertised as unsupported: nothing is saved to load.
@@ -259,7 +259,9 @@ impl State {
         let (saved, history) = Session::resume_in(&self.sessions_dir, sid)
             .await
             .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
-        let (_, replay) = self.start_session(params, Some((saved, history))).await?;
+        let (_, replay) = self
+            .start_session(params, Some((saved, history)), None)
+            .await?;
         let mut frames: Vec<Value> = replay
             .into_iter()
             .map(|p| rpc::notification("session/update", p))
@@ -270,11 +272,13 @@ impl State {
 
     /// Start a session for `session/new`, or for `session/load` with the
     /// saved transcript and its history. Returns the session id and, for a
-    /// load, the `session/update` params that replay the history.
+    /// load, the `session/update` params that replay the history. `id` keeps
+    /// the id of an evicted session that was never saved (never prompted).
     async fn start_session(
         &mut self,
         params: &Value,
         saved: Option<(Session, Vec<Message>)>,
+        id: Option<String>,
     ) -> Result<(String, Vec<Value>), RpcError> {
         let cwd = params
             .get("cwd")
@@ -285,6 +289,9 @@ impl State {
             .expect("Some(cwd) validates to Some(dir)");
         let mut cfg = self.config.clone();
         cfg.retarget_cwd(dir);
+        // routerBudget caps the session like the SDK, -p and the TUI;
+        // SdkSession reads only max_budget_usd.
+        cfg.max_budget_usd = cfg.session_budget();
         cfg.extra_mcp_servers.extend(mcp_servers(params));
         // Starting servers here stalls other sessions' updates for up to the
         // per-server startup timeout; acceptable for a once-per-session cost.
@@ -315,6 +322,10 @@ impl State {
             transcript.saved = history.len();
             session.resume_history(file.id.clone(), history);
             transcript.file = Some(file);
+        } else if let Some(id) = id {
+            // The Transcript creates its file on the first save, as for a
+            // new session.
+            session.resume_history(id, Vec::new());
         }
         let session_id = session.session_id.clone();
         let cancel = session.cancel_signal();
@@ -358,8 +369,9 @@ impl State {
 
     /// Make room for one more live session: an editor that keeps the agent
     /// running opens a session per thread, and each kept its history and MCP
-    /// server processes until it quit. Only idle sessions already on disk
-    /// go, so a later prompt or `session/load` restores them whole; without
+    /// server processes until it quit. Only idle sessions go: a later prompt
+    /// or `session/load` restores one from disk whole, and one never
+    /// prompted (an opened thread panel) starts again under its id. Without
     /// persistence nothing could restore them, so nothing is evicted.
     fn evict_idle_sessions(&mut self, incoming: &str) {
         if self.config.no_session_persistence {
@@ -373,11 +385,7 @@ impl State {
         let mut idle: Vec<(std::time::Instant, String)> = self
             .sessions
             .iter()
-            .filter(|(sid, h)| {
-                *sid != incoming
-                    && h.prompt_id.is_none()
-                    && Session::exists_in(&self.sessions_dir, sid)
-            })
+            .filter(|(sid, h)| *sid != incoming && h.prompt_id.is_none())
             .map(|(sid, h)| (h.last_used, sid.clone()))
             .collect();
         idle.sort();
@@ -427,10 +435,17 @@ impl State {
         if let Some(start) = self.evicted.get(sid).cloned() {
             // The editor still shows the thread: reload it as it was, with
             // no replay, since the client already has the conversation.
-            let (saved, history) = Session::resume_in(&self.sessions_dir, sid)
-                .await
-                .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
-            self.start_session(&start, Some((saved, history))).await?;
+            if Session::exists_in(&self.sessions_dir, sid) {
+                let (saved, history) = Session::resume_in(&self.sessions_dir, sid)
+                    .await
+                    .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("{e:#}")))?;
+                self.start_session(&start, Some((saved, history)), None)
+                    .await?;
+            } else {
+                // Never prompted, so never saved: start it fresh, same id.
+                self.start_session(&start, None, Some(sid.to_string()))
+                    .await?;
+            }
         }
         let h = self
             .sessions
@@ -2433,6 +2448,85 @@ mod tests {
         let close = json!({"jsonrpc":"2.0","id":52,"method":"session/close","params":{"sessionId":"ghost"}});
         let out = st.handle_line(&close.to_string()).await;
         assert_eq!(out[0]["error"]["code"], json!(rpc::RESOURCE_NOT_FOUND));
+    }
+
+    /// A `session/new` never prompted (an opened thread panel) was never on
+    /// disk, so it was never evicted: its MCP servers lived until the
+    /// editor quit. It is evicted too, and its first prompt starts it again
+    /// under the same id.
+    #[tokio::test]
+    async fn sessions_never_prompted_are_evicted_and_restart_under_their_id() {
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        let (host, _seen) = text_model("ok").await;
+        cfg.ollama_host = host;
+        let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        let sessions = sessions_in(&dir);
+        let mut st = State {
+            config: cfg,
+            sessions_dir: sessions.clone(),
+            initialized: true,
+            sessions: HashMap::new(),
+            evicted: HashMap::new(),
+            max_live: 2,
+            pending: HashMap::new(),
+            next_id: 1,
+            notif_tx,
+            done_tx,
+        };
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            let out = st.handle_line(&new_session_line(n, &cwd)).await;
+            ids.push(out[0]["result"]["sessionId"].as_str().unwrap().to_string());
+        }
+        assert_eq!(st.sessions.len(), 2);
+        assert!(st.evicted.contains_key(&ids[0]));
+        assert!(!Session::exists_in(&sessions, &ids[0]));
+
+        let line = json!({"jsonrpc":"2.0","id":10,"method":"session/prompt","params":prompt(&ids[0], "hi")});
+        assert!(st.handle_line(&line.to_string()).await.is_empty());
+        let out = st.handle_turn_done(done_rx.recv().await.unwrap());
+        assert_eq!(out[0]["result"]["stopReason"], json!("end_turn"), "{out:?}");
+        assert!(st.sessions.contains_key(&ids[0]));
+        let (_, history) = Session::resume_in(&sessions, &ids[0]).await.unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+    }
+
+    /// routerBudget capped -p, the TUI and the SDK, but not ACP sessions:
+    /// SdkSession reads only max_budget_usd.
+    #[tokio::test]
+    async fn router_budget_caps_acp_sessions() {
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        let (host, seen) = text_model("ok").await;
+        cfg.ollama_host = host;
+        cfg.max_budget_usd = None;
+        cfg.router_budget = Some(0.0);
+        cfg.config_dir_override = Some(dir.path().join("config"));
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/settings.json"),
+            r#"{"routerBudget": 0}"#,
+        )
+        .unwrap();
+        let sessions = sessions_in(&dir);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut c = Client::start(cfg, sessions);
+        c.init().await;
+        let (_, created) = c
+            .call(1, "session/new", json!({"cwd": cwd, "mcpServers": []}))
+            .await;
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        let (_, answer) = c.call(2, "session/prompt", prompt(&sid, "hi")).await;
+        assert_eq!(
+            answer["result"]["stopReason"],
+            json!("max_turn_requests"),
+            "{answer}"
+        );
+        assert!(chat_requests(&seen).is_empty(), "the model was called");
+        c.close().await;
     }
 
     /// A session started over ACP is saved as it goes, so another agent

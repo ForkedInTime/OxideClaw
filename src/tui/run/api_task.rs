@@ -859,6 +859,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
             let window = crate::compact::turn_window(&config, routing.as_ref().map(|r| &r.router));
             let context_tokens = response.usage.context_tokens();
             let need = crate::compact::compact_needed(context_tokens, window);
+            // A bigger tier helps even when compacting cannot.
             let moved = need == CompactNeeded::Summarise
                 && escalate(
                     &mut routing,
@@ -870,7 +871,11 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     &tx,
                 )
                 .await;
-            match need {
+            let overhead = || {
+                let defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
+                crate::compact::fixed_overhead(&system_prompt, &defs)
+            };
+            match crate::compact::compactable(context_tokens, overhead, window) {
                 _ if moved || !config.auto_compact_enabled => {}
                 CompactNeeded::Snip => {
                     if crate::compact::snip_compact(&mut messages, &config.model) {

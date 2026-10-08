@@ -268,7 +268,7 @@ fn extract_chunks(
         symbol_nodes,
         full_source: source,
     };
-    collect_symbols(&root, &ctx, &mut chunks, 0);
+    collect_symbols(&root, &ctx, &mut chunks, 0, false);
 
     // If we got zero symbols (e.g. a config file or unusual structure),
     // fall back to indexing the entire file as one chunk.
@@ -328,22 +328,34 @@ const MAX_SYMBOL_DEPTH: usize = 8;
 /// Longest chunk stored; the rest of a huge function is cut off.
 const MAX_CHUNK_LINES: usize = 200;
 
-/// Recursively collect symbol nodes from the AST.
+/// Recursively collect symbol nodes from the AST. `in_container` is set
+/// below a container (its body included): there each member's chunk also
+/// takes the text since the previous member, so the doc comments,
+/// attributes, fields and required signatures between members stay
+/// searchable.
 fn collect_symbols(
     node: &tree_sitter::Node,
     ctx: &CollectCtx<'_>,
     chunks: &mut Vec<CodeChunk>,
     depth: usize,
+    in_container: bool,
 ) {
     if depth > MAX_SYMBOL_DEPTH {
         return;
     }
 
+    // End of the previous member at this level, inside a container.
+    let mut prev_end: Option<usize> = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if !ctx.symbol_nodes.contains(&child.kind()) {
             // Recurse into non-symbol nodes (e.g. module bodies, program root)
-            collect_symbols(&child, ctx, chunks, depth + 1);
+            let before = chunks.len();
+            collect_symbols(&child, ctx, chunks, depth + 1, in_container);
+            // Symbols found inside it have their chunks: not taken again.
+            if chunks.len() > before && prev_end.is_some() {
+                prev_end = Some(child.end_byte());
+            }
             continue;
         }
 
@@ -358,8 +370,20 @@ fn collect_symbols(
             child
         };
         let src_len = ctx.full_source.len();
-        let start_byte = child.start_byte().min(src_len);
-        let start_line = (child.start_position().row + 1) as i64; // 1-indexed
+        let node_start = child.start_byte().min(src_len);
+        // From the first non-blank byte after the previous member.
+        let start_byte = match prev_end {
+            Some(end) if end < node_start => {
+                let gap = &ctx.full_source[end..node_start];
+                end + (gap.len() - gap.trim_start().len())
+            }
+            _ => node_start,
+        };
+        let start_line = (child.start_position().row + 1) as i64 // 1-indexed
+            - ctx.full_source[start_byte..node_start].matches('\n').count() as i64;
+        if in_container {
+            prev_end = Some(child.end_byte().min(src_len));
+        }
         let symbol_name = extract_symbol_name(&symbol, ctx.source);
         let symbol_kind = node_kind_to_symbol_kind(symbol.kind()).to_string();
 
@@ -372,14 +396,34 @@ fn collect_symbols(
             let end_line = start_line + header.lines().count().max(1) as i64 - 1;
             chunks.push(CodeChunk {
                 file_path: ctx.file_path.to_string(),
-                symbol_name,
-                symbol_kind,
+                symbol_name: symbol_name.clone(),
+                symbol_kind: symbol_kind.clone(),
                 language: ctx.lang_name.to_string(),
                 start_line,
                 end_line,
                 content: cap_chunk_lines(header),
             });
-            collect_symbols(&symbol, ctx, chunks, depth + 1);
+            collect_symbols(&symbol, ctx, chunks, depth + 1, true);
+            // What follows the last member (required signatures, fields,
+            // trailing comments), less the closing brace.
+            if let Some(last) = last_symbol_end(&symbol, ctx, depth + 1) {
+                let end = symbol.end_byte().min(src_len);
+                let rest = ctx.full_source[last.min(end)..end].trim();
+                let rest = rest.strip_suffix('}').map_or(rest, str::trim_end);
+                if !rest.is_empty() {
+                    let at = ctx.full_source[last.min(end)..end].find(rest).unwrap_or(0) + last;
+                    let line = ctx.full_source[..at.min(src_len)].matches('\n').count() as i64 + 1;
+                    chunks.push(CodeChunk {
+                        file_path: ctx.file_path.to_string(),
+                        symbol_name,
+                        symbol_kind,
+                        language: ctx.lang_name.to_string(),
+                        start_line: line,
+                        end_line: line + rest.lines().count().max(1) as i64 - 1,
+                        content: cap_chunk_lines(rest),
+                    });
+                }
+            }
             continue;
         }
 
@@ -395,6 +439,25 @@ fn collect_symbols(
             content: cap_chunk_lines(content),
         });
     }
+}
+
+/// End byte of the last symbol `collect_symbols` would find below `node`
+/// at `depth`: where a container's trailing text begins.
+fn last_symbol_end(node: &tree_sitter::Node, ctx: &CollectCtx<'_>, depth: usize) -> Option<usize> {
+    if depth > MAX_SYMBOL_DEPTH {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    for child in children.into_iter().rev() {
+        if ctx.symbol_nodes.contains(&child.kind()) {
+            return Some(child.end_byte());
+        }
+        if let Some(end) = last_symbol_end(&child, ctx, depth + 1) {
+            return Some(end);
+        }
+    }
+    None
 }
 
 /// Start byte of the first symbol `collect_symbols` would find below `node`
@@ -1070,6 +1133,39 @@ impl MyStruct {
                 .any(|c| c.symbol_name == "decorated_definition")
         );
         assert!(chunk(&chunks, "Store").content.contains("Keeps things"));
+    }
+
+    /// Splitting containers into a header and member chunks dropped what
+    /// sits between members: doc comments and attributes on the second and
+    /// later methods, and required trait methods after a provided one.
+    #[test]
+    fn text_between_and_after_members_stays_in_the_index() {
+        let src = "impl Store {\n    fn first(&self) {}\n\n    /// unique_doc_word explains it\n    #[inline]\n    fn second(&self) {}\n    // trailing_note_word\n}\n\ntrait Shape {\n    fn provided(&self) {}\n    fn required_signature(&self);\n}\n";
+        let chunks = chunks_of("store.rs", src, "rust");
+        let all: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        for word in [
+            "unique_doc_word",
+            "#[inline]",
+            "trailing_note_word",
+            "required_signature",
+        ] {
+            assert!(all.contains(word), "{word} lost: {all}");
+        }
+        let second = chunk(&chunks, "second");
+        assert!(
+            second.content.starts_with("/// unique_doc_word"),
+            "{}",
+            second.content
+        );
+        assert_eq!((second.start_line, second.end_line), (4, 6));
+        assert_eq!(chunk(&chunks, "first").content, "fn first(&self) {}");
+        let trailing = chunks
+            .iter()
+            .find(|c| c.content.contains("required_signature"))
+            .unwrap();
+        assert_eq!(trailing.symbol_name, "Shape");
+        assert_eq!(trailing.start_line, 12);
+        assert!(!trailing.content.contains('}'), "{}", trailing.content);
     }
 
     /// A Java method's first identifier-like child is its return type.

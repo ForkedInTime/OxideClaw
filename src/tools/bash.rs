@@ -575,13 +575,15 @@ impl Tool for BashTool {
 
         // Apply sandbox if enabled
         let allow_net = ctx.sandbox_allow_network;
-        let command = if let Some(ref mode) = ctx.sandbox_mode {
+        // `placeholders` is held until the command is done, then removes
+        // the mount points bwrap left on the host.
+        let (command, placeholders) = if let Some(ref mode) = ctx.sandbox_mode {
             match crate::sandbox::apply_sandbox(&input.command, mode, &ctx.cwd, allow_net) {
-                Ok(cmd) => cmd,
+                Ok(wrapped) => wrapped,
                 Err(reason) => return Ok(ToolOutput::error(reason)),
             }
         } else {
-            input.command.clone()
+            (input.command.clone(), Default::default())
         };
 
         let command_str = command.clone();
@@ -593,6 +595,7 @@ impl Tool for BashTool {
         let sandboxed = ctx.sandbox_mode.is_some();
 
         let fut = async move {
+            let _placeholders = placeholders;
             let mut cmd = Command::new(&shell);
             crate::tools::scrub_dotenv_keys(cmd.as_std_mut());
             if sandboxed {

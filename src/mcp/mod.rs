@@ -65,16 +65,24 @@ impl Tool for McpDynamicTool {
     }
 }
 
+/// The log file `main` opened: `$TMP/oxideclaw.log`, or the per-user
+/// fallback when another user owns that. Unset when neither opened.
+pub static LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// What the TUI, `/mcp` and `/doctor` say about servers that failed to
 /// start. The reason is only in the log: the TUI owns the terminal.
 pub fn failed_notice(names: &[String]) -> String {
+    let log = LOG_PATH
+        .get()
+        .map(|p| format!("The reason is in {}; ", p.display()))
+        .unwrap_or_default();
     format!(
-        "MCP server{} failed to start, so {} tools are unavailable: {}. The reason is \
-         in {}; `oxideclaw mcp list` checks them again.",
+        "MCP server{} failed to start, so {} tools are unavailable: {}. {}`oxideclaw mcp \
+         list` checks them again.",
         if names.len() == 1 { "" } else { "s" },
         if names.len() == 1 { "its" } else { "their" },
         names.join(", "),
-        std::env::temp_dir().join("oxideclaw.log").display()
+        log,
     )
 }
 
@@ -195,6 +203,20 @@ fn fit_tool_name(name: String, used: &mut std::collections::HashSet<String>) -> 
 
 #[cfg(test)]
 mod description_tests {
+    /// The notice named `$TMP/oxideclaw.log` even when the log went to the
+    /// per-user fallback or nowhere. Only the file `main` opened is named.
+    #[test]
+    fn the_failure_notice_names_only_the_log_that_was_opened() {
+        let names = vec!["db".to_string()];
+        let notice = super::failed_notice(&names);
+        assert!(notice.contains("failed to start, so its tools"), "{notice}");
+        match super::LOG_PATH.get() {
+            Some(p) => assert!(notice.contains(&p.display().to_string()), "{notice}"),
+            None => assert!(!notice.contains("oxideclaw.log"), "{notice}"),
+        }
+        assert!(notice.ends_with("`oxideclaw mcp list` checks them again."));
+    }
+
     #[test]
     fn tool_names_fit_the_api_pattern_and_stay_unique() {
         let mut used = std::collections::HashSet::new();

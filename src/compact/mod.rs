@@ -148,6 +148,37 @@ pub fn compact_needed(input_tokens: u64, window: u64) -> CompactNeeded {
     }
 }
 
+/// Tokens a request costs before any history: the system prompt and the
+/// tool definitions (schema plus description), estimated at 4 chars a token.
+pub fn fixed_overhead(system: &str, tools: &[crate::api::types::ToolDefinition]) -> u64 {
+    let tools: usize = tools
+        .iter()
+        .map(|t| t.input_schema.to_string().len() + t.description.len())
+        .sum();
+    crate::router::estimate_context_tokens(system, &[]) + tools as u64 / 4
+}
+
+/// `compact_needed`, except that compacting is not attempted when it cannot
+/// help: once the fixed `overhead` alone reaches the snip line (a small
+/// served Ollama window), snipping or summarising the history never gets
+/// back under it, and a summary on every turn and tool round only replaces
+/// the history with a summary of a summary. A warning stays; the
+/// served-window notice tells the user how to raise the window.
+/// `overhead` is only worked out when compaction is due.
+pub fn compactable(
+    context_tokens: u64,
+    overhead: impl FnOnce() -> u64,
+    window: u64,
+) -> CompactNeeded {
+    let need = compact_needed(context_tokens, window);
+    let compacts = matches!(need, CompactNeeded::Snip | CompactNeeded::Summarise);
+    if compacts && overhead() >= thresholds(window).1 {
+        CompactNeeded::Warn
+    } else {
+        need
+    }
+}
+
 // ── snipCompact ─────────────────────────────────────────────────────────────
 
 const SNIP_PLACEHOLDER: &str = "[content removed by snipCompact to reduce context size]";
@@ -609,6 +640,27 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()).unwrap();
         assert!(body["max_tokens"].as_u64().unwrap() >= 32_000, "{body}");
         assert_eq!(body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn nothing_is_compacted_when_the_fixed_part_fills_the_window() {
+        // 4096 tokens: the snip line is 3440.
+        assert_eq!(compactable(4000, || 3500, 4096), CompactNeeded::Warn);
+        assert_eq!(compactable(3600, || 3440, 4096), CompactNeeded::Warn);
+        // Room left after the fixed part: compaction can help.
+        assert_eq!(compactable(4000, || 1000, 4096), CompactNeeded::Summarise);
+        assert_eq!(compactable(3500, || 1000, 4096), CompactNeeded::Snip);
+        assert_eq!(compactable(100, || 3500, 4096), CompactNeeded::None);
+        let tools = [crate::api::types::ToolDefinition {
+            name: "T".into(),
+            description: "d".repeat(40),
+            input_schema: serde_json::json!({}),
+            cache_control: None,
+        }];
+        assert_eq!(
+            fixed_overhead(&"s".repeat(400), &tools),
+            crate::router::estimate_context_tokens(&"s".repeat(400), &[]) + 42 / 4
+        );
     }
 
     #[test]

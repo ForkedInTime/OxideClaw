@@ -986,7 +986,10 @@ impl App {
     /// after Esc and a new prompt must not end that turn.
     fn finish_side_task(&mut self) {
         self.side_task = None;
-        if self.api_task.is_none() && self.browse_progress_rx.is_none() {
+        if self.api_task.is_none()
+            && self.browse_progress_rx.is_none()
+            && self.prompt_hooks.is_none()
+        {
             self.finish_loading();
         }
         self.scroll_to_bottom();
@@ -999,7 +1002,7 @@ impl App {
         self.browse_approval_rx = None;
         self.browse_approval = None;
         self.browse_cancel = None;
-        if self.api_task.is_none() && self.side_task.is_none() {
+        if self.api_task.is_none() && self.side_task.is_none() && self.prompt_hooks.is_none() {
             self.finish_loading();
         }
         self.scroll_to_bottom();
@@ -1966,6 +1969,26 @@ mod background_event_tests {
         turn.abort();
 
         app.api_task = None;
+        app.finish_browse();
+        assert!(!app.is_loading);
+
+        // A prompt still waiting on its userPromptSubmit hooks has no
+        // api_task yet, but owns the spinner just the same.
+        app.start_loading();
+        app.prompt_hooks = Some(PendingPromptHooks {
+            task: tokio::spawn(std::future::pending::<crate::hooks::HookResult>()),
+            hook_text: "hello".into(),
+            raw: "hello".into(),
+            voice_goal: None,
+        });
+        app.finish_browse();
+        assert!(app.is_loading);
+        let side = tokio::spawn(std::future::pending::<()>());
+        app.side_task = Some(side.abort_handle());
+        app.finish_side_task();
+        assert!(app.is_loading);
+        side.abort();
+        app.prompt_hooks.take().unwrap().task.abort();
         app.finish_browse();
         assert!(!app.is_loading);
     }

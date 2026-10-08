@@ -700,7 +700,8 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let end = rest[..rest.len().min(12)].find(';');
+        // Bytes, not a str slice: byte 12 may fall inside a multibyte char.
+        let end = rest.as_bytes().iter().take(12).position(|&c| c == b';');
         let decoded = end.and_then(|e| {
             let name = &rest[1..e];
             let c = match name {
@@ -758,6 +759,21 @@ mod tests {
                 ToolResultContent::Text { text } => text.as_str(),
             })
             .collect()
+    }
+
+    /// decode_entities sliced the str at byte 12 after a '&', inside a
+    /// multibyte char here: a panic, and under panic=abort the agent died.
+    #[test]
+    fn entities_next_to_multibyte_text_do_not_panic() {
+        let text = strip_tags("<p>Q&A日本語のページです</p>");
+        assert!(text.contains("Q&A日本語のページです"), "{text}");
+        assert!(strip_tags("<p>&amp;日本&lt;</p>").contains("&日本<"));
+        let page = format!(
+            "{}<p>Q&A日本語のページです</p>{}",
+            "<div>".repeat(600),
+            "</div>".repeat(600)
+        );
+        assert!(html_to_text(&page).contains("Q&A日本語のページです"));
     }
 
     /// Deep nesting used to hit html2text's TooNarrow `.expect()` and abort.
