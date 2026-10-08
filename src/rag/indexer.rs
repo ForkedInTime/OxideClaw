@@ -589,8 +589,10 @@ pub fn index_project(db: &RagDb, project: &Path, force: bool) -> Result<IndexRes
             .unwrap_or(0);
 
         if !force {
+            // Any change, not just a newer one: `cp -p`, `rsync -a`, `tar -x`
+            // and backups restore content with an older mtime.
             let indexed_mtime = db.file_mtime(&rel_path).unwrap_or(0);
-            if mtime <= indexed_mtime {
+            if mtime == indexed_mtime {
                 files_skipped += 1;
                 continue;
             }
@@ -857,6 +859,37 @@ mod tests {
         std::fs::write(tmp.path().join("lib.rs"), "fn b() {}").unwrap();
         let r = index_project(&db, tmp.path(), false).unwrap();
         assert_eq!(r.files_indexed, 1, "the edited file must be re-indexed");
+    }
+
+    /// A file restored with an older mtime (`cp -p` from a backup) was
+    /// skipped, so the index kept serving the code it replaced.
+    #[test]
+    fn a_file_replaced_with_an_older_mtime_is_reindexed() {
+        let tmp = setup_project(&[("lib.rs", "fn current_code() {}")]);
+        let db = test_db(tmp.path());
+        index_project(&db, tmp.path(), false).unwrap();
+
+        let path = tmp.path().join("lib.rs");
+        std::fs::write(&path, "fn restored_code() {}").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 365);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let r = index_project(&db, tmp.path(), false).unwrap();
+        assert_eq!(r.files_indexed, 1);
+        let names: Vec<String> = db
+            .conn
+            .prepare("SELECT symbol_name FROM code_chunks")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, ["restored_code"]);
     }
 
     #[test]
