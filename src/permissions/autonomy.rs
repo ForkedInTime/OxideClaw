@@ -19,8 +19,8 @@ pub enum Autonomy {
     /// Edits inside the project are pre-approved, except to the files in
     /// [`is_protected`]; commands still prompt.
     AutoEdit,
-    /// Everything is pre-approved. Only with the bwrap sandbox, and never
-    /// when started from `$HOME` or above it.
+    /// Everything is pre-approved. Only with the bwrap sandbox and its
+    /// network off, and never when started from `$HOME` or above it.
     FullAuto,
 }
 
@@ -147,10 +147,12 @@ impl Autonomy {
         self.rank() >= other.rank()
     }
 
-    /// The mode the gates apply: `full-auto` without a usable bwrap
-    /// sandbox (see [`full_auto_blocker`]) is `ask`.
-    pub fn effective(self, sandbox_enabled: bool, sandbox_mode: &str) -> Self {
-        if self == Self::FullAuto && full_auto_blocker(sandbox_enabled, sandbox_mode).is_some() {
+    /// The mode the gates apply: `full-auto` without a usable,
+    /// network-isolated bwrap sandbox (see [`full_auto_blocker`]) is `ask`.
+    pub fn effective(self, sandbox_enabled: bool, sandbox_mode: &str, allow_network: bool) -> Self {
+        if self == Self::FullAuto
+            && full_auto_blocker(sandbox_enabled, sandbox_mode, allow_network).is_some()
+        {
             Self::Ask
         } else {
             self
@@ -224,10 +226,16 @@ impl std::fmt::Display for Autonomy {
 }
 
 /// Why `full-auto` cannot be used with this sandbox setting, or `None` when
-/// it can: it needs bwrap, enabled and installed, on Linux. firejail does
-/// not qualify: its default profile leaves all of `$HOME` writable, where
-/// bwrap binds only the project directory read-write.
-pub fn full_auto_blocker(sandbox_enabled: bool, sandbox_mode: &str) -> Option<String> {
+/// it can: it needs bwrap, enabled and installed, on Linux, with its network
+/// off. firejail does not qualify: its default profile leaves all of `$HOME`
+/// writable, where bwrap binds only the project directory read-write. bwrap
+/// confines only the filesystem: with the network on, a command injected by
+/// a file the model read could post the project's source anywhere, unprompted.
+pub fn full_auto_blocker(
+    sandbox_enabled: bool,
+    sandbox_mode: &str,
+    allow_network: bool,
+) -> Option<String> {
     if !cfg!(target_os = "linux") {
         return Some(
             "full-auto is unavailable on this platform until a native sandbox ships: it \
@@ -240,6 +248,14 @@ pub fn full_auto_blocker(sandbox_enabled: bool, sandbox_mode: &str) -> Option<St
             "full-auto requires the bwrap sandbox, which leaves only the project \
              directory writable (firejail and strict do not): run /sandbox enable bwrap \
              first."
+                .into(),
+        );
+    }
+    if allow_network {
+        return Some(
+            "full-auto requires the sandbox's network off, so an unprompted command cannot \
+             send the project anywhere: run /sandbox network off first \
+             (sandboxAllowNetwork: false)."
                 .into(),
         );
     }
@@ -675,27 +691,45 @@ mod tests {
             (true, "nonsense"),
         ] {
             assert!(
-                full_auto_blocker(enabled, mode).is_some(),
+                full_auto_blocker(enabled, mode, false).is_some(),
                 "{enabled} {mode}"
             );
-            assert_eq!(Autonomy::FullAuto.effective(enabled, mode), Autonomy::Ask);
+            assert_eq!(
+                Autonomy::FullAuto.effective(enabled, mode, false),
+                Autonomy::Ask
+            );
         }
         assert_eq!(
-            Autonomy::AutoEdit.effective(false, "strict"),
+            Autonomy::AutoEdit.effective(false, "strict", true),
             Autonomy::AutoEdit
         );
         if !cfg!(target_os = "linux") {
-            assert!(full_auto_blocker(true, "bwrap").is_some());
+            assert!(full_auto_blocker(true, "bwrap", false).is_some());
         } else if crate::sandbox::bwrap_available() {
-            assert_eq!(full_auto_blocker(true, "bwrap"), None);
+            assert_eq!(full_auto_blocker(true, "bwrap", false), None);
             assert_eq!(
-                Autonomy::FullAuto.effective(true, "bwrap"),
+                Autonomy::FullAuto.effective(true, "bwrap", false),
                 Autonomy::FullAuto
             );
         } else {
-            let why = full_auto_blocker(true, "bwrap").unwrap();
+            let why = full_auto_blocker(true, "bwrap", false).unwrap();
             assert!(why.contains("not installed"), "{why}");
         }
+    }
+
+    /// bwrap confines the filesystem, not the network: with it on, an
+    /// unprompted command could send the project and secrets anywhere.
+    #[test]
+    fn full_auto_requires_the_sandbox_network_off() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let why = full_auto_blocker(true, "bwrap", true).unwrap();
+        assert!(why.contains("/sandbox network off"), "{why}");
+        assert_eq!(
+            Autonomy::FullAuto.effective(true, "bwrap", true),
+            Autonomy::Ask
+        );
     }
 
     #[test]

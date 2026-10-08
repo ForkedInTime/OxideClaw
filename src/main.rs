@@ -650,11 +650,13 @@ fn load_dotenv_auto() {
             // CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME / HOME, none of which a .env may set.
             let deny = project_dotenv_deny(&settings::Settings::load_global(), &cwd);
             let skipped = load_dotenv(&env_path, deny);
-            // Warn if project .env exists — it won't leak into tool subprocesses
+            // Its other variables never reach tool subprocesses; the loaded keys
+            // do, unless a sandbox strips them (`sandbox::scrub_credentials`).
             eprintln!(
                 "Note: .env detected in project root. Only oxideclaw-specific keys \
                  (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.; API keys only in trusted \
-                 folders) are loaded. Project vars are NOT injected into tool execution."
+                 folders) are loaded; other project vars are not. Shell commands inherit \
+                 those keys unless /sandbox is enabled."
             );
             if !skipped.is_empty() {
                 eprintln!(

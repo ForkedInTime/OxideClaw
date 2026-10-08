@@ -240,8 +240,8 @@ pub(super) fn cmd_autonomy(args: &str, current: crate::permissions::Autonomy) ->
              .claude/, .env*, .mcp.json, CI, hook and build/test config (package.json,\n              \
              Cargo.toml, Makefile, conftest.py, node_modules/, ...); never when\n              \
              started in $HOME; commands still prompt\n  \
-             full-auto — nothing prompts; needs /sandbox enable bwrap (not firejail),\n              \
-             Linux only; never when started in $HOME\n\n\
+             full-auto — nothing prompts; needs /sandbox enable bwrap (not firejail)\n              \
+             and /sandbox network off, Linux only; never when started in $HOME\n\n\
              permissions.deny rules hold in every mode. /autonomy lasts for this session;\n\
              set \"autonomy\" in settings.json to keep it.\n\n\
              Usage: /autonomy <mode>"
@@ -478,7 +478,7 @@ pub(super) fn cmd_sandbox(args: &str, ctx: &CommandContext) -> CommandAction {
             _ => CommandAction::Message(format!(
                 "Network is currently: {}\n\n\
                  /sandbox network on   — allow outbound network (bwrap mode)\n\
-                 /sandbox network off  — block outbound network (bwrap mode)",
+                 /sandbox network off  — block outbound network (bwrap mode; full-auto needs it)",
                 if ctx.config.sandbox_allow_network {
                     "on (allowed)"
                 } else {

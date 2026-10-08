@@ -579,6 +579,9 @@ impl LspClient {
             Launch::Shell(line) => {
                 let mut c = Command::new("sh");
                 c.arg("-c").arg(format!("exec {line}"));
+                // A sandboxed server runs project code (build scripts,
+                // proc macros) like the Bash tool's commands.
+                crate::sandbox::scrub_credentials(c.as_std_mut());
                 c
             }
         };

@@ -251,7 +251,13 @@ fn runnable_detected(
         let probe = format!("{resolved} clippy --version");
         let wrapped = containment.wrap(&probe, cwd).ok()?;
         if !matches!(
-            run_command(cwd, &wrapped, timeout_secs, cancel),
+            run_command(
+                cwd,
+                &wrapped,
+                timeout_secs,
+                cancel,
+                containment.sandbox_mode.is_some()
+            ),
             CommandResult::Pass
         ) {
             return None;
@@ -363,7 +369,16 @@ pub fn should_trigger(config: &AutoFixConfig, autonomy_mode: Autonomy) -> bool {
 /// NOTE on implementation: the original spec called for `wait_timeout`, but
 /// pulling in a new dep for ~20 lines isn't worth it. We use a poll+kill loop
 /// via `try_wait`, which has the same behavior with no extra deps.
-pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool) -> CommandResult {
+///
+/// `sandboxed` (the command is contained like the Bash tool's) keeps
+/// OxideClaw's provider keys out of its environment, as Bash does.
+pub fn run_command(
+    cwd: &Path,
+    cmd: &str,
+    timeout_secs: u64,
+    cancel: &AtomicBool,
+    sandboxed: bool,
+) -> CommandResult {
     if cmd.trim().is_empty() {
         return CommandResult::Skipped {
             reason: "empty test command".to_string(),
@@ -396,6 +411,9 @@ pub fn run_command(cwd: &Path, cmd: &str, timeout_secs: u64, cancel: &AtomicBool
         c.args(["/D", "/S", "/C"]).raw_arg(format!("\"{cmd}\""));
         c
     };
+    if sandboxed {
+        crate::sandbox::scrub_credentials(&mut command);
+    }
     let spawn = command
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -598,6 +616,7 @@ pub fn run_checks(
     test_cmd: Option<&str>,
     timeout_secs: u64,
     cancel: &AtomicBool,
+    sandboxed: bool,
 ) -> CheckOutcome {
     if lint_cmd.is_none() && test_cmd.is_none() {
         return CheckOutcome::NoRunners;
@@ -607,7 +626,7 @@ pub fn run_checks(
     let mut lint_failed = false;
 
     if let Some(cmd) = lint_cmd {
-        match run_command(cwd, cmd, timeout_secs, cancel) {
+        match run_command(cwd, cmd, timeout_secs, cancel, sandboxed) {
             CommandResult::Pass => {}
             CommandResult::Fail { stderr } => {
                 lint_failed = true;
@@ -635,7 +654,7 @@ pub fn run_checks(
     let mut test_failed = false;
 
     if let Some(cmd) = test_cmd {
-        match run_command(cwd, cmd, timeout_secs, cancel) {
+        match run_command(cwd, cmd, timeout_secs, cancel, sandboxed) {
             CommandResult::Pass => {}
             CommandResult::Fail { stderr } => {
                 test_failed = true;
@@ -899,6 +918,7 @@ pub fn run_auto_fix_check(
             test_run.as_deref(),
             config.timeout_secs,
             cancel,
+            containment.sandbox_mode.is_some(),
         );
         let lsp = lsp.and_then(|h| h.join().ok()).unwrap_or_default();
         (outcome, lsp)
@@ -1524,7 +1544,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("shim.cmd"), "@exit /b 0\r\n").unwrap();
         std::fs::write(td.path().join("in.txt"), "xa by\r\n").unwrap();
-        let run = |cmd: &str| super::run_command(td.path(), cmd, 60, &cancel);
+        let run = |cmd: &str| super::run_command(td.path(), cmd, 60, &cancel, false);
         assert!(
             matches!(run("shim"), super::CommandResult::Pass),
             "{:?}",
@@ -1560,11 +1580,18 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         let started = std::time::Instant::now();
-        let r = super::run_command(td.path(), "sleep 30", 0, &cancel);
+        let r = super::run_command(td.path(), "sleep 30", 0, &cancel, false);
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(matches!(r, super::CommandResult::Skipped { .. }), "{r:?}");
         // A cancelled lint never goes on to start the tests.
-        let outcome = super::run_checks(td.path(), Some("true"), Some("touch ran"), 0, &cancel);
+        let outcome = super::run_checks(
+            td.path(),
+            Some("true"),
+            Some("touch ran"),
+            0,
+            &cancel,
+            false,
+        );
         assert!(matches!(outcome, super::CheckOutcome::Skipped { .. }));
         assert!(!td.path().join("ran").exists());
     }
@@ -1727,6 +1754,7 @@ mod tests {
             "echo build-noise >&2; head -c 200000 /dev/zero | tr '\\0' x; echo; echo 'test result: FAILED'; exit 1",
             30,
             &NOT_CANCELLED,
+            false,
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         match r {
@@ -1750,7 +1778,8 @@ mod tests {
                 "read -r pid comm state ppid pgrp sid rest < /proc/$$/stat; \
                  test \"$sid\" = \"$$\" && test \"$pgrp\" = \"$$\"",
                 10,
-                &NOT_CANCELLED
+                &NOT_CANCELLED,
+                false
             ),
             CommandResult::Pass
         ));
@@ -1768,6 +1797,7 @@ mod tests {
             "sleep 30 & echo 'test failed'; exit 1",
             20,
             &NOT_CANCELLED,
+            false,
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
@@ -1806,6 +1836,7 @@ mod tests {
                  while [ ! -e escaped ]; do sleep 0.05; done; exit 0",
                 timeout,
                 &NOT_CANCELLED,
+                false,
             );
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(10),
@@ -1825,7 +1856,8 @@ mod tests {
                 td.path(),
                 "test \"a b\" = 'a b' && X=1 true",
                 10,
-                &NOT_CANCELLED
+                &NOT_CANCELLED,
+                false
             ),
             CommandResult::Pass
         ));
@@ -1922,6 +1954,7 @@ mod tests {
             Some("true"), // tests: same
             5,
             &NOT_CANCELLED,
+            false,
         );
         assert!(matches!(outcome, CheckOutcome::Pass), "got {outcome:?}");
     }
@@ -1939,6 +1972,7 @@ mod tests {
             Some(&test_cmd),
             5,
             &NOT_CANCELLED,
+            false,
         );
         match outcome {
             CheckOutcome::Fail {
@@ -1961,7 +1995,14 @@ mod tests {
     #[test]
     fn run_checks_lint_pass_tests_fail() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), Some("true"), Some("false"), 5, &NOT_CANCELLED);
+        let outcome = run_checks(
+            dir.path(),
+            Some("true"),
+            Some("false"),
+            5,
+            &NOT_CANCELLED,
+            false,
+        );
         match outcome {
             CheckOutcome::Fail {
                 lint_stderr,
@@ -1977,7 +2018,7 @@ mod tests {
     #[test]
     fn run_checks_no_runners() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), None, None, 5, &NOT_CANCELLED);
+        let outcome = run_checks(dir.path(), None, None, 5, &NOT_CANCELLED, false);
         assert!(
             matches!(outcome, CheckOutcome::NoRunners),
             "got {outcome:?}"
@@ -1987,14 +2028,14 @@ mod tests {
     #[test]
     fn run_checks_lint_only_pass() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), Some("true"), None, 5, &NOT_CANCELLED);
+        let outcome = run_checks(dir.path(), Some("true"), None, 5, &NOT_CANCELLED, false);
         assert!(matches!(outcome, CheckOutcome::Pass), "got {outcome:?}");
     }
 
     #[test]
     fn run_checks_tests_only_fail() {
         let dir = tempdir().unwrap();
-        let outcome = run_checks(dir.path(), None, Some("false"), 5, &NOT_CANCELLED);
+        let outcome = run_checks(dir.path(), None, Some("false"), 5, &NOT_CANCELLED, false);
         match outcome {
             CheckOutcome::Fail {
                 lint_stderr,

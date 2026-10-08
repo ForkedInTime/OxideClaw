@@ -1473,18 +1473,26 @@ impl Config {
 
     /// The autonomy mode the permission gates apply.
     pub fn effective_autonomy(&self) -> crate::permissions::Autonomy {
-        self.autonomy
-            .effective(self.sandbox_enabled, &self.sandbox_mode)
+        self.autonomy.effective(
+            self.sandbox_enabled,
+            &self.sandbox_mode,
+            self.sandbox_allow_network,
+        )
     }
 
-    /// `full-auto` without a usable bwrap sandbox falls back to
-    /// `ask`; returns the line that says so, or `None` when nothing changed.
+    /// `full-auto` without a usable, network-isolated bwrap sandbox falls
+    /// back to `ask`; returns the line that says so, or `None` when nothing
+    /// changed.
     pub fn fall_back_from_full_auto(&mut self) -> Option<String> {
         use crate::permissions::{Autonomy, autonomy::full_auto_blocker};
         if self.autonomy != Autonomy::FullAuto {
             return None;
         }
-        let why = full_auto_blocker(self.sandbox_enabled, &self.sandbox_mode)?;
+        let why = full_auto_blocker(
+            self.sandbox_enabled,
+            &self.sandbox_mode,
+            self.sandbox_allow_network,
+        )?;
         self.autonomy = Autonomy::Ask;
         Some(format!("Autonomy is \"ask\", not \"full-auto\": {why}"))
     }
@@ -4248,6 +4256,21 @@ mod autonomy_migration_tests {
         assert!(c.fall_back_from_full_auto().is_some());
         assert_eq!(c.autonomy, Autonomy::Ask);
         assert_eq!(c.fall_back_from_full_auto(), None);
+
+        // `/sandbox network on` under full-auto drops to ask as well.
+        if cfg!(target_os = "linux") {
+            let mut c = Config {
+                autonomy: Autonomy::FullAuto,
+                sandbox_enabled: true,
+                sandbox_mode: "bwrap".into(),
+                sandbox_allow_network: true,
+                ..Config::default()
+            };
+            assert_eq!(c.effective_autonomy(), Autonomy::Ask);
+            let why = c.fall_back_from_full_auto().unwrap();
+            assert!(why.contains("network off"), "{why}");
+            assert_eq!(c.autonomy, Autonomy::Ask);
+        }
     }
 }
 

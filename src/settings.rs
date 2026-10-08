@@ -297,8 +297,8 @@ pub struct Settings {
     /// - "ask" (default): edits and commands prompt unless a rule allows them
     /// - "auto-edit": edits inside the project need no prompt, except to VCS,
     ///   agent, CI, hook and build/test-runner config; commands still prompt
-    /// - "full-auto": no prompts at all, only under the bwrap sandbox and not
-    ///   when started in $HOME
+    /// - "full-auto": no prompts at all, only under the bwrap sandbox with
+    ///   `sandboxAllowNetwork: false`, and not when started in $HOME
     ///
     /// Deny rules hold in every mode. A project file may only make it stricter.
     pub autonomy: Option<String>,

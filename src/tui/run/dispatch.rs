@@ -929,12 +929,17 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 "sandboxAllowNetwork",
                 serde_json::Value::Bool(allow),
             );
-            let msg = if allow {
+            let mut msg = if allow {
                 "Sandbox network: allowed (bwrap will not use --unshare-net)."
             } else {
                 "Sandbox network: blocked (bwrap will use --unshare-net)."
-            };
-            app.entries.push(ChatEntry::system(msg.to_string()));
+            }
+            .to_string();
+            if let Some(why) = config.fall_back_from_full_auto() {
+                msg.push('\n');
+                msg.push_str(&why);
+            }
+            app.entries.push(ChatEntry::system(msg));
             app.scroll_to_bottom();
         }
         CommandAction::EditClaudeMd => {
@@ -1815,7 +1820,13 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         CommandAction::SetAutonomy(mode) => {
             use crate::permissions::{Autonomy, autonomy::full_auto_blocker};
             let blocker = (mode == Autonomy::FullAuto)
-                .then(|| full_auto_blocker(config.sandbox_enabled, &config.sandbox_mode))
+                .then(|| {
+                    full_auto_blocker(
+                        config.sandbox_enabled,
+                        &config.sandbox_mode,
+                        config.sandbox_allow_network,
+                    )
+                })
                 .flatten();
             let msg = match blocker {
                 Some(why) => format!("{why}\nAutonomy stays {}.", config.autonomy),

@@ -392,6 +392,33 @@ pub fn apply_sandbox(
     }
 }
 
+/// The variables that carry OxideClaw's own credentials: the Anthropic
+/// chain, every OpenAI-compatible provider's key and the Whisper key.
+pub fn credential_env_keys() -> Vec<&'static str> {
+    use crate::api::openai_compat::{PROVIDERS, provider_key_envs};
+    let mut keys = vec![
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "XAI_API_KEY",
+        "WHISPER_API_KEY",
+    ];
+    keys.extend(PROVIDERS.iter().flat_map(provider_key_envs));
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// Keep OxideClaw's credentials out of a command run under the sandbox. The
+/// sandbox binds no `.env`, so the inherited environment was the only way
+/// in, and the user who turned the sandbox on did so to contain a command
+/// the model chose. Variables set after this (settings.json `env`) still
+/// reach it: those the user named for commands on purpose.
+pub fn scrub_credentials(cmd: &mut Command) {
+    for key in credential_env_keys() {
+        cmd.env_remove(key);
+    }
+}
+
 /// Sandbox gate for command-executing tools that the namespace wrappers cannot
 /// wrap. `bwrap_wrap` / `firejail_wrap` hard-code `bash -c`, so routing a
 /// PowerShell command through them would hand the script to bash and change its
@@ -490,6 +517,35 @@ pub(crate) fn shell_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A sandboxed command inherited every provider key, so an injected
+    /// `curl -d "$ANTHROPIC_API_KEY" ...` sent it out without a prompt.
+    #[cfg(unix)]
+    #[test]
+    fn scrubbed_commands_see_no_provider_credentials() {
+        let keys = credential_env_keys();
+        for k in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GROQ_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "WHISPER_API_KEY",
+        ] {
+            assert!(keys.contains(&k), "{k}");
+        }
+        assert!(!keys.contains(&"PATH") && !keys.contains(&""));
+
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s|%s' \"${GROQ_API_KEY-unset}\" \"$KEEP\""])
+            .env("GROQ_API_KEY", "gsk-leak")
+            .env("KEEP", "kept");
+        scrub_credentials(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|kept");
+    }
 
     /// An unrecognised mode used to return the command unchanged — running it
     /// fully unsandboxed, skipping `strict_check`, while the UI still reported

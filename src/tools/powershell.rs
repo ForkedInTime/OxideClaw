@@ -85,6 +85,10 @@ impl Tool for PowerShellTool {
         let mut truncated = false;
         let fut = async {
             let mut cmd = Command::new("pwsh");
+            // Only strict reaches here; it still keeps keys from the command.
+            if ctx.sandbox_mode.is_some() {
+                crate::sandbox::scrub_credentials(cmd.as_std_mut());
+            }
             cmd.args(["-NoProfile", "-NonInteractive", "-Command", &input.command])
                 .current_dir(&ctx.cwd)
                 // Inherited stdin lets an interactive prompt fight the TUI for

@@ -498,9 +498,13 @@ impl Tool for BashTool {
         let cwd = ctx.cwd.clone();
         let extra_env = ctx.env.clone();
         let shell = ctx.command_shell();
+        let sandboxed = ctx.sandbox_mode.is_some();
 
         let fut = async move {
             let mut cmd = Command::new(&shell);
+            if sandboxed {
+                crate::sandbox::scrub_credentials(cmd.as_std_mut());
+            }
             cmd.arg("-c")
                 .arg(&command)
                 .current_dir(&cwd)
