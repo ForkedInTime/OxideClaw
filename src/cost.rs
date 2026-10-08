@@ -131,7 +131,15 @@ pub(crate) fn model_price(model: &str) -> ModelPrice {
             ..rough(input, output)
         };
         if id.contains("flash-lite") {
-            gemini(0.10, 0.40)
+            // Per generation: 3.x Flash-Lite costs 2.5-3.75x what 2.x does.
+            if id.contains("gemini-2-") {
+                gemini(0.10, 0.40)
+            } else if id.contains("gemini-3") {
+                gemini(0.25, 1.50)
+            } else {
+                // As for any unrecognised Gemini model below.
+                rough(4.0, 18.0)
+            }
         } else if id.contains("gemini-3") && id.contains("flash") {
             gemini(0.50, 3.0)
         } else if id.contains("gemini-2-0-flash") {
@@ -673,6 +681,9 @@ mod tests {
         for (model, input, output) in [
             ("gemini:gemini-2.5-flash", 0.30, 2.50),
             ("gemini:gemini-2.5-flash-lite", 0.10, 0.40),
+            ("gemini:gemini-2.0-flash-lite", 0.10, 0.40),
+            ("gemini:gemini-3.1-flash-lite-preview", 0.25, 1.50),
+            ("gemini:gemini-flash-lite-latest", 4.0, 18.0),
             ("gemini:gemini-2.5-pro", 1.25, 10.0),
             ("gemini:gemini-3-pro-preview", 2.0, 12.0),
         ] {
