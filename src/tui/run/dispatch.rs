@@ -1107,6 +1107,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // deny rule or guard hook did nothing until a restart.
             reloaded.extend(config.reload_permissions_and_hooks(&settings));
             perm_state.replace_rules(&config.permissions_allow, &config.permissions_deny);
+            // Read once at startup before, so a tightened mode in
+            // settings.json did nothing until a restart. The full-auto
+            // fallback below sees the reloaded sandbox.
+            let (autonomy_moved, autonomy_notice) = config.reload_autonomy(&settings);
 
             // OXIDECLAW_OPENAI_API, when set, still wins over the file.
             let openai_api = settings
@@ -1196,9 +1200,6 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 config.sandbox_allow_network = net;
                 reloaded.push("sandboxAllowNetwork");
             }
-            // Read once at startup before, so a tightened mode in
-            // settings.json did nothing until a restart.
-            let (autonomy_moved, autonomy_notice) = config.reload_autonomy(&settings);
             let autonomy_fallback = config.fall_back_from_full_auto();
             if autonomy_moved {
                 reloaded.push("autonomy");
