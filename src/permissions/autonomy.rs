@@ -213,7 +213,10 @@ impl Autonomy {
             // pre-approved command could rewrite every dotfile, so full-auto
             // pre-approves nothing there, edits or commands.
             Self::FullAuto if project_holds_home(project, home) => Verdict::Rules,
-            Self::FullAuto => Verdict::PreApproved,
+            // Only shell commands run under bwrap. Reads outside the project,
+            // WebFetch, the browser and sub-agents run in-process, so they
+            // keep the rules (in the SDK and ACP: the host's prompt).
+            Self::FullAuto if crate::permissions::is_command_tool(tool) => Verdict::PreApproved,
             _ => Verdict::Rules,
         }
     }
@@ -588,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn suggest_prompts_every_edit_and_full_auto_pre_approves_the_rest() {
+    fn suggest_prompts_every_edit_and_full_auto_pre_approves_commands() {
         let root = Path::new("/proj");
         let home = Some(Path::new("/home/u"));
         for tool in EDIT_TOOLS {
@@ -637,10 +640,21 @@ mod tests {
             ),
             Verdict::Rules
         );
-        assert_eq!(
-            Autonomy::FullAuto.verdict_with_home("ExitWorktree", &json!({}), root, home),
-            Verdict::PreApproved
-        );
+        // Tools bwrap does not confine are left to the rules too.
+        for tool in [
+            "ExitWorktree",
+            "Read",
+            "WebFetch",
+            "Agent",
+            "EnterWorktree",
+            "browser_navigate",
+        ] {
+            assert_eq!(
+                Autonomy::FullAuto.verdict_with_home(tool, &json!({}), root, home),
+                Verdict::Rules,
+                "{tool}"
+            );
+        }
         for tool in ["Bash", "Write"] {
             assert_eq!(
                 Autonomy::Ask.verdict_with_home(tool, &write("a"), root, home),

@@ -268,6 +268,19 @@ mod tests {
             engine(false, Policy::default()).evaluate(q, &input),
             ApprovalDecision::Deny
         );
+        // Only commands run under bwrap: protocol.md leaves everything else
+        // (here a read outside the project and a fetch) to `ask` / `deny`.
+        for (tool, input) in [
+            ("Read", serde_json::json!({"file_path": "/etc/passwd"})),
+            ("WebFetch", serde_json::json!({"url": "https://example.com/"})),
+        ] {
+            assert_eq!(e.evaluate(tool, &input), ApprovalDecision::Ask, "{tool}");
+            assert_eq!(
+                engine(false, Policy::default()).evaluate(tool, &input),
+                ApprovalDecision::Deny,
+                "{tool}"
+            );
+        }
         // The host's own lists still decide it.
         let allow = Policy {
             allow: vec![q.to_string()],
