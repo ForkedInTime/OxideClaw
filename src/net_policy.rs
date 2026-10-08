@@ -78,10 +78,10 @@ impl NetPolicy {
 
     /// Reject an address this policy must not connect to.
     pub fn check_ip(&self, ip: IpAddr) -> Result<()> {
-        // `::ffff:a.b.c.d` is the same wire destination as `a.b.c.d`;
-        // classify the embedded v4 so the mapping is not an escape hatch.
+        // `::ffff:a.b.c.d`, NAT64 and 6to4 addresses carry an IPv4 wire
+        // destination; classify that so the embedding is not an escape hatch.
         let ip = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            IpAddr::V6(v6) => embedded_v4(v6).map(IpAddr::V4).unwrap_or(ip),
             v4 => v4,
         };
         let always_denied = match ip {
@@ -98,6 +98,14 @@ impl NetPolicy {
                     || v6.is_multicast()
                     || v6.is_unicast_link_local()
                     || METADATA_V6.contains(&v6)
+                    // The local-use NAT64 prefix's length is the operator's
+                    // choice, so the embedded v4 cannot be located reliably;
+                    // at least refuse the /96 layout's link-local and metadata
+                    // endpoints, which LOCAL_OK must never reach.
+                    || (is_local_nat64(v6) && {
+                        let v4 = low_v4(v6);
+                        v4.is_link_local() || METADATA_V4.contains(&v4)
+                    })
             }
         };
         if always_denied {
@@ -107,7 +115,7 @@ impl NetPolicy {
         }
         let private = match ip {
             IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || is_cgnat(v4),
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || is_local_nat64(v6),
         };
         if private && !self.allow_private {
             bail!(
@@ -507,6 +515,32 @@ const LOCAL_SUFFIXES: [&str; 10] = [
     "corp",
     "private",
 ];
+
+/// The IPv4 destination `v6` stands for on the wire: IPv4-mapped
+/// `::ffff:a.b.c.d`, the NAT64 well-known prefix `64:ff9b::/96`, the
+/// deprecated IPv4-compatible `::a.b.c.d`, and 6to4 `2002:aabb:ccdd::/48`.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    match v6.segments() {
+        [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(low_v4(v6)),
+        [0, 0, 0, 0, 0, 0, _, _] if !v6.is_unspecified() && !v6.is_loopback() => Some(low_v4(v6)),
+        [0x2002, hi, lo, ..] => Some(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))),
+        _ => None,
+    }
+}
+
+/// The low 32 bits of `v6` as an IPv4 address.
+fn low_v4(v6: Ipv6Addr) -> Ipv4Addr {
+    Ipv4Addr::from((v6.to_bits() & 0xffff_ffff) as u32)
+}
+
+/// `64:ff9b:1::/48` (RFC 8215), the NAT64 prefix for translators inside a
+/// network, which reach its private IPv4 space. Treated as private.
+fn is_local_nat64(v6: Ipv6Addr) -> bool {
+    matches!(v6.segments(), [0x64, 0xff9b, 1, ..])
+}
 
 /// 100.64.0.0/10 (RFC 6598, carrier-grade NAT). Treated as private.
 fn is_cgnat(ip: Ipv4Addr) -> bool {
@@ -1496,6 +1530,42 @@ mod tests {
                 .check_ip(ip("::ffff:93.184.216.34"))
                 .is_ok()
         );
+    }
+
+    /// Only `::ffff:a.b.c.d` was unwrapped, so on an IPv6-only network with
+    /// NAT64 `64:ff9b::a00:5` reached 10.0.0.5 under the strict policy.
+    #[test]
+    fn nat64_compat_and_6to4_addresses_are_classified_as_their_v4() {
+        for a in [
+            "64:ff9b::a00:5",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1:a00:0:500::",
+            "::a00:5",
+            "2002:a00:5::1",
+            "2002:c0a8:101::1",
+        ] {
+            assert!(NetPolicy::STRICT.check_ip(ip(a)).is_err(), "{a}");
+        }
+        for a in [
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::a9fe:a9fe",
+            "::a9fe:a9fe",
+            "2002:a9fe:a9fe::1",
+        ] {
+            assert!(NetPolicy::LOCAL_OK.check_ip(ip(a)).is_err(), "{a}");
+        }
+        for a in ["64:ff9b::5db8:d822", "2002:5db8:d822::1", "::5db8:d822"] {
+            assert!(NetPolicy::STRICT.check_ip(ip(a)).is_ok(), "{a}");
+        }
+        assert!(NetPolicy::LOCAL_OK.check_ip(ip("64:ff9b::a00:5")).is_ok());
+        assert!(
+            NetPolicy::LOCAL_OK
+                .check_ip(ip("64:ff9b:1:a00:0:500::"))
+                .is_ok()
+        );
+        // An embedded 127.x stays a hard private denial, not a grantable
+        // loopback service.
+        assert!(!is_loopback(ip("64:ff9b::7f00:1")));
     }
 
     #[test]

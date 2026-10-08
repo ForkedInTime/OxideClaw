@@ -44,6 +44,7 @@ WebFetch and WebBrowser run without an approval prompt, so a prompt-injected tur
 
 - **Always refused:** link-local (`169.254.0.0/16`, `fe80::/10`, where `169.254.169.254` lives), unspecified, multicast, broadcast and IPv4 documentation ranges, and the metadata endpoints outside link-local (`100.100.100.200`, `fd00:ec2::254`).
 - **Refused unless `allowPrivateNetworkFetch: true`:** loopback, RFC 1918, CGNAT (`100.64.0.0/10`) and ULA (`fc00::/7`).
+- IPv6 addresses that carry an IPv4 destination (`::ffff:a.b.c.d`, NAT64 `64:ff9b::/96`, `::a.b.c.d`, 6to4 `2002::/16`) are classified as that IPv4 address. The local-use NAT64 prefix `64:ff9b:1::/48` counts as private.
 - A direct connection is pinned to the checked addresses, so a second DNS answer cannot redirect it.
 
 **Behind a proxy** (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, honouring `NO_PROXY`) the hostname is still resolved and checked locally first; the proxy never sees a request the policy refuses. Public destinations are then sent to the proxy by name, private ones (when allowed) and `NO_PROXY` hosts connect directly with the same pinning. The proxy resolves the name again itself, so the address pin cannot extend through it.
