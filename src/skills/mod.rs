@@ -354,14 +354,16 @@ pub async fn load_skills_in(cwd: &Path, deny: &ReadDeny) -> LoadedSkills {
 /// also holds legacy flat `<name>.md` skills. `.agents/skills` is the
 /// cross-agent standard directory, where only `<name>/SKILL.md` is a skill
 /// (a README.md there is not one). `.claude/skills` and `~/.claude/skills`
-/// are Claude Code's; OxideClaw only reads them.
+/// are Claude Code's; OxideClaw only reads them. The project directories are
+/// read at every level from `cwd` up to the repo root, nearest first.
 fn skill_dirs(cwd: &Path, config_dir: &Path, home: Option<&Path>) -> Vec<(PathBuf, bool)> {
-    let mut candidates = vec![
-        (cwd.join(".agents").join("skills"), false),
-        (cwd.join(".oxideclaw").join("skills"), true),
-        (cwd.join(".claude").join("skills"), true),
-        (config_dir.join("skills"), true),
-    ];
+    let mut candidates = Vec::new();
+    for level in project_levels(cwd, home) {
+        candidates.push((level.join(".agents").join("skills"), false));
+        candidates.push((level.join(".oxideclaw").join("skills"), true));
+        candidates.push((level.join(".claude").join("skills"), true));
+    }
+    candidates.push((config_dir.join("skills"), true));
     if let Some(home) = home {
         candidates.push((home.join(".claude").join("skills"), true));
     }
@@ -375,6 +377,27 @@ fn skill_dirs(cwd: &Path, config_dir: &Path, home: Option<&Path>) -> Vec<(PathBu
         }
     }
     dirs
+}
+
+/// `cwd` and its parents up to the git work-tree root (a `.git` file counts,
+/// for worktrees), so a monorepo's root skills load in `packages/web` too.
+/// With no `.git` below `home` or the filesystem root only `cwd` is used,
+/// so a stray folder's skills above an unversioned directory never load.
+fn project_levels(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut levels = Vec::new();
+    for dir in cwd.ancestors() {
+        if Some(dir) == home && dir != cwd {
+            break;
+        }
+        levels.push(dir.to_path_buf());
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return levels;
+        }
+        if Some(dir) == home {
+            break;
+        }
+    }
+    vec![cwd.to_path_buf()]
 }
 
 /// [`load_skills_in`] with the config and home directories passed in. On a
@@ -942,6 +965,51 @@ mod tests {
         }
         assert_eq!(skills["commit"].description, "home commit");
         assert_eq!(skills["dup"].description, "aa");
+    }
+
+    /// Skills were only looked up in cwd, so `cd packages/web && oxideclaw`
+    /// lost a monorepo's root `.agents/skills`.
+    #[tokio::test]
+    async fn repo_root_skills_load_from_a_subdirectory_and_nearer_ones_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let sub = at(&repo, "packages/web");
+        write(
+            &at(&repo, ".agents/skills/release/SKILL.md"),
+            &skill_md("release", "root release", "b"),
+        );
+        write(
+            &at(&repo, ".claude/skills/shared/SKILL.md"),
+            &skill_md("shared", "root", "b"),
+        );
+        write(
+            &at(&sub, ".claude/skills/shared/SKILL.md"),
+            &skill_md("shared", "nearest", "b"),
+        );
+        // Above the repo root: never read.
+        write(
+            &at(dir.path(), ".agents/skills/outside/SKILL.md"),
+            &skill_md("outside", "o", "b"),
+        );
+        let cfg = dir.path().join("cfg");
+        let none = ReadDeny::default();
+
+        let loaded = load_skills_at(&sub, &cfg, None, &none).await;
+        assert_eq!(loaded.skills["release"].description, "root release");
+        assert_eq!(loaded.skills["shared"].description, "nearest");
+        assert!(!loaded.skills.contains_key("outside"));
+
+        // Not in a repo: only cwd itself.
+        let plain = dir.path().join("plain/sub");
+        write(
+            &at(dir.path(), "plain/.agents/skills/up/SKILL.md"),
+            &skill_md("up", "u", "b"),
+        );
+        std::fs::create_dir_all(&plain).unwrap();
+        let loaded = load_skills_at(&plain, &cfg, None, &none).await;
+        assert!(!loaded.skills.contains_key("up"));
+        assert!(!loaded.skills.contains_key("outside"));
     }
 
     #[tokio::test]
