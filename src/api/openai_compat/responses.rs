@@ -737,23 +737,33 @@ impl OpenAiCompatClient {
         };
 
         let mut resp = self.send_responses(&url, &body).await?;
-        if !resp.status().is_success() {
+        // Each fallback drops one feature the server refused and resends;
+        // neither can fire twice, since its own condition no longer holds.
+        let mut summary_sent = summary;
+        while !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            if !(summary && summary_refused(status, &text)) {
+            if !body.tools.is_empty()
+                && status == reqwest::StatusCode::BAD_REQUEST
+                && text.contains("does not support tools")
+            {
+                // As on Chat Completions: text-only for the rest of the
+                // session, with a one-time notice, rather than fail every turn.
+                self.no_tools.store(true, Ordering::Relaxed);
+                debug!("Model does not support tools — disabling for this session");
+                body.instructions = patch_system_no_tools(&body.instructions);
+                body.tools = vec![];
+            } else if summary_sent && summary_refused(status, &text) {
+                // Leave summaries off for the rest of the session rather than
+                // fail every turn over a display setting.
+                self.no_summary.store(true, Ordering::Relaxed);
+                debug!("Reasoning summaries refused, sending without: {text}");
+                body.reasoning = reasoning_param(false);
+                summary_sent = false;
+            } else {
                 return Err(anyhow!("{} error {status}: {text}", self.provider_name));
             }
-            // Leave summaries off for the rest of the session rather than
-            // fail every turn over a display setting.
-            self.no_summary.store(true, Ordering::Relaxed);
-            debug!("Reasoning summaries refused, sending without: {text}");
-            body.reasoning = reasoning_param(false);
             resp = self.send_responses(&url, &body).await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("{} error {status}: {text}", self.provider_name));
-            }
         }
 
         let (result, items) = parse_responses_stream(resp, on_text).await?;
@@ -1741,6 +1751,46 @@ mod tests {
         );
         assert_eq!(bodies[1]["reasoning"], json!({"effort": "low"}));
         assert_eq!(bodies[2]["reasoning"], json!({"effort": "low"}));
+    }
+
+    /// The text-only fallback for a model without tool support existed only
+    /// on Chat Completions, so over the Responses API every turn failed.
+    #[tokio::test]
+    async fn a_model_without_tools_falls_back_to_text_only() {
+        let refusal =
+            json!({"error": {"message": "registry.ollama.ai/library/gemma:2b does not support tools"}})
+                .to_string();
+        let (url, reqs) = serve_seq(vec![
+            ("400 Bad Request", "application/json", refusal),
+            ("200 OK", "text/event-stream", text_turn()),
+            ("200 OK", "text/event-stream", text_turn()),
+        ])
+        .await;
+        let c = responses_client(url);
+        let with_tools = || {
+            let mut r = request("oai:gemma:2b");
+            r.system = crate::api::types::SystemContent::Plain("Be terse.".into());
+            r.tools = vec![ToolDefinition {
+                name: "Read".into(),
+                description: "read a file".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                cache_control: None,
+            }];
+            r
+        };
+        let r = c.messages_stream(with_tools(), |_| {}).await.unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+        assert!(c.take_tools_notice());
+        c.messages_stream(with_tools(), |_| {}).await.unwrap();
+
+        let bodies: Vec<_> = reqs.await.unwrap().into_iter().map(|(_, b)| b).collect();
+        assert_eq!(bodies[0]["tools"].as_array().map(Vec::len), Some(1));
+        for b in &bodies[1..] {
+            assert!(b.get("tools").is_none(), "{b}");
+            let instructions = b["instructions"].as_str().unwrap();
+            assert!(instructions.starts_with("Be terse."), "{instructions}");
+            assert_ne!(instructions, "Be terse.", "not patched for text-only");
+        }
     }
 
     /// Any other 400 is the user's error to see, not a reason to retry.
