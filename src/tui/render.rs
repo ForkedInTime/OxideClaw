@@ -1081,7 +1081,12 @@ fn draw_browse_approval(f: &mut Frame, area: Rect, app: &App, tc: ThemeColors) {
             "D",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("]eny", Style::default().fg(Color::DarkGray)),
+        Span::styled("]eny   [", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("] stop /browse", Style::default().fg(Color::DarkGray)),
     ]);
     let para = paragraph(Text::from(lines)).wrap(Wrap { trim: true });
 

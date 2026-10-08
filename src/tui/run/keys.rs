@@ -207,7 +207,14 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         match key.code {
             Char('a') | Char('A') => answer_browse_approval(app, true, "  ✓ Approved"),
             Char('d') | Char('D') => answer_browse_approval(app, false, "  ✗ Denied"),
-            KeyCode::Esc => answer_browse_approval(app, false, "  ✗ Cancelled"),
+            // Esc cancels everywhere else, so it stops the run too: a
+            // denied action alone left the agent driving the browser.
+            KeyCode::Esc => {
+                answer_browse_approval(app, false, "  ✗ Denied — stopping /browse");
+                if let Some(cancel) = app.browse_cancel.take() {
+                    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             _ => {} // ignore other keys while prompt is active
         }
         return Ok(());
@@ -1309,6 +1316,24 @@ mod browse_approval_key_tests {
         assert!(!last.contains("✓ Approved"), "{last}");
         assert!(last.contains("expired"), "{last}");
     }
+
+    /// Esc said "Cancelled" but only denied the one action; the run went on.
+    #[tokio::test]
+    async fn esc_denies_the_action_and_stops_the_browse() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (p, mut rx) = prompt();
+        app.browse_approval = Some(p);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.browse_cancel = Some(cancel.clone());
+        ctrl_c_tests::press(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await;
+        assert!(!rx.try_recv().unwrap(), "action approved");
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst), "run kept going");
+        assert!(last_entry(&app).contains("stopping /browse"));
+    }
 }
 
 #[cfg(test)]
@@ -1445,7 +1470,7 @@ mod ctrl_c_tests {
     use crate::tui::app::PendingUserQuestion;
     use crossterm::event::KeyEvent;
 
-    async fn press(app: &mut App, key: KeyEvent) {
+    pub(super) async fn press(app: &mut App, key: KeyEvent) {
         let dir = tempfile::tempdir().unwrap();
         let mut messages = Vec::new();
         let mut client =
