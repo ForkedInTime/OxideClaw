@@ -301,6 +301,16 @@ pub fn add(
     force: bool,
 ) -> Result<PathBuf> {
     let path = scope.write_path(cwd, config_dir);
+    let mut json = read_json_object(&path)?;
+    // Replacing would silently drop the old entry's env and headers, often
+    // a hand-set token. `force` only allows literal secrets in .mcp.json.
+    if json.get("mcpServers").and_then(|m| m.get(name)).is_some() {
+        anyhow::bail!(
+            "MCP server '{name}' already exists in the {scope} scope ({}). Remove it \
+             first with `oxideclaw mcp remove --scope {scope} {name}`.",
+            path.display()
+        );
+    }
     if scope == Scope::Project && !force {
         let secrets = literal_secrets(&cfg);
         if !secrets.is_empty() {
@@ -315,7 +325,6 @@ pub fn add(
             );
         }
     }
-    let mut json = read_json_object(&path)?;
     if !json.get("mcpServers").is_some_and(|v| v.is_object()) {
         json["mcpServers"] = serde_json::json!({});
     }
@@ -503,6 +512,37 @@ mod tests {
         // Another project does not see it.
         let other = tempfile::tempdir().unwrap();
         assert!(list(other.path(), home.path()).is_empty());
+    }
+
+    /// The CLI's `mcp add`, `add-json` and `add-from-claude-desktop` call
+    /// `add` directly; a second add must not replace the first entry.
+    #[test]
+    fn adding_an_existing_name_is_refused_and_keeps_the_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (r, h) = (repo.path(), home.path());
+        add(
+            "gh",
+            stdio(&[("GITHUB_TOKEN", "ghp_1")]),
+            Scope::Local,
+            r,
+            h,
+            false,
+        )
+        .unwrap();
+
+        let err = add("gh", stdio(&[]), Scope::Local, r, h, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists in the local scope"), "{err}");
+        let servers = list(r, h);
+        assert_eq!(servers.len(), 1);
+        match &servers[0].config {
+            McpServerConfig::Stdio(s) => assert_eq!(s.env["GITHUB_TOKEN"], "ghp_1"),
+            other => panic!("{other:?}"),
+        }
+        // Another scope is a different file and still takes the name.
+        add("gh", stdio(&[]), Scope::User, r, h, false).unwrap();
     }
 
     #[test]
