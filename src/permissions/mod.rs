@@ -1088,6 +1088,16 @@ pub fn split_compound_command(cmd: &str, grammar: ShellGrammar) -> Vec<&str> {
         // the right, exactly like `;`. Newlines separate statements in both
         // sh and PowerShell: missing them let a `git ` prefix rule match
         // "git status\nrm -rf /" as one sub-command.
+        //
+        // Inside a redirect (`2>&1`, `>&2`, `<&3`, `&>file`) `&` names a file
+        // descriptor instead; splitting there turned `cargo test 2>&1` into a
+        // stray `1` part that no allow rule matches. `defeats_prefix_rules`
+        // still sees the `>` of any form that can write a file.
+        if c == '&'
+            && (cmd[..i].ends_with(['>', '<']) || cmd[i + 1..].starts_with('>'))
+        {
+            continue;
+        }
         if matches!(c, '&' | '|' | ';' | '\n' | '\r') {
             let part = cmd[start..i].trim();
             if !part.is_empty() {
@@ -1196,22 +1206,59 @@ pub fn check_compound_command_as(
 /// Shell constructs a prefix rule cannot vouch for: `$(…)`, backticks and
 /// process substitution run other commands; `>` writes files; newlines and
 /// ANSI-C quotes (`$'…'`) are where the splitter's quote tracking can be
-/// fooled (`echo # it's⏎rm -rf ~`). Discarding output is fine. PowerShell
-/// also runs commands inside `(…)`, `@(…)` and script blocks `{…}`.
+/// fooled (`echo # it's⏎rm -rf ~`). Discarding output and duplicating a
+/// descriptor (`2>&1`, `>&2`, `>&-`) are fine. PowerShell also runs commands
+/// inside `(…)`, `@(…)` and script blocks `{…}`, and a typographic quote is
+/// one more place where quote tracking can disagree with the shell.
 fn defeats_prefix_rules(cmd: &str, grammar: ShellGrammar) -> bool {
-    let cmd = cmd
-        .replace("2>&1", "")
+    let cmd = strip_fd_duplications(cmd)
         .replace(">/dev/null", "")
         .replace("> /dev/null", "");
-    let ps: &[&str] = if grammar == ShellGrammar::PowerShell {
-        &["(", "{"]
-    } else {
-        &[]
-    };
+    if grammar == ShellGrammar::PowerShell
+        && cmd
+            .chars()
+            .any(|c| matches!(c, '(' | '{' | '\u{2018}'..='\u{201E}'))
+    {
+        return true;
+    }
     ["$(", "`", "<(", ">(", ">", "\n", "\r", "$'"]
         .iter()
-        .chain(ps)
         .any(|t| cmd.contains(t))
+}
+
+/// Remove `>&N` and `>&-`, which only point one descriptor at another. The
+/// target must end the word: `>&2x` writes to a file named `2x`.
+fn strip_fd_duplications(cmd: &str) -> String {
+    let b = cmd.as_bytes();
+    let mut out = String::with_capacity(cmd.len());
+    let mut i = 0;
+    let mut kept = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'>' && b[i + 1] == b'&' {
+            let mut j = i + 2;
+            if j < b.len() && b[j] == b'-' {
+                j += 1;
+            } else {
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+            }
+            let ends_word = j == b.len()
+                || matches!(
+                    b[j],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b')'
+                );
+            if j > i + 2 && ends_word {
+                out.push_str(&cmd[kept..i]);
+                kept = j;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&cmd[kept..]);
+    out
 }
 
 /// Words that run the rest of the command line as a command: shell keywords
@@ -1888,6 +1935,52 @@ mod tests {
         }
     }
 
+    /// PowerShell runs `( … )`, `@( … )` and scriptblocks in argument position,
+    /// treats `\` as a plain character and curly quotes as quotes, so each of
+    /// these hid a second command from a prefix rule.
+    #[test]
+    fn powershell_prefix_rules_cover_powershell_syntax() {
+        let st = PermissionState::new(
+            false,
+            &[
+                "PowerShell(git:*)".to_string(),
+                "PowerShell(prefix:Get-)".to_string(),
+            ],
+            &[],
+        );
+        for cmd in [
+            "git status (Remove-Item x)",
+            "git log @(Remove-Item x)",
+            "Get-Date | Get-Item -Path { Remove-Item x }",
+            "git status \\; Remove-Item x",
+            "git log \"a\\\" ; Remove-Item x ; \"b\"",
+            "git log \u{201C}it's\u{201D} ; Remove-Item x",
+        ] {
+            assert!(
+                matches!(
+                    check_compound_command(&st, "PowerShell", cmd),
+                    CheckResult::Ask
+                ),
+                "must prompt: {cmd:?}"
+            );
+        }
+        for cmd in ["Get-Process", "Get-ChildItem C:\\src", "git status 2>&1"] {
+            assert!(
+                matches!(
+                    check_compound_command(&st, "PowerShell", cmd),
+                    CheckResult::Allow
+                ),
+                "must stay allowed: {cmd:?}"
+            );
+        }
+        // Bash keeps its own escape and quoting rules.
+        let bash = PermissionState::new(false, &["Bash(git:*)".to_string()], &[]);
+        assert!(matches!(
+            check_compound_command(&bash, "Bash", "git commit -m \"fix (parser)\""),
+            CheckResult::Allow
+        ));
+    }
+
     /// A command-executing tool that is gated but not compound-checked has
     /// prefix rules that chaining can bypass. Adding one to SENSITIVE_TOOLS
     /// without adding it here is precisely the mistake this catches.
@@ -2007,6 +2100,45 @@ mod tests {
         assert!(matches!(
             check_compound_command(&all, "Bash", "git log > out.txt"),
             CheckResult::Allow
+        ));
+    }
+
+    /// The `&` in `2>&1` names a descriptor; splitting there left a stray `1`
+    /// part that matched no rule, so `cargo test 2>&1` always prompted (and was
+    /// denied outright in `-p` mode) under `Bash(cargo test:*)`.
+    #[test]
+    fn descriptor_redirects_do_not_defeat_prefix_rules() {
+        let s = PermissionState::new(
+            false,
+            &["Bash(cargo test:*)".into(), "Bash(tail:*)".into()],
+            &[],
+        );
+        let check = |c: &str| check_compound_command(&s, "Bash", c);
+        for c in [
+            "cargo test 2>&1",
+            "cargo test 2>&1 | tail -20",
+            "cargo test >&2",
+            "cargo test 1>&2 2>/dev/null",
+            "cargo test 3>&-",
+        ] {
+            assert!(matches!(check(c), CheckResult::Allow), "{c:?}");
+        }
+        // Forms that write a file still ask.
+        for c in [
+            "cargo test &> out.txt",
+            "cargo test &>>out.txt",
+            "cargo test >&out.txt",
+            "cargo test >&2x",
+            "cargo test 2>&1 > out.txt",
+        ] {
+            assert!(matches!(check(c), CheckResult::Ask), "{c:?}");
+        }
+        // A real background `&` after a redirect still separates commands.
+        let parts = split_compound_command("git status 2>&1 & rm -rf /", ShellGrammar::Posix);
+        assert_eq!(parts, ["git status 2>&1", "rm -rf /"]);
+        assert!(matches!(
+            check("cargo test 2>&1 & rm -rf /"),
+            CheckResult::Ask
         ));
     }
 
