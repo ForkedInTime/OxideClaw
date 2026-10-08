@@ -12,10 +12,8 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Deserialize;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use crate::api::openai_compat::{
@@ -360,10 +358,12 @@ fn pick_tool_model(models: &[(String, Option<Vec<String>>)]) -> Option<&str> {
 pub struct OllamaClient {
     client: Client,
     pub base_url: String,
-    /// Set to true after the first 400 "does not support tools" — skips tools on all future calls.
-    no_tools: Arc<AtomicBool>,
-    /// Set to true after the user has already been notified about text-only mode.
-    tools_notice_sent: Arc<AtomicBool>,
+    /// Models that answered 400 "does not support tools", sent without tools
+    /// from then on. Keyed by model because router tiers share this client
+    /// (and its clones): one tool-less tier must not strip tools from the rest.
+    no_tools: Arc<Mutex<HashSet<String>>>,
+    /// The models in `no_tools` the user has already been told about.
+    tools_notice_sent: Arc<Mutex<HashSet<String>>>,
 }
 
 impl OllamaClient {
@@ -378,21 +378,24 @@ impl OllamaClient {
         Ok(Self {
             client,
             base_url: base_url.into(),
-            no_tools: Arc::new(AtomicBool::new(false)),
-            tools_notice_sent: Arc::new(AtomicBool::new(false)),
+            no_tools: Arc::default(),
+            tools_notice_sent: Arc::default(),
         })
     }
 
-    /// Returns true if this model has been detected as not supporting tools.
+    /// Returns true if any model has been detected as not supporting tools.
     #[allow(dead_code)]
     pub fn tools_disabled(&self) -> bool {
-        self.no_tools.load(Ordering::Relaxed)
+        !self.no_tools.lock().unwrap().is_empty()
     }
 
-    /// Returns true the first time called after tools are disabled — used to send a one-time notice.
+    /// Returns true once per model that lost its tools — used to send a one-time notice.
     pub fn take_tools_notice(&self) -> bool {
-        self.no_tools.load(Ordering::Relaxed)
-            && !self.tools_notice_sent.swap(true, Ordering::Relaxed)
+        let no_tools = self.no_tools.lock().unwrap();
+        let mut sent = self.tools_notice_sent.lock().unwrap();
+        let before = sent.len();
+        sent.extend(no_tools.iter().cloned());
+        sent.len() > before
     }
 
     /// Streaming call to Ollama — translates request and response.
@@ -406,7 +409,7 @@ impl OllamaClient {
         let url = format!("{}/v1/chat/completions", self.base_url);
         debug!("POST {url} model={model} (via Ollama)");
 
-        let no_tools = self.no_tools.load(Ordering::Relaxed);
+        let no_tools = self.no_tools.lock().unwrap().contains(&model);
         let system_str = system_to_string(&request.system);
 
         let system = if no_tools {
@@ -423,7 +426,7 @@ impl OllamaClient {
         };
 
         let mut oai_request = OaiRequest {
-            model,
+            model: model.clone(),
             messages: oai_messages,
             tools: oai_tools,
             stream: true,
@@ -449,8 +452,8 @@ impl OllamaClient {
             let body = resp.text().await.unwrap_or_default();
             // If the model doesn't support tools, cache that and retry without them
             if status.as_u16() == 400 && body.contains("does not support tools") {
-                self.no_tools.store(true, Ordering::Relaxed);
-                debug!("Model does not support tools — disabling tools for this session");
+                self.no_tools.lock().unwrap().insert(model);
+                debug!("Model does not support tools — disabling its tools for this session");
                 let patched_system = patch_system_no_tools(&system_str);
                 oai_request.messages =
                     translate_messages(&patched_system, &request.messages, false, false, None);
@@ -857,5 +860,107 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    /// Router tiers share one Ollama client: a tier whose model has no tool
+    /// support must not switch tools off for the other models.
+    #[tokio::test]
+    async fn a_tool_less_model_keeps_tools_for_the_other_models() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body_start = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..body_start]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                while buf.len() < body_start + len {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();
+                let model = body["model"].as_str().unwrap().to_string();
+                let tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
+                log.lock().unwrap().push((model.clone(), tools));
+                let resp = if model == "gemma3" && tools {
+                    let err = r#"{"error":"gemma3 does not support tools"}"#;
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{err}",
+                        err.len()
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     connection: close\r\n\r\ndata: [DONE]\n\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let request = |model: &str| MessagesRequest {
+            model: model.into(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            system: Default::default(),
+            tools: vec![ToolDefinition {
+                name: "Read".into(),
+                description: "Read a file".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            }],
+            stream: None,
+            thinking: None,
+            output_config: None,
+            betas: vec![],
+            session_id: None,
+            explicit_max_tokens: false,
+            cache_history: false,
+        };
+
+        let session = OllamaClient::new(format!("http://{addr}")).unwrap();
+        let tier = session.clone();
+        tier.messages_stream(request("ollama:gemma3"), |_| {})
+            .await
+            .unwrap();
+        assert!(session.take_tools_notice(), "gemma3's notice is due");
+        assert!(!session.take_tools_notice(), "and only once");
+        session
+            .messages_stream(request("ollama:qwen3-coder"), |_| {})
+            .await
+            .unwrap();
+        tier.messages_stream(request("ollama:gemma3"), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("gemma3".to_string(), true),
+                ("gemma3".to_string(), false),
+                ("qwen3-coder".to_string(), true),
+                ("gemma3".to_string(), false),
+            ]
+        );
+        assert!(!session.take_tools_notice());
     }
 }
