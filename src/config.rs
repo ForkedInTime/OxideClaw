@@ -1050,7 +1050,7 @@ impl Config {
     /// `/reload`'s share of `load_project`: the permission rules and hooks
     /// from re-read `settings`, keeping the command-line rules and `--bare`
     /// turning hooks off. Returns the settings keys that changed.
-    pub(crate) fn reload_permissions_and_hooks(
+    pub fn reload_permissions_and_hooks(
         &mut self,
         settings: &crate::settings::Settings,
     ) -> Vec<&'static str> {
