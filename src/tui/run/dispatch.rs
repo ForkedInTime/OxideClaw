@@ -1076,6 +1076,10 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if settings.auto_fix.is_some() {
                 reloaded.push("autoFixLoop");
             }
+            // The TUI's PermissionState was built once at startup, so a new
+            // deny rule or guard hook did nothing until a restart.
+            reloaded.extend(config.reload_permissions_and_hooks(&settings));
+            perm_state.replace_rules(&config.permissions_allow, &config.permissions_deny);
 
             // OXIDECLAW_OPENAI_API, when set, still wins over the file.
             let openai_api = settings

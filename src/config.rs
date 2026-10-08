@@ -1047,6 +1047,36 @@ impl Config {
         }
     }
 
+    /// `/reload`'s share of `load_project`: the permission rules and hooks
+    /// from re-read `settings`, keeping the command-line rules and `--bare`
+    /// turning hooks off. Returns the settings keys that changed.
+    pub(crate) fn reload_permissions_and_hooks(
+        &mut self,
+        settings: &crate::settings::Settings,
+    ) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let before = (
+            self.permissions_allow.clone(),
+            self.permissions_deny.clone(),
+        );
+        self.permissions_allow = settings.permissions.allow.clone();
+        self.permissions_deny = settings.permissions.deny.clone();
+        self.add_cli_permission_rules();
+        if (&self.permissions_allow, &self.permissions_deny) != (&before.0, &before.1) {
+            changed.push("permissions");
+        }
+        let hooks_before = serde_json::to_value(&self.hooks).ok();
+        let disable = self.bare_mode || settings.disable_all_hooks.unwrap_or(false);
+        self.hooks = settings.hooks.clone();
+        if serde_json::to_value(&self.hooks).ok() != hooks_before
+            || disable != self.disable_all_hooks
+        {
+            changed.push("hooks");
+        }
+        self.disable_all_hooks = disable;
+        changed
+    }
+
     /// A default config for `cwd` (the process's when None) with
     /// `load_project` applied.
     fn for_project(
@@ -3509,6 +3539,37 @@ mod flag_settings_retarget_tests {
             "{:?}",
             cfg.settings_notices
         );
+    }
+
+    /// /reload left the permission rules and hooks from startup in place, so
+    /// a deny rule or guard hook added mid-session did nothing.
+    #[test]
+    fn reload_replaces_permission_rules_and_hooks_but_keeps_cli_and_bare() {
+        let mut cfg = Config {
+            permissions_allow: vec!["Read".into(), "Bash(ls:*)".into()],
+            permissions_deny: vec!["Bash(curl:*)".into()],
+            cli_permissions_deny: vec!["Bash(curl:*)".into()],
+            ..Config::default()
+        };
+        let settings: crate::settings::Settings = serde_json::from_str(
+            r#"{"permissions": {"deny": ["Bash(git push:*)"]},
+                "hooks": {"preToolUse": [{"matcher": "Bash", "command": "guard"}]}}"#,
+        )
+        .unwrap();
+        let changed = cfg.reload_permissions_and_hooks(&settings);
+        assert_eq!(changed, ["permissions", "hooks"]);
+        assert!(cfg.permissions_allow.is_empty());
+        assert_eq!(cfg.permissions_deny, ["Bash(git push:*)", "Bash(curl:*)"]);
+        let hooks = cfg.hooks.as_ref().unwrap();
+        assert_eq!(hooks.pre_tool_use[0].command, "guard");
+        assert!(!cfg.disable_all_hooks);
+        assert!(cfg.reload_permissions_and_hooks(&settings).is_empty());
+
+        // --bare keeps hooks off whatever the file says.
+        cfg.bare_mode = true;
+        cfg.disable_all_hooks = true;
+        cfg.reload_permissions_and_hooks(&settings);
+        assert!(cfg.disable_all_hooks);
     }
 
     /// /reload re-read only the settings files and wrote them over the

@@ -161,7 +161,7 @@ Claude Code sessions import with `oxideclaw config import-claude --sessions`; se
 
 | Command | Description |
 |---------|-------------|
-| `/reload` | Hot-reload settings, CLAUDE.md, AGENTS.md, GEMINI.md |
+| `/reload` | Hot-reload settings (permission rules and hooks included), CLAUDE.md, AGENTS.md, GEMINI.md |
 | `/config` | Show current configuration |
 | `/autonomy [mode]` | Show or switch the [autonomy mode](#autonomy-modes) for this session |
 

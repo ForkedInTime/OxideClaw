@@ -65,6 +65,9 @@ pub struct PermissionState {
 struct Inner {
     /// Tools the user has said "always allow" for this session
     always_allowed: HashSet<String>,
+    /// Allow rules from settings and `--allowed-tools`, kept apart from the
+    /// session's picks so `/reload` can replace them without losing those.
+    rule_allowed: HashSet<String>,
     /// Tools permanently denied by settings.json (permissions.deny)
     deny_list: HashSet<String>,
     /// Whether the user enabled --dangerously-skip-permissions
@@ -84,15 +87,19 @@ impl PermissionState {
             bypass,
             ..Inner::default()
         };
-        for t in allow {
-            inner.always_allowed.insert(t.clone());
-        }
-        for t in deny {
-            inner.deny_list.insert(t.clone());
-        }
+        inner.rule_allowed = allow.iter().cloned().collect();
+        inner.deny_list = deny.iter().cloned().collect();
         Self {
             inner: Arc::new(Mutex::new(inner)),
         }
+    }
+
+    /// Swap in re-read allow and deny rules (`/reload`). Session "always
+    /// allow" picks stay.
+    pub fn replace_rules(&self, allow: &[String], deny: &[String]) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.rule_allowed = allow.iter().cloned().collect();
+        inner.deny_list = deny.iter().cloned().collect();
     }
 
     /// Resolve relative path rules against `cwd` (the project root).
@@ -152,7 +159,7 @@ impl PermissionState {
         }
 
         // Check always-allowed — also supports prefix rules
-        for rule in &inner.always_allowed {
+        for rule in inner.always_allowed.iter().chain(&inner.rule_allowed) {
             if rule_hits(rule, tool_name, input, &cwd, false) == RuleMatch::Match {
                 return CheckResult::Allow;
             }
@@ -2396,6 +2403,32 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    /// `/reload` swaps the settings rules but keeps the session's picks.
+    #[test]
+    fn replace_rules_swaps_settings_rules_and_keeps_session_allows() {
+        let st = PermissionState::new(false, &["Bash(ls:*)".into()], &[]);
+        st.record_always_allow("Write");
+        let push = serde_json::json!({"command": "git push"});
+        let ls = serde_json::json!({"command": "ls"});
+        assert!(matches!(
+            st.check_with_input("Bash", Some(&ls)),
+            CheckResult::Allow
+        ));
+        st.replace_rules(&[], &["Bash(git push:*)".into()]);
+        assert!(matches!(
+            st.check_with_input("Bash", Some(&push)),
+            CheckResult::Deny
+        ));
+        assert!(matches!(
+            st.check_with_input("Bash", Some(&ls)),
+            CheckResult::Ask
+        ));
+        assert!(matches!(
+            st.check_with_input("Write", None),
+            CheckResult::Allow
+        ));
     }
 
     #[test]
