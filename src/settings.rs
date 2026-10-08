@@ -566,6 +566,11 @@ pub struct PermissionsConfig {
     /// Tools to always deny without asking
     #[serde(default)]
     pub deny: Vec<String>,
+
+    /// Claude Code's confirm-first rules. OxideClaw has no ask list; they are
+    /// read only to drop the allow rules they narrow (see `load_in`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask: Vec<String>,
 }
 
 /// Largest settings / .mcp.json / .env / output-style file read. Real ones
@@ -952,7 +957,8 @@ impl Settings {
         let mcp_extra = mcp_json_path
             .exists()
             .then(|| Self::load_mcp_json(&mcp_json_path));
-        let merged = Self::merge_with_trust(global, project, mcp_extra, trusted);
+        let mut merged = Self::merge_with_trust(global, project, mcp_extra, trusted);
+        merged.drop_allow_rules_ask_narrows();
         // Written by the user (`mcp add --scope local`) and outside the repo,
         // so the trust gate does not apply.
         let local_path = Self::local_mcp_path(config_dir, cwd);
@@ -960,6 +966,30 @@ impl Settings {
             merged.merge(Self::load_mcp_json(&local_path))
         } else {
             merged
+        }
+    }
+
+    /// Claude Code checks `ask` before `allow`, so a committed `allow:
+    /// ["Bash(git:*)"]` with `ask: ["Bash(git push:*)"]` still prompts for a
+    /// push there. Without an ask list here the allow rule would run it
+    /// unprompted, so it is dropped. This only tightens, so a project's ask
+    /// rules apply whether or not it is trusted.
+    fn drop_allow_rules_ask_narrows(&mut self) {
+        let ask = &self.permissions.ask;
+        let (dropped, kept): (Vec<String>, Vec<String>) =
+            std::mem::take(&mut self.permissions.allow)
+                .into_iter()
+                .partition(|r| {
+                    ask.iter()
+                        .any(|a| crate::permissions::ask_rule_narrows(a, r))
+                });
+        self.permissions.allow = kept;
+        if !dropped.is_empty() {
+            self.notices.push(format!(
+                "permissions.allow: ignored {} — permissions.ask narrows them, and OxideClaw \
+                 has no ask list, so they would run those calls without a prompt.",
+                dropped.join(", ")
+            ));
         }
     }
 
@@ -1251,6 +1281,15 @@ impl Settings {
                 deny: {
                     let mut v = self.permissions.deny;
                     for item in other.permissions.deny {
+                        if !v.contains(&item) {
+                            v.push(item);
+                        }
+                    }
+                    v
+                },
+                ask: {
+                    let mut v = self.permissions.ask;
+                    for item in other.permissions.ask {
                         if !v.contains(&item) {
                             v.push(item);
                         }
@@ -2146,6 +2185,35 @@ mod helper_mode_tests {
         let s = Settings::load_in(home.path(), repo.path());
         assert_eq!(s.api_key_helper.as_deref(), Some("echo k"));
         assert!(s.helper_rejected.is_empty());
+    }
+
+    /// Claude Code prompts for a push under `allow: Bash(git:*)` plus `ask:
+    /// Bash(git push:*)`; with no ask list here, the allow rule ran it
+    /// unprompted in a trusted project.
+    #[test]
+    fn allow_rules_an_ask_rule_narrows_are_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            serde_json::json!({
+                "trustedProjects": [repo.path()],
+                "permissions": {"allow": ["Bash(npm test:*)"]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(repo.path().join(".claude")).unwrap();
+        std::fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{"permissions": {"allow": ["Bash(git:*)", "Read(./src/**)"],
+                                "ask": ["Bash(git push:*)"]}}"#,
+        )
+        .unwrap();
+        let s = Settings::load_in(home.path(), repo.path());
+        assert_eq!(s.permissions.allow, vec!["Bash(npm test:*)", "Read(./src/**)"]);
+        assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
+        assert!(s.notices[0].contains("Bash(git:*)"), "{:?}", s.notices);
     }
 
     /// An untrusted project's helper is reported as untrusted, not as a

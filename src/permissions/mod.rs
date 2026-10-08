@@ -774,6 +774,48 @@ pub fn name_rule_matches(rule: &str, tool_name: &str) -> bool {
     }
 }
 
+/// Whether a Claude Code `ask` rule narrows `allow`: some call the allow rule
+/// permits is one the ask rule wanted confirmed. Claude Code checks ask
+/// before allow; OxideClaw has no ask list, so such an allow rule would run
+/// that call unprompted. Errs toward true, since dropping an allow rule only
+/// costs a prompt.
+pub fn ask_rule_narrows(ask: &str, allow: &str) -> bool {
+    fn split(r: &str) -> (&str, Option<&str>) {
+        match r.split_once('(') {
+            Some((tool, rest)) => (tool.trim(), Some(rest.strip_suffix(')').unwrap_or(rest))),
+            None => (r.trim(), None),
+        }
+    }
+    let ((ask_tool, ask_inner), (allow_tool, allow_inner)) = (split(ask), split(allow));
+    let same_tool = if ask_tool.starts_with("mcp__") || allow_tool.starts_with("mcp__") {
+        name_rule_matches(ask_tool, allow_tool) || name_rule_matches(allow_tool, ask_tool)
+    } else {
+        rule_covers(ask_tool, allow_tool) || rule_covers(allow_tool, ask_tool)
+    };
+    if !same_tool {
+        return false;
+    }
+    // Only command rules are compared by content: `Bash(npm test:*)` is not
+    // narrowed by `Bash(git push:*)`. Path and domain rules are not worth
+    // intersecting for a rule that only saves a prompt.
+    let command_rule = ask_tool.eq_ignore_ascii_case("Bash")
+        || ask_tool.eq_ignore_ascii_case("PowerShell");
+    let (true, Some(ask_inner), Some(allow_inner)) = (command_rule, ask_inner, allow_inner) else {
+        return true;
+    };
+    // The literal text every matching command starts with.
+    let lead = |inner: &str| {
+        let inner = inner
+            .strip_prefix("prefix:")
+            .or_else(|| inner.strip_suffix(":*"))
+            .unwrap_or(inner);
+        let literal = inner.split('*').next().unwrap_or("");
+        literal.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let (a, b) = (lead(ask_inner), lead(allow_inner));
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
 /// Whether a plan-mode block-list entry covers `tool_name`; a trailing `*`
 /// blocks a whole family (`mcp__*`).
 pub fn blocked_entry_matches(entry: &str, tool_name: &str) -> bool {
@@ -1580,6 +1622,27 @@ fn truncate(s: &str, max: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ask_rules_narrow_the_allow_rules_they_overlap() {
+        use super::ask_rule_narrows as narrows;
+        // Claude Code prompts for `git push` despite `Bash(git:*)`.
+        assert!(narrows("Bash(git push:*)", "Bash(git:*)"));
+        assert!(narrows("Bash(git push:*)", "Bash(git push origin main)"));
+        assert!(narrows("Bash(git push:*)", "Bash"));
+        assert!(narrows("Bash", "Bash(npm test:*)"));
+        assert!(narrows("bash(prefix:git push)", "Bash(git  push --force)"));
+        assert!(!narrows("Bash(git push:*)", "Bash(npm test:*)"));
+        assert!(!narrows("Bash(git push:*)", "Read(./src/**)"));
+        assert!(!narrows("PowerShell(git push:*)", "Bash(git:*)"));
+        // Other tools compare by tool, the Read/Edit families included.
+        assert!(narrows("Read(./secrets/**)", "Grep"));
+        assert!(narrows("Write(./prod/**)", "Edit(./src/**)"));
+        // MCP names cover by server, either way round.
+        assert!(narrows("mcp__github__push_files", "mcp__github"));
+        assert!(narrows("mcp__github", "mcp__github__create_issue"));
+        assert!(!narrows("mcp__github__push_files", "mcp__slack"));
+    }
+
     /// An ESC in a model-supplied command must reach the approval prompt as
     /// visible text, not as a terminal sequence that rewrites the prompt.
     #[test]

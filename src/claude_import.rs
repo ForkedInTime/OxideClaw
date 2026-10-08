@@ -428,10 +428,18 @@ pub fn import_claude(
                 .map_or(0, Vec::len)
         };
         lines.push(format!(
-            "  --permissions     {} allow, {} deny rule(s)",
+            "  --permissions     {} allow, {} deny, {} ask rule(s)",
             rules("allow"),
-            rules("deny")
+            rules("deny"),
+            rules("ask")
         ));
+        if rules("ask") > 0 {
+            lines.push(
+                "                    OxideClaw has no ask list: allow rules an ask rule narrows \
+                 are not imported, so those calls keep prompting."
+                    .to_string(),
+            );
+        }
         lines.push(format!(
             "  --api-key-helper  {}",
             helper.map_or("none".to_string(), |h| format!("`{h}`"))
@@ -534,12 +542,32 @@ pub fn import_claude(
                 dst.display()
             );
         };
+        let ask: Vec<&str> = permissions
+            .and_then(|p| p.get("ask"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mut narrowed: Vec<String> = Vec::new();
         for kind in ["allow", "deny"] {
-            let rules: Vec<Value> = permissions
+            let mut rules: Vec<Value> = permissions
                 .and_then(|p| p.get(kind))
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter(|r| r.is_string()).cloned().collect())
                 .unwrap_or_default();
+            // Claude Code checks ask before allow; with no ask list here, an
+            // allow rule an ask rule narrows would run that call unprompted.
+            if kind == "allow" {
+                rules.retain(|r| {
+                    let r = r.as_str().expect("filtered to strings");
+                    let hit = ask
+                        .iter()
+                        .any(|a| crate::permissions::ask_rule_narrows(a, r));
+                    if hit {
+                        narrowed.push(r.to_string());
+                    }
+                    !hit
+                });
+            }
             let list = target
                 .entry(kind)
                 .or_insert_with(|| Value::Array(Vec::new()));
@@ -554,6 +582,14 @@ pub fn import_claude(
                 }
             }
             lines.push(format!("permissions.{kind}: {added} added"));
+        }
+        if !narrowed.is_empty() {
+            lines.push(format!(
+                "  permissions.allow: skipped {} rule(s) that Claude Code's ask rules narrow, \
+                 so they would run unprompted here: {}",
+                narrowed.len(),
+                narrowed.join(", ")
+            ));
         }
         let other: Vec<&String> = permissions
             .map(|p| p.keys().filter(|k| *k != "allow" && *k != "deny").collect())
@@ -1272,6 +1308,46 @@ mod tests {
             .find(|l| l.contains("updatedInput"))
             .unwrap_or_else(|| panic!("{lines:?}"));
         assert!(note.contains("jq '") && !note.contains("audit"), "{note}");
+    }
+
+    /// `ask: Bash(git push:*)` prompts in Claude Code despite `allow:
+    /// Bash(git:*)`; importing the allow rule alone ran pushes unprompted.
+    #[test]
+    fn import_claude_skips_allow_rules_an_ask_rule_narrows() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join("claude");
+        write(
+            &claude.join("settings.json"),
+            r#"{"permissions": {
+                "allow": ["Bash(git:*)", "Read(./src/**)", "mcp__github", "mcp__slack"],
+                "ask": ["Bash(git push:*)", "mcp__github__push_files"]
+            }}"#,
+        );
+        let config = td.path().join("config");
+        let listing = import_claude(&claude, &config, ImportOptions::default())
+            .unwrap()
+            .join("\n");
+        assert!(listing.contains("4 allow, 0 deny, 2 ask"), "{listing}");
+        assert!(listing.contains("no ask list"), "{listing}");
+
+        let opts = ImportOptions {
+            permissions: true,
+            ..Default::default()
+        };
+        let lines = import_claude(&claude, &config, opts).unwrap();
+        let s = read(&config.join("settings.json"));
+        assert_eq!(
+            s["permissions"]["allow"],
+            serde_json::json!(["Read(./src/**)", "mcp__slack"])
+        );
+        let note = lines
+            .iter()
+            .find(|l| l.contains("skipped 2 rule(s)"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(
+            note.contains("Bash(git:*)") && note.contains("mcp__github"),
+            "{note}"
+        );
     }
 
     #[test]
