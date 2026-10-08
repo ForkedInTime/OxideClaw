@@ -1554,8 +1554,14 @@ async fn run_loop(
                                 print!("\x07"); // terminal bell
                                 let _ = std::io::stdout().flush();
                                 tokio::spawn(async {
+                                    // Without a notification daemon (SSH, no
+                                    // D-Bus) it prints an error, which would
+                                    // land on top of the frame.
                                     let _ = tokio::process::Command::new("notify-send")
                                         .args(["oxideclaw", "Task complete"])
+                                        .stdin(std::process::Stdio::null())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
                                         .spawn();
                                 });
                             }

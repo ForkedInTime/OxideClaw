@@ -1292,16 +1292,22 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
 
         CommandAction::OpenBrowser(url) => {
-            // Try platform-specific openers
-            let opened = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .spawn()
-                .is_ok()
-                || std::process::Command::new("open").arg(&url).spawn().is_ok()
-                || std::process::Command::new("cmd.exe")
-                    .args(["/C", "start", &url])
+            // Try platform-specific openers. Their output (xdg-open's and
+            // the browser's chatter) would land on top of the frame.
+            let quiet = |mut c: std::process::Command| {
+                c.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .spawn()
-                    .is_ok();
+                    .is_ok()
+            };
+            let mut xdg = std::process::Command::new("xdg-open");
+            xdg.arg(&url);
+            let mut open = std::process::Command::new("open");
+            open.arg(&url);
+            let mut start = std::process::Command::new("cmd.exe");
+            start.args(["/C", "start", &url]);
+            let opened = quiet(xdg) || quiet(open) || quiet(start);
             let msg = if opened {
                 format!("Opened in browser: {}", url)
             } else {

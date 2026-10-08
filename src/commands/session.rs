@@ -25,9 +25,13 @@ const CLIPBOARD_TOOLS: &[(&str, &[&str])] = &[
 /// EOF (wl-copy forks its selection server only then) see the end of input.
 fn pipe_to(cmd: &str, args: &[&str], text: &str) -> std::io::Result<std::process::ExitStatus> {
     use std::io::Write;
+    // Quiet: an error ("Can't open display") would print over the TUI frame,
+    // and the exit status already says whether it worked.
     let mut child = std::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     child
         .stdin
