@@ -1,7 +1,7 @@
 /// tree-sitter based code indexer.
 ///
 /// Walks the project, parses source files with language-specific grammars,
-/// extracts top-level symbols (functions, structs, classes, impls, etc.),
+/// extracts symbols (functions, structs, classes, impls and their methods),
 /// and stores them as searchable chunks in the RAG database.
 ///
 /// Incremental: only re-indexes files whose mtime changed since last index.
@@ -169,8 +169,16 @@ pub struct CodeChunk {
 }
 
 /// Extract symbol name from a tree-sitter node.
-/// Looks for the first `identifier` or `name` child.
+/// The node's `name` field, else its first `identifier` or `name` child.
 fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
+    // The grammar's `name` field first: the first identifier child is the
+    // return type of a Java method like `Widget build()`.
+    if let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+    {
+        return name.to_string();
+    }
     // Walk direct children looking for an identifier
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -296,6 +304,30 @@ struct CollectCtx<'a> {
     full_source: &'a str,
 }
 
+/// Symbols whose members are indexed as chunks of their own. A 500-line
+/// `impl` or class stored as one chunk was cut at 200 lines, so every
+/// method below that was missing from the index.
+const CONTAINER_NODES: &[&str] = &[
+    "impl_item",
+    "trait_item",
+    "mod_item",
+    "class_declaration",
+    "class_definition",
+    "interface_declaration",
+    "enum_declaration",
+];
+
+/// `export ...` and `@decorator ...`: the chunk is the wrapped declaration,
+/// with the wrapper's text kept so the decorators and `export` stay in it.
+const WRAPPER_NODES: &[&str] = &["export_statement", "decorated_definition"];
+
+/// How deep the walk goes: members sit two levels below their container
+/// (container -> body -> member), and containers nest (mod -> impl -> fn).
+const MAX_SYMBOL_DEPTH: usize = 8;
+
+/// Longest chunk stored; the rest of a huge function is cut off.
+const MAX_CHUNK_LINES: usize = 200;
+
 /// Recursively collect symbol nodes from the AST.
 fn collect_symbols(
     node: &tree_sitter::Node,
@@ -303,40 +335,41 @@ fn collect_symbols(
     chunks: &mut Vec<CodeChunk>,
     depth: usize,
 ) {
-    // Don't recurse too deep
-    if depth > 3 {
+    if depth > MAX_SYMBOL_DEPTH {
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        let kind = child.kind();
+        if !ctx.symbol_nodes.contains(&child.kind()) {
+            // Recurse into non-symbol nodes (e.g. module bodies, program root)
+            collect_symbols(&child, ctx, chunks, depth + 1);
+            continue;
+        }
 
-        if ctx.symbol_nodes.contains(&kind) {
-            let start_line = (child.start_position().row + 1) as i64; // 1-indexed
-            let end_line = (child.end_position().row + 1) as i64;
+        let symbol = if WRAPPER_NODES.contains(&child.kind()) {
+            // `export default <expr>` has no declaration: the wrapper is the chunk.
+            child
+                .child_by_field_name("declaration")
+                .or_else(|| child.child_by_field_name("definition"))
+                .filter(|d| ctx.symbol_nodes.contains(&d.kind()))
+                .unwrap_or(child)
+        } else {
+            child
+        };
+        let src_len = ctx.full_source.len();
+        let start_byte = child.start_byte().min(src_len);
+        let start_line = (child.start_position().row + 1) as i64; // 1-indexed
+        let symbol_name = extract_symbol_name(&symbol, ctx.source);
+        let symbol_kind = node_kind_to_symbol_kind(symbol.kind()).to_string();
 
-            // Extract the source text for this node
-            let start_byte = child.start_byte();
-            let end_byte = child.end_byte();
-            let src_len = ctx.full_source.len();
-            let content = &ctx.full_source[start_byte.min(src_len)..end_byte.min(src_len)];
-
-            // Cap chunk size at 200 lines — huge functions get truncated
-            let content = if end_line - start_line > 200 {
-                let lines: Vec<&str> = content.lines().take(200).collect();
-                format!(
-                    "{}\n// ... ({} more lines)",
-                    lines.join("\n"),
-                    end_line - start_line - 200
-                )
-            } else {
-                content.to_string()
-            };
-
-            let symbol_name = extract_symbol_name(&child, ctx.source);
-            let symbol_kind = node_kind_to_symbol_kind(kind).to_string();
-
+        if CONTAINER_NODES.contains(&symbol.kind())
+            && let Some(first) = first_symbol_start(&symbol, ctx, depth + 1)
+        {
+            // The container's own chunk is its header (signature, fields,
+            // docs) up to the first member; the members follow as their own.
+            let header = ctx.full_source[start_byte..first.clamp(start_byte, src_len)].trim_end();
+            let end_line = start_line + header.lines().count().max(1) as i64 - 1;
             chunks.push(CodeChunk {
                 file_path: ctx.file_path.to_string(),
                 symbol_name,
@@ -344,13 +377,60 @@ fn collect_symbols(
                 language: ctx.lang_name.to_string(),
                 start_line,
                 end_line,
-                content,
+                content: cap_chunk_lines(header),
             });
-        } else {
-            // Recurse into non-symbol nodes (e.g. module bodies, program root)
-            collect_symbols(&child, ctx, chunks, depth + 1);
+            collect_symbols(&symbol, ctx, chunks, depth + 1);
+            continue;
+        }
+
+        let end_line = (child.end_position().row + 1) as i64;
+        let content = &ctx.full_source[start_byte..child.end_byte().clamp(start_byte, src_len)];
+        chunks.push(CodeChunk {
+            file_path: ctx.file_path.to_string(),
+            symbol_name,
+            symbol_kind,
+            language: ctx.lang_name.to_string(),
+            start_line,
+            end_line,
+            content: cap_chunk_lines(content),
+        });
+    }
+}
+
+/// Start byte of the first symbol `collect_symbols` would find below `node`
+/// at `depth`, so a container's header ends where its first member begins.
+fn first_symbol_start(
+    node: &tree_sitter::Node,
+    ctx: &CollectCtx<'_>,
+    depth: usize,
+) -> Option<usize> {
+    if depth > MAX_SYMBOL_DEPTH {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if ctx.symbol_nodes.contains(&child.kind()) {
+            return Some(child.start_byte());
+        }
+        if let Some(start) = first_symbol_start(&child, ctx, depth + 1) {
+            return Some(start);
         }
     }
+    None
+}
+
+/// `content` cut to `MAX_CHUNK_LINES`, with a note of how much was dropped.
+fn cap_chunk_lines(content: &str) -> String {
+    let total = content.lines().count();
+    if total <= MAX_CHUNK_LINES {
+        return content.to_string();
+    }
+    let lines: Vec<&str> = content.lines().take(MAX_CHUNK_LINES).collect();
+    format!(
+        "{}\n// ... ({} more lines)",
+        lines.join("\n"),
+        total - MAX_CHUNK_LINES
+    )
 }
 
 // ─── Indexing engine ─────────────────────────────────────────────────────────
@@ -893,5 +973,92 @@ impl MyStruct {
         // Should have extracted: public_func, MyStruct, Color, MyStruct (impl)
         let chunks = db.chunk_count().unwrap();
         assert!(chunks >= 4, "expected at least 4 chunks, got {chunks}");
+    }
+
+    fn chunks_of(path: &str, source: &str, lang: &str) -> Vec<CodeChunk> {
+        extract_chunks(path, source, lang, get_ts_language(lang).unwrap())
+    }
+
+    fn chunk<'a>(chunks: &'a [CodeChunk], name: &str) -> &'a CodeChunk {
+        chunks
+            .iter()
+            .find(|c| c.symbol_name == name)
+            .unwrap_or_else(|| {
+                let names: Vec<&str> = chunks.iter().map(|c| c.symbol_name.as_str()).collect();
+                panic!("no chunk named {name}; got {names:?}")
+            })
+    }
+
+    /// An impl was one chunk cut at 200 lines, so a method further down
+    /// (`prune_inactive` at line 508 of `impl Session`) was not in the index.
+    #[test]
+    fn methods_past_line_200_of_an_impl_are_their_own_chunks() {
+        let mut src =
+            String::from("pub struct Session;\n\nimpl Session {\n    // Sessions on disk.\n");
+        for i in 0..250 {
+            src.push_str(&format!("    fn filler_{i}(&self) -> u32 {{ {i} }}\n"));
+        }
+        src.push_str("    pub fn prune_inactive(&self) -> u32 {\n        3\n    }\n}\n");
+        src.push_str("\nmod outer {\n    impl super::Session {\n        fn nested_method(&self) {}\n    }\n}\n");
+        let chunks = chunks_of("session.rs", &src, "rust");
+
+        let late = chunk(&chunks, "prune_inactive");
+        assert_eq!((late.start_line, late.end_line), (255, 257));
+        assert_eq!(late.symbol_kind, "function");
+        assert!(late.content.starts_with("pub fn prune_inactive"));
+
+        // The impl's own chunk is its header, not a second copy of every method.
+        let header = chunks.iter().find(|c| c.symbol_kind == "impl").unwrap();
+        assert_eq!((header.start_line, header.end_line), (3, 4));
+        assert!(header.content.contains("Sessions on disk"));
+        assert!(!header.content.contains("filler_0"));
+
+        // mod -> impl -> fn sits deeper than the old depth cap.
+        assert_eq!(chunk(&chunks, "nested_method").start_line, 262);
+    }
+
+    /// Same for a Python class; a decorated method keeps its decorator and
+    /// is named after the function, not `decorated_definition`.
+    #[test]
+    fn decorated_methods_past_line_200_of_a_class_are_indexed_by_name() {
+        let mut src = String::from("class Store:\n    \"\"\"Keeps things.\"\"\"\n\n");
+        for i in 0..210 {
+            src.push_str(&format!("    def filler_{i}(self):\n        return {i}\n"));
+        }
+        src.push_str("    @staticmethod\n    def rebuild_cache():\n        return 1\n");
+        let chunks = chunks_of("store.py", &src, "python");
+
+        let late = chunk(&chunks, "rebuild_cache");
+        assert_eq!((late.start_line, late.end_line), (424, 426));
+        assert!(late.content.starts_with("@staticmethod"));
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.symbol_name == "decorated_definition")
+        );
+        assert!(chunk(&chunks, "Store").content.contains("Keeps things"));
+    }
+
+    /// A Java method's first identifier-like child is its return type.
+    #[test]
+    fn java_methods_are_named_after_the_method_not_the_return_type() {
+        let src = "class Factory {\n    Widget build() {\n        return new Widget();\n    }\n}\n";
+        let chunks = chunks_of("Factory.java", src, "java");
+        assert_eq!(chunk(&chunks, "build").start_line, 2);
+        assert!(!chunks.iter().any(|c| c.symbol_name == "Widget"));
+    }
+
+    /// `export class` is indexed through the class: its methods too.
+    #[test]
+    fn exported_class_methods_are_indexed() {
+        let src =
+            "export class Api {\n  fetchUser(id) {\n    return id;\n  }\n}\nexport default 42;\n";
+        let chunks = chunks_of("api.ts", src, "typescript");
+        let class = chunk(&chunks, "Api");
+        assert_eq!(class.symbol_kind, "class");
+        assert!(class.content.starts_with("export class Api"));
+        assert_eq!(chunk(&chunks, "fetchUser").start_line, 2);
+        // No declaration to unwrap: the export itself is the chunk, as before.
+        assert!(chunks.iter().any(|c| c.symbol_kind == "export"));
     }
 }

@@ -99,7 +99,9 @@ fn ensure_git_excluded(cwd: &Path) {
 ///   1 — Baseline: code_chunks, chunks_fts, rag_meta. (Indexes that lived in
 ///       `<project>/.claude/rag.db` also held the memory tables; memory now
 ///       has its own database, see `crate::memory`.)
-pub(crate) const RAG_SCHEMA_VERSION: i64 = 1;
+///   2 — Same tables. Members of impls and classes became chunks of their
+///       own, so every file is re-indexed once (its stored mtime is reset).
+pub(crate) const RAG_SCHEMA_VERSION: i64 = 2;
 
 /// Where code indexes live: `$XDG_CACHE_HOME/oxideclaw/rag`, falling back
 /// to `~/.cache/oxideclaw/rag`. `None` when neither is known: the index is
@@ -634,16 +636,31 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
                 )?;
                 debug!("RAG schema migrated: 0 -> 1 (baseline recorded)");
             }
+            1 => {
+                // Rows stay searchable until the next pass replaces them;
+                // no file has mtime 0, so that pass re-indexes every one.
+                // The UPDATE trigger deletes each row from chunks_fts, which
+                // fails on a row it never held (an index from before the FTS
+                // table existed), so bring chunks_fts in sync first.
+                conn.execute_batch(
+                    "BEGIN;
+                     INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild');
+                     UPDATE code_chunks SET mtime = 0;
+                     UPDATE rag_meta SET value = '2' WHERE key = 'schema_version';
+                     COMMIT;",
+                )?;
+                debug!("RAG schema migrated: 1 -> 2 (chunks marked for re-index)");
+            }
             // Future migrations go here. Example:
             //
-            // 1 => {
+            // 2 => {
             //     conn.execute_batch(
             //         "BEGIN;
             //          ALTER TABLE code_chunks ADD COLUMN embedding BLOB;
-            //          UPDATE rag_meta SET value='2' WHERE key='schema_version';
+            //          UPDATE rag_meta SET value='3' WHERE key='schema_version';
             //          COMMIT;"
             //     )?;
-            //     debug!("RAG schema migrated: 1 -> 2");
+            //     debug!("RAG schema migrated: 2 -> 3");
             // }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -827,6 +844,28 @@ mod tests {
             1,
             "migration must preserve existing data"
         );
+    }
+
+    /// A v1 index stored impls and classes whole; opening it as v2 marks
+    /// every file for re-indexing so the members get their own chunks.
+    #[test]
+    fn v1_index_is_marked_for_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rag.db");
+        {
+            let db = RagDb::open_at(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "INSERT INTO code_chunks (file_path, symbol_name, symbol_kind, language, start_line, end_line, content, mtime)
+                     VALUES ('lib.rs', 'Big', 'impl', 'rust', 1, 300, 'impl Big {}', 1700000000000000000);
+                     UPDATE rag_meta SET value = '1' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+        let db = RagDb::open_at(&path).unwrap();
+        assert_eq!(read_schema_version(&db.conn).unwrap(), 2);
+        assert_eq!(db.chunk_count().unwrap(), 1, "old rows stay searchable");
+        assert_eq!(db.file_mtime("lib.rs").unwrap(), 0);
     }
 
     /// Re-opening an already-current DB must be idempotent — no duplicate
