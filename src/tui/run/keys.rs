@@ -47,6 +47,14 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     } = ctx;
     use KeyCode::*;
 
+    // Ahead of every overlay and dialog: they swallowed it (AskUser typed a
+    // 'c'), so Ctrl+C did not quit while one was open. The quit path denies
+    // a pending approval and cancels a pending question.
+    if key.code == Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        app.should_quit = true;
+        return Ok(());
+    }
+
     // Overlay dismissal takes second priority (after permission dialog)
     if app.overlay.is_some() {
         let is_interactive = app.overlay.as_ref().is_some_and(|o| o.is_interactive());
@@ -253,8 +261,9 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // Block input while loading (except Ctrl+C and Esc)
-    if app.is_loading && key.code != Char('c') && key.code != Esc {
+    // Block input while loading, except Esc (Ctrl+C was handled above).
+    // Matching the bare code let plain 'c' through to the input.
+    if app.is_loading && key.code != Esc {
         return Ok(());
     }
 
@@ -272,10 +281,6 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     }
 
     match (key.code, key.modifiers) {
-        (Char('c'), KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
-
         // Ctrl+R — toggle voice recording (only when voice mode is enabled)
         (Char('r'), KeyModifiers::CONTROL) if config.voice_enabled => {
             if app.voice_recording {
@@ -1226,5 +1231,95 @@ mod overlay_key_tests {
         )
         .await;
         assert_eq!(app.pending_delete.as_deref(), Some("old-session"));
+    }
+}
+
+#[cfg(test)]
+mod ctrl_c_tests {
+    use super::*;
+    use crate::tui::app::PendingUserQuestion;
+    use crossterm::event::KeyEvent;
+
+    async fn press(app: &mut App, key: KeyEvent) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut messages = Vec::new();
+        let mut client =
+            ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
+        let mut config = Config {
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let perm_state = PermissionState::new(false, &[], &[]);
+        let skills = std::collections::HashMap::new();
+        let mut system_prompt = String::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let todo_state = TodoState::default();
+        let mut session = Session::at_path("current", dir.path().join("current.jsonl"));
+        let spawn_registry = crate::spawn::new_registry();
+        handle_key(KeyCtx {
+            key,
+            app,
+            messages: &mut messages,
+            client: &mut client,
+            tools: &[],
+            config: &mut config,
+            perm_state: &perm_state,
+            skills: &skills,
+            system_prompt: &mut system_prompt,
+            tx: &tx,
+            todo_state: &todo_state,
+            session: &mut session,
+            saved_count: &mut 0,
+            mcp_statuses: &[],
+            spawn_registry: &spawn_registry,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    /// Ctrl+C in the AskUser dialog typed a 'c' into the answer and the app
+    /// kept running.
+    #[tokio::test]
+    async fn ctrl_c_quits_from_the_ask_user_dialog() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        let (reply, _rx) = oneshot::channel();
+        app.pending_user_question = Some(PendingUserQuestion {
+            question: "which?".into(),
+            reply,
+            input: Vec::new(),
+            cursor: 0,
+        });
+        press(&mut app, ctrl_c()).await;
+        assert!(app.should_quit);
+        let q = app.pending_user_question.as_ref().unwrap();
+        assert!(q.input.is_empty(), "typed {:?}", q.input);
+    }
+
+    /// The overlay and browse-approval branches ignored Ctrl+C.
+    #[tokio::test]
+    async fn ctrl_c_quits_with_an_overlay_open() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.overlay = Some(Overlay::with_items("models", "x", vec!["m".into()]));
+        press(&mut app, ctrl_c()).await;
+        assert!(app.should_quit);
+    }
+
+    /// Typing ahead during a turn left only the 'c's in the input box: the
+    /// loading guard let the bare 'c' code through.
+    #[tokio::test]
+    async fn plain_c_is_blocked_while_loading() {
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.start_loading();
+        for mods in [KeyModifiers::NONE, KeyModifiers::ALT] {
+            press(&mut app, KeyEvent::new(KeyCode::Char('c'), mods)).await;
+        }
+        assert!(app.input.is_empty(), "typed {:?}", app.input);
+        assert!(!app.should_quit);
+        press(&mut app, ctrl_c()).await;
+        assert!(app.should_quit);
     }
 }
