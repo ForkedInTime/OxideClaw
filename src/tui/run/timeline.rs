@@ -959,6 +959,9 @@ mod tests {
         let note = h.last_note();
         assert!(note.contains("b.txt"), "{note}");
         assert!(note.contains("nothing was changed"), "{note}");
+        // A commit leaves the work tree as it is, so it never clears this.
+        assert!(!note.contains("Commit"), "{note}");
+        assert!(note.contains("put those files back"), "{note}");
         assert_eq!(h.read("b.txt").as_deref(), Some("mine\n"));
         assert_eq!(h.read("a.txt").as_deref(), Some("a3\n"));
         assert_eq!(h.prompts().await, vec!["one", "two", "three"]);

@@ -943,9 +943,12 @@ fn restore(
             if more > 0 {
                 clobbered.push(format!("+{more} more"));
             }
+            // The guard compares against the work tree, so a commit does
+            // not clear it and a stash also takes the turns' own edits.
             anyhow::bail!(
                 "nothing was changed: {} changed since the last snapshot and would be \
-                 overwritten. Commit, stash or revert those edits, then try again.",
+                 overwritten. Copy your edits aside and put those files back as they \
+                 were at that snapshot, then try again.",
                 clobbered.join(", ")
             );
         }
