@@ -212,6 +212,61 @@ fn publish_history(history: &TurnHistory, messages: &[Message], results: &[Conte
     }
 }
 
+/// Replace `messages` with a summary, running the compact hooks, and tell
+/// the app. Only between rounds: the summary replaces any tool_use whose
+/// results are still to come. A snipped copy goes to the model, so the
+/// summary request has a chance to fit a history that may not.
+#[allow(clippy::too_many_arguments)]
+async fn summarise_turn(
+    client: &ApiBackend,
+    config: &Config,
+    session_id: &str,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    task_cost: &mut crate::cost::CostTracker,
+    messages: &mut Vec<Message>,
+    history: &TurnHistory,
+    read_cache: &crate::tools::ReadCache,
+) -> anyhow::Result<()> {
+    let mut snipped = messages.clone();
+    crate::compact::snip_compact(&mut snipped, &config.model);
+    if let Some(hook_cfg) = &config.hooks
+        && !config.disable_all_hooks
+    {
+        hooks::run_pre_compact_hooks(hook_cfg, session_id, &config.cwd).await;
+    }
+    let bill = |u: &Usage| {
+        task_cost.record_with_cache(
+            &config.model,
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
+        let _ = tx.send(AppEvent::usage(&config.model, u));
+    };
+    let replacement = crate::compact::summarize_compact(client, &snipped, config, bill).await?;
+    let summary_len = match replacement.first().and_then(|m| m.content.first()) {
+        Some(ContentBlock::Text { text }) => text.len(),
+        _ => 0,
+    };
+    if let Some(hook_cfg) = &config.hooks
+        && !config.disable_all_hooks
+    {
+        hooks::run_post_compact_hooks(hook_cfg, session_id, &config.cwd).await;
+    }
+    let _ = tx.send(AppEvent::Compacted {
+        replacement: replacement.clone(),
+        summary_len,
+        base: None,
+    });
+    *messages = replacement;
+    publish_history(history, messages, &[]);
+    // The summary dropped the bodies of this turn's reads; a re-read must
+    // return the file, not "unchanged".
+    read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    Ok(())
+}
+
 /// Every tool_use needs a tool_result in the next message or the next
 /// request is rejected. A turn cut short mid-round leaves some unanswered:
 /// the tools that never ran or never finished.
@@ -452,6 +507,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
     // prompt, tool definitions, maxTokens) leaves no room: compacting again
     // only summarises the summary, billing a call each time.
     let mut overflow_compacted = false;
+    // The context passed the summarise threshold on a tool round: summarise
+    // before the next request, once that round's results are in.
+    let mut summarise_pending = false;
     // Retries consumed by the auto-fix loop within the current user turn.
     // Reset to 0 on every user prompt; the retry helper enforces the cap.
     let mut auto_fix_retries: u32 = 0;
@@ -469,6 +527,41 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 "Stopped after {turn_limit} tool iterations — possible loop detected."
             )));
             return;
+        }
+        if std::mem::take(&mut summarise_pending) {
+            let _ = tx.send(AppEvent::SystemMessage(
+                "Context critically full — auto-compacting (summarise)…".into(),
+            ));
+            let (sum_client, sum_config) = compaction_backend(
+                &config,
+                &client,
+                routing
+                    .as_ref()
+                    .map(|r| &r.router)
+                    .or(compact_router.as_ref()),
+            );
+            if let Err(e) = summarise_turn(
+                &sum_client,
+                &sum_config,
+                session_id,
+                &tx,
+                &mut task_cost,
+                &mut messages,
+                &history,
+                &read_cache,
+            )
+            .await
+            {
+                // The provider rejects an overflow loudly (handled below)
+                // or Ollama truncates it; old tool results are the bulk.
+                let _ = tx.send(AppEvent::SystemMessage(format!(
+                    "Auto-compact failed: {e}. Snipping old tool results instead."
+                )));
+                if crate::compact::snip_compact(&mut messages, &config.model) {
+                    read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    publish_history(&history, &messages, &[]);
+                }
+            }
         }
 
         // Build tool definitions, optionally adding prompt cache marker to the last one
@@ -675,52 +768,19 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     .map(|r| &r.router)
                     .or(compact_router.as_ref()),
             );
-            let mut snipped = messages.clone();
-            crate::compact::snip_compact(&mut snipped, &sum_config.model);
-            if let Some(hook_cfg) = &config.hooks
-                && !config.disable_all_hooks
+            match summarise_turn(
+                &sum_client,
+                &sum_config,
+                session_id,
+                &tx,
+                &mut task_cost,
+                &mut messages,
+                &history,
+                &read_cache,
+            )
+            .await
             {
-                hooks::run_pre_compact_hooks(hook_cfg, session_id, &config.cwd).await;
-            }
-            let bill = |u: &Usage| {
-                task_cost.record_with_cache(
-                    &sum_config.model,
-                    u.input_tokens,
-                    u.output_tokens,
-                    u.cache_read_input_tokens,
-                    u.cache_creation_input_tokens,
-                );
-                let _ = tx.send(AppEvent::usage(&sum_config.model, u));
-            };
-            match crate::compact::summarize_compact(&sum_client, &snipped, &sum_config, bill).await
-            {
-                Ok(replacement) => {
-                    let summary_len = replacement
-                        .first()
-                        .and_then(|m| m.content.first())
-                        .map(|b| {
-                            if let ContentBlock::Text { text } = b {
-                                text.len()
-                            } else {
-                                0
-                            }
-                        })
-                        .unwrap_or(0);
-                    if let Some(hook_cfg) = &config.hooks
-                        && !config.disable_all_hooks
-                    {
-                        hooks::run_post_compact_hooks(hook_cfg, session_id, &config.cwd).await;
-                    }
-                    let _ = tx.send(AppEvent::Compacted {
-                        replacement: replacement.clone(),
-                        summary_len,
-                        base: None,
-                    });
-                    messages = replacement;
-                    publish_history(&history, &messages, &[]);
-                    // The summary dropped the bodies of this turn's reads;
-                    // a re-read must return the file, not "unchanged".
-                    read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                Ok(()) => {
                     overflow_compacted = true;
                     continue; // retry outer loop with compacted history
                 }
@@ -789,7 +849,8 @@ pub(super) async fn run_api_task(task: ApiTask) {
         // The tier is fixed for the rest of this prompt and Ollama truncates
         // an overflow silently instead of failing, so measure each response
         // against the turn's window; the auto-compact after the turn only
-        // measures against the largest tier's.
+        // measures against the largest tier's. A turn that ends here is left
+        // to that between-turns check.
         if response.stop_reason == Some(StopReason::ToolUse) {
             use crate::compact::CompactNeeded;
             let window = crate::compact::turn_window(&config, routing.as_ref().map(|r| &r.router));
@@ -806,19 +867,24 @@ pub(super) async fn run_api_task(task: ApiTask) {
                     &tx,
                 )
                 .await;
-            if !moved
-                && matches!(need, CompactNeeded::Snip | CompactNeeded::Summarise)
-                && config.auto_compact_enabled
-                && crate::compact::snip_compact(&mut messages, &config.model)
-            {
-                let _ = tx.send(AppEvent::SystemMessage(format!(
-                    "Context is {}% of {}'s window: stripped old tool results (snipCompact).",
-                    context_tokens * 100 / window.max(1),
-                    config.model
-                )));
-                publish_history(&history, &messages, &[]);
-                // A re-read must return the file, not "unchanged".
-                read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            match need {
+                _ if moved || !config.auto_compact_enabled => {}
+                CompactNeeded::Snip => {
+                    if crate::compact::snip_compact(&mut messages, &config.model) {
+                        let _ = tx.send(AppEvent::SystemMessage(format!(
+                            "Context is {}% of {}'s window: stripped old tool results (snipCompact).",
+                            context_tokens * 100 / window.max(1),
+                            config.model
+                        )));
+                        publish_history(&history, &messages, &[]);
+                        // A re-read must return the file, not "unchanged".
+                        read_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    }
+                }
+                // Summarise before the next request, once this round's
+                // results are in: now it would orphan them.
+                CompactNeeded::Summarise => summarise_pending = true,
+                _ => {}
             }
         }
 
@@ -1844,6 +1910,50 @@ mod loop_guard_tests {
                 .is_some_and(|e| e.contains("after compacting")),
             "{failed:?}"
         );
+    }
+
+    /// The TUI compacted only between turns or after a provider rejected a
+    /// request, so a long turn ran into the window (Ollama truncates
+    /// silently, others fail with a 400). Now the summarise band is acted
+    /// on between tool rounds, as in -p and the SDK.
+    #[tokio::test]
+    async fn a_full_context_is_summarised_between_tool_rounds() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})];
+        let full = sse(&tool, "tool_use").replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
+        let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
+        let (url, seen) = serve(vec![full, text("1. Primary Request: go"), text("done")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut t, mut rx) = task(url, dir.path(), None);
+        t.config.auto_compact_enabled = true;
+        t.perm_state = PermissionState::new(false, &["Nope".into()], &[]);
+        run_api_task(t).await;
+
+        let bodies: Vec<serde_json::Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3, "turn, summary, turn");
+        let last = bodies[2]["messages"].as_array().unwrap();
+        assert_eq!(last.len(), 1, "{last:?}");
+        assert!(
+            last[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("automatically compacted")
+        );
+        let (mut compacted, mut done) = (false, false);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Compacted { base: None, .. } => compacted = true,
+                AppEvent::Done { .. } => done = true,
+                AppEvent::TurnFailed(e) => panic!("turn failed: {e}"),
+                _ => {}
+            }
+        }
+        assert!(compacted && done);
     }
 
     /// The mid-turn compact never ran the documented preCompact /
