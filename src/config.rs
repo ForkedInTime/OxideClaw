@@ -1441,15 +1441,21 @@ impl Config {
         self.auto_fix = af;
     }
 
-    /// Re-read trust after /trust or /reload, together with the auto-fix
-    /// block that trust gates.
+    /// Re-read trust after /trust, together with the auto-fix block and
+    /// router tiers that trust gates. An unknown classifier was already
+    /// reported at startup.
     pub fn refresh_trust(&mut self) {
         let settings = self.load_settings();
+        let _ = self.apply_trust_settings(&settings);
+    }
+
+    /// Take trust, and the auto-fix block and router tiers it gates, from
+    /// freshly merged settings (/trust, /reload). Returns a notice for an
+    /// unknown classifier.
+    pub fn apply_trust_settings(&mut self, settings: &crate::settings::Settings) -> Option<String> {
         self.project_trusted = settings.project_trusted;
         self.apply_auto_fix_settings(settings.auto_fix.as_ref());
-        // Router tiers are trust-gated too; an unknown classifier was
-        // already reported at startup.
-        let _ = self.apply_router_settings(&settings);
+        self.apply_router_settings(settings)
     }
 
     /// Apply the router tiers, switch and classifier from merged settings.
@@ -3943,6 +3949,49 @@ mod flag_settings_retarget_tests {
         assert!(!cfg.router_enabled);
         assert_eq!(cfg.router_high_model, None);
         assert!(cfg.router_fingerprint() == untrusted);
+    }
+
+    /// /reload took trust from disk but left the router alone, so a
+    /// revoked project's tiers kept getting prompts and tier edits in
+    /// settings.json were ignored until a restart.
+    #[test]
+    fn reloaded_settings_move_the_router_with_trust() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+        let tiers = |low: &str| {
+            std::fs::write(
+                project.path().join(".claude/settings.json"),
+                format!(r#"{{"router": {{"low": "{low}", "high": "ollama:b"}}}}"#),
+            )
+            .unwrap();
+        };
+        tiers("groq:a");
+        let trust = serde_json::json!({ "trustedProjects": [project.path()] }).to_string();
+        std::fs::write(home.path().join("settings.json"), trust).unwrap();
+        let mut cfg = Config {
+            cwd: project.path().into(),
+            config_dir_override: Some(home.path().into()),
+            ..Config::default()
+        };
+        let reload = |cfg: &mut Config| {
+            let before = cfg.router_fingerprint();
+            let settings = cfg.load_settings();
+            assert_eq!(cfg.apply_trust_settings(&settings), None);
+            cfg.router_fingerprint() != before
+        };
+        assert!(reload(&mut cfg));
+        assert_eq!(cfg.router_low_model.as_deref(), Some("groq:a"));
+
+        tiers("groq:c");
+        assert!(reload(&mut cfg), "an edited tier is picked up");
+        assert_eq!(cfg.router_low_model.as_deref(), Some("groq:c"));
+
+        std::fs::write(home.path().join("settings.json"), "{}").unwrap();
+        assert!(reload(&mut cfg), "revoking trust moves the router");
+        assert!(!cfg.project_trusted);
+        assert_eq!(cfg.router_low_model, None);
+        assert!(!cfg.router_enabled);
     }
 
     #[test]

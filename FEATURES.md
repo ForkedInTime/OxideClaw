@@ -318,7 +318,7 @@ The router starts on once two or more tiers are set in the `router` block. `"ena
 
 On a local or OpenAI-compatible session, only the tiers you name go to another provider, so switching the router on never sends prompts somewhere you did not choose. Unset tiers follow `/model`; tiers set in settings.json or with `/router <tier>` stay.
 
-Tiers, `enabled: true` and the classifier in a project's `.claude/settings.json` apply only once the project is `/trust`ed. An untrusted project can still switch the router off, and its `routerBudget` may lower your budget but not raise it. This covers the router only: a project's `model` and `phaseRouter` settings still apply untrusted.
+Tiers, `enabled: true` and the classifier in a project's `.claude/settings.json` apply only once the project is `/trust`ed. An untrusted project can still switch the router off, and its `routerBudget` may lower your budget but not raise it. `/trust`, `/trust revoke` and `/reload` (which also picks up edits to the router settings) apply from the next prompt; only the settings that moved change, so a `/router off` or `/router <tier>` from this session stays unless that same setting changed, and a router that settings switch on says so with its tiers. This covers the router only: a project's `model` and `phaseRouter` settings still apply untrusted.
 
 Compaction measures the history against the largest window among the tiers a turn can still go to; tiers skipped for the session or without a credential do not count, and with none left the session model's window applies. Inside a turn, once the tier is picked, it measures against that tier's window: the tier is picked once per prompt, and Ollama truncates an overflow silently rather than failing over.
 

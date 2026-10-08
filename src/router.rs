@@ -243,6 +243,32 @@ impl RouterConfig {
         r
     }
 
+    /// Settings moved router fields away from `before` (/trust, /reload):
+    /// take those fields from `config` and leave the rest as this session
+    /// set them, so a `/router off` or `/router <tier>` is not undone by a
+    /// change that never touched it. Tier health is kept.
+    pub fn reapply_settings(&mut self, config: &Config, before: &crate::config::RouterFingerprint) {
+        let after = config.router_fingerprint();
+        let fresh = Self::from_config(config);
+        if after.0 != before.0 {
+            self.enabled = fresh.enabled;
+        }
+        if after.1 != before.1 {
+            self.classifier = fresh.classifier;
+        }
+        for (tier, moved) in [
+            (Complexity::Low, after.2 != before.2),
+            (Complexity::Medium, after.3 != before.3),
+            (Complexity::High, after.4 != before.4),
+            (Complexity::SuperHigh, after.5 != before.5),
+        ] {
+            if moved {
+                *self.model_mut(tier) = fresh.model_for(tier).to_string();
+                self.pinned[tier.rank()] = fresh.pinned[tier.rank()];
+            }
+        }
+    }
+
     /// Tier models that would take a local session's prompts off this
     /// machine: empty unless the router is on and `session_model` runs on
     /// Ollama or LM Studio.
@@ -1399,6 +1425,37 @@ mod tests {
         // On with two, unless switched off.
         assert!(starts_enabled(None, 2));
         assert!(!starts_enabled(Some(false), 4));
+    }
+
+    /// /trust and /reload rebuilt the router from settings whenever a
+    /// router setting moved, undoing this session's `/router off` and
+    /// `/router <tier>` even though only another tier changed.
+    #[test]
+    fn a_settings_change_keeps_the_session_choices_it_did_not_touch() {
+        let mut config = Config {
+            model: "claude-sonnet-5".into(),
+            router_enabled: true,
+            router_low_model: Some("groq:llama-3.1-8b-instant".into()),
+            ..Config::default()
+        };
+        let mut r = RouterConfig::from_config(&config);
+        r.enabled = false;
+        r.set_model(Complexity::Medium, "claude-haiku-4-5".into());
+
+        // Trust revoked: the project's low tier goes, nothing else moved.
+        let before = config.router_fingerprint();
+        config.router_low_model = None;
+        r.reapply_settings(&config, &before);
+        assert_eq!(r.low_model, "claude-haiku-4-5", "revoked tier dropped");
+        assert!(!r.enabled, "/router off survives");
+        assert_eq!(r.medium_model, "claude-haiku-4-5", "/router mid survives");
+
+        // A setting that does move the switch still applies.
+        let before = config.router_fingerprint();
+        config.router_enabled = false;
+        r.enabled = true;
+        r.reapply_settings(&config, &before);
+        assert!(!r.enabled);
     }
 
     /// A local session with the router on names the tiers that leave the

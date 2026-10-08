@@ -1071,15 +1071,21 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let settings = config.load_settings();
             let mut reloaded = Vec::new();
             // Trust may have changed since startup, and it gates the
-            // project's autoFixLoop block; rebuild both together.
+            // project's autoFixLoop block and router tiers; rebuild them
+            // together, or a revoked project's tiers kept getting prompts.
             let was_trusted = config.project_trusted;
-            config.project_trusted = settings.project_trusted;
+            let router_before = config.router_fingerprint();
+            let router_notice = config.apply_trust_settings(&settings);
             if was_trusted && !config.project_trusted {
                 stop_language_servers(tools);
             }
-            config.apply_auto_fix_settings(settings.auto_fix.as_ref());
             if settings.auto_fix.is_some() {
                 reloaded.push("autoFixLoop");
+            }
+            let router_moved = config.router_fingerprint() != router_before;
+            let router_turned_on = router_moved && resync_router(app, config, &router_before);
+            if router_moved {
+                reloaded.push("router");
             }
             // The TUI's PermissionState was built once at startup, so a new
             // deny rule or guard hook did nothing until a restart.
@@ -1193,6 +1199,16 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if let Some(why) = autonomy_fallback {
                 msg.push('\n');
                 msg.push_str(&why);
+            }
+            for line in [
+                router_notice,
+                router_turned_on.then(|| router_on_notice(app)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                msg.push('\n');
+                msg.push_str(&line);
             }
             // Otherwise a typo reads as "no changes detected".
             if !settings.load_errors.is_empty() {
@@ -2131,14 +2147,12 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 stop_language_servers(tools);
             }
             // The project's router tiers are trust-gated: a revoked
-            // project's tiers must stop getting prompts now. Rebuild only
-            // when they moved, so `/router on|off` and `/router <tier>`
-            // made this session survive an unrelated /trust.
-            if config.router_fingerprint() != router_before {
-                let health = std::mem::take(&mut app.router.health);
-                app.router = crate::router::RouterConfig::from_config(config);
-                app.router.health = health;
-                app.routed_model = None;
+            // project's tiers must stop getting prompts now.
+            if config.router_fingerprint() != router_before
+                && resync_router(app, config, &router_before)
+            {
+                let line = router_on_notice(app);
+                app.entries.push(ChatEntry::system(line));
             }
         }
         CommandAction::AutoCommitStatus => {
@@ -2716,6 +2730,34 @@ fn starts_model_turn(
 /// that changed since it was last read counts: `--model` and
 /// `ANTHROPIC_MODEL` outrank settings at startup, and a reload made to pick
 /// up a CLAUDE.md edit used to revert them silently.
+/// Bring the session router in line with settings that moved away from
+/// `before`. Only the moved fields change, so `/router on|off` and
+/// `/router <tier>` survive an unrelated /trust or /reload. True when this
+/// switched the router on.
+fn resync_router(
+    app: &mut App,
+    config: &crate::config::Config,
+    before: &crate::config::RouterFingerprint,
+) -> bool {
+    let was_on = app.router.enabled;
+    app.router.reapply_settings(config, before);
+    app.routed_model = None;
+    !was_on && app.router.enabled
+}
+
+/// Said when settings switch the router on mid-session, since its tiers
+/// may be on other providers than the session model.
+fn router_on_notice(app: &App) -> String {
+    format!(
+        "Smart model router is now ON from settings: low → {}, medium → {}, \
+         high → {}, super-high → {}. /router off turns it off.",
+        app.router.low_model,
+        app.router.medium_model,
+        app.router.high_model,
+        app.router.super_high_model,
+    )
+}
+
 fn reloaded_model(
     settings_model: Option<&str>,
     last_seen: &mut Option<String>,
