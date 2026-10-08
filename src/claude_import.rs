@@ -204,7 +204,16 @@ pub fn migrate(claude: &Path, config: &Path, data: &Path) -> Vec<String> {
                 opt_in.push(("permissions.allow".into(), "--permissions"));
             }
             if theirs.get("apiKeyHelper").is_some_and(is_set) {
-                opt_in.push(("apiKeyHelper".into(), "--api-key-helper"));
+                let redirect = redirect_keys(&theirs);
+                if redirect.is_empty() {
+                    opt_in.push(("apiKeyHelper".into(), "--api-key-helper"));
+                } else {
+                    // `--api-key-helper` would refuse it: no point offering.
+                    left_behind.push(format!(
+                        "apiKeyHelper (its keys are for {})",
+                        redirect.join(" / ")
+                    ));
+                }
             }
             for key in LEFT_BEHIND_KEYS {
                 let Some(v) = theirs.get(*key).filter(|v| !v.is_null()) else {
@@ -472,6 +481,12 @@ pub fn import_claude(
     let hooks = theirs.get("hooks").map(convert_hooks).unwrap_or_default();
     let permissions = theirs.get("permissions").and_then(Value::as_object);
     let helper = theirs.get("apiKeyHelper").and_then(Value::as_str);
+    let redirect = theirs.as_object().map(redirect_keys).unwrap_or_default();
+    let redirect_why = format!(
+        "Claude Code's env sets {}, so its keys are for that endpoint; OxideClaw only talks \
+         to api.anthropic.com and would send them there",
+        redirect.join(", ")
+    );
     // settings.json first: older OxideClaw versions wrote their servers there.
     let mut servers = theirs
         .get("mcpServers")
@@ -523,6 +538,11 @@ pub fn import_claude(
             "  --api-key-helper  {}",
             helper.map_or("none".to_string(), |h| format!("`{h}`"))
         ));
+        if helper.is_some() && !redirect.is_empty() {
+            lines.push(format!(
+                "                    not importable: {redirect_why}."
+            ));
+        }
         let mut mcp = if servers.is_empty() {
             "none".to_string()
         } else {
@@ -691,6 +711,9 @@ pub fn import_claude(
             (None, _) => lines.push("apiKeyHelper: none to import".into()),
             (Some(h), Some(mine)) if h != mine => {
                 lines.push(format!("apiKeyHelper: kept the existing `{mine}`"))
+            }
+            (Some(_), _) if !redirect.is_empty() => {
+                lines.push(format!("apiKeyHelper: not imported; {redirect_why}."))
             }
             (Some(h), _) => {
                 root.insert("apiKeyHelper".into(), Value::String(h.to_string()));
@@ -870,6 +893,35 @@ fn is_set(v: &Value) -> bool {
         Value::Object(o) => o.values().any(is_set),
         _ => true,
     }
+}
+
+/// `env` settings that send Claude Code's requests somewhere other than
+/// api.anthropic.com: an LLM gateway, Bedrock or Vertex.
+const REDIRECT_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+];
+
+/// The [`REDIRECT_ENV_KEYS`] Claude Code's settings set. With any, its
+/// `apiKeyHelper` mints keys for that endpoint; OxideClaw has no base URL
+/// override, so it would send them to api.anthropic.com (and get a 401).
+fn redirect_keys(theirs: &Map<String, Value>) -> Vec<&'static str> {
+    let env = theirs.get("env").and_then(Value::as_object);
+    REDIRECT_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|k| {
+            let v = env.and_then(|e| e.get(*k)).and_then(Value::as_str);
+            let v = v.map(str::trim).unwrap_or_default();
+            // CLAUDE_CODE_USE_* are switches: "0" / "false" leave them off.
+            !v.is_empty()
+                && !(k.starts_with("CLAUDE_CODE_USE_")
+                    && (v == "0" || v.eq_ignore_ascii_case("false")))
+        })
+        .collect()
 }
 
 fn join_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
@@ -1480,6 +1532,64 @@ mod tests {
         // The result parses as OxideClaw settings with the hook in force.
         let parsed = crate::settings::Settings::load_file(&config.join("settings.json"));
         assert_eq!(parsed.hooks.unwrap().pre_tool_use[0].command, "audit");
+    }
+
+    /// A helper that mints keys for Claude Code's gateway (`env.
+    /// ANTHROPIC_BASE_URL`) would send them to api.anthropic.com here: it is
+    /// refused, with the reason, and the first run stops offering it.
+    #[test]
+    fn a_gateway_api_key_helper_is_not_imported() {
+        let td = tempfile::tempdir().unwrap();
+        let claude = td.path().join("claude");
+        let settings = r#"{"apiKeyHelper": "~/bin/litellm-token",
+            "env": {"ANTHROPIC_BASE_URL": "https://llm-gw.corp"}}"#;
+        write(&claude.join("settings.json"), settings);
+        let config = td.path().join("config");
+        let listing = import_claude(&claude, None, &claude, &config, ImportOptions::default())
+            .unwrap()
+            .join("\n");
+        assert!(
+            listing.contains("not importable") && listing.contains("ANTHROPIC_BASE_URL"),
+            "{listing}"
+        );
+
+        let opts = ImportOptions {
+            api_key_helper: true,
+            ..Default::default()
+        };
+        let lines = import_claude(&claude, None, &claude, &config, opts).unwrap();
+        assert!(
+            read(&config.join("settings.json"))
+                .get("apiKeyHelper")
+                .is_none()
+        );
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("apiKeyHelper:"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(
+            line.contains("not imported") && line.contains("api.anthropic.com"),
+            "{line}"
+        );
+
+        let text = migrate(&claude, &td.path().join("c2"), &td.path().join("d2")).join("\n");
+        assert!(!text.contains("--api-key-helper"), "{text}");
+        assert!(
+            text.contains("apiKeyHelper (its keys are for ANTHROPIC_BASE_URL)"),
+            "{text}"
+        );
+
+        // A switch set to "0" sends nothing elsewhere.
+        write(
+            &claude.join("settings.json"),
+            r#"{"apiKeyHelper": "vault read key", "env": {"CLAUDE_CODE_USE_BEDROCK": "0"}}"#,
+        );
+        let config = td.path().join("config3");
+        import_claude(&claude, None, &claude, &config, opts).unwrap();
+        assert_eq!(
+            read(&config.join("settings.json"))["apiKeyHelper"],
+            "vault read key"
+        );
     }
 
     /// A guard that rewrites the call through `updatedInput` would run the
