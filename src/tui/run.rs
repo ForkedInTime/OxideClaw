@@ -1542,6 +1542,9 @@ async fn run_loop(
                         }
                         AppEvent::Compacted { ref replacement, summary_len, base: None } => {
                             consecutive_compact_count = 0; // successful compact resets thrash counter
+                            // Sent by the running turn: the summary stands in for its prompt.
+                            let carried =
+                                timeline::carry_inflight_mark(&mut session, &messages, replacement);
                             messages = replacement.clone();
                             if !config.no_session_persistence {
                                 let to_save = replacement.clone();
@@ -1549,6 +1552,9 @@ async fn run_loop(
                                 let _ = session.overwrite(&to_save).await;
                             }
                             timeline::after_compaction(&mut session, &messages).await;
+                            if carried && let Err(e) = session.save_meta().await {
+                                tracing::warn!("undo timeline: failed to save meta: {e}");
+                            }
                             app.apply(AppEvent::Compacted {
                                 replacement: replacement.clone(),
                                 summary_len,

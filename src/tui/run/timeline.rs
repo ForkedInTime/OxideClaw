@@ -78,6 +78,34 @@ pub(super) fn prune_timeline(session: &mut Session, messages: &[Message]) -> boo
     true
 }
 
+/// A compaction in the middle of a turn (the request outgrew the context)
+/// replaces the running turn's prompt with the summary. Re-point that
+/// turn's mark at the summary, so the prune that follows keeps it: dropped,
+/// the turn's snapshot paired with no prompt, its edits could never be
+/// undone, and `/undo 1` took the whole summary off as conversation only.
+/// `before` is the history the compaction replaced. Returns whether the
+/// mark moved.
+pub(super) fn carry_inflight_mark(
+    session: &mut Session,
+    before: &[Message],
+    replacement: &[Message],
+) -> bool {
+    let (Some(prompt), Some(summary)) = (
+        before.iter().rfind(|m| is_prompt(m)),
+        replacement.iter().rfind(|m| is_prompt(m)),
+    ) else {
+        return false;
+    };
+    let running = prompt_fingerprint(prompt);
+    match session.meta.timeline.last_mut() {
+        Some(mark) if mark.prompt == running => {
+            mark.prompt = prompt_fingerprint(summary);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Bring the timeline in line with a history a compaction replaced:
 /// [`prune_timeline`], and the end of /redo. The undone turns were answered
 /// after a prefix that is gone; put back after the summary, their signed
@@ -598,6 +626,14 @@ mod tests {
         /// One turn as the run loop drives it: prompt on the timeline, the
         /// agent's edits, then `Done` saves the transcript and snapshots.
         async fn turn(&mut self, prompt: &str, edits: &[(&str, &str)]) {
+            self.start_turn(prompt).await;
+            for (rel, body) in edits {
+                self.write(rel, body);
+            }
+            self.finish_turn(prompt).await;
+        }
+
+        async fn start_turn(&mut self, prompt: &str) {
             begin_agent_turn(&mut self.session, &self.config, &[]).await;
             self.app.entries.push(ChatEntry::user(prompt));
             push_prompt_turn(
@@ -608,9 +644,11 @@ mod tests {
                 &mut self.session,
             )
             .await;
-            for (rel, body) in edits {
-                self.write(rel, body);
-            }
+        }
+
+        /// The reply and `Done`: the transcript is saved and the files
+        /// snapshotted.
+        async fn finish_turn(&mut self, prompt: &str) {
             self.messages.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
@@ -1222,6 +1260,45 @@ mod tests {
         h.undo(2).await;
         assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"), "only turn three");
         assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"));
+        assert!(h.prompts().await.is_empty());
+    }
+
+    /// A turn whose request outgrew the context was compacted mid-turn:
+    /// the summary replaced its prompt and the prune dropped its mark, so
+    /// `/undo 1` took the summary off as conversation only and the turn's
+    /// edits stayed on disk for good.
+    #[tokio::test]
+    async fn a_turn_compacted_mid_turn_stays_undoable() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.start_turn("two").await;
+        // The run loop's handler for the running turn's compaction.
+        let replacement = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "summary of the conversation so far".into(),
+            }],
+        }];
+        assert!(carry_inflight_mark(
+            &mut h.session,
+            &h.messages,
+            &replacement
+        ));
+        h.messages = replacement;
+        h.session.overwrite(&h.messages).await.unwrap();
+        h.saved = h.messages.len();
+        after_compaction(&mut h.session, &h.messages).await;
+        assert_eq!(h.session.meta.timeline.len(), 1, "the running turn's mark");
+        // The turn carries on after the compaction and edits.
+        h.write("a.txt", "a2\n");
+        h.write("b.txt", "b2\n");
+        h.finish_turn("two").await;
+
+        h.undo(1).await;
+        let note = h.last_note();
+        assert!(!note.contains("predate"), "{note}");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"), "{note}");
+        assert_eq!(h.read("b.txt"), None);
         assert!(h.prompts().await.is_empty());
     }
 
