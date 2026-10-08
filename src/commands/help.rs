@@ -84,6 +84,7 @@ pub(super) fn cmd_keybindings() -> CommandAction {
             "  dd            Clear entire line\n",
             "  j / k         Scroll chat down / up\n",
             "  G             Scroll to bottom\n",
+            "  Enter         Send (in either mode)\n",
             "\n",
             "Chat & scrolling\n",
             "  PageUp/Down   Scroll chat\n",

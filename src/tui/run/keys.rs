@@ -55,8 +55,12 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         return Ok(());
     }
 
+    // Ctrl+R that stops a recording goes past every overlay, dialog and the
+    // loading gate to its arm below: swallowed, the mic kept capturing.
+    let stops_recording = stops_recording(app, &key);
+
     // Overlay dismissal takes second priority (after permission dialog)
-    if app.overlay.is_some() {
+    if app.overlay.is_some() && !stops_recording {
         let is_interactive = app.overlay.as_ref().is_some_and(|o| o.is_interactive());
         match key.code {
             KeyCode::Esc | KeyCode::Char('q')
@@ -170,7 +174,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     }
 
     // Permission dialog takes priority
-    if let Some(perm) = &mut app.pending_permission {
+    if !stops_recording && let Some(perm) = &mut app.pending_permission {
         // y/a only once render has shown every row of the command; until
         // then the arrows scroll the dialog and n/Esc still deny.
         let shown = perm.fully_shown;
@@ -203,7 +207,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     }
 
     // Browse approval dialog takes priority after permission dialog
-    if app.browse_approval.is_some() {
+    if app.browse_approval.is_some() && !stops_recording {
         match key.code {
             Char('a') | Char('A') => answer_browse_approval(app, true, "  ✓ Approved"),
             Char('d') | Char('D') => answer_browse_approval(app, false, "  ✗ Denied"),
@@ -221,7 +225,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     }
 
     // AskUser dialog takes priority after permission dialog
-    if let Some(ref mut q) = app.pending_user_question {
+    if !stops_recording && let Some(ref mut q) = app.pending_user_question {
         match key.code {
             Enter => {
                 let answer: String = q.input.iter().collect();
@@ -271,7 +275,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     // Block input while loading, except Esc (Ctrl+C was handled above) and
     // chat scrolling, wanted most while output streams. Matching the bare
     // code let plain 'c' through to the input.
-    if app.is_loading && key.code != Esc && !scrolls_chat(&key) {
+    if app.is_loading && key.code != Esc && !scrolls_chat(&key) && !stops_recording {
         return Ok(());
     }
 
@@ -1136,9 +1140,10 @@ fn tts_playing(app: &App) -> bool {
 }
 
 /// Whether vim mode gets this key before the main match. Esc while a turn or
-/// TTS is running and Ctrl+S must reach their cancel/stop arms: vim would eat
-/// them as a mode switch, and while loading every other key is blocked, so
-/// Ctrl+C (quit) was the only way out.
+/// TTS is running, Ctrl+S, and Ctrl+R stopping a recording must reach their
+/// cancel/stop arms: vim would eat them as a mode switch, and while loading
+/// every other key is blocked, so Ctrl+C (quit) was the only way out. Enter
+/// sends in either mode.
 fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
     if !app.vim_enabled {
         return false;
@@ -1147,7 +1152,13 @@ fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
     let cancels_work =
         key.code == KeyCode::Esc && (app.is_loading || tts_playing(app) || clone_armed);
     let stops_tts = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
-    !(cancels_work || stops_tts || scrolls_chat(key))
+    // Normal mode had no use for Enter, so it silently did not send.
+    let submits = key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE;
+    !(cancels_work || stops_tts || scrolls_chat(key) || submits || stops_recording(app, key))
+}
+
+fn stops_recording(app: &App, key: &crossterm::event::KeyEvent) -> bool {
+    app.voice_recording && key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL
 }
 
 /// PageUp/PageDown and Ctrl+Home/End scroll the chat in every mode: vim
@@ -1261,6 +1272,23 @@ mod vim_routing_tests {
         ));
     }
 
+    /// Ctrl+R in normal mode did not stop a recording started in insert
+    /// mode, and Enter in normal mode did nothing.
+    #[test]
+    fn ctrl_r_stop_and_enter_bypass_normal_mode() {
+        let mut app = vim_app(true);
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(vim_routes_key(&app, &ctrl_r));
+        app.voice_recording = true;
+        assert!(!vim_routes_key(&app, &ctrl_r));
+        assert!(!vim_routes_key(&app, &enter));
+        assert!(vim_routes_key(
+            &app,
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+    }
+
     /// After a reply or `/voice test` finished speaking, the next Esc
     /// printed "TTS stopped." instead of entering vim normal mode.
     #[test]
@@ -1340,7 +1368,10 @@ mod browse_approval_key_tests {
         )
         .await;
         assert!(!rx.try_recv().unwrap(), "action approved");
-        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst), "run kept going");
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "run kept going"
+        );
         assert!(last_entry(&app).contains("stopping /browse"));
     }
 }
@@ -1480,13 +1511,17 @@ mod ctrl_c_tests {
     use crossterm::event::KeyEvent;
 
     pub(super) async fn press(app: &mut App, key: KeyEvent) {
+        press_with(app, Config::default(), key).await;
+    }
+
+    async fn press_with(app: &mut App, config: Config, key: KeyEvent) {
         let dir = tempfile::tempdir().unwrap();
         let mut messages = Vec::new();
         let mut client =
             ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
         let mut config = Config {
             cwd: dir.path().to_path_buf(),
-            ..Config::default()
+            ..config
         };
         let perm_state = PermissionState::new(false, &[], &[]);
         let skills = std::collections::HashMap::new();
@@ -1547,6 +1582,34 @@ mod ctrl_c_tests {
         assert!(app.should_quit);
     }
 
+    /// With an overlay open (or during a turn) Ctrl+R was swallowed and
+    /// the recorder kept capturing.
+    #[tokio::test]
+    async fn ctrl_r_stops_a_recording_with_an_overlay_open() {
+        let config = Config {
+            voice_enabled: true,
+            ..Config::default()
+        };
+        let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+        app.overlay = Some(Overlay::new("help", "x"));
+        app.start_loading();
+        app.voice_recording = true;
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        app.voice_stop_tx = Some(stop_tx);
+        press_with(
+            &mut app,
+            config,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .await;
+        assert!(!app.voice_recording);
+        assert!(stop_rx.try_recv().is_ok(), "recorder not told to stop");
+        assert!(app.overlay.is_some(), "overlay closed");
+        if let Some(t) = app.voice_transcribe_task.take() {
+            t.abort();
+        }
+    }
+
     /// PageUp/PageDown were dropped during a turn, and PageDown jumped
     /// straight to the bottom instead of paging back down.
     #[tokio::test]
@@ -1566,11 +1629,7 @@ mod ctrl_c_tests {
             press(&mut app, key(KeyCode::PageDown)).await;
             assert_eq!(app.scroll, up, "vim {vim}");
             assert!(!app.follow_bottom, "PageDown jumped to the bottom");
-            press(
-                &mut app,
-                KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
-            )
-            .await;
+            press(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)).await;
             assert!(app.follow_bottom);
         }
     }
