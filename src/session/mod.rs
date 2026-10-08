@@ -278,9 +278,16 @@ impl Session {
     }
 
     /// Load this session's transcript, first rewriting the file if its tail
-    /// was torn by a crash mid-append. Dropping the torn line only in memory
-    /// was one-shot: the next append glued onto the fragment, and the session
-    /// then refused to load ("corrupt at line N").
+    /// was torn by a crash mid-append or its history needed repair stubs.
+    /// Dropping the torn line only in memory was one-shot: the next append
+    /// glued onto the fragment, and the session then refused to load
+    /// ("corrupt at line N").
+    ///
+    /// The stubs are written too, so the file holds what the caller counts
+    /// as saved. Left in memory only, the next prompt was appended straight
+    /// after the unanswered tool_use, every later load spliced the stub into
+    /// it, and the prompt then read as a tool result: its turn lost its undo
+    /// mark, and so did every turn before it.
     async fn load_and_heal(&self) -> Result<Vec<Message>> {
         let content = match fs::read_to_string(&self.path).await {
             Ok(c) => c,
@@ -288,18 +295,15 @@ impl Session {
             Err(e) => return Err(e.into()),
         };
         let (mut messages, torn) = parse_intact_lines(&self.id, &content)?;
-        if torn {
-            // The intact lines, not the repaired list: repair stubs are
-            // rebuilt on every load, and persisting one would put two user
-            // turns in a row on disk once the next prompt is appended.
-            if let Err(e) = self.overwrite(&messages).await {
-                tracing::warn!(
-                    "session {}: could not rewrite torn transcript: {e}",
-                    self.id
-                );
-            }
+        let repaired = repair_loaded(&self.id, &mut messages);
+        if (torn || repaired > 0)
+            && let Err(e) = self.overwrite(&messages).await
+        {
+            tracing::warn!(
+                "session {}: could not rewrite the repaired transcript: {e}",
+                self.id
+            );
         }
-        repair_loaded(&self.id, &mut messages);
         Ok(messages)
     }
 
@@ -880,7 +884,7 @@ fn parse_intact_lines(id: &str, content: &str) -> Result<(Vec<Message>, bool)> {
 /// Recovery can leave an assistant `tool_use` unanswered (its `tool_result`
 /// was the torn line). The API rejects that outright, so repair before the
 /// history is ever sent.
-fn repair_loaded(id: &str, messages: &mut Vec<Message>) {
+fn repair_loaded(id: &str, messages: &mut Vec<Message>) -> usize {
     let repaired = repair_dangling_tool_uses(messages);
     if repaired > 0 {
         tracing::warn!(
@@ -888,6 +892,7 @@ fn repair_loaded(id: &str, messages: &mut Vec<Message>) {
              interrupted turn"
         );
     }
+    repaired
 }
 
 /// Create `dir` and its missing parents. Session files hold tool output,
@@ -1323,6 +1328,29 @@ mod durability_tests {
         let last = got.last().expect("history must not be empty");
         assert_eq!(last.role, Role::User, "must end answering the tool_use");
         assert_eq!(ids_of_results(last), vec!["toolu_9".to_string()]);
+    }
+
+    /// The repair stub for a torn tool_result stayed in memory only: the
+    /// next prompt was appended right after the unanswered tool_use, and
+    /// every later load spliced the stub into it. The prompt then read as a
+    /// tool result, and its turn (and every earlier one) lost its undo mark.
+    #[tokio::test]
+    async fn a_prompt_sent_after_a_repaired_tail_stays_a_prompt() {
+        let d = tempfile::tempdir().unwrap();
+        let msgs = vec![msg("go"), tool_use("toolu_9"), tool_result("toolu_9")];
+        write_jsonl(d.path(), "s", &msgs, Some(10));
+        let mut s = Session::at_path("s", d.path().join("s.jsonl"));
+        let mut live = s.load_and_heal().await.unwrap();
+        assert_eq!(live.len(), 3, "the stub answers the tool_use");
+        // What the run loop does next: everything loaded counts as saved,
+        // and Done appends the next turn.
+        let saved = live.len();
+        live.push(msg("next"));
+        s.append(&live[saved..]).await.unwrap();
+
+        let reloaded = s.load_and_heal().await.unwrap();
+        assert_eq!(reloaded, live);
+        assert!(ids_of_results(&reloaded[3]).is_empty(), "still a prompt");
     }
 
     /// Blank lines are padding, not damage.
