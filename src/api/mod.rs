@@ -638,6 +638,33 @@ pub fn context_window_for_model(model: &str) -> u64 {
         };
         return if one_million { 1_000_000 } else { 200_000 };
     }
+    // OpenAI ids, parsed from the `gpt-` token on so `oai:` and
+    // `openrouter:openai/` prefixes do not matter. GPT-4.1 and the GPT-5.4+
+    // base and `-pro` models take ~1M input tokens; GPT-5.0-5.3 and every
+    // `-mini` / `-nano` take 272k. The generic `gpt-4` row below would give
+    // GPT-4.1 128k, and the default would give GPT-5 200k.
+    if let Some(i) = m.find("gpt-") {
+        let id = m[i..].split(['@', ':']).next().unwrap_or_default();
+        if id.starts_with("gpt-4.1") {
+            return 1_047_576;
+        }
+        if let Some(v) = openai_compat::responses::gpt_version(id)
+            && v.0 >= 5
+        {
+            return if id.contains("-chat") {
+                128_000
+            } else if v >= (5, 4) && !id.contains("-mini") && !id.contains("-nano") {
+                1_050_000
+            } else {
+                272_000
+            };
+        }
+    }
+    // Every `ollama:` id contains "llama", which gave Mistral and DeepSeek
+    // 128k, so match families on the name after that prefix. Only the
+    // prefix goes: Gemma tags such as `gemma3:1b` keep their colon.
+    let ollama = m.strip_prefix("ollama:");
+    let m = ollama.unwrap_or(&m);
     // Gemma before Gemini, so an id naming both is not given 1M: a guess
     // above the real window means compaction never fires before the server
     // rejects the request.
@@ -673,6 +700,10 @@ pub fn context_window_for_model(model: &str) -> u64 {
         64_000
     } else if m.contains("mistral") {
         32_000
+    } else if ollama.is_some() {
+        // Ollama truncates an overflow silently instead of rejecting it, so
+        // an unknown local model keeps the smaller 128k guess.
+        128_000
     } else {
         // Unknown models: assume a 200k Claude-class window.
         200_000
@@ -793,6 +824,46 @@ mod context_window_tests {
         assert_eq!(w("ollama:gemma2:9b"), 8_192);
         assert_eq!(w("ollama:gemma4"), 131_072);
         assert_eq!(w("something-new"), 200_000);
+    }
+
+    #[test]
+    fn ollama_prefix_does_not_read_as_llama() {
+        assert_eq!(w("ollama:mistral"), 32_000);
+        assert_eq!(w("ollama:deepseek-r1"), 64_000);
+        assert_eq!(w("ollama:llama3.1"), 128_000);
+        assert_eq!(w("ollama:qwen2.5-coder"), 128_000);
+    }
+
+    #[test]
+    fn openai_models_get_their_real_window() {
+        for m in [
+            "oai:gpt-4.1",
+            "oai:gpt-4.1-mini",
+            "openai:gpt-4.1-nano",
+            "openrouter:openai/gpt-4.1",
+        ] {
+            assert_eq!(w(m), 1_047_576, "{m}");
+        }
+        for m in [
+            "oai:gpt-5",
+            "oai:gpt-5-mini",
+            "oai:gpt-5.2",
+            "oai:gpt-5.1-codex-max",
+            "openrouter:openai/gpt-5.4-mini",
+        ] {
+            assert_eq!(w(m), 272_000, "{m}");
+        }
+        for m in [
+            "oai:gpt-5.4",
+            "oai:gpt-5.5-pro",
+            "openrouter:openai/gpt-5.4",
+        ] {
+            assert_eq!(w(m), 1_050_000, "{m}");
+        }
+        assert_eq!(w("oai:gpt-5-chat-latest"), 128_000);
+        assert_eq!(w("oai:gpt-4o"), 128_000);
+        assert_eq!(w("openrouter:openai/gpt-4o-mini"), 128_000);
+        assert_eq!(w("oai:gpt-4-turbo"), 128_000);
     }
 }
 
