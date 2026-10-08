@@ -1917,7 +1917,14 @@ async fn run_loop(
                     last_tokens_in = 0;
                 }
                 CompactNeeded::Summarise => {
-                    if config.auto_compact_enabled {
+                    if config.auto_compact_enabled && app.cost_tracker.over_budget() {
+                        // A summary is a full-history request: past the cap
+                        // it is spend the user did not ask for.
+                        app.entries.push(ChatEntry::system(
+                            "Context critically full, but the /budget limit is reached — \
+                             not auto-compacting. Raise it with /budget or run /clear.",
+                        ));
+                    } else if config.auto_compact_enabled {
                         consecutive_compact_count += 1;
                         if consecutive_compact_count >= 3 {
                             app.entries.push(ChatEntry::error(

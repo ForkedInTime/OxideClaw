@@ -2781,7 +2781,9 @@ fn starts_model_turn(
     mcp_statuses: &[crate::mcp::types::McpServerStatus],
 ) -> bool {
     match action {
+        // /compact sends the whole history for a summary.
         CommandAction::SendPrompt(_)
+        | CommandAction::Compact
         | CommandAction::BrowseUrl(_)
         | CommandAction::BrowserScreenshot
         | CommandAction::Browse { .. } => true,
@@ -3033,9 +3035,9 @@ mod reload_tests {
 mod budget_tests {
     use super::*;
 
-    /// /summary, skills, plugin commands and the browser commands went
-    /// straight to the model after /budget was spent; only typed messages
-    /// were refused.
+    /// /summary, /compact, skills, plugin commands and the browser commands
+    /// went straight to the model after /budget was spent; only typed
+    /// messages were refused.
     #[test]
     fn spent_budget_blocks_prompt_sending_slash_commands() {
         let mut skills = std::collections::HashMap::new();
@@ -3060,6 +3062,7 @@ mod budget_tests {
         let turn = |a: CommandAction, input: &str| starts_model_turn(&a, input, &skills, &statuses);
 
         assert!(turn(dispatch_action("/summary"), "/summary"));
+        assert!(turn(dispatch_action("/compact"), "/compact"));
         assert!(turn(CommandAction::BrowserScreenshot, "/screenshot"));
         assert!(turn(CommandAction::Unknown("deploy".into()), "/deploy now"));
         assert!(turn(
