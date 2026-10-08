@@ -22,6 +22,10 @@ pub enum AppEvent {
         output: u64,
         cache_read: u64,
         cache_write: u64,
+        /// The call carried the session's history, so its input is what the
+        /// status bar's ctx % shows. Side calls (the router's classifier,
+        /// summaries, sub-agents, /spawn, /browse) read something else.
+        context: bool,
     },
     /// The full turn is complete — carries the updated full message history
     Done {
@@ -92,7 +96,8 @@ pub enum AppEvent {
 }
 
 impl AppEvent {
-    /// One billed API call, recorded by the event loop like a turn's own.
+    /// One billed side call, recorded by the event loop like a turn's own
+    /// but leaving the ctx % alone.
     pub fn usage(model: &str, u: &crate::api::types::Usage) -> Self {
         AppEvent::Usage {
             model: model.to_string(),
@@ -100,6 +105,7 @@ impl AppEvent {
             output: u.output_tokens,
             cache_read: u.cache_read_input_tokens,
             cache_write: u.cache_creation_input_tokens,
+            context: false,
         }
     }
 }

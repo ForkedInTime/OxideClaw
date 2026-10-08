@@ -1357,9 +1357,15 @@ async fn run_loop(
                 let mut ev = event;
                 loop {
                     match ev {
-                        AppEvent::Usage { ref model, input, output, cache_read, cache_write } => {
+                        AppEvent::Usage { ref model, input, output, cache_read, cache_write, context } => {
                             let was_warning = app.cost_tracker.budget_warning();
+                            let shown = app.cost_tracker.last_input_tokens;
                             app.cost_tracker.record_with_cache(model, input, output, cache_read, cache_write);
+                            // A classifier call reads a few hundred tokens: the
+                            // gauge read near 0% until the turn's first response.
+                            if !context {
+                                app.cost_tracker.last_input_tokens = shown;
+                            }
                             turn_tokens.0 += input + cache_read + cache_write;
                             turn_tokens.1 += output;
                             if app.cost_tracker.over_budget() {

@@ -889,7 +889,9 @@ mod tests {
                 output,
                 cache_read,
                 cache_write,
+                context,
             }) => {
+                assert!(!context, "an engine's calls leave the ctx % alone");
                 assert_eq!(model, "claude-sonnet-4-6");
                 assert_eq!((input, output, cache_read, cache_write), (10, 20, 4, 3));
             }

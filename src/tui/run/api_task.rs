@@ -731,6 +731,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
             output: response.usage.output_tokens,
             cache_read: response.usage.cache_read_input_tokens,
             cache_write: response.usage.cache_creation_input_tokens,
+            context: true,
         });
 
         // One-time notice when an Ollama model is detected as not supporting tools
@@ -1089,13 +1090,7 @@ pub(super) async fn run_api_task(task: ApiTask) {
                                 u.cache_read_input_tokens,
                                 u.cache_creation_input_tokens,
                             );
-                            let _ = tx.send(AppEvent::Usage {
-                                model,
-                                input: u.input_tokens,
-                                output: u.output_tokens,
-                                cache_read: u.cache_read_input_tokens,
-                                cache_write: u.cache_creation_input_tokens,
-                            });
+                            let _ = tx.send(AppEvent::usage(&model, &u));
                         }
                         ctx.budget_remaining_usd = task_cost.remaining();
 
@@ -2283,6 +2278,42 @@ mod router_tests {
             compact_router: None,
         };
         (task, rx, seen)
+    }
+
+    /// The classifier's usage is billed but is not the session's context:
+    /// taken for it, the status bar's ctx % fell to near 0% until the
+    /// turn's first response.
+    #[tokio::test]
+    async fn the_classifier_call_is_billed_without_moving_the_ctx_gauge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut task, mut rx, seen) = routed_task(
+            |_, n| {
+                if n == 0 {
+                    Reply::Text("low")
+                } else {
+                    Reply::Text("done")
+                }
+            },
+            dir.path(),
+        )
+        .await;
+        task.router.as_mut().unwrap().classifier = crate::router::Classifier::Model;
+        run_api_task(task).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["small", "small"]);
+        let mut usage = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Usage { model, context, .. } = ev {
+                usage.push((model, context));
+            }
+        }
+        assert_eq!(
+            usage,
+            vec![
+                ("ollama:small".to_string(), false),
+                ("ollama:small".to_string(), true)
+            ]
+        );
     }
 
     /// The low tier fails; the turn finishes one tier up, the status line
