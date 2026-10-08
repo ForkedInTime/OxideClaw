@@ -729,12 +729,13 @@ fn prepare_config_dirs() {
     }
 }
 
-/// Exit status owed to a SIGINT/SIGTERM that ended -p, --headless or acp,
-/// or to a `browse` run that missed its goal; `main` exits with it after
+/// Exit status owed to a SIGINT/SIGTERM/SIGHUP that ended -p, --headless or
+/// acp, or to a `browse` run that missed its goal; `main` exits with it after
 /// the runtime (and every guard on a child process) is dropped.
 static SIGNAL_EXIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
-/// Runs `fut` to completion, or returns None once SIGINT/SIGTERM arrives.
+/// Runs `fut` to completion, or returns None once SIGINT/SIGTERM arrives, or
+/// SIGHUP when the terminal it was started from closes.
 /// Bash/PowerShell tools and hooks run in their own process groups, so the
 /// terminal's Ctrl-C never reaches them, and dying on the default signal
 /// action skips the destructors that kill them: they ran on as orphans.
@@ -745,9 +746,10 @@ async fn until_signal<F: std::future::Future>(fut: F) -> Option<F::Output> {
         use tokio::signal::unix::{SignalKind, signal};
         // Registered before `fut` is first polled, so no tool can start
         // while the default action is still in place.
-        let (Ok(mut int), Ok(mut term)) = (
+        let (Ok(mut int), Ok(mut term), Ok(mut hup)) = (
             signal(SignalKind::interrupt()),
             signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
         ) else {
             return Some(fut.await);
         };
@@ -755,6 +757,7 @@ async fn until_signal<F: std::future::Future>(fut: F) -> Option<F::Output> {
             out = fut => return Some(out),
             _ = int.recv() => 130,
             _ = term.recv() => 143,
+            _ = hup.recv() => 129,
         };
         let _ = SIGNAL_EXIT.set(code);
         None

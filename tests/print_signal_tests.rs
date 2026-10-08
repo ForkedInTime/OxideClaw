@@ -1,6 +1,6 @@
-//! Regression: Ctrl-C/SIGTERM during `oxideclaw -p` must kill the running
-//! Bash tool's process group. Tools run in their own group, so the signal
-//! never reaches them, and dying on the default action skipped the guard
+//! Regression: Ctrl-C/SIGTERM/SIGHUP during `oxideclaw -p` must kill the
+//! running Bash tool's process group. Tools run in their own group, so the
+//! signal never reaches them, and dying on the default action skipped the guard
 //! that kills them: the command ran on as an orphan of init.
 //!
 //! Unix-only: process groups and signals are POSIX.
@@ -182,4 +182,10 @@ fn sigint_during_print_kills_the_running_tool() {
 #[test]
 fn sigterm_during_print_kills_the_running_tool() {
     interrupted_print_kills_the_tool(libc::SIGTERM, 143);
+}
+
+/// The terminal `-p` was started from closed.
+#[test]
+fn sighup_during_print_kills_the_running_tool() {
+    interrupted_print_kills_the_tool(libc::SIGHUP, 129);
 }

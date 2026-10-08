@@ -448,6 +448,63 @@ static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Hand the terminal to a child (sudo, $EDITOR). With the flags still pushed,
 /// kitty-protocol terminals send Ctrl+C as `ESC[99;5u`, so the child cannot
 /// be interrupted and an editor receives garbage.
+/// A signal the TUI has to answer itself. It does not die on the default
+/// action: tools and hooks run in their own sessions (setsid), so a closed
+/// terminal or `kill <pid>` never reaches them, and only the quit path's
+/// drops and cleanup stop them, adopt the turn and restore the terminal.
+enum StopSignal {
+    /// The terminal went away (tab closed, SSH dropped).
+    Hangup,
+    Terminate,
+    /// Only reaches us while raw mode is off (sudo, $EDITOR): it is aimed at
+    /// that child, and in raw mode Ctrl+C is a key event instead.
+    Interrupt,
+}
+
+#[cfg(unix)]
+struct StopSignals {
+    hangup: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(not(unix))]
+struct StopSignals;
+
+impl StopSignals {
+    /// None if registration failed; the default actions then still apply.
+    fn register() -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Some(Self {
+                hangup: signal(SignalKind::hangup()).ok()?,
+                terminate: signal(SignalKind::terminate()).ok()?,
+                interrupt: signal(SignalKind::interrupt()).ok()?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    async fn recv(this: &mut Option<Self>) -> StopSignal {
+        #[cfg(unix)]
+        if let Some(s) = this {
+            tokio::select! {
+                Some(()) = s.hangup.recv() => return StopSignal::Hangup,
+                Some(()) = s.terminate.recv() => return StopSignal::Terminate,
+                Some(()) = s.interrupt.recv() => return StopSignal::Interrupt,
+                else => {}
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = this;
+        std::future::pending().await
+    }
+}
+
 fn suspend_tty() {
     release_input_modes(&mut io::stdout());
     let _ = disable_raw_mode();
@@ -532,17 +589,19 @@ pub async fn run_tui(
         KEYBOARD_ENHANCED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let result = run_loop(config, resume_id, initial_input, initial_prompt).await;
-    disable_raw_mode()?;
+    // Best effort: after a hangup these writes fail, and `?` here would
+    // replace run_loop's result with that error.
+    let _ = disable_raw_mode();
     let mut cleanup = io::stdout();
     if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = execute!(cleanup, PopKeyboardEnhancementFlags);
     }
-    execute!(
+    let _ = execute!(
         cleanup,
         DisableBracketedPaste,
         DisableMouseCapture,
         crossterm::cursor::Show
-    )?;
+    );
     result
 }
 
@@ -947,6 +1006,10 @@ async fn run_loop(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut term_events = EventStream::new();
+    // Before the first prompt can start a tool.
+    let mut stop_signals = StopSignals::register();
+    // Set once the terminal is gone: nothing more can be drawn or read.
+    let mut tty_gone = false;
 
     // Daily update notice. Runs detached; the first frame never waits on it.
     crate::update_check::spawn(&config, tx.clone());
@@ -1349,24 +1412,50 @@ async fn run_loop(
         app.context_window =
             compaction_window(&config, Some(&app.router), Some(&config.phase_router));
 
-        {
+        // The tty hangs up before SIGHUP arrives, and a write in between
+        // fails with EIO: quit through the cleanup below instead of
+        // returning the error past it.
+        if !tty_gone {
             let needed = viewport_height(&app, last_term_cols, last_term_rows);
             if needed != current_vp_h {
                 let old_bottom = terminal.get_frame().area().bottom();
                 drop(terminal);
-                if frame_drawn {
-                    scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom)?;
+                if frame_drawn
+                    && scroll_off_screen(&mut io::stdout(), last_term_rows, old_bottom).is_err()
+                {
+                    tty_gone = true;
                 }
                 terminal = make_top_terminal(last_term_cols, last_term_rows, needed)?;
                 current_vp_h = needed;
             }
         }
-        terminal.draw(|f| draw(f, &mut app))?;
-        frame_drawn = true;
+        if !tty_gone {
+            if terminal.draw(|f| draw(f, &mut app)).is_err() {
+                tty_gone = true;
+            } else {
+                frame_drawn = true;
+            }
+        }
+        if tty_gone {
+            app.should_quit = true;
+        }
 
         // ── Wait for next activity: API event, keyboard, or 50 ms heartbeat ──
         tokio::select! {
             biased; // prioritise API events so streaming renders without delay
+
+            // Straight to the quit path below, without waiting on input.
+            _ = std::future::ready(()), if app.should_quit => {}
+
+            // Ahead of the API events, which a busy stream never runs dry of.
+            sig = StopSignals::recv(&mut stop_signals) => match sig {
+                StopSignal::Hangup => {
+                    tty_gone = true;
+                    app.should_quit = true;
+                }
+                StopSignal::Terminate => app.should_quit = true,
+                StopSignal::Interrupt => {}
+            },
 
             // API / background task events
             Some(event) = rx.recv() => {
@@ -1967,7 +2056,9 @@ async fn run_loop(
             // worktree (the registry that tracks it dies with us); tell the
             // user where completed, unmerged work is.
             if let Some(msg) = crate::spawn::cleanup_on_exit(&spawn_registry, &config.cwd).await {
-                eprintln!("{msg}");
+                // eprintln! panics on a hung-up tty, aborting the cleanup below.
+                use std::io::Write;
+                let _ = writeln!(io::stderr(), "{msg}");
             }
             // Language servers (the LSP tool's and auto-fix's) get a clean
             // `shutdown` / `exit` instead of a SIGKILL from the drop.
