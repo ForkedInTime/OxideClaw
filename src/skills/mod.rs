@@ -2,9 +2,11 @@
 //!
 //! Three formats supported:
 //! 1. Agent Skills: a `<name>/SKILL.md` directory with YAML frontmatter
-//!    (`name` and `description` required, other fields tolerated) and any
-//!    supporting files. Only the frontmatter is read at load; the body is
-//!    read when the skill runs.
+//!    (`name`, `description`; other fields tolerated) and any supporting
+//!    files. As in Claude Code every field is optional: the name defaults to
+//!    the folder's and the description to the body's first paragraph. Only
+//!    the name and description stay loaded; the body is read when the skill
+//!    runs.
 //! 2. Legacy flat `<name>.md`: `# Title\nDescription\n---\nPrompt with {{ARGS}}`
 //! 3. Flat `<name>.md` with YAML frontmatter (`name`, `description`,
 //!    `category`, `params`)
@@ -62,7 +64,12 @@ impl Skill {
         let skill = match &self.skill_file {
             None => self,
             Some(file) => {
-                loaded = parse_skill_md(&read_skill_file(file, deny)?)?;
+                let dir_name = file
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                loaded = parse_skill_md(&read_skill_file(file, deny)?, dir_name)?;
                 &loaded
             }
         };
@@ -321,7 +328,7 @@ impl LoadedSkills {
             .map(|(path, why)| format!("  {} — {why}", path.display()))
             .collect();
         Some(format!(
-            "Skipped {} invalid skill(s); a SKILL.md needs YAML frontmatter with `name` and `description`:\n{}",
+            "Skipped {} invalid skill(s):\n{}",
             self.invalid.len(),
             lines.join("\n")
         ))
@@ -398,8 +405,9 @@ pub(crate) async fn load_skills_at(
                 if fs::symlink_metadata(&file).await.is_err() {
                     continue;
                 }
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let skill = read_skill_file(&file, deny)
-                    .and_then(|c| parse_skill_md(&c))
+                    .and_then(|c| parse_skill_md(&c, dir_name))
                     .map(|mut s| {
                         // Progressive disclosure: only name and description
                         // stay loaded; `invoke` reads the body.
@@ -458,16 +466,31 @@ fn read_skill_file(path: &Path, deny: &ReadDeny) -> std::result::Result<String, 
     }
 }
 
-/// Parse an Agent Skills `SKILL.md`: frontmatter with a `name` usable as a
-/// `/name` command and a non-empty `description` is required.
-fn parse_skill_md(content: &str) -> std::result::Result<Skill, String> {
+/// Parse an Agent Skills `SKILL.md` in the folder `dir_name`. Claude Code
+/// makes every frontmatter field optional, and its skills must load as they
+/// are: a missing `name` is the folder's, a missing `description` the first
+/// paragraph of the body, and a file with no frontmatter is all body. The
+/// name must still work as a `/name` command and something must describe
+/// the skill.
+fn parse_skill_md(content: &str, dir_name: &str) -> std::result::Result<Skill, String> {
     let content = content.trim_start_matches('\u{feff}').trim_start();
-    if !(content.starts_with("---\n") || content.starts_with("---\r\n")) {
-        return Err("no YAML frontmatter".into());
-    }
-    let skill = parse_yaml_skill(content, "").map_err(|e| format!("malformed frontmatter: {e}"))?;
+    let mut skill = if content.starts_with("---\n") || content.starts_with("---\r\n") {
+        parse_yaml_skill(content, dir_name).map_err(|e| format!("malformed frontmatter: {e}"))?
+    } else {
+        Skill {
+            name: dir_name.to_lowercase().replace(' ', "-"),
+            description: String::new(),
+            prompt_template: content.trim().to_string(),
+            category: None,
+            params: Vec::new(),
+            skill_file: None,
+        }
+    };
     if skill.name.is_empty() {
-        return Err("frontmatter has no `name`".into());
+        return Err("no `name` in the frontmatter".into());
+    }
+    if skill.description.trim().is_empty() {
+        skill.description = first_paragraph(&skill.prompt_template);
     }
     if skill
         .name
@@ -479,9 +502,29 @@ fn parse_skill_md(content: &str) -> std::result::Result<Skill, String> {
         ));
     }
     if skill.description.trim().is_empty() {
-        return Err("frontmatter has no `description`".into());
+        return Err("no `description` in the frontmatter and an empty body".into());
     }
     Ok(skill)
+}
+
+/// The first paragraph of a skill body as one line, heading marks dropped
+/// and capped so a body that is one long paragraph does not become the
+/// listing.
+fn first_paragraph(body: &str) -> String {
+    let para: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| l.is_empty())
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.trim_start_matches('#').trim())
+        .collect();
+    let text = para.join(" ");
+    if text.chars().count() > 250 {
+        let cut: String = text.chars().take(247).collect();
+        format!("{cut}…")
+    } else {
+        text
+    }
 }
 
 fn bundled_skills() -> Vec<Skill> {
@@ -720,6 +763,49 @@ mod tests {
         );
     }
 
+    /// Claude Code makes every SKILL.md field optional, but a SKILL.md with
+    /// no `name`, no `description` or no frontmatter at all was skipped, so
+    /// `~/.claude/skills/deploy/SKILL.md` with only `description:` never
+    /// became /deploy.
+    #[tokio::test]
+    async fn claude_code_skills_without_name_or_frontmatter_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let [agents, _, claude, _, home] = locations(dir.path());
+        write(
+            &at(&home, "deploy/SKILL.md"),
+            "---\ndescription: Deploy the app\n---\nRun deploy.sh",
+        );
+        write(
+            &at(&claude, "Fix Issue/SKILL.md"),
+            "# Fix an issue\nfrom the tracker\n\nRead the issue, then fix it.",
+        );
+        write(
+            &at(&agents, "notes/SKILL.md"),
+            "---\nname: notes\n---\n\nKeep notes tidy.\n\nMore.",
+        );
+
+        let loaded = load(dir.path()).await;
+        assert!(loaded.invalid.is_empty(), "{:?}", loaded.invalid);
+        let deploy = &loaded.skills["deploy"];
+        assert_eq!(deploy.description, "Deploy the app");
+        let fix = &loaded.skills["fix-issue"];
+        assert_eq!(fix.description, "Fix an issue from the tracker");
+        assert_eq!(loaded.skills["notes"].description, "Keep notes tidy.");
+
+        // Invoking parses the file again and must agree on name and body.
+        let none = ReadDeny::default();
+        assert!(
+            deploy.invoke("", &none).unwrap().ends_with("Run deploy.sh"),
+            "{:?}",
+            deploy.invoke("", &none)
+        );
+        let prompt = fix.invoke("#42", &none).unwrap();
+        assert!(
+            prompt.ends_with("Read the issue, then fix it.\n\n#42"),
+            "{prompt}"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_flat_skills_still_load_but_not_from_agents_skills() {
         let dir = tempfile::tempdir().unwrap();
@@ -775,14 +861,10 @@ mod tests {
     async fn invalid_skills_are_skipped_with_one_warning_naming_each_path() {
         let dir = tempfile::tempdir().unwrap();
         let [agents, _, claude, _, _] = locations(dir.path());
-        write(&at(&agents, "plain/SKILL.md"), "Just a body");
+        write(&at(&agents, "empty/SKILL.md"), "---\nname: empty\n---\n");
         write(
-            &at(&agents, "noname/SKILL.md"),
-            "---\ndescription: d\n---\nbody",
-        );
-        write(
-            &at(&agents, "nodesc/SKILL.md"),
-            "---\nname: nodesc\n---\nbody",
+            &at(&agents, "slash/SKILL.md"),
+            "---\nname: a/b\ndescription: d\n---\nbody",
         );
         write(
             &at(&agents, "badyaml/SKILL.md"),
@@ -798,26 +880,18 @@ mod tests {
 
         let loaded = load(dir.path()).await;
         assert!(loaded.skills.contains_key("good"));
-        for name in [
-            "plain",
-            "noname",
-            "nodesc",
-            "badyaml",
-            "never-closed",
-            "notes",
-        ] {
+        for name in ["empty", "a/b", "slash", "badyaml", "never-closed", "notes"] {
             assert!(!loaded.skills.contains_key(name), "{name} loaded");
         }
         let warning = loaded.warning().unwrap();
         assert!(
-            warning.starts_with("Skipped 5 invalid skill(s)"),
+            warning.starts_with("Skipped 4 invalid skill(s)"),
             "{warning}"
         );
-        assert_eq!(warning.lines().count(), 6, "{warning}");
+        assert_eq!(warning.lines().count(), 5, "{warning}");
         for (path, why) in [
-            (at(&agents, "plain/SKILL.md"), "no YAML frontmatter"),
-            (at(&agents, "noname/SKILL.md"), "no `name`"),
-            (at(&agents, "nodesc/SKILL.md"), "no `description`"),
+            (at(&agents, "empty/SKILL.md"), "no `description`"),
+            (at(&agents, "slash/SKILL.md"), "not a single command word"),
             (at(&agents, "badyaml/SKILL.md"), "malformed frontmatter"),
             (claude.join("flat.md"), "malformed frontmatter"),
         ] {
@@ -899,7 +973,7 @@ mod tests {
         let home = dir.path().join("home");
         let config = home.join(".claude");
         let shared = at(&config, "skills");
-        write(&at(&shared, "broken/SKILL.md"), "no frontmatter");
+        write(&at(&shared, "broken/SKILL.md"), "---\nname: [oops\n---\nb");
         write(&at(&shared, "ok/SKILL.md"), &skill_md("ok", "OK", "b"));
 
         let dirs = super::skill_dirs(&home, &config, Some(&home));

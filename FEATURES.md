@@ -599,7 +599,7 @@ description: Cut a release, bump the version and tag it
 Run scripts/bump.sh with the new version, then ...
 ```
 
-`name` and `description` are required; other fields (`license`, `allowed-tools`, `metadata`, ...) are accepted and ignored. Only the name and description are loaded at startup. The body of `SKILL.md` is read when the skill runs, and the model is given the skill's folder so it reads the supporting files only when the instructions need them. A `SKILL.md` without frontmatter, `name` or `description` is skipped, and a startup notice (and the `DiscoverSkills` output) lists each skipped path with the reason.
+As in Claude Code, every field is optional: `name` defaults to the folder's name and `description` to the first paragraph of the body, and a `SKILL.md` with no frontmatter is all body. Other fields (`license`, `allowed-tools`, `metadata`, ...) are accepted and ignored. Only the name and description are loaded at startup. The body of `SKILL.md` is read when the skill runs, and the model is given the skill's folder so it reads the supporting files only when the instructions need them. A `SKILL.md` with malformed frontmatter, a name that is not one command word, or nothing to describe it (no `description` and an empty body) is skipped, and a startup notice (and the `DiscoverSkills` output) lists each skipped path with the reason.
 
 Skills are looked up in this order; on a name collision the first one wins, and the built-in skills (`commit`, `review`, `explain`, `fix`, `test`) only fill names nothing else uses:
 

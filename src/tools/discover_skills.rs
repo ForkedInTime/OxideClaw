@@ -142,7 +142,7 @@ mod tests {
             "---\nname: release\ndescription: Cut a release\n---\nSECRET-BODY steps",
         )
         .unwrap();
-        std::fs::write(skills.join("broken/SKILL.md"), "no frontmatter").unwrap();
+        std::fs::write(skills.join("broken/SKILL.md"), "---\nname: [oops\n---\nb").unwrap();
 
         let loaded = crate::skills::load_skills_at(
             &proj,
@@ -159,7 +159,7 @@ mod tests {
         assert!(!out.contains("SECRET-BODY"), "{out}");
         let broken = std::path::Path::new("broken").join("SKILL.md");
         assert!(
-            out.contains(&format!("{} — no YAML frontmatter", broken.display())),
+            out.contains(&format!("{} — malformed frontmatter", broken.display())),
             "{out}"
         );
     }

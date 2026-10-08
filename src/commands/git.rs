@@ -403,7 +403,7 @@ For each distinct area, use AskUserQuestion to confirm:
 
 ## Phase 4: Generate Verifier Skill
 
-Write the skill to `.agents/skills/<verifier-name>/SKILL.md`, the Agent Skills layout that OxideClaw and other agents load. The folder name must equal the `name` field, and the frontmatter needs both `name` and `description` or the skill is skipped. Put any helper script the verifier needs in that same folder and refer to it by its path relative to the folder.
+Write the skill to `.agents/skills/<verifier-name>/SKILL.md`, the Agent Skills layout that OxideClaw and other agents load. The folder name must equal the `name` field, and the frontmatter needs both `name` and `description`, or other agents skip the skill. Put any helper script the verifier needs in that same folder and refer to it by its path relative to the folder.
 
 Use this template:
 
