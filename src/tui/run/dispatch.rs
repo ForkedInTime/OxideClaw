@@ -1659,8 +1659,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::MemoryForget(query) => {
             let cwd = config.cwd.clone();
-            match crate::memory::MemoryStore::open(&cwd) {
-                Ok(store) => match store.forget_matching(&query) {
+            match crate::memory::MemoryStore::open_existing(&cwd) {
+                Ok(Some(store)) => match store.forget_matching(&query) {
                     Ok(removed) if removed.is_empty() => {
                         let mut msg = format!("No memories matched every word of '{query}'.");
                         // Near misses, so the user can forget one by its key.
@@ -1692,6 +1692,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .entries
                         .push(ChatEntry::system(format!("Memory forget error: {e}"))),
                 },
+                Ok(None) => app.entries.push(ChatEntry::system(format!(
+                    "No memories matched every word of '{query}'."
+                ))),
                 Err(e) => app
                     .entries
                     .push(ChatEntry::system(format!("Memory store error: {e}"))),
@@ -1700,8 +1703,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::MemorySearch(query) => {
             let cwd = config.cwd.clone();
-            match crate::memory::MemoryStore::open(&cwd) {
-                Ok(store) => match store.search(&query, 10) {
+            match crate::memory::MemoryStore::open_existing(&cwd) {
+                Ok(Some(store)) => match store.search(&query, 10) {
                     Ok(results) if results.is_empty() => {
                         app.entries.push(ChatEntry::system(format!(
                             "No memories found for '{query}'."
@@ -1722,6 +1725,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .entries
                         .push(ChatEntry::system(format!("Memory search error: {e}"))),
                 },
+                Ok(None) => app.entries.push(ChatEntry::system(format!(
+                    "No memories found for '{query}'."
+                ))),
                 Err(e) => app
                     .entries
                     .push(ChatEntry::system(format!("Memory store error: {e}"))),
@@ -1730,8 +1736,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::MemoryList => {
             let cwd = config.cwd.clone();
-            match crate::memory::MemoryStore::open(&cwd) {
-                Ok(store) => match store.list(None) {
+            match crate::memory::MemoryStore::open_existing(&cwd) {
+                Ok(Some(store)) => match store.list(None) {
                     Ok(memories) if memories.is_empty() => {
                         app.entries.push(ChatEntry::system(
                             "No memories stored yet. Use /remember <text> to add one.".to_string(),
@@ -1754,6 +1760,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .entries
                         .push(ChatEntry::system(format!("Memory list error: {e}"))),
                 },
+                Ok(None) => app.entries.push(ChatEntry::system(
+                    "No memories stored yet. Use /remember <text> to add one.".to_string(),
+                )),
                 Err(e) => app
                     .entries
                     .push(ChatEntry::system(format!("Memory store error: {e}"))),
@@ -1762,8 +1771,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::MemoryClear => {
             let cwd = config.cwd.clone();
-            match crate::memory::MemoryStore::open(&cwd) {
-                Ok(store) => match store.clear_all() {
+            match crate::memory::MemoryStore::open_existing(&cwd) {
+                Ok(Some(store)) => match store.clear_all() {
                     Ok(()) => app
                         .entries
                         .push(ChatEntry::system("All memories cleared.".to_string())),
@@ -1771,6 +1780,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .entries
                         .push(ChatEntry::system(format!("Memory clear error: {e}"))),
                 },
+                Ok(None) => app
+                    .entries
+                    .push(ChatEntry::system("All memories cleared.".to_string())),
                 Err(e) => app
                     .entries
                     .push(ChatEntry::system(format!("Memory store error: {e}"))),
@@ -1791,8 +1803,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
         }
         CommandAction::MemoryInject => {
             let cwd = config.cwd.clone();
-            match crate::memory::MemoryStore::open(&cwd) {
-                Ok(store) => match store.build_context(10) {
+            match crate::memory::MemoryStore::open_existing(&cwd) {
+                Ok(Some(store)) => match store.build_context(10) {
                     Ok(ctx_text) if ctx_text.is_empty() => {
                         app.entries.push(ChatEntry::system(
                             "No memories to inject — store is empty.".to_string(),
@@ -1807,6 +1819,9 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                         .entries
                         .push(ChatEntry::system(format!("Memory context error: {e}"))),
                 },
+                Ok(None) => app.entries.push(ChatEntry::system(
+                    "No memories to inject — store is empty.".to_string(),
+                )),
                 Err(e) => app
                     .entries
                     .push(ChatEntry::system(format!("Memory store error: {e}"))),
@@ -3337,5 +3352,89 @@ mod teleport_tests {
         super::write_teleport(&path, "{\"a\":1}").unwrap();
         assert_eq!(mode(&path), 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}");
+    }
+}
+
+#[cfg(test)]
+mod slash_tests {
+    use super::*;
+
+    /// Run `input` through `run_slash_command` with `config`.
+    async fn run(
+        app: &mut App,
+        config: &mut Config,
+        skills: &std::collections::HashMap<String, crate::skills::Skill>,
+        input: &str,
+    ) {
+        let mut messages = Vec::new();
+        let mut client =
+            ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
+        let perm_state = PermissionState::new(false, &[], &[]);
+        let mut system_prompt = String::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let todo_state = TodoState::default();
+        let mut session = Session::at_path("current", config.cwd.join("current.jsonl"));
+        let spawn_registry = crate::spawn::new_registry();
+        run_slash_command(
+            input.to_string(),
+            KeyCtx {
+                key: crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                app,
+                messages: &mut messages,
+                client: &mut client,
+                tools: &[],
+                config,
+                perm_state: &perm_state,
+                skills,
+                system_prompt: &mut system_prompt,
+                tx: &tx,
+                todo_state: &todo_state,
+                session: &mut session,
+                saved_count: &mut 0,
+                mcp_statuses: &[],
+                spawn_registry: &spawn_registry,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `/memory list` and the other reads created `.claude/memory.db` (and
+    /// edited .git/info/exclude) in a project that had no memories.
+    #[tokio::test]
+    async fn memory_reads_create_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            cwd: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        let skills = std::collections::HashMap::new();
+        for cmd in [
+            "/memory list",
+            "/memory search auth",
+            "/memory inject",
+            "/memory forget auth",
+            "/memory clear",
+        ] {
+            run(&mut app, &mut config, &skills, cmd).await;
+            assert!(
+                !dir.path().join(".claude").exists(),
+                "{cmd} created a store"
+            );
+        }
+        let texts: Vec<_> = app.entries.iter().map(|e| e.text.as_str()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("No memories stored yet")),
+            "{texts:?}"
+        );
+
+        run(&mut app, &mut config, &skills, "/memory add use tabs").await;
+        assert!(dir.path().join(".claude/memory.db").is_file());
+        run(&mut app, &mut config, &skills, "/memory list").await;
+        let last = &app.entries.last().unwrap().text;
+        assert!(last.contains("use tabs"), "{last}");
     }
 }
