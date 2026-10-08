@@ -455,23 +455,32 @@ pub struct Fetched {
     pub status: reqwest::StatusCode,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Set when the fetch stopped at a redirect to another host instead of
+    /// following it (`follow_cross_host: false`); `body` is then empty.
+    pub redirect_to: Option<Url>,
 }
 
 /// GET `url` under `policy`: every hop is resolved and checked before any
 /// connection is made, redirects are followed manually (max
 /// [`MAX_REDIRECTS`]), and the body is refused — before or during the read —
 /// once it exceeds `max_bytes`.
+///
+/// With `follow_cross_host` false, a redirect to a different host is not
+/// followed: the result carries it in `redirect_to`, so the caller can send
+/// the new host back through the permission gate (WebFetch domain rules).
 pub async fn fetch(
     url: &str,
     policy: &NetPolicy,
     max_bytes: usize,
     timeout: std::time::Duration,
+    follow_cross_host: bool,
 ) -> Result<Fetched> {
     fetch_with_env(
         url,
         policy,
         max_bytes,
         timeout,
+        follow_cross_host,
         |k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()),
         &lookup_system,
     )
@@ -500,6 +509,7 @@ async fn fetch_with_env<L, F>(
     policy: &NetPolicy,
     max_bytes: usize,
     timeout: std::time::Duration,
+    follow_cross_host: bool,
     env: impl Fn(&str) -> Option<String>,
     lookup: &L,
 ) -> Result<Fetched>
@@ -508,6 +518,11 @@ where
     F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
     let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL {url:?}: {e}"))?;
+    let host_key = |u: &Url| {
+        u.host_str()
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+    };
+    let origin_host = host_key(&current);
     for _ in 0..=MAX_REDIRECTS {
         let host = current
             .host_str()
@@ -537,9 +552,19 @@ where
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok());
             if let Some(loc) = location {
-                current = current
+                let target = current
                     .join(loc)
                     .map_err(|e| anyhow!("bad redirect target {loc:?}: {e}"))?;
+                if !follow_cross_host && host_key(&target) != origin_host {
+                    return Ok(Fetched {
+                        final_url: current,
+                        status,
+                        content_type: String::new(),
+                        body: Vec::new(),
+                        redirect_to: Some(target),
+                    });
+                }
+                current = target;
                 continue;
             }
             // A 3xx with no Location is just a response; fall through.
@@ -571,6 +596,7 @@ where
             status,
             content_type,
             body,
+            redirect_to: None,
         });
     }
     bail!("too many redirects (more than {MAX_REDIRECTS} hops)")
@@ -1356,7 +1382,7 @@ mod tests {
     #[tokio::test]
     async fn strict_policy_never_connects_to_a_loopback_server() {
         let (base, hits) = scripted_server(vec![ok("secret")]).await;
-        let err = fetch(&base, &NetPolicy::STRICT, 1 << 20, SECS)
+        let err = fetch(&base, &NetPolicy::STRICT, 1 << 20, SECS, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("private"), "{err}");
@@ -1370,7 +1396,7 @@ mod tests {
     #[tokio::test]
     async fn allowed_redirect_is_followed_and_final_url_reported() {
         let (base, hits) = scripted_server(vec![redirect("/final"), ok("done")]).await;
-        let got = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS)
+        let got = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS, true)
             .await
             .unwrap();
         assert_eq!(got.body, b"done");
@@ -1386,7 +1412,7 @@ mod tests {
     #[tokio::test]
     async fn redirect_to_a_denied_address_is_refused() {
         let (base, hits) = scripted_server(vec![redirect("http://169.254.169.254/latest/")]).await;
-        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS)
+        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("169.254.169.254"), "{err}");
@@ -1397,10 +1423,41 @@ mod tests {
         );
     }
 
+    /// WebFetch domain rules see only the first host, so a redirect to
+    /// another host must come back to the caller instead of being read.
+    #[tokio::test]
+    async fn cross_host_redirect_stops_unless_followed() {
+        let (base, hits) = scripted_server(vec![redirect("/same"), ok("first")]).await;
+        let (other_base, other_hits) = scripted_server(vec![ok("other")]).await;
+        let other = other_base.replace("127.0.0.1", "localhost");
+
+        // Same host: followed even when cross-host hops are not.
+        let got = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS, false)
+            .await
+            .unwrap();
+        assert_eq!(got.body, b"first");
+        assert!(got.redirect_to.is_none());
+
+        let (base, hits2) =
+            scripted_server(vec![redirect(&format!("{other}/x")), ok("unread")]).await;
+        let got = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS, false)
+            .await
+            .unwrap();
+        assert_eq!(got.status, 302);
+        assert!(got.body.is_empty());
+        assert_eq!(
+            got.redirect_to.as_ref().map(Url::as_str),
+            Some(format!("{other}/x").as_str())
+        );
+        assert_eq!(hits2.load(Ordering::SeqCst), 1, "the target is not fetched");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn redirect_loop_stops_after_max_hops() {
         let (base, hits) = scripted_server(vec![redirect("/again")]).await;
-        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS)
+        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1 << 20, SECS, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redirect"), "{err}");
@@ -1412,7 +1469,7 @@ mod tests {
         let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
                     content-length: 10000000\r\nconnection: close\r\n\r\nx";
         let (base, _) = scripted_server(vec![resp.to_string()]).await;
-        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1000, SECS)
+        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1000, SECS, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
@@ -1425,7 +1482,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n{big}"
         );
         let (base, _) = scripted_server(vec![resp]).await;
-        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1000, SECS)
+        let err = fetch(&base, &NetPolicy::LOCAL_OK, 1000, SECS, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
@@ -1434,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn body_within_cap_is_returned_with_content_type() {
         let (base, _) = scripted_server(vec![ok("hello")]).await;
-        let got = fetch(&base, &NetPolicy::LOCAL_OK, 1000, SECS)
+        let got = fetch(&base, &NetPolicy::LOCAL_OK, 1000, SECS, true)
             .await
             .unwrap();
         assert_eq!(got.body, b"hello");
@@ -1656,7 +1713,7 @@ mod tests {
             "http://93.184.215.14/x",
             "http://public.example/y",
         ] {
-            let got = fetch_with_env(url, &NetPolicy::STRICT, 1024, t, &env, &fake_dns)
+            let got = fetch_with_env(url, &NetPolicy::STRICT, 1024, t, true, &env, &fake_dns)
                 .await
                 .unwrap();
             assert_eq!(got.body, b"via-proxy", "{url}");
@@ -1700,7 +1757,7 @@ mod tests {
         let t = std::time::Duration::from_secs(10);
         let (base, hits) = scripted_server(vec![ok("local")]).await;
 
-        let err = fetch_with_env(&base, &NetPolicy::STRICT, 1024, t, &env, &fake_dns)
+        let err = fetch_with_env(&base, &NetPolicy::STRICT, 1024, t, true, &env, &fake_dns)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("private"), "{err}");
@@ -1709,6 +1766,7 @@ mod tests {
             &NetPolicy::LOCAL_OK,
             1024,
             t,
+            true,
             &env,
             &fake_dns,
         )
@@ -1716,7 +1774,7 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("metadata"), "{err}");
 
-        let got = fetch_with_env(&base, &NetPolicy::LOCAL_OK, 1024, t, &env, &fake_dns)
+        let got = fetch_with_env(&base, &NetPolicy::LOCAL_OK, 1024, t, true, &env, &fake_dns)
             .await
             .unwrap();
         assert_eq!(got.body, b"local");
@@ -1797,7 +1855,7 @@ mod tests {
                 "http://imds.example/latest/meta-data/",
                 "https://imds.example/latest/meta-data/",
             ] {
-                let err = fetch_with_env(url, &policy, 1024, t, &env, &fake_dns)
+                let err = fetch_with_env(url, &policy, 1024, t, true, &env, &fake_dns)
                     .await
                     .unwrap_err();
                 assert!(err.to_string().contains("metadata"), "{url}: {err}");
@@ -1808,6 +1866,7 @@ mod tests {
             &NetPolicy::STRICT,
             1024,
             t,
+            true,
             &env,
             &fake_dns,
         )
@@ -1907,13 +1966,13 @@ mod tests {
         let (base, hits) = scripted_server(vec![ok("local")]).await;
         let url = base.replace("127.0.0.1", "dev.example");
 
-        let err = fetch_with_env(&url, &NetPolicy::STRICT, 1024, t, &env, &fake_dns)
+        let err = fetch_with_env(&url, &NetPolicy::STRICT, 1024, t, true, &env, &fake_dns)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("private"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-        let got = fetch_with_env(&url, &NetPolicy::LOCAL_OK, 1024, t, &env, &fake_dns)
+        let got = fetch_with_env(&url, &NetPolicy::LOCAL_OK, 1024, t, true, &env, &fake_dns)
             .await
             .unwrap();
         assert_eq!(got.body, b"local");
@@ -1981,6 +2040,7 @@ mod tests {
                 &NetPolicy::LOCAL_OK,
                 1024,
                 t,
+                true,
                 &env,
                 &fake_dns,
             )

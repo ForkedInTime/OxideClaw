@@ -57,18 +57,29 @@ impl Tool for WebFetchTool {
         let input: WebFetchInput = serde_json::from_value(input)?;
 
         // Scheme, host, DNS and redirect hops are all checked by the
-        // policy; the body is refused past MAX_RESPONSE_BYTES.
+        // policy; the body is refused past MAX_RESPONSE_BYTES. Cross-host
+        // redirects are not followed: `WebFetch(domain:...)` rules only saw
+        // the first host, so the new one has to come back through the gate.
         let fetched = match crate::net_policy::fetch(
             &input.url,
             &self.policy,
             MAX_RESPONSE_BYTES,
             FETCH_TIMEOUT,
+            false,
         )
         .await
         {
             Ok(f) => f,
             Err(e) => return Ok(ToolOutput::error(format!("Fetch failed: {e}"))),
         };
+
+        if let Some(target) = fetched.redirect_to {
+            return Ok(ToolOutput::success(format!(
+                "{} redirected to {target} (a different host). Call WebFetch again \
+                 with that URL to fetch it.",
+                fetched.final_url
+            )));
+        }
 
         let status = fetched.status;
         if !status.is_success() {
@@ -126,7 +137,7 @@ fn html_to_text(html: &str) -> String {
 mod tests {
     use super::*;
     use crate::api::types::ToolResultContent;
-    use crate::net_policy::test_support::{ok_with, scripted_server};
+    use crate::net_policy::test_support::{ok_with, redirect, scripted_server};
     use std::sync::atomic::Ordering;
 
     async fn run(policy: NetPolicy, url: &str) -> ToolOutput {
@@ -195,6 +206,21 @@ mod tests {
             let out = run(NetPolicy::LOCAL_OK, &base).await;
             assert!(text(&out).contains("caf\u{c3}\u{a9}"), "{}", text(&out));
         }
+    }
+
+    /// A redirect to another host is reported, not followed, so the next
+    /// hop goes through the permission gate's domain rules.
+    #[tokio::test]
+    async fn cross_host_redirect_is_returned_to_the_model() {
+        let (other_base, other_hits) = scripted_server(vec![ok_with("text/plain", "denied")]).await;
+        let target = format!("{}/raw", other_base.replace("127.0.0.1", "localhost"));
+        let (base, _) = scripted_server(vec![redirect(&target)]).await;
+        let out = run(NetPolicy::LOCAL_OK, &base).await;
+        assert!(!out.is_error, "{}", text(&out));
+        assert!(text(&out).contains(&target), "{}", text(&out));
+        assert!(text(&out).contains("Call WebFetch again"), "{}", text(&out));
+        assert!(!text(&out).contains("denied"));
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

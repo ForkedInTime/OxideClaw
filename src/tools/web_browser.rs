@@ -188,7 +188,10 @@ fn chromium_args(
 
 /// Plain HTTP fetch as fallback.
 async fn fetch_plain(url: &str, policy: &NetPolicy, max_chars: usize) -> Result<String> {
-    let fetched = crate::net_policy::fetch(url, policy, MAX_RESPONSE_BYTES, FETCH_TIMEOUT).await?;
+    // WebBrowser has no domain rules to re-check, and Chromium follows
+    // redirects itself on the main path.
+    let fetched =
+        crate::net_policy::fetch(url, policy, MAX_RESPONSE_BYTES, FETCH_TIMEOUT, true).await?;
     if !fetched.status.is_success() {
         anyhow::bail!("HTTP {}", fetched.status);
     }
