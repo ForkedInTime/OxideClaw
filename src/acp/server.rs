@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::mcp::types::{HttpServerConfig, McpServerConfig, StdioServerConfig};
 use crate::sdk::protocol::{Capabilities, Policy, SdkNotification};
 use crate::sdk::session::{CancelSignal, SdkSession, TurnEnd};
+use crate::sdk::transport::request_id_from_prefix;
 use crate::sdk::transport::stdio::{LineRead, spawn_line_reader};
 use crate::sdk::validate_session_cwd;
 use crate::session::Session;
@@ -104,13 +105,16 @@ impl AcpServer {
                     let Some(read) = read else { break };
                     match read? {
                         (LineRead::Eof, _) => break,
-                        (LineRead::TooLong, _) => vec![rpc::error(
-                            &Value::Null,
+                        // The id is recovered where the line's start holds
+                        // one: with null, the client cannot match the error
+                        // to its request, and a session/prompt spins forever.
+                        (LineRead::TooLong, start) => vec![rpc::error(
+                            &request_id_from_prefix(&start).unwrap_or(Value::Null),
                             rpc::PARSE_ERROR,
-                            format!("line exceeds {MAX_LINE_BYTES} bytes"),
+                            format!("line exceeds {} MB", MAX_LINE_BYTES / (1024 * 1024)),
                         )],
-                        (LineRead::InvalidUtf8, _) => vec![rpc::error(
-                            &Value::Null,
+                        (LineRead::InvalidUtf8, lossy) => vec![rpc::error(
+                            &request_id_from_prefix(&lossy).unwrap_or(Value::Null),
                             rpc::PARSE_ERROR,
                             "line is not valid UTF-8",
                         )],
@@ -1562,6 +1566,39 @@ mod tests {
                 Some("Cancelled by the client.".to_string())
             )
         );
+    }
+
+    /// A prompt over 4 MB (a large @-mentioned file, inlined) was answered
+    /// with id null, so the editor's prompt never completed. The error now
+    /// carries the request's id, read from the start of the line; so does a
+    /// non-UTF-8 line's.
+    #[tokio::test]
+    async fn an_over_long_or_non_utf8_request_gets_an_error_with_its_id() {
+        let (cfg, _dir) = test_config();
+        let big = format!(
+            r#"{{"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{{"sessionId":"s","prompt":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "x".repeat(MAX_LINE_BYTES + 10)
+        );
+        let mut input = big.into_bytes();
+        input.push(b'\n');
+        input.extend_from_slice(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"u1\",\"method\":\"x\",\"params\":\"\xff\"}\n",
+        );
+        input.extend_from_slice(init_line().as_bytes());
+        input.push(b'\n');
+        let out = drive_raw(cfg, &input).await;
+        assert_eq!(out[0]["id"], json!(42), "{}", out[0]);
+        assert_eq!(out[0]["error"]["code"], json!(rpc::PARSE_ERROR));
+        assert!(
+            out[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("4 MB"),
+            "{}",
+            out[0]
+        );
+        assert_eq!(out[1]["id"], json!("u1"), "{}", out[1]);
+        assert_eq!(out[2]["id"], json!(0));
     }
 
     /// One non-UTF-8 line used to end the whole ACP process.

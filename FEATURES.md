@@ -446,7 +446,7 @@ Features: streaming responses, tool approval policies, cost tracking, context he
 | `session/cancel` | Stops the in-flight model stream and skips queued tools; the prompt is answered with `cancelled`. |
 | `session/set_mode` | Not supported (`-32601`). |
 
-Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, prompt for an unknown session, media prompt), `-32002` when `session/load` names no saved session, `-32000` when a prompt is already running (including a `session/load` of a session mid-prompt), `-32601` unsupported method.
+Errors use JSON-RPC codes: `-32602` invalid params (bad `cwd`, prompt for an unknown session, media prompt), `-32002` when `session/load` names no saved session, `-32000` when a prompt is already running (including a `session/load` of a session mid-prompt), `-32601` unsupported method. A message line is limited to 4 MB, embedded resources included: a longer one (a prompt that inlines a large @-mentioned file) is answered with `-32700` and the request's `id`, read from the start of the line, so the prompt ends with an error instead of waiting.
 
 ---
 

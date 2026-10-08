@@ -535,7 +535,7 @@ The `capabilities` object tells the agent what the host environment supports:
 ## Transport Notes
 
 - One JSON object per line (NDJSON)
-- Max line size: 4MB
+- Max line size: 4MB. A longer line is discarded and answered with `parse_error`, carrying the request's `id` when one is found in its first 64 KB (so put `id` before large fields)
 - Blank lines are ignored
 - Stderr is used for debug logs (redirect to /dev/null in production)
 - Close stdin to shut down the server

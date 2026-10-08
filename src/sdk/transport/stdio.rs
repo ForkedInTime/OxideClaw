@@ -14,6 +14,9 @@ use tokio::sync::{Mutex, mpsc};
 /// Max line size: 4MB — generous limit for large tool outputs.
 const MAX_LINE_SIZE: usize = 4 * 1024 * 1024;
 
+/// How much of an over-long line is kept to find its request id in.
+const TOO_LONG_PREFIX: usize = 64 * 1024;
+
 pub struct StdioTransport {
     /// Started on the first read, so `new()` works outside a runtime.
     lines: Option<mpsc::Receiver<std::io::Result<(LineRead, String)>>>,
@@ -97,7 +100,10 @@ fn classify_line((read, line): (LineRead, String)) -> Classified {
         LineRead::Eof => Classified::Eof, // EOF — host closed stdin
         LineRead::TooLong => {
             eprintln!("[sdk] Warning: line exceeds 4MB");
-            bad(String::new(), "line exceeds 4MB")
+            let id = crate::sdk::transport::request_id_from_prefix(&line)
+                .map(|id| crate::sdk::transport::request_id(&serde_json::json!({ "id": id })))
+                .unwrap_or_default();
+            bad(id, "line exceeds 4MB")
         }
         LineRead::InvalidUtf8 => {
             eprintln!("[sdk] Warning: line is not valid UTF-8");
@@ -127,7 +133,9 @@ fn classify_line((read, line): (LineRead, String)) -> Classified {
 pub(crate) enum LineRead {
     Eof,
     Line,
-    /// The line exceeded `max` bytes; it was drained and discarded.
+    /// The line exceeded `max` bytes; it was drained and discarded. The
+    /// buffer holds the lossy text of its first `TOO_LONG_PREFIX` bytes, for
+    /// recovering the request id only.
     TooLong,
     /// The line was not valid UTF-8. Not fatal: one bad line from the host
     /// must not end the session. Its lossy text is in the buffer, for
@@ -198,8 +206,12 @@ pub(crate) async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
             }
         });
     }
-    // No newline within the cap: drain the rest of the line in bounded
-    // chunks and report it as over-long.
+    // No newline within the cap: keep the start, where the request id is,
+    // so the host's request is not left waiting on a reply without one.
+    // Then drain the rest of the line in bounded chunks.
+    buf.push_str(&String::from_utf8_lossy(
+        &bytes[..bytes.len().min(TOO_LONG_PREFIX)],
+    ));
     loop {
         bytes.clear();
         let n = {
@@ -366,6 +378,31 @@ mod bounded_read_tests {
             classify_line((LineRead::Line, "  \n".into())),
             Classified::Skip
         ));
+    }
+
+    /// An over-long request was answered with id "", so the host's request
+    /// waited forever. The line's start is kept, and its id read from it.
+    #[tokio::test]
+    async fn an_over_long_request_gets_an_error_reply_with_its_id() {
+        let line = format!(
+            "{{\"type\":\"session/prompt\",\"id\":\"p9\",\"prompt\":\"{}\"}}\nok\n",
+            "x".repeat(10_000)
+        );
+        let mut lines = spawn_line_reader(
+            BufReader::new(std::io::Cursor::new(line.into_bytes())),
+            1024,
+        );
+        match classify_line(lines.recv().await.unwrap().unwrap()) {
+            Classified::Request(Err(bad)) => {
+                assert_eq!(bad.id, "p9");
+                assert_eq!(bad.code, "parse_error");
+            }
+            _ => panic!("no error reply for an over-long line"),
+        }
+        match lines.recv().await {
+            Some(Ok((LineRead::Line, l))) => assert_eq!(l.trim(), "ok"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
