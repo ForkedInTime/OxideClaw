@@ -78,9 +78,19 @@ pub(super) fn prune_timeline(session: &mut Session, messages: &[Message]) -> boo
     true
 }
 
-/// [`prune_timeline`], saved.
-pub(super) async fn prune_timeline_and_save(session: &mut Session, messages: &[Message]) {
-    if prune_timeline(session, messages)
+/// Bring the timeline in line with a history a compaction replaced:
+/// [`prune_timeline`], and the end of /redo. The undone turns were answered
+/// after a prefix that is gone; put back after the summary, their signed
+/// thinking is a 400 on models that bind it to the conversation, on every
+/// later request.
+pub(super) async fn after_compaction(session: &mut Session, messages: &[Message]) {
+    let pruned = prune_timeline(session, messages);
+    let had_redo = !session.meta.redo.is_empty();
+    session.meta.redo.clear();
+    if had_redo && let Err(e) = session.save_redo(false).await {
+        tracing::warn!("undo timeline: failed to remove the redo turns: {e}");
+    }
+    if (pruned || had_redo)
         && let Err(e) = session.save_meta().await
     {
         tracing::warn!("undo timeline: failed to save meta: {e}");
@@ -663,7 +673,7 @@ mod tests {
             self.session.overwrite(&self.messages).await.unwrap();
             self.saved = self.messages.len();
             if prune {
-                prune_timeline_and_save(&mut self.session, &self.messages).await;
+                after_compaction(&mut self.session, &self.messages).await;
             }
         }
 
@@ -1017,6 +1027,28 @@ mod tests {
         assert!(h.last_note().contains("predate"), "{}", h.last_note());
         assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
         assert_eq!(h.read("b.txt").as_deref(), Some("b2\n"));
+    }
+
+    /// A compaction ends /redo: the undone turns would go back after a
+    /// summary they were never answered against.
+    #[tokio::test]
+    async fn a_compaction_ends_redo() {
+        let mut h = Harness::new(true).await;
+        h.turn("one", &[("a.txt", "a1\n")]).await;
+        h.turn("two", &[("a.txt", "a2\n")]).await;
+        h.undo(1).await;
+        assert!(h.sessions.path().join("s1.redo").exists());
+
+        h.compact(true).await;
+        assert!(h.session.meta.redo.is_empty());
+        assert!(!h.sessions.path().join("s1.redo").exists());
+        h.redo(1).await;
+        assert_eq!(h.last_note(), "[redo] nothing to redo");
+        assert_eq!(h.read("a.txt").as_deref(), Some("a1\n"));
+        assert_eq!(
+            h.prompts().await,
+            vec!["summary of the conversation so far"]
+        );
     }
 
     /// A compaction drops the marks of the turns it summarised and keeps

@@ -1546,7 +1546,7 @@ async fn run_loop(
                                 saved_count = to_save.len();
                                 let _ = session.overwrite(&to_save).await;
                             }
-                            timeline::prune_timeline_and_save(&mut session, &messages).await;
+                            timeline::after_compaction(&mut session, &messages).await;
                             app.apply(AppEvent::Compacted {
                                 replacement: replacement.clone(),
                                 summary_len,
@@ -1752,7 +1752,7 @@ async fn run_loop(
                         saved_count = messages.len();
                         let _ = session.overwrite(&messages).await;
                     }
-                    timeline::prune_timeline_and_save(&mut session, &messages).await;
+                    timeline::after_compaction(&mut session, &messages).await;
                     // The last turn's token count measured the history
                     // that was just summarised.
                     last_tokens_in = 0;
