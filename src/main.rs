@@ -1453,6 +1453,7 @@ async fn run() -> Result<()> {
         }
         // A hook blocking a later message still leaves the earlier turns to save.
         let mut outcome = Ok(());
+        let mut prompted = false;
         for prompt in prompts {
             let prompt = match &config.hooks {
                 Some(h) if !config.disable_all_hooks => {
@@ -1479,6 +1480,7 @@ async fn run() -> Result<()> {
                 Some(r) => r?,
                 None => return Ok(()),
             }
+            prompted = true;
             // A script must be able to tell a cut-off run from a finished one.
             if engine.hit_turn_cap() {
                 outcome = Err(anyhow::anyhow!(
@@ -1489,10 +1491,13 @@ async fn run() -> Result<()> {
             }
         }
         // Overwrite, not append: compaction may have rewritten the history.
-        if let Some(s) = resumed
+        if let Some(mut s) = resumed
             && !config.no_session_persistence
         {
             s.overwrite(engine.history()).await?;
+            if prompted {
+                s.end_timeline().await?;
+            }
         }
         return outcome;
     }

@@ -411,6 +411,22 @@ impl Session {
         }
     }
 
+    /// End the undo timeline and the /redo turns after a run that continued
+    /// the conversation without them (`-p --resume`, ACP `session/load`).
+    /// Its prompts have no marks, so a later /undo could pair one with an
+    /// older turn's mark of the same text ("go on") and restore that turn's
+    /// files, and /redo would put undone turns back after turns they never
+    /// saw. The earlier turns stay undoable for the conversation only.
+    pub async fn end_timeline(&mut self) -> Result<()> {
+        if self.meta.timeline.is_empty() && self.meta.redo.is_empty() {
+            return Ok(());
+        }
+        self.meta.timeline.clear();
+        self.meta.redo.clear();
+        self.save_redo(false).await?;
+        self.save_meta().await
+    }
+
     /// Persist the current `SessionMeta` to disk. Used by the auto-commit loop
     /// to checkpoint updated `auto_commits` / `undo_position` after each turn.
     pub async fn save_meta(&self) -> anyhow::Result<()> {

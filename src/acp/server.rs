@@ -560,6 +560,14 @@ impl Transcript {
             Ok(()) => {
                 self.saved = history.len();
                 self.rewrite = false;
+                // A loaded TUI session: these turns are not on its undo
+                // timeline (see `Session::end_timeline`).
+                if let Err(e) = file.end_timeline().await {
+                    tracing::warn!(
+                        "acp: could not end the undo timeline of {}: {e:#}",
+                        session.session_id
+                    );
+                }
             }
             Err(e) => tracing::warn!("acp: could not save session {}: {e:#}", session.session_id),
         }
@@ -2036,6 +2044,56 @@ mod tests {
 
         let (_, history) = Session::resume_in(&sessions, sid).await.unwrap();
         assert_eq!(history.len(), 8, "{history:?}");
+    }
+
+    /// A TUI session continued over ACP gets turns its undo timeline never
+    /// saw: the timeline and the /redo turns end, so a later /redo cannot
+    /// put an undone turn after them and /undo cannot pair one of them
+    /// with an older turn of the same text.
+    #[tokio::test]
+    async fn session_load_ends_the_tui_undo_timeline() {
+        use crate::session::{TurnMark, UndoneTurn, prompt_fingerprint};
+        let (mut cfg, dir) = test_config();
+        cfg.model = "ollama:test-model".into();
+        cfg.ollama_host = text_model("Going.").await.0;
+        let sessions = sessions_in(&dir);
+        let sid = "5f0c6d1e-0000-4000-8000-00000000beef";
+        let go = text(Role::User, "go");
+        let mut saved = Session::create_in(&sessions, sid.into()).await.unwrap();
+        saved
+            .append(&[go.clone(), text(Role::Assistant, "went")])
+            .await
+            .unwrap();
+        let mark = TurnMark {
+            prompt: prompt_fingerprint(&go),
+            before: 0,
+        };
+        saved.meta.timeline.push(mark.clone());
+        saved.meta.redo.push(UndoneTurn {
+            mark,
+            after: 2,
+            messages: vec![text(Role::User, "fix"), text(Role::Assistant, "fixed")],
+        });
+        saved.save_meta().await.unwrap();
+        saved.save_redo(true).await.unwrap();
+        let redo_file = sessions.join(format!("{sid}.redo"));
+        assert!(redo_file.exists());
+
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut c = Client::start(cfg, sessions.clone());
+        c.init().await;
+        let load = json!({"sessionId": sid, "cwd": cwd, "mcpServers": []});
+        let (_, answer) = c.call(1, "session/load", load).await;
+        assert_eq!(answer["result"], json!({}), "{answer}");
+        let (_, answer) = c.call(2, "session/prompt", prompt(sid, "go")).await;
+        assert_eq!(answer["result"]["stopReason"], json!("end_turn"));
+        c.close().await;
+
+        let (resumed, history) = Session::resume_in(&sessions, sid).await.unwrap();
+        assert_eq!(history.len(), 4, "{history:?}");
+        assert!(resumed.meta.timeline.is_empty());
+        assert!(resumed.meta.redo.is_empty());
+        assert!(!redo_file.exists());
     }
 
     /// A session started over ACP is saved as it goes, so another agent
