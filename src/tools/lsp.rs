@@ -763,30 +763,35 @@ impl LspClient {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
-                // Read Content-Length header
-                let mut header = String::new();
-                if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
+                // Headers run to the first empty line. pylsp also sends
+                // Content-Type, and header names are case-insensitive:
+                // reading one header and one "blank" line misframed every
+                // message from such a server.
+                let mut content_length = 0usize;
+                let mut eof = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        eof = true;
+                        break;
+                    }
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if eof {
                     // Server gone: fail every in-flight request now rather
                     // than letting each sit out the full request timeout.
                     dead_clone.store(true, Ordering::SeqCst);
                     pending_clone.lock().await.clear();
                     break;
                 }
-                let header = header.trim().to_string();
-
-                if !header.starts_with("Content-Length:") {
-                    continue;
-                }
-
-                let content_length: usize = header
-                    .trim_start_matches("Content-Length:")
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-
-                // Read the blank line
-                let mut blank = String::new();
-                let _ = reader.read_line(&mut blank).await;
 
                 if content_length == 0 {
                     continue;
@@ -1471,6 +1476,31 @@ mod lifecycle_tests {
             body
         );
         ("sh".to_string(), vec!["-c".to_string(), script])
+    }
+
+    /// pylsp frames every message with a Content-Type header after
+    /// Content-Length; the reader took that header for the blank line and
+    /// read the body two bytes early, so no answer ever parsed.
+    #[tokio::test]
+    async fn extra_headers_and_header_case_do_not_break_framing() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        let script = format!(
+            "read -r _line; printf 'content-length: {}\\r\\nContent-Type: \
+             application/vscode-jsonrpc; charset=utf8\\r\\n\\r\\n%s' '{}'; sleep 5",
+            body.len(),
+            body
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec!["-c".to_string(), script];
+        let client = LspClient::connect("sh", &args, dir.path(), &Launch::Plain)
+            .await
+            .unwrap();
+        let init = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.initialize("sh", dir.path()),
+        )
+        .await;
+        assert!(matches!(init, Ok(Ok(()))), "{init:?}");
     }
 
     /// The server must still be alive when `initialize` is sent. Before the
