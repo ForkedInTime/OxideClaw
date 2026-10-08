@@ -286,11 +286,12 @@ impl QueryEngine {
 
     /// Replace the history with a summary (snip if that fails) once the
     /// context is critically full. Call only between rounds: the summary
-    /// replaces any tool_use whose results are still to come.
-    async fn auto_summarise(&mut self) {
+    /// replaces any tool_use whose results are still to come. Returns
+    /// whether the summary replaced the history.
+    async fn auto_summarise(&mut self) -> bool {
         if !self.config.auto_compact_enabled {
             self.notice("Context critically full. Enable auto_compact or run /compact now.".red());
-            return;
+            return false;
         }
         self.notice("Auto-compacting: summarising conversation (summarizeCompact)…".yellow());
         // Billed like any other call: it carries the whole history, so it
@@ -301,19 +302,89 @@ impl QueryEngine {
                 let _ = sink.send((self.config.model.clone(), u.clone()));
             }
         };
-        match summarize_compact(&self.client, &self.messages, &self.config, bill).await {
+        let summarised = match summarize_compact(&self.client, &self.messages, &self.config, bill)
+            .await
+        {
             Ok(replacement) => {
                 self.messages = replacement;
                 self.notice(
                     "Compaction complete. Conversation history replaced with summary.".green(),
                 );
+                true
             }
             Err(e) => {
                 self.notice(format!("Compact failed: {e}. Falling back to snip.").red());
                 snip_compact(&mut self.messages, &self.config.model);
+                false
             }
-        }
+        };
         self.forget_reads();
+        summarised
+    }
+
+    /// The provider rejected the request as longer than the window: shrink
+    /// the history so a retry fits. Returns whether it shrank. The history
+    /// ends with a user message here (the prompt or tool results), so a
+    /// summary orphans no tool_use.
+    async fn compact_after_overflow(&mut self) -> bool {
+        if !self.config.auto_compact_enabled {
+            return false;
+        }
+        self.notice("Prompt too long — auto-compacting context…".yellow());
+        // The summary request carries the history too: without the old tool
+        // results it has a chance to fit.
+        let snipped = snip_compact(&mut self.messages, &self.config.model);
+        if snipped {
+            self.forget_reads();
+        }
+        self.auto_summarise().await || snipped
+    }
+
+    /// Act on how full the last response says the context is, measured
+    /// against `window`, the window of the tier this turn runs on. Returns
+    /// whether to summarise once this round's tool results are in.
+    async fn check_context(&mut self, response: &StreamedResponse, window: u64) -> bool {
+        let context_tokens = response.usage.context_tokens();
+        match compact_needed(context_tokens, window) {
+            CompactNeeded::None => {}
+            CompactNeeded::Warn => {
+                self.notice(
+                    format!(
+                        "Warning: context is {:.0}% full ({} / {} tokens). \
+                         Use /compact or enable auto_compact.",
+                        context_tokens as f64 * 100.0 / window as f64,
+                        context_tokens,
+                        window
+                    )
+                    .yellow(),
+                );
+            }
+            CompactNeeded::Snip => {
+                if self.config.auto_compact_enabled {
+                    self.notice(
+                        "Auto-compacting: stripping old tool results (snipCompact)…".yellow(),
+                    );
+                    if snip_compact(&mut self.messages, &self.config.model) {
+                        self.forget_reads();
+                    }
+                } else {
+                    self.notice("Context near limit. Enable auto_compact or run /compact.".yellow());
+                }
+            }
+            // Summarising now would replace the assistant tool_use that the
+            // results appended next answer, orphaning them (a 400).
+            // Summarise once they are in.
+            CompactNeeded::Summarise if response.stop_reason == Some(StopReason::ToolUse) => {
+                return true;
+            }
+            CompactNeeded::Summarise if self.history_saved => {
+                self.auto_summarise().await;
+            }
+            // The loop ends after this turn and the history with it: a
+            // summary now would be a full-history call nobody reads.
+            CompactNeeded::Summarise => {}
+        }
+        false
     }
 
     /// After compaction the bodies of earlier reads are gone from the
@@ -481,6 +552,7 @@ impl QueryEngine {
 
         let max_turns = self.turn_cap();
         let mut turn = 0u32;
+        let mut overflow_retried = false;
 
         loop {
             turn += 1;
@@ -537,7 +609,8 @@ impl QueryEngine {
                 // unless part of the answer is already out.
                 Err(e) => {
                     let err = format!("{e:#}");
-                    let trigger = if crate::api::is_context_overflow(&err) {
+                    let overflow = crate::api::is_context_overflow(&err);
+                    let trigger = if overflow {
                         crate::router::Trigger::ContextOverflow
                     } else {
                         crate::router::Trigger::ApiError
@@ -550,6 +623,23 @@ impl QueryEngine {
                             println!();
                         }
                         continue;
+                    }
+                    // No larger tier took it: one tool round can grow the
+                    // history past the window between two size checks.
+                    if overflow && !streamed && !overflow_retried {
+                        overflow_retried = true;
+                        if self.compact_after_overflow().await {
+                            if human {
+                                println!();
+                            }
+                            continue;
+                        }
+                    }
+                    if overflow && !self.config.auto_compact_enabled {
+                        return Err(e.context(
+                            "the conversation no longer fits the model's context window \
+                             (autoCompact is off)",
+                        ));
                     }
                     return Err(e);
                 }
@@ -611,47 +701,7 @@ impl QueryEngine {
             } else {
                 compaction_window(&self.config, router, None)
             };
-            let mut summarise_after_tools = false;
-            let context_tokens = response.usage.context_tokens();
-            match compact_needed(context_tokens, window) {
-                CompactNeeded::None => {}
-                CompactNeeded::Warn => {
-                    self.notice(
-                        format!(
-                            "Warning: context is {:.0}% full ({} / {} tokens). \
-                             Use /compact or enable auto_compact.",
-                            context_tokens as f64 * 100.0 / window as f64,
-                            context_tokens,
-                            window
-                        )
-                        .yellow(),
-                    );
-                }
-                CompactNeeded::Snip => {
-                    if self.config.auto_compact_enabled {
-                        self.notice(
-                            "Auto-compacting: stripping old tool results (snipCompact)…".yellow(),
-                        );
-                        if snip_compact(&mut self.messages, &self.config.model) {
-                            self.forget_reads();
-                        }
-                    } else {
-                        self.notice(
-                            "Context near limit. Enable auto_compact or run /compact.".yellow(),
-                        );
-                    }
-                }
-                // Summarising now would replace the assistant tool_use that the
-                // results appended below answer, orphaning them (a 400).
-                // Summarise once they are in.
-                CompactNeeded::Summarise if response.stop_reason == Some(StopReason::ToolUse) => {
-                    summarise_after_tools = true;
-                }
-                CompactNeeded::Summarise if self.history_saved => self.auto_summarise().await,
-                // The loop ends after this turn and the history with it: a
-                // summary now would be a full-history call nobody reads.
-                CompactNeeded::Summarise => {}
-            }
+            let summarise_after_tools = self.check_context(&response, window).await;
 
             // Check stop reason
             match &response.stop_reason {
@@ -977,6 +1027,7 @@ impl QueryEngine {
         // The agent's answer is its last message, not all its narration.
         let mut final_text = String::new();
         let mut turns = 0u32;
+        let mut overflow_retried = false;
 
         loop {
             turns += 1;
@@ -990,11 +1041,24 @@ impl QueryEngine {
             let request = self.request_for(&self.config.model, tool_defs);
 
             let mut turn_text = String::new();
-            let (response, served_model) = self
+            let turn_result = self
                 .stream_turn(request, |chunk| {
                     turn_text.push_str(chunk);
                 })
-                .await?;
+                .await;
+            let (response, served_model) = match turn_result {
+                Ok(r) => r,
+                // Tool results of up to 100k characters each: one round can
+                // push the history past the window between two size checks.
+                Err(e) if !overflow_retried && crate::api::is_context_overflow(&format!("{e:#}")) => {
+                    overflow_retried = true;
+                    if self.compact_after_overflow().await {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
             if !turn_text.trim().is_empty() {
                 final_text = turn_text;
             }
@@ -1017,6 +1081,11 @@ impl QueryEngine {
                 });
             }
 
+            // Sub-agents run up to 50 rounds of large tool results: without
+            // this they ran into the window and lost all their work.
+            let window = turn_window(&self.config, None);
+            let summarise_after_tools = self.check_context(&response, window).await;
+
             match &response.stop_reason {
                 Some(StopReason::EndTurn)
                 | Some(StopReason::Other)
@@ -1036,6 +1105,9 @@ impl QueryEngine {
                         final_text
                             .push_str(&format!("\n\n[Stopped: budget of ${budget:.2} reached.]"));
                         break;
+                    }
+                    if summarise_after_tools {
+                        self.auto_summarise().await;
                     }
                 }
                 Some(StopReason::StopSequence) => break,
@@ -1559,6 +1631,103 @@ pub(crate) mod scripted_api_tests {
         assert!(e.read_cache.lock().unwrap().is_empty(), "stale read cache");
     }
 
+    fn scripted_engine(url: String, dir: &std::path::Path) -> QueryEngine {
+        let config = Config {
+            model: "claude-sonnet-5".into(),
+            api_key: "sk-ant-test".into(),
+            cwd: dir.to_path_buf(),
+            auto_compact_enabled: true,
+            ..Config::default()
+        };
+        let mut e = QueryEngine::new(config, Vec::new()).unwrap();
+        e.quiet = true;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        e.client = ApiBackend::Anthropic(c);
+        e
+    }
+
+    fn bodies(seen: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect()
+    }
+
+    fn compacted(body: &serde_json::Value) -> bool {
+        let msgs = body["messages"].as_array().unwrap();
+        msgs.len() == 1
+            && msgs[0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("automatically compacted"))
+    }
+
+    /// Sub-agents and /spawn agents (query_and_collect) never compacted, so
+    /// a long run grew past the window and failed with all its work lost.
+    #[tokio::test]
+    async fn sub_agents_summarise_between_tool_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})];
+        let full = sse(&tool, "tool_use").replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
+        let summary = sse(
+            &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
+            "end_turn",
+        );
+        let done = sse(&[serde_json::json!({"type":"text","text":"done"})], "end_turn");
+        let (url, seen) = serve(vec![full, summary, done]).await;
+        let mut e = scripted_engine(url, dir.path());
+
+        let out = e.query_and_collect("explore").await.unwrap();
+
+        assert_eq!(tool_text(&out), "done");
+        let bodies = bodies(&seen);
+        assert_eq!(bodies.len(), 3, "turn, summary, turn");
+        assert!(compacted(&bodies[2]), "{}", bodies[2]["messages"]);
+    }
+
+    /// A request rejected as too long was fatal in -p, sub-agents and the
+    /// SDK: one tool round can take the history from under the summarise
+    /// threshold to past the window. It is compacted and retried once.
+    #[tokio::test]
+    async fn an_overflowing_request_is_compacted_and_retried_once() {
+        let too_long = || {
+            http_error(
+                "400 Bad Request",
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 205290 tokens > 200000 maximum"}}"#,
+            )
+        };
+        let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
+        let dir = tempfile::tempdir().unwrap();
+
+        let (url, seen) = serve(vec![too_long(), text("summary"), text("answer")]).await;
+        scripted_engine(url, dir.path()).query("hi").await.unwrap();
+        let b = bodies(&seen);
+        assert_eq!(b.len(), 3, "turn, summary, retried turn");
+        assert!(compacted(&b[2]), "{}", b[2]["messages"]);
+
+        let (url, seen) = serve(vec![too_long(), text("summary"), text("answer")]).await;
+        let out = scripted_engine(url, dir.path())
+            .query_and_collect("hi")
+            .await
+            .unwrap();
+        assert_eq!(tool_text(&out), "answer");
+        assert!(compacted(&bodies(&seen)[2]));
+
+        // Still too long after compacting: an error, not a loop.
+        let (url, seen) = serve(vec![too_long(), text("summary"), too_long(), text("x")]).await;
+        assert!(scripted_engine(url, dir.path()).query("hi").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 3);
+
+        // autoCompact off: the error says why nothing was done about it.
+        let (url, seen) = serve(vec![too_long(), text("x")]).await;
+        let mut e = scripted_engine(url, dir.path());
+        e.config.auto_compact_enabled = false;
+        let err = format!("{:#}", e.query("hi").await.unwrap_err());
+        assert!(err.contains("autoCompact is off"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     fn http_error(status: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1622,6 +1791,7 @@ pub(crate) mod scripted_api_tests {
         );
         let (url, seen) = serve(vec![too_long, ok]).await;
         let mut e = fallback_engine(url, dir.path());
+        e.config.auto_compact_enabled = false;
         assert!(e.query("hi").await.is_err());
         assert_eq!(seen.lock().unwrap().len(), 1, "a 400 is not an overload");
     }

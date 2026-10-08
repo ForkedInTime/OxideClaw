@@ -421,6 +421,7 @@ impl SdkSession {
         let mut loop_turn = 0u32;
         let mut end = TurnEnd::EndTurn;
         let mut overflow_compacted = false;
+        let mut overflow_retried = false;
 
         loop {
             loop_turn += 1;
@@ -497,7 +498,8 @@ impl SdkSession {
                     // A routed turn the cheap tier failed moves one tier
                     // up, unless part of the answer already reached the host.
                     let err = format!("{e:#}");
-                    let trigger = if crate::api::is_context_overflow(&err) {
+                    let overflow = crate::api::is_context_overflow(&err);
+                    let trigger = if overflow {
                         crate::router::Trigger::ContextOverflow
                     } else {
                         crate::router::Trigger::ApiError
@@ -531,6 +533,28 @@ impl SdkSession {
                         turn_output_tokens += o;
                         base = self.messages.len();
                         self.messages.extend(turn);
+                        continue;
+                    }
+                    // No larger tier took it, and this turn itself no longer
+                    // fits: one tool round can grow the history past the
+                    // window between two size checks. The history ends with
+                    // the prompt or tool results, so a summary orphans no
+                    // tool_use.
+                    if overflow
+                        && turn_text.is_empty()
+                        && !overflow_retried
+                        && self.config.auto_compact_enabled
+                    {
+                        overflow_retried = true;
+                        // Without the old tool results the summary request
+                        // has a chance to fit.
+                        if crate::compact::snip_compact(&mut self.messages, &self.config.model) {
+                            self.history_rewritten = true;
+                            self.forget_reads();
+                        }
+                        let (i, o) = self.auto_summarise().await;
+                        turn_input_tokens += i;
+                        turn_output_tokens += o;
                         continue;
                     }
                     // ACP runs every prompt on this session. Keeping a turn
@@ -1971,6 +1995,36 @@ mod guard_tests {
 
         assert!(s.messages.is_empty());
         assert!(s.read_cache.lock().unwrap().is_empty(), "stale read kept");
+    }
+
+    /// A request rejected as too long ended the ACP turn and dropped it,
+    /// although one tool round can take the history from under the
+    /// summarise threshold to past the window. It is compacted and retried.
+    #[tokio::test]
+    async fn an_overflowing_request_is_compacted_and_retried() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 205290 tokens > 200000 maximum"}}"#;
+        let too_long = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
+        let (url, seen) = serve(vec![too_long, text("summary"), text("answer")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.auto_compact_enabled = true;
+        let (mut s, _) = session(c);
+        let mut client = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        client.set_base_url_for_test(url);
+        s.client = ApiBackend::Anthropic(client);
+
+        s.execute_turn("hi".into()).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().len(), 3, "turn, summary, retried turn");
+        assert!(s.take_history_rewritten());
+        assert_eq!(s.messages.len(), 2, "{:?}", s.messages);
+        assert!(matches!(&s.messages[0].content[0],
+            ContentBlock::Text { text } if text.contains("automatically compacted")));
     }
 
     /// The SDK sidecar and ACP sent `thinking: None, output_config: None`
