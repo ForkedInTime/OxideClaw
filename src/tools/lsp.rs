@@ -21,6 +21,7 @@ use tokio::time::Instant;
 /// One language server per (command, project root). A fresh server per call
 /// meant paying rust-analyzer's full startup and indexing on every query.
 type ClientCache = Arc<Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>>;
+type StartLocks = Arc<std::sync::Mutex<HashMap<(String, PathBuf), Arc<Mutex<()>>>>>;
 
 /// The session's language servers: the LSP tool and the auto-fix
 /// diagnostics share them, so a server starts once whichever needs it first.
@@ -31,7 +32,7 @@ pub struct LspPool {
     /// start it. Not the `clients` lock: one slow start (jdtls, a cold
     /// rust-analyzer) held every other server's start behind it, and
     /// auto-fix's shared deadline then gave those up.
-    starting: Arc<std::sync::Mutex<HashMap<(String, PathBuf), Arc<Mutex<()>>>>>,
+    starting: StartLocks,
     /// Bumped by `shutdown`: a server whose start straddles it is stopped,
     /// not cached, so it cannot outlive `/trust revoke`.
     epoch: Arc<AtomicU64>,
@@ -2041,7 +2042,10 @@ while True:
         std::fs::write(&a, "local x = 2\n").unwrap();
         std::fs::write(&b, "local x = 2\n").unwrap();
         std::fs::remove_file(&c).unwrap();
-        client.refresh_open_documents(&[a.clone()]).await.unwrap();
+        client
+            .refresh_open_documents(std::slice::from_ref(&a))
+            .await
+            .unwrap();
         // The server handles messages in order: once it answers, it has
         // logged everything before.
         let barrier = || client.request("shutdown", Value::Null);
