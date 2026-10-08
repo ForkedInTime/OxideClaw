@@ -68,11 +68,24 @@ fn run(env: &Env, args: &[&str], extra_env: &[(&str, String)], stdin: &str) -> O
 /// OpenAI-compatible endpoint that answers every request with `reply` and
 /// records each request body.
 fn serve(reply: serde_json::Value) -> (u16, Arc<Mutex<Vec<String>>>) {
+    serve_seq(vec![sse_response(&reply)])
+}
+
+fn sse_response(reply: &serde_json::Value) -> String {
+    let body = format!("data: {reply}\n\ndata: [DONE]\n\n");
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Like `serve`, answering the n-th request with the n-th raw HTTP response
+/// and every later one with the last.
+fn serve_seq(responses: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let seen = bodies.clone();
-    let body = format!("data: {reply}\n\ndata: [DONE]\n\n");
     std::thread::spawn(move || {
         for sock in listener.incoming() {
             let Ok(mut sock) = sock else { return };
@@ -102,12 +115,13 @@ fn serve(reply: serde_json::Value) -> (u16, Arc<Mutex<Vec<String>>>) {
             let Some(request_body) = request_body else {
                 continue;
             };
-            seen.lock().unwrap().push(request_body);
-            let _ = write!(
-                sock,
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            let n = {
+                let mut seen = seen.lock().unwrap();
+                seen.push(request_body);
+                seen.len()
+            };
+            let response = &responses[(n - 1).min(responses.len() - 1)];
+            let _ = sock.write_all(response.as_bytes());
         }
     });
     (port, bodies)
@@ -433,4 +447,41 @@ fn malformed_tool_flags_exit_non_zero_with_the_reason() {
         assert_eq!(out.status.code(), Some(1), "{flag} {value}");
         assert!(stderr(&out).contains(needle), "{}", stderr(&out));
     }
+}
+
+/// `-p --session-id` saved nothing when a request failed: the next run
+/// with the same id had no record of the tool calls the failed run made.
+#[test]
+fn a_failed_print_run_still_saves_its_session() {
+    let e = env();
+    let body = r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#;
+    let bad = format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (port, _) = serve_seq(vec![
+        sse_response(&bash_call_reply("echo saved-marker")),
+        bad,
+    ]);
+    let id = "6f1c2a7e-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
+    let args = [
+        "-p",
+        "--dangerously-skip-permissions",
+        "--session-id",
+        id,
+        "--model",
+        "openai-compat:test",
+    ];
+    let out = run(&e, &[&args[..], &["first"]].concat(), &openai_env(port), "");
+    assert!(!out.status.success(), "the second request failed");
+
+    let (port, bodies) = serve(text_reply("ok"));
+    let out = run(&e, &[&args[..], &["second"]].concat(), &openai_env(port), "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        bodies[0].contains("first") && bodies[0].contains("saved-marker"),
+        "{}",
+        bodies[0]
+    );
 }

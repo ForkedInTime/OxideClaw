@@ -1515,11 +1515,19 @@ async fn run() -> Result<()> {
                 }
                 _ => prompt,
             };
-            match until_signal(engine.query(prompt)).await {
-                Some(r) => r?,
-                None => return Ok(()),
-            }
+            // A failed or interrupted prompt still leaves its earlier tool
+            // rounds (and the prompts before it) to save: their edits are on disk.
+            // Sent, so saved without an undo mark even if it fails below.
             prompted = true;
+            match until_signal(engine.query(prompt)).await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    outcome = Err(e);
+                    break;
+                }
+                // SIGNAL_EXIT already holds the exit status.
+                None => break,
+            }
             // A script must be able to tell a cut-off run from a finished one.
             if engine.hit_turn_cap() {
                 outcome = Err(anyhow::anyhow!(
@@ -1533,9 +1541,16 @@ async fn run() -> Result<()> {
         if let Some(mut s) = resumed
             && !config.no_session_persistence
         {
-            s.overwrite(engine.history()).await?;
-            if prompted {
-                s.end_timeline().await?;
+            let mut saved = s.overwrite(engine.history()).await;
+            if saved.is_ok() && prompted {
+                saved = s.end_timeline().await;
+            }
+            if let Err(e) = saved {
+                // The run's own error says more about what went wrong.
+                if outcome.is_ok() {
+                    return Err(e);
+                }
+                eprintln!("Warning: session not saved: {e:#}");
             }
         }
         return outcome;
