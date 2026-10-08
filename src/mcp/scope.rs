@@ -6,7 +6,9 @@
 //!   own config, loads without `/trust`.
 //! - `project`: the repo's `.mcp.json` (and, read-only here, `mcpServers` in
 //!   `.claude/settings.json`). Shared and usually committed, so it loads only
-//!   in a `/trust`ed project and `add` refuses literal secrets for it.
+//!   in a `/trust`ed project and `add` refuses literal secrets for it (env
+//!   values, headers, URL userinfo, and key- or token-named URL query
+//!   values and command args).
 //! - `user`: `mcpServers` in the config dir's `settings.json`, every project.
 //!
 //! Load order, later wins: user, project settings, `.mcp.json`, local.
@@ -146,9 +148,11 @@ pub fn list(cwd: &Path, config_dir: &Path) -> Vec<ScopedServer> {
     loaded
 }
 
-/// Literal env values or headers in `cfg`, named for the refusal message. A
-/// `${NAME}` reference (or `Bearer ${NAME}`) holds no secret: each user's
-/// environment fills it in at startup.
+/// Literal secrets in `cfg`, named for the refusal message: env values and
+/// headers, URL userinfo, and URL query values or command args whose name
+/// says they hold a key or token. A `${NAME}` reference (or
+/// `Bearer ${NAME}`) holds no secret: each user's environment fills it in
+/// at startup.
 fn literal_secrets(cfg: &McpServerConfig) -> Vec<String> {
     let (kind, map) = match cfg {
         McpServerConfig::Stdio(s) => ("env", &s.env),
@@ -160,7 +164,112 @@ fn literal_secrets(cfg: &McpServerConfig) -> Vec<String> {
         .map(|(k, _)| format!("{kind} {k}"))
         .collect();
     keys.sort();
+    match cfg {
+        McpServerConfig::Http(h) => keys.extend(url_secrets(&h.url)),
+        McpServerConfig::Stdio(s) => {
+            let mut args = s.args.iter().peekable();
+            while let Some(arg) = args.next() {
+                if arg.contains("://") {
+                    keys.extend(url_secrets(arg));
+                    continue;
+                }
+                let (name, value) = match arg.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    // `--api-key sk-…`: the value is the next arg.
+                    None if arg.starts_with('-') => (
+                        arg.as_str(),
+                        args.peek()
+                            .filter(|v| !v.starts_with('-'))
+                            .map(|v| v.as_str()),
+                    ),
+                    None => continue,
+                };
+                if secretish(name) && value.is_some_and(is_literal) {
+                    keys.push(format!("arg {name}"));
+                }
+            }
+        }
+    }
     keys
+}
+
+/// Userinfo and secret-named query values in what looks like a URL. Parsed
+/// by hand, since a `${HOST}` placeholder is no valid host for a URL parser.
+fn url_secrets(url: &str) -> Vec<String> {
+    let Some((_, rest)) = url.split_once("://") else {
+        return Vec::new();
+    };
+    let rest = rest.split('#').next().unwrap_or_default();
+    let (before_query, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let authority = before_query.split('/').next().unwrap_or_default();
+    let mut found = Vec::new();
+    if let Some((userinfo, _)) = authority.rsplit_once('@')
+        && is_literal(userinfo)
+    {
+        found.push("url userinfo".to_string());
+    }
+    for pair in query.split('&') {
+        if let Some((name, value)) = pair.split_once('=')
+            && secretish(name)
+            && is_literal(value)
+        {
+            found.push(format!("url query {name}"));
+        }
+    }
+    found
+}
+
+/// A value that is neither empty nor built from `${VAR}` references.
+fn is_literal(v: &str) -> bool {
+    !v.is_empty() && !v.contains("${")
+}
+
+/// Whether a flag, variable or query name says its value is a credential:
+/// `--api-key`, `GITHUB_TOKEN`, `apiKey`, `sig`. Settings about one, such
+/// as `--token-file` or `--auth-mode`, are not.
+fn secretish(name: &str) -> bool {
+    let name = name.trim_start_matches('-').to_ascii_lowercase();
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let Some(last) = words.last() else {
+        return false;
+    };
+    if matches!(
+        *last,
+        "file" | "path" | "env" | "mode" | "type" | "url" | "dir" | "name" | "id"
+    ) {
+        return false;
+    }
+    words.iter().any(|w| {
+        matches!(
+            *w,
+            "key"
+                | "apikey"
+                | "token"
+                | "secret"
+                | "password"
+                | "passwd"
+                | "pwd"
+                | "auth"
+                | "authorization"
+                | "sig"
+                | "signature"
+                | "credential"
+                | "credentials"
+                | "pat"
+        ) || [
+            "apikey",
+            "accesskey",
+            "secretkey",
+            "privatekey",
+            "token",
+            "secret",
+        ]
+        .iter()
+        .any(|s| w.ends_with(s) && w.len() > s.len())
+    })
 }
 
 fn is_reference(v: &str) -> bool {
@@ -180,8 +289,9 @@ fn is_reference(v: &str) -> bool {
 }
 
 /// Write `name` into `scope`'s file and return the file. The project scope
-/// refuses literal env values and headers unless `force`: `.mcp.json` is
-/// shared and usually committed, so they would reach everyone with the repo.
+/// refuses literal secrets (see `literal_secrets`) unless `force`:
+/// `.mcp.json` is shared and usually committed, so they would reach everyone
+/// with the repo.
 pub fn add(
     name: &str,
     cfg: McpServerConfig,
@@ -198,7 +308,8 @@ pub fn add(
                 "not writing '{name}' to {}: it has {} and that file is shared with \
                  everyone who has the repo (it is usually committed). Use the default \
                  local scope to keep it private to you, reference a variable each user \
-                 sets (e.g. -e TOKEN='${{TOKEN}}'), or pass --force to write it anyway.",
+                 sets (e.g. -e TOKEN='${{TOKEN}}', ?api_key=${{KEY}} or --api-key \
+                 '${{KEY}}'), or pass --force to write it anyway.",
                 path.display(),
                 secrets.join(", ")
             );
@@ -425,6 +536,53 @@ mod tests {
         assert!(add("h", http, Scope::Project, repo.path(), home.path(), false).is_err());
         assert!(!mcp_json.exists());
 
+        // So are keys in a URL or in command args.
+        let http = |url: &str| {
+            McpServerConfig::Http(HttpServerConfig {
+                url: url.into(),
+                headers: Default::default(),
+                disabled: false,
+                sse: false,
+                literal: false,
+            })
+        };
+        let with_args = |args: &[&str]| {
+            McpServerConfig::Stdio(StdioServerConfig {
+                command: "npx".into(),
+                args: args.iter().map(|a| a.to_string()).collect(),
+                env: Default::default(),
+                disabled: false,
+                literal: false,
+            })
+        };
+        let refused = |cfg: McpServerConfig, what: &str| {
+            let err = add("x", cfg, Scope::Project, repo.path(), home.path(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(what), "{what}: {err}");
+            assert!(!mcp_json.exists());
+        };
+        refused(http("https://u:pw@mcp.example.test/mcp"), "url userinfo");
+        refused(http("https://ghp_x@mcp.example.test/mcp"), "url userinfo");
+        refused(
+            http("https://mcp.example.test/mcp?transport=sse&api_key=sk-live-1"),
+            "url query api_key",
+        );
+        refused(http("https://${HOST}/mcp?apiKey=abc"), "url query apiKey");
+        refused(
+            with_args(&["-y", "pkg", "--api-key", "sk-live-1"]),
+            "arg --api-key",
+        );
+        refused(with_args(&["pkg", "--token=lit"]), "arg --token");
+        refused(
+            with_args(&["pkg", "GITHUB_TOKEN=ghp_x"]),
+            "arg GITHUB_TOKEN",
+        );
+        refused(
+            with_args(&["mcp-remote", "https://h.test/mcp?access_token=t"]),
+            "url query access_token",
+        );
+
         // A reference names the secret without holding it.
         let refs = [
             ("GITHUB_TOKEN", "${GITHUB_TOKEN}"),
@@ -440,6 +598,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, mcp_json);
+        // Settings about a credential, and references, are not secrets.
+        for (name, cfg) in [
+            (
+                "u1",
+                http("https://mcp.example.test/mcp?api_key=${KEY}&transport=sse"),
+            ),
+            ("u2", http("https://${USER}:${PASS}@mcp.example.test/mcp")),
+            ("u3", http("https://mcp.example.test/mcp?max_tokens=100")),
+            (
+                "a1",
+                with_args(&[
+                    "pkg",
+                    "--token-file",
+                    "x",
+                    "--auth-mode",
+                    "oauth",
+                    "--api-key",
+                    "${KEY}",
+                    "--max-tokens",
+                    "100",
+                    "--debug",
+                ]),
+            ),
+        ] {
+            add(name, cfg, Scope::Project, repo.path(), home.path(), false)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
 
         // --force writes it.
         let tok = [("GITHUB_TOKEN", "ghp_secret")];

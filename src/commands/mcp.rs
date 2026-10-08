@@ -166,19 +166,31 @@ pub(super) fn mcp_add_server(
 ) -> CommandAction {
     use crate::mcp::scope::Scope;
     use crate::mcp::types::{HttpServerConfig, McpServerConfig, StdioServerConfig};
+    // `--force` before or after `--scope`, as on the command line.
+    fn take_force(args: &str) -> (bool, &str) {
+        match split_first_word(args) {
+            ("--force", rest) => (true, rest),
+            _ => (false, args),
+        }
+    }
+    let (force, args) = take_force(args);
     let (scope, args) = match take_scope(args) {
         Ok(v) => v,
         Err(e) => return CommandAction::Message(e),
     };
+    let (force_after, args) = take_force(args);
+    let force = force || force_after;
     let scope = scope.unwrap_or(Scope::Local);
     let (name, rest) = split_first_word(args);
     if name.is_empty() {
         return CommandAction::Message(
-            "Usage: /mcp add [--scope local|project|user] <name> <command|url> [args...]\n\
+            "Usage: /mcp add [--scope local|project|user] [--force] <name> <command|url> \
+             [args...]\n\
              Examples:\n  /mcp add github npx -y @modelcontextprotocol/server-github\n  \
              /mcp add remote http://localhost:3000/mcp\n\
              local (default): only you, this project. user: only you, every project. \
-             project: the repo's .mcp.json, shared; starts after /trust."
+             project: the repo's .mcp.json, shared; starts after /trust, and \
+             --force writes a literal secret there."
                 .into(),
         );
     }
@@ -221,7 +233,7 @@ pub(super) fn mcp_add_server(
         })
     };
 
-    match crate::mcp::scope::add(name, server_cfg, scope, cwd, config_dir, false) {
+    match crate::mcp::scope::add(name, server_cfg, scope, cwd, config_dir, force) {
         Ok(path) => {
             let mut msg = format!(
                 "MCP server '{name}' added to the {scope} scope ({}).\nRestart oxideclaw to connect.",
@@ -324,6 +336,25 @@ mod tests {
         assert!(r.join(".mcp.json").is_file());
         msg(mcp_add_server("-s user gh npx other", r, h));
         assert!(msg(mcp_add_server("--scope=nope x y", r, h)).contains("unknown scope"));
+        // A literal key in a shared URL is refused, and --force (which the
+        // refusal suggests) writes it.
+        let keyed = "https://h.test/mcp?api_key=sk-1";
+        let out = msg(mcp_add_server(&format!("-s project k {keyed}"), r, h));
+        assert!(out.contains("url query api_key"), "{out}");
+        let out = msg(mcp_add_server(
+            &format!("--force -s project k {keyed}"),
+            r,
+            h,
+        ));
+        assert!(out.contains("project scope"), "{out}");
+        let out = msg(mcp_add_server(
+            &format!("-s project --force k2 {keyed}"),
+            r,
+            h,
+        ));
+        assert!(out.contains("project scope"), "{out}");
+        msg(mcp_remove_server("--scope project k", r, h));
+        msg(mcp_remove_server("--scope project k2", r, h));
 
         let config = Config {
             cwd: r.to_path_buf(),

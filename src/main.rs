@@ -426,7 +426,8 @@ enum McpSubcommand {
         /// refuses literal values (use KEY='${KEY}') unless --force
         #[arg(short = 'e', long)]
         env: Vec<String>,
-        /// With --scope project, write literal env values anyway
+        /// With --scope project, write literal secrets anyway (env values,
+        /// URL credentials, key- or token-named args)
         #[arg(long)]
         force: bool,
     },
@@ -441,7 +442,8 @@ enum McpSubcommand {
         /// after /trust), or user (all your projects)
         #[arg(short = 's', long, default_value = "local", value_parser = parse_mcp_scope)]
         scope: McpScope,
-        /// With --scope project, write literal env values or headers anyway
+        /// With --scope project, write literal secrets anyway (env values,
+        /// headers, URL credentials, key- or token-named args)
         #[arg(long)]
         force: bool,
     },
@@ -452,7 +454,8 @@ enum McpSubcommand {
         /// after /trust), or user (all your projects)
         #[arg(short = 's', long, default_value = "local", value_parser = parse_mcp_scope)]
         scope: McpScope,
-        /// With --scope project, write literal env values or headers anyway
+        /// With --scope project, write literal secrets anyway (env values,
+        /// headers, URL credentials, key- or token-named args)
         #[arg(long)]
         force: bool,
     },
