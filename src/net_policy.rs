@@ -202,11 +202,15 @@ impl NetPolicy {
 
     /// Scheme + host + DNS check. Returns every address the host resolved
     /// to, all of which passed `check_ip`, so the caller can pin them.
+    /// Test-only: callers use `check_browser_url` or `fetch`, which also
+    /// handle names only an upstream proxy can resolve.
+    #[cfg(test)]
     pub async fn resolve(&self, url: &Url) -> Result<Vec<SocketAddr>> {
         self.resolve_with(url, &lookup_system).await
     }
 
     /// `resolve` with the name lookup done by `lookup`.
+    #[cfg(test)]
     async fn resolve_with<L, F>(&self, url: &Url, lookup: &L) -> Result<Vec<SocketAddr>>
     where
         L: Fn(String, u16) -> F,

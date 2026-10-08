@@ -71,8 +71,24 @@ impl Tool for WebBrowserTool {
             Ok(u) => u,
             Err(e) => return Ok(ToolOutput::error(format!("Invalid URL: {e}"))),
         };
-        if let Err(e) = self.policy.resolve(&url).await {
-            return Ok(ToolOutput::error(format!("WebBrowser refused: {e}")));
+        // The same check browser_navigate makes, so a name only HTTP(S)_PROXY
+        // can resolve passes here as it does in the proxy and the fallback
+        // fetch. This tool has no prompt to grant loopback, so any loopback
+        // address the policy needs a grant for is refused.
+        match self
+            .policy
+            .check_browser_url(&url, &crate::net_policy::LoopbackGrants::default())
+            .await
+        {
+            Err(e) => return Ok(ToolOutput::error(format!("WebBrowser refused: {e}"))),
+            Ok(need) if !need.is_empty() => {
+                return Ok(ToolOutput::error(format!(
+                    "WebBrowser refused: destination {} is a private or loopback address; \
+                     set allowPrivateNetworkFetch: true to permit it",
+                    need[0].ip()
+                )));
+            }
+            Ok(_) => {}
         }
 
         // Try headless Chromium first. It follows redirects, meta refresh and
