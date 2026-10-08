@@ -268,9 +268,10 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // Block input while loading, except Esc (Ctrl+C was handled above).
-    // Matching the bare code let plain 'c' through to the input.
-    if app.is_loading && key.code != Esc {
+    // Block input while loading, except Esc (Ctrl+C was handled above) and
+    // chat scrolling, wanted most while output streams. Matching the bare
+    // code let plain 'c' through to the input.
+    if app.is_loading && key.code != Esc && !scrolls_chat(&key) {
         return Ok(());
     }
 
@@ -707,9 +708,7 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             }
         }
         (PageUp, _) => app.scroll_up(),
-        (PageDown, _) => {
-            app.follow_bottom = true;
-        }
+        (PageDown, _) => app.scroll_down(),
         (Char('u'), KeyModifiers::CONTROL) => app.clear_line(),
         (Char(c), _) => app.insert_char(c),
         _ => {}
@@ -1148,7 +1147,17 @@ fn vim_routes_key(app: &App, key: &crossterm::event::KeyEvent) -> bool {
     let cancels_work =
         key.code == KeyCode::Esc && (app.is_loading || tts_playing(app) || clone_armed);
     let stops_tts = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
-    !(cancels_work || stops_tts)
+    !(cancels_work || stops_tts || scrolls_chat(key))
+}
+
+/// PageUp/PageDown and Ctrl+Home/End scroll the chat in every mode: vim
+/// normal mode had no use for them and dropped them.
+fn scrolls_chat(key: &crossterm::event::KeyEvent) -> bool {
+    match key.code {
+        KeyCode::PageUp | KeyCode::PageDown => true,
+        KeyCode::Home | KeyCode::End => key.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 /// Shift+Enter is only distinguishable from Enter where the terminal took
@@ -1536,6 +1545,34 @@ mod ctrl_c_tests {
         app.overlay = Some(Overlay::with_items("models", "x", vec!["m".into()]));
         press(&mut app, ctrl_c()).await;
         assert!(app.should_quit);
+    }
+
+    /// PageUp/PageDown were dropped during a turn, and PageDown jumped
+    /// straight to the bottom instead of paging back down.
+    #[tokio::test]
+    async fn page_keys_scroll_by_a_page_even_while_loading() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for vim in [false, true] {
+            let mut app = App::new("claude-sonnet-4-6", std::path::Path::new("/tmp"));
+            app.vim_enabled = vim;
+            app.vim_normal = vim;
+            app.start_loading();
+            app.follow_bottom = false;
+            app.scroll = 100;
+            press(&mut app, key(KeyCode::PageUp)).await;
+            let up = app.scroll;
+            assert!(up < 100, "PageUp ignored (vim {vim})");
+            press(&mut app, key(KeyCode::PageUp)).await;
+            press(&mut app, key(KeyCode::PageDown)).await;
+            assert_eq!(app.scroll, up, "vim {vim}");
+            assert!(!app.follow_bottom, "PageDown jumped to the bottom");
+            press(
+                &mut app,
+                KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+            )
+            .await;
+            assert!(app.follow_bottom);
+        }
     }
 
     /// Typing ahead during a turn left only the 'c's in the input box: the

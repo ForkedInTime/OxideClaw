@@ -766,6 +766,14 @@ pub struct PendingPromptHooks {
     pub voice_goal: Option<String>,
 }
 
+/// Rows PageUp/PageDown move the chat: about half the terminal.
+fn page_rows() -> usize {
+    (crossterm::terminal::size()
+        .map(|(_, h)| h as usize / 2)
+        .unwrap_or(10))
+    .max(5)
+}
+
 /// Format a raw model ID into a human-readable name like "Sonnet 4.6".
 /// Handles both new format (claude-sonnet-4-6) and old (claude-3-5-sonnet-20241022).
 /// Non-claude models (Ollama) are returned as-is.
@@ -1348,26 +1356,18 @@ impl App {
 
     // ── Scroll helpers ────────────────────────────────────────────────────────
 
-    /// Scroll up by n lines; disables auto-follow.
+    /// Scroll up by half a screen; disables auto-follow.
     pub fn scroll_up(&mut self) {
         self.follow_bottom = false;
-        // Use ~half the terminal height for a page-like feel
-        let amount = (crossterm::terminal::size()
-            .map(|(_, h)| h as usize / 2)
-            .unwrap_or(10))
-        .max(5);
-        self.scroll = self.scroll.saturating_sub(amount);
+        self.scroll = self.scroll.saturating_sub(page_rows());
     }
 
-    /// Scroll down by n lines; re-enables auto-follow when at bottom.
-    #[allow(dead_code)]
-    pub fn scroll_down(&mut self, total: usize) {
-        self.follow_bottom = false;
-        let amount = (crossterm::terminal::size()
-            .map(|(_, h)| h as usize / 2)
-            .unwrap_or(10))
-        .max(5);
-        self.scroll = (self.scroll + amount).min(total.saturating_sub(1));
+    /// Scroll down by half a screen. Render clamps the offset and turns
+    /// auto-follow back on once it reaches the bottom.
+    pub fn scroll_down(&mut self) {
+        if !self.follow_bottom {
+            self.scroll = self.scroll.saturating_add(page_rows());
+        }
     }
 
     /// Snap to newest content and stay there (auto-follow on).
