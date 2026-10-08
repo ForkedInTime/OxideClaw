@@ -734,7 +734,8 @@ const REACH_TIMEOUT: Duration = Duration::from_millis(1500);
 const CLASSIFIER_MAX_TOKENS: u32 = 16;
 
 /// The cap for a classifier that may think first (an OpenAI reasoning
-/// model, or a thinking model behind Ollama or Chat Completions): reasoning
+/// model, a thinking model behind Ollama or Chat Completions, or a Claude
+/// model whose thinking cannot be switched off): reasoning
 /// tokens count against the cap, and 16 is spent before any label.
 const CLASSIFIER_REASONING_MAX_TOKENS: u32 = 1024;
 
@@ -1026,7 +1027,25 @@ pub(crate) async fn classify(
             effort: crate::api::openai_compat::responses::lowest_effort(bare).into(),
         }
     });
-    let may_think = crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
+    let mut may_think =
+        crate::api::is_ollama_model(model) || crate::api::is_openai_compat_model(model);
+    // Claude 5+ and Fable/Mythos think with the field omitted, which spends
+    // the 16 tokens before any label: switch thinking off where the model
+    // allows it, and where it does not, ask for low effort and leave room.
+    let mut output_config = output_config;
+    let thinking = if may_think {
+        None
+    } else {
+        use crate::api::thinking;
+        let off = thinking::thinking_for(model, Some(0), CLASSIFIER_MAX_TOKENS, None, false);
+        if off.is_none() && thinking::supports_adaptive_thinking(model) {
+            may_think = true;
+            output_config = Some(thinking::OutputConfig {
+                effort: "low".into(),
+            });
+        }
+        off
+    };
     let request = MessagesRequest {
         model: model.to_string(),
         max_tokens: if may_think {
@@ -1043,7 +1062,7 @@ pub(crate) async fn classify(
         }],
         tools: Vec::new(),
         stream: None,
-        thinking: None,
+        thinking,
         output_config,
         betas: Vec::new(),
         session_id: None,
@@ -1538,6 +1557,66 @@ mod tests {
         assert!(route.reason.contains("timed out"), "{}", route.reason);
         assert!(out.classifier_usage.is_none());
         assert_eq!(*seen.lock().unwrap(), vec!["small".to_string()]);
+    }
+
+    /// A Claude 5 classifier thinks unless told otherwise, and its thinking
+    /// spent the 16-token cap before any label: off where the model allows
+    /// it, low effort and room to think where it does not.
+    #[tokio::test]
+    async fn a_claude_classifier_does_not_spend_its_cap_thinking() {
+        use crate::query_engine::scripted_api_tests::{serve, sse};
+        let label = || {
+            sse(
+                &[serde_json::json!({"type":"text","text":"low"})],
+                "end_turn",
+            )
+        };
+        let models = [
+            "claude-haiku-4-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+        ];
+        let (url, seen) = serve(models.iter().map(|_| label()).collect()).await;
+        let mut c = crate::api::ClaudeClient::new("sk-ant-test").unwrap();
+        c.set_base_url_for_test(url);
+        let client = ApiBackend::Anthropic(c);
+        for model in models {
+            let (tier, _) = classify(
+                &client,
+                model,
+                "yes",
+                Duration::from_secs(10),
+                crate::api::OpenAiApi::default(),
+            )
+            .await;
+            assert_eq!(tier, Ok(Complexity::Low), "{model}");
+        }
+        let fields: Vec<serde_json::Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let v: serde_json::Value = serde_json::from_str(b).unwrap();
+                serde_json::json!([
+                    v["max_tokens"],
+                    v["thinking"]["type"],
+                    v["output_config"]["effort"]
+                ])
+            })
+            .collect();
+        use serde_json::json;
+        assert_eq!(
+            fields,
+            [
+                json!([16, null, null]),
+                json!([16, "disabled", null]),
+                json!([16, "between_tools", null]),
+                json!([1024, null, "low"]),
+                json!([1024, null, "low"]),
+            ]
+        );
     }
 
     #[tokio::test]
