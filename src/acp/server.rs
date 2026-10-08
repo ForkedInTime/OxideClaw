@@ -282,7 +282,7 @@ impl State {
         let mut session = SdkSession::new(
             cfg,
             tools,
-            Policy::default(),
+            acp_policy(),
             Capabilities::default(),
             self.notif_tx.clone(),
             self.notif_tx.clone(),
@@ -608,6 +608,19 @@ pub(crate) fn initialize_result(load_session: bool) -> Value {
         "agentInfo": {"name": "oxideclaw", "title": "OxideClaw", "version": VERSION},
         "authMethods": [],
     })
+}
+
+/// The SDK policy of an ACP session: every tool asks, and a permission
+/// dialog waits for the user, however long they read the diff. ACP has no
+/// way to withdraw a `session/request_permission`, so a timeout left the
+/// dialog open after the tool was refused and dropped the user's Allow;
+/// `session/cancel` is how the editor gives up on one.
+pub(crate) fn acp_policy() -> Policy {
+    Policy {
+        // `await_approval` caps an unrepresentable deadline at decades.
+        approval_timeout_seconds: u64::MAX,
+        ..Policy::default()
+    }
 }
 
 /// ACP `ToolKind` for one of our tool names.
@@ -1064,6 +1077,25 @@ mod tests {
         assert_eq!(stop_reason(TurnEnd::BudgetExceeded), "max_turn_requests");
         assert_eq!(stop_reason(TurnEnd::Refusal), "refusal");
         assert_eq!(stop_reason(TurnEnd::Cancelled), "cancelled");
+    }
+
+    /// A permission dialog the user takes over a minute on still decides
+    /// the call: the SDK's 60 s default refused it underneath the dialog.
+    #[tokio::test(start_paused = true)]
+    async fn an_acp_permission_prompt_never_times_out() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(String, Option<String>)>();
+        let timeout = std::time::Duration::from_secs(acp_policy().approval_timeout_seconds);
+        let wait = tokio::spawn(async move {
+            crate::sdk::session::await_approval(&mut rx, "a1", timeout).await
+        });
+        // Paused time jumps straight past any finite deadline in this span.
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        assert!(!wait.is_finished(), "the approval timed out");
+        tx.send(("a1".into(), None)).unwrap();
+        assert!(matches!(
+            wait.await.unwrap(),
+            crate::sdk::session::ApprovalOutcome::Approved
+        ));
     }
 
     #[test]
