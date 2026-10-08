@@ -655,6 +655,9 @@ impl QueryEngine {
             if human {
                 println!(); // newline after streamed text
             }
+            if let Some(note) = self.client.take_context_notice() {
+                self.notice(note.yellow());
+            }
             // stream-json reports every turn as it ends; json waits for the
             // run to end, so stdout holds a single JSON document.
             if self.stream_json_output && !full_text.is_empty() {
@@ -2606,7 +2609,6 @@ mod tests {
         let counter = hits.clone();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                counter.fetch_add(1, Ordering::SeqCst);
                 // Read the headers and the Content-Length body, then answer.
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -2631,6 +2633,15 @@ mod tests {
                         }
                     }
                 }
+                // The client also asks /api/ps and /api/show for the
+                // context the model is served with; only chats count.
+                if !String::from_utf8_lossy(&buf).starts_with("POST /v1/chat/completions") {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    continue;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
                 let args = r#"{\"achieved\":false,\"summary\":\"stuck\"}"#;
                 let chunk = format!(
                     r#"{{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"c1","type":"function","function":{{"name":"browse_done","arguments":"{args}"}}}}]}},"finish_reason":"tool_calls"}}]}}"#

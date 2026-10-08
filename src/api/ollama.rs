@@ -12,8 +12,11 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use tracing::debug;
 
 use crate::api::openai_compat::{
@@ -33,6 +36,120 @@ pub fn is_ollama_model(model: &str) -> bool {
 /// Strip "ollama:" prefix → bare model name for the Ollama API.
 pub fn strip_ollama_prefix(model: &str) -> &str {
     model.strip_prefix(OLLAMA_PREFIX).unwrap_or(model)
+}
+
+// ─── Served context window ────────────────────────────────────────────────────
+
+/// Ollama's own `num_ctx` when neither the server's `OLLAMA_CONTEXT_LENGTH`
+/// nor the model's Modelfile sets one.
+const OLLAMA_DEFAULT_NUM_CTX: u64 = 4096;
+
+/// The context each Ollama model (bare name) is served with, once a reply
+/// from it has been seen; `None` when the server would not say. The
+/// OpenAI-compatible endpoint cannot set `num_ctx`, so the server's choice
+/// is the window: a longer prompt loses its oldest messages, silently.
+fn served_windows() -> &'static Mutex<HashMap<String, Option<u64>>> {
+    static W: OnceLock<Mutex<HashMap<String, Option<u64>>>> = OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// The context window Ollama serves `model` (with or without `ollama:`)
+/// with, when known.
+pub fn served_context_window(model: &str) -> Option<u64> {
+    let w = served_windows().lock().unwrap_or_else(|e| e.into_inner());
+    w.get(strip_ollama_prefix(model)).copied().flatten()
+}
+
+fn record_served_window(model: &str, window: Option<u64>) {
+    served_windows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(strip_ollama_prefix(model).to_string(), window);
+}
+
+/// Whether Ollama's `name` (always tagged, `qwen3:latest`) is `model`.
+fn same_model(name: &str, model: &str) -> bool {
+    name == model || name.strip_suffix(":latest") == Some(model)
+}
+
+/// `num_ctx` from `/api/show`'s `parameters` text (`num_ctx    32768`).
+fn num_ctx_parameter(parameters: &str) -> Option<u64> {
+    parameters.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        (words.next() == Some("num_ctx"))
+            .then(|| words.next()?.parse().ok())
+            .flatten()
+    })
+}
+
+/// The window the server gives `model`: the loaded runner's context from
+/// `/api/ps` (newer Ollama), else the Modelfile's `num_ctx` or the server
+/// default, capped at the length the model was trained for. `None` when
+/// neither endpoint answers.
+async fn ask_served_window(client: &Client, base_url: &str, model: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Ps {
+        #[serde(default)]
+        models: Vec<PsModel>,
+    }
+    #[derive(Deserialize)]
+    struct PsModel {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        context_length: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct Show {
+        #[serde(default)]
+        parameters: String,
+        #[serde(default)]
+        model_info: HashMap<String, serde_json::Value>,
+    }
+    let budget = std::time::Duration::from_secs(3);
+    let ps = async {
+        let resp = client.get(format!("{base_url}/api/ps")).send().await.ok()?;
+        resp.status().is_success().then_some(())?;
+        resp.json::<Ps>().await.ok()
+    };
+    if let Ok(Some(ps)) = tokio::time::timeout(budget, ps).await
+        && let Some(n) = ps
+            .models
+            .iter()
+            .find(|m| same_model(&m.name, model))
+            .and_then(|m| m.context_length)
+            .filter(|n| *n > 0)
+    {
+        return Some(n);
+    }
+    let show = async {
+        let resp = client
+            .post(format!("{base_url}/api/show"))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .ok()?;
+        resp.status().is_success().then_some(())?;
+        resp.json::<Show>().await.ok()
+    };
+    let show = tokio::time::timeout(budget, show).await.ok().flatten()?;
+    // The server's OLLAMA_CONTEXT_LENGTH is invisible from here; this
+    // environment's is right for a server started from it.
+    let configured = num_ctx_parameter(&show.parameters)
+        .or_else(|| {
+            std::env::var("OLLAMA_CONTEXT_LENGTH")
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(OLLAMA_DEFAULT_NUM_CTX);
+    let trained = show
+        .model_info
+        .iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, v)| v.as_u64());
+    Some(trained.map_or(configured, |t| configured.min(t)))
 }
 
 // ─── Model discovery ──────────────────────────────────────────────────────────
@@ -364,6 +481,9 @@ pub struct OllamaClient {
     no_tools: Arc<Mutex<HashSet<String>>>,
     /// The models in `no_tools` the user has already been told about.
     tools_notice_sent: Arc<Mutex<HashSet<String>>>,
+    /// A request outgrew the served window; taken once by the frontend.
+    context_notice: Arc<Mutex<Option<String>>>,
+    context_notice_sent: Arc<AtomicBool>,
 }
 
 impl OllamaClient {
@@ -380,7 +500,18 @@ impl OllamaClient {
             base_url: base_url.into(),
             no_tools: Arc::default(),
             tools_notice_sent: Arc::default(),
+            context_notice: Arc::default(),
+            context_notice_sent: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The first time a request outgrew the window Ollama serves its model
+    /// with: what the user can do about it.
+    pub fn take_context_notice(&self) -> Option<String> {
+        self.context_notice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Returns true if any model has been detected as not supporting tools.
@@ -408,6 +539,33 @@ impl OllamaClient {
         let model = strip_ollama_prefix(&request.model).to_string();
         let url = format!("{}/v1/chat/completions", self.base_url);
         debug!("POST {url} model={model} (via Ollama)");
+
+        // Ollama keeps the newest messages that fit and drops the rest
+        // without an error, so the user hears it from here or not at all.
+        if let Some(window) = served_context_window(&model) {
+            let tools: usize = request
+                .tools
+                .iter()
+                .map(|t| t.input_schema.to_string().len() + t.description.len())
+                .sum();
+            let estimate = crate::router::estimate_context_tokens(
+                &system_to_string(&request.system),
+                &request.messages,
+            ) + tools as u64 / 4;
+            if estimate > window && !self.context_notice_sent.swap(true, Ordering::Relaxed) {
+                let note = format!(
+                    "Ollama serves {model} with a {window}-token context and this conversation \
+                     (about {estimate} tokens) no longer fits: Ollama drops the oldest messages \
+                     without saying so. Raise it with OLLAMA_CONTEXT_LENGTH on the Ollama \
+                     server, or `PARAMETER num_ctx` in a Modelfile."
+                );
+                tracing::warn!("{note}");
+                *self
+                    .context_notice
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(note);
+            }
+        }
 
         let no_tools = self.no_tools.lock().unwrap().contains(&model);
         let system_str = system_to_string(&request.system);
@@ -478,6 +636,17 @@ impl OllamaClient {
         }
 
         let (result, _) = parse_oai_stream(resp, on_text).await?;
+        // Asked once the model is loaded, so `/api/ps` reports the context
+        // its runner was started with. Compaction and the context meter
+        // measure against it from the next request on.
+        let known = served_windows()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&model);
+        if !known {
+            let window = ask_served_window(&self.client, &self.base_url, &model).await;
+            record_served_window(&model, window);
+        }
         Ok(result)
     }
 }
@@ -557,7 +726,7 @@ pub(crate) mod fake_server {
     }
 
     /// Headers plus a `content-length` body, however the reads split them.
-    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+    pub(super) async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -962,5 +1131,147 @@ mod tests {
             ]
         );
         assert!(!session.take_tools_notice());
+    }
+}
+
+#[cfg(test)]
+mod served_window_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// An Ollama whose chat answers "hi", and whose `/api/ps` and
+    /// `/api/show` answer with `ps` and `show` (`None`: 404).
+    async fn ollama(ps: Option<serde_json::Value>, show: Option<serde_json::Value>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let req = super::fake_server::read_request(&mut sock).await;
+                let line = req.lines().next().unwrap_or("").to_string();
+                let (ctype, body) = if line.contains("/chat/completions") {
+                    let chunk = serde_json::json!({
+                        "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+                    });
+                    (
+                        "text/event-stream",
+                        Some(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+                    )
+                } else if line.starts_with("GET /api/ps") {
+                    ("application/json", ps.as_ref().map(|v| v.to_string()))
+                } else if line.starts_with("POST /api/show") {
+                    ("application/json", show.as_ref().map(|v| v.to_string()))
+                } else {
+                    ("application/json", None)
+                };
+                let resp = match body {
+                    Some(b) => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}",
+                        b.len()
+                    ),
+                    None => "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_string(),
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn request(model: &str, text: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.into(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: text.into() }],
+            }],
+            system: Default::default(),
+            tools: vec![],
+            stream: None,
+            thinking: None,
+            output_config: None,
+            betas: vec![],
+            session_id: None,
+            explicit_max_tokens: false,
+            cache_history: false,
+        }
+    }
+
+    async fn chat(url: &str, model: &str, text: &str) -> OllamaClient {
+        let c = OllamaClient::new(url).unwrap();
+        c.messages_stream(request(model, text), |_| {})
+            .await
+            .unwrap();
+        c
+    }
+
+    /// Every `ollama:` id was given 128k ("llama" is in "ollama"), while
+    /// Ollama served a few thousand tokens and dropped the rest silently:
+    /// compaction never fired. The window is now what the server reports.
+    #[tokio::test]
+    async fn the_window_is_the_one_ollama_serves() {
+        let model = "ollama:wnd-ps";
+        assert_eq!(crate::api::context_window_for_model(model), 128_000);
+        let url = ollama(
+            Some(
+                serde_json::json!({"models": [{"name": "wnd-ps:latest", "context_length": 8192}]}),
+            ),
+            Some(serde_json::json!({"parameters": "num_ctx 16384"})),
+        )
+        .await;
+        let c = chat(&url, model, "hi").await;
+        assert_eq!(served_context_window(model), Some(8192));
+        assert_eq!(crate::api::context_window_for_model(model), 8192);
+
+        // A conversation past it is dropped from the front without an
+        // error, so the user is told, once.
+        assert_eq!(c.take_context_notice(), None);
+        let long = "x".repeat(8192 * 4 * 2);
+        c.messages_stream(request(model, &long), |_| {})
+            .await
+            .unwrap();
+        let note = c.take_context_notice().expect("told");
+        assert!(
+            note.contains("8192") && note.contains("OLLAMA_CONTEXT_LENGTH"),
+            "{note}"
+        );
+        c.messages_stream(request(model, &long), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(c.take_context_notice(), None, "told once");
+    }
+
+    /// An Ollama whose /api/ps does not report the context: the
+    /// Modelfile's num_ctx, capped at what the model was trained for.
+    #[tokio::test]
+    async fn without_ps_the_modelfile_and_training_length_decide() {
+        let url = ollama(
+            Some(serde_json::json!({"models": []})),
+            Some(serde_json::json!({
+                "parameters": "stop \"<|im_end|>\"\nnum_ctx                        16384",
+                "model_info": {"qwen2.context_length": 32768}
+            })),
+        )
+        .await;
+        chat(&url, "ollama:wnd-param", "hi").await;
+        assert_eq!(served_context_window("ollama:wnd-param"), Some(16384));
+
+        let url = ollama(
+            None,
+            Some(serde_json::json!({"model_info": {"llama.context_length": 2048}})),
+        )
+        .await;
+        chat(&url, "ollama:wnd-trained", "hi").await;
+        assert_eq!(served_context_window("ollama:wnd-trained"), Some(2048));
+
+        // Nothing answers: the name-based guess stays.
+        let url = ollama(None, None).await;
+        chat(&url, "ollama:wnd-llama-none", "hi").await;
+        assert_eq!(served_context_window("ollama:wnd-llama-none"), None);
+        assert_eq!(
+            crate::api::context_window_for_model("ollama:wnd-llama-none"),
+            128_000
+        );
     }
 }

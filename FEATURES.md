@@ -53,6 +53,8 @@ oxideclaw
 
 Models that don't support tool use get automatic text-only fallback. Ollama models are always free in cost tracking.
 
+Ollama runs each model with its own context size (`OLLAMA_CONTEXT_LENGTH` on the server, or `PARAMETER num_ctx` in a Modelfile; a few thousand tokens by default) and drops the oldest messages of a longer conversation without an error. After a model's first reply OxideClaw asks the server for that size (`/api/ps`, else `/api/show`) and measures the context meter and compaction against it; when a conversation outgrows it, a one-time notice says how to raise it.
+
 ### OpenAI-Compatible Providers
 
 OxideClaw supports any OpenAI-compatible API endpoint. Pick one with a

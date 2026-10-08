@@ -818,6 +818,9 @@ pub(super) async fn run_api_task(task: ApiTask) {
                 "Note: this model doesn't support tools — running in text-only mode.".into(),
             ));
         }
+        if let Some(note) = client.take_context_notice() {
+            let _ = tx.send(AppEvent::SystemMessage(note));
+        }
         if client.take_summary_notice() {
             let _ = tx.send(AppEvent::SystemMessage(
                 "Note: OpenAI refused reasoning summaries (they need a verified organization), \

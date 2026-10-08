@@ -1358,6 +1358,19 @@ pub(crate) mod fake_chat {
                 let (log, reply) = (log.clone(), reply.clone());
                 tokio::spawn(async move {
                     let req = read_request(&mut sock).await;
+                    // The Ollama client also asks /api/ps and /api/show for
+                    // the served context; those are not model requests.
+                    if !req
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .contains("/chat/completions")
+                    {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
                     let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
                         return;

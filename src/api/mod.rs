@@ -625,6 +625,15 @@ pub fn default_max_tokens(model: &str) -> u32 {
 /// "context % full" display scale with this, so it must not undercount: a
 /// 200k guess on a 1M model throws away history at 18% of the real window.
 pub fn context_window_for_model(model: &str) -> u64 {
+    // What the Ollama server serves the model with, once it has said: the
+    // name says nothing about it ("llama" matches every `ollama:` id), and
+    // a guess above it means compaction never fires while Ollama drops
+    // the oldest messages.
+    if is_ollama_model(model)
+        && let Some(w) = ollama::served_context_window(model)
+    {
+        return w;
+    }
     let m = crate::commands::resolve_model_alias(model).to_lowercase();
     // Bedrock/Vertex ids wrap the first-party id (`us.anthropic.claude-…`,
     // `claude-…@date`), so parse from the `claude-` token on.
@@ -1015,6 +1024,15 @@ impl ApiBackend {
             Self::Ollama(c) => c.take_tools_notice(),
             Self::OpenAiCompat(c) => c.take_tools_notice(),
             Self::Anthropic(_) => false,
+        }
+    }
+
+    /// The first time a request outgrew the context an Ollama server gives
+    /// its model, what to do about it.
+    pub fn take_context_notice(&self) -> Option<String> {
+        match self {
+            Self::Ollama(c) => c.take_context_notice(),
+            Self::OpenAiCompat(_) | Self::Anthropic(_) => None,
         }
     }
 
