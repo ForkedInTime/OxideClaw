@@ -733,27 +733,6 @@ impl Settings {
         trusted: bool,
     ) -> Settings {
         let mut dropped: Vec<String> = Vec::new();
-        // Trusted or not, a project's autonomy may only tighten the user's:
-        // an unprompted mode is the user's own choice, and project files
-        // written while `auto-edit` and `full-auto` still prompted must not
-        // turn the prompts off now that they mean what they say.
-        let mut notices = Vec::new();
-        if let Some(a) = project.autonomy.take() {
-            use crate::permissions::Autonomy;
-            let user = global
-                .autonomy
-                .as_deref()
-                .and_then(Autonomy::parse)
-                .unwrap_or_default();
-            match Autonomy::parse(&a) {
-                Some(mode) if mode.at_least_as_strict_as(user) => project.autonomy = Some(a),
-                _ => notices.push(format!(
-                    "This project's settings set autonomy \"{a}\" — ignored: a project may \
-                     only make it stricter than yours (\"{user}\"). Use /autonomy or your \
-                     own settings.json to change it."
-                )),
-            }
-        }
         let mcp_extra = if trusted {
             mcp_extra
         } else {
@@ -962,6 +941,43 @@ impl Settings {
             }
             None
         };
+        // Trusted or not, a project's autonomy may only tighten the user's:
+        // an unprompted mode is the user's own choice, and project files
+        // written while `auto-edit` and `full-auto` still prompted must not
+        // turn the prompts off now that they mean what they say.
+        let mut notices = Vec::new();
+        if let Some(a) = project.autonomy.take() {
+            use crate::permissions::Autonomy;
+            // The mode the user's setting runs as in this session: a stored
+            // full-auto without a usable sandbox is `ask`, which `auto-edit`
+            // would loosen. The sandbox is the session's, after the trust
+            // filter, so an untrusted repo cannot pick it.
+            let user = global
+                .autonomy
+                .as_deref()
+                .and_then(Autonomy::parse)
+                .unwrap_or_default()
+                .effective(
+                    project.sandbox_enabled.or(global.sandbox_enabled).unwrap_or(false),
+                    project
+                        .sandbox_mode
+                        .as_deref()
+                        .or(global.sandbox_mode.as_deref())
+                        .unwrap_or("strict"),
+                    project
+                        .sandbox_allow_network
+                        .or(global.sandbox_allow_network)
+                        .unwrap_or(true),
+                );
+            match Autonomy::parse(&a) {
+                Some(mode) if mode.at_least_as_strict_as(user) => project.autonomy = Some(a),
+                _ => notices.push(format!(
+                    "This project's settings set autonomy \"{a}\" — ignored: a project may \
+                     only make it stricter than yours (\"{user}\"). Use /autonomy or your \
+                     own settings.json to change it."
+                )),
+            }
+        }
         let mut merged = global.merge(project);
         if let Some(extra) = mcp_extra {
             merged = merged.merge(extra);
@@ -1835,6 +1851,13 @@ mod project_trust_tests {
     /// trusted or not, may only tighten the user's mode.
     #[test]
     fn a_project_autonomy_only_tightens_the_users() {
+        let merge_in = |global: Settings, proj: &str, trusted: bool| {
+            let project = Settings {
+                autonomy: Some(proj.into()),
+                ..Settings::default()
+            };
+            Settings::merge_with_trust(global, project, None, trusted)
+        };
         let merge = |user: Option<&str>, proj: &str, trusted: bool| {
             let global = Settings {
                 autonomy: user.map(Into::into),
@@ -1854,7 +1877,9 @@ mod project_trust_tests {
                 (None, "suggest", Some("suggest")),
                 (None, "ask", Some("ask")),
                 (Some("auto-edit"), "ask", Some("ask")),
-                (Some("full-auto"), "auto-edit", Some("auto-edit")),
+                // No sandbox here, so the user's full-auto runs as ask.
+                (Some("full-auto"), "auto-edit", None),
+                (Some("full-auto"), "ask", Some("ask")),
                 (Some("auto-edit"), "full-auto", None),
                 (Some("suggest"), "ask", None),
             ] {
@@ -1866,6 +1891,42 @@ mod project_trust_tests {
                 );
                 assert_eq!(m.notices.is_empty(), kept.is_some(), "{:?}", m.notices);
                 assert!(!m.untrusted_project_config.contains(&"autonomy".into()));
+            }
+            // A trusted project's sandbox is the session's, so the user's
+            // full-auto runs there and auto-edit tightens it; an untrusted
+            // one cannot pick the sandbox mode.
+            let global = Settings {
+                autonomy: Some("full-auto".into()),
+                ..Settings::default()
+            };
+            let project = Settings {
+                autonomy: Some("auto-edit".into()),
+                sandbox_enabled: Some(true),
+                sandbox_mode: Some("bwrap".into()),
+                sandbox_allow_network: Some(false),
+                ..Settings::default()
+            };
+            let m = Settings::merge_with_trust(global, project, None, trusted);
+            let runs = crate::permissions::autonomy::full_auto_blocker(true, "bwrap", false)
+                .is_none();
+            if trusted && runs {
+                assert_eq!(m.autonomy.as_deref(), Some("auto-edit"));
+            } else {
+                assert_eq!(m.autonomy.as_deref(), Some("full-auto"), "trusted {trusted}");
+                assert!(m.notices[0].contains("(\"ask\")"), "{:?}", m.notices);
+            }
+            // Where the user's full-auto does run, auto-edit tightens it.
+            if runs {
+                let global = Settings {
+                    autonomy: Some("full-auto".into()),
+                    sandbox_enabled: Some(true),
+                    sandbox_mode: Some("bwrap".into()),
+                    sandbox_allow_network: Some(false),
+                    ..Settings::default()
+                };
+                let m = merge_in(global, "auto-edit", trusted);
+                assert_eq!(m.autonomy.as_deref(), Some("auto-edit"));
+                assert!(m.notices.is_empty(), "{:?}", m.notices);
             }
         }
     }
