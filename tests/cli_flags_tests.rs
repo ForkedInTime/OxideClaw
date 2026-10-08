@@ -476,7 +476,12 @@ fn a_failed_print_run_still_saves_its_session() {
     assert!(!out.status.success(), "the second request failed");
 
     let (port, bodies) = serve(text_reply("ok"));
-    let out = run(&e, &[&args[..], &["second"]].concat(), &openai_env(port), "");
+    let out = run(
+        &e,
+        &[&args[..], &["second"]].concat(),
+        &openai_env(port),
+        "",
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     let bodies = bodies.lock().unwrap();
     assert!(

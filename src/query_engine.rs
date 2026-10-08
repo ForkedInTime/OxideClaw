@@ -302,22 +302,21 @@ impl QueryEngine {
                 let _ = sink.send((self.config.model.clone(), u.clone()));
             }
         };
-        let summarised = match summarize_compact(&self.client, &self.messages, &self.config, bill)
-            .await
-        {
-            Ok(replacement) => {
-                self.messages = replacement;
-                self.notice(
-                    "Compaction complete. Conversation history replaced with summary.".green(),
-                );
-                true
-            }
-            Err(e) => {
-                self.notice(format!("Compact failed: {e}. Falling back to snip.").red());
-                snip_compact(&mut self.messages, &self.config.model);
-                false
-            }
-        };
+        let summarised =
+            match summarize_compact(&self.client, &self.messages, &self.config, bill).await {
+                Ok(replacement) => {
+                    self.messages = replacement;
+                    self.notice(
+                        "Compaction complete. Conversation history replaced with summary.".green(),
+                    );
+                    true
+                }
+                Err(e) => {
+                    self.notice(format!("Compact failed: {e}. Falling back to snip.").red());
+                    snip_compact(&mut self.messages, &self.config.model);
+                    false
+                }
+            };
         self.forget_reads();
         summarised
     }
@@ -368,7 +367,9 @@ impl QueryEngine {
                         self.forget_reads();
                     }
                 } else {
-                    self.notice("Context near limit. Enable auto_compact or run /compact.".yellow());
+                    self.notice(
+                        "Context near limit. Enable auto_compact or run /compact.".yellow(),
+                    );
                 }
             }
             // Summarising now would replace the assistant tool_use that the
@@ -1078,7 +1079,9 @@ impl QueryEngine {
                 Ok(r) => r,
                 // Tool results of up to 100k characters each: one round can
                 // push the history past the window between two size checks.
-                Err(e) if !overflow_retried && crate::api::is_context_overflow(&format!("{e:#}")) => {
+                Err(e)
+                    if !overflow_retried && crate::api::is_context_overflow(&format!("{e:#}")) =>
+                {
                     overflow_retried = true;
                     if self.compact_after_overflow().await {
                         continue;
@@ -1697,12 +1700,16 @@ pub(crate) mod scripted_api_tests {
     async fn sub_agents_summarise_between_tool_rounds() {
         let dir = tempfile::tempdir().unwrap();
         let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})];
-        let full = sse(&tool, "tool_use").replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
+        let full =
+            sse(&tool, "tool_use").replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
         let summary = sse(
             &[serde_json::json!({"type":"text","text":"1. Primary Request: hi"})],
             "end_turn",
         );
-        let done = sse(&[serde_json::json!({"type":"text","text":"done"})], "end_turn");
+        let done = sse(
+            &[serde_json::json!({"type":"text","text":"done"})],
+            "end_turn",
+        );
         let (url, seen) = serve(vec![full, summary, done]).await;
         let mut e = scripted_engine(url, dir.path());
 

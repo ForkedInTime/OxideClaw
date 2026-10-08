@@ -1920,7 +1920,8 @@ mod loop_guard_tests {
     async fn a_full_context_is_summarised_between_tool_rounds() {
         use crate::query_engine::scripted_api_tests::{serve, sse};
         let tool = [serde_json::json!({"type":"tool_use","id":"t1","name":"Nope","input":{}})];
-        let full = sse(&tool, "tool_use").replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
+        let full =
+            sse(&tool, "tool_use").replace(r#""input_tokens":1,"#, r#""input_tokens":950000,"#);
         let text = |t: &str| sse(&[serde_json::json!({"type":"text","text":t})], "end_turn");
         let (url, seen) = serve(vec![full, text("1. Primary Request: go"), text("done")]).await;
         let dir = tempfile::tempdir().unwrap();
