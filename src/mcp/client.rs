@@ -258,7 +258,14 @@ pub(crate) struct StdioTransport {
     closed: Arc<AtomicBool>,
     timeout: Duration,
     tool_timeout: Duration,
+    /// Dropped with the transport, which tells the reap task to kill a
+    /// server that does not exit on stdin EOF.
+    _kill_on_drop: oneshot::Sender<()>,
 }
+
+/// How long a stdio server gets to exit on stdin EOF once its transport is
+/// dropped, before it is killed.
+const STDIO_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 impl StdioTransport {
     pub async fn connect(
@@ -267,7 +274,7 @@ impl StdioTransport {
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
     ) -> Result<Self> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncWriteExt, BufReader};
         use tokio::process::Command;
 
         #[cfg(windows)]
@@ -321,9 +328,24 @@ impl StdioTransport {
             }
         });
 
-        // Reap task: prevent zombie process
+        // Reap task: prevents a zombie. It owns the child until it exits,
+        // so `kill_on_drop` only fires at runtime shutdown; a server that is
+        // stuck or ignores stdin EOF is killed here once the transport is
+        // gone (a startup timeout, a failed handshake, a closed ACP session).
+        let (kill_tx, kill_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let _ = child.wait().await;
+            let dropped = tokio::select! {
+                _ = child.wait() => false,
+                _ = kill_rx => true,
+            };
+            if dropped
+                && tokio::time::timeout(STDIO_EXIT_GRACE, child.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
         });
 
         // Reader task: child stdout → pending oneshots
@@ -340,10 +362,24 @@ impl StdioTransport {
             let mut reader = BufReader::new(stdout);
             let mut buf = Vec::new();
             loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                match read_line_capped(&mut reader, &mut buf, MAX_STDIO_LINE_BYTES).await {
+                    Ok(StdioLine::Eof) | Err(_) => break,
+                    Ok(StdioLine::Line) => {}
+                    Ok(StdioLine::TooLong) => {
+                        // Almost always the reply to a call in flight, whose
+                        // id is lost with the line: fail what is waiting
+                        // rather than leave it to its timeout. The server
+                        // itself may still be fine, so keep reading.
+                        tracing::warn!(
+                            "MCP stdio server sent a line over {MAX_STDIO_LINE_BYTES} bytes; dropped"
+                        );
+                        for (_, tx) in pending_clone.lock().await.drain() {
+                            let _ = tx.send(Err(anyhow!(
+                                "MCP server sent a message over {MAX_STDIO_LINE_BYTES} bytes"
+                            )));
+                        }
+                        continue;
+                    }
                 }
                 let trimmed = buf.trim_ascii();
                 if trimmed.is_empty() {
@@ -396,7 +432,68 @@ impl StdioTransport {
             closed,
             timeout: REQUEST_TIMEOUT,
             tool_timeout: tool_timeout(),
+            _kill_on_drop: kill_tx,
         })
+    }
+}
+
+/// Largest stdout line (one JSON-RPC message) buffered from a stdio server,
+/// the same bound as an HTTP body.
+const MAX_STDIO_LINE_BYTES: usize = MAX_HTTP_BODY_BYTES;
+
+enum StdioLine {
+    Eof,
+    /// A line, in `buf` with its newline (none on a final unterminated one).
+    Line,
+    /// A line over the cap, read to its end and dropped.
+    TooLong,
+}
+
+/// `read_until(b'\n')` that stops buffering past `max` bytes, so a server
+/// writing a huge or newline-free blob cannot grow our memory without end.
+async fn read_line_capped<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<StdioLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    buf.clear();
+    let mut over = false;
+    let mut read_any = false;
+    loop {
+        let avail = reader.fill_buf().await?;
+        if avail.is_empty() {
+            return Ok(match (over, read_any) {
+                (true, _) => StdioLine::TooLong,
+                (false, true) => StdioLine::Line,
+                (false, false) => StdioLine::Eof,
+            });
+        }
+        read_any = true;
+        let (n, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (avail.len(), false),
+        };
+        if !over {
+            if buf.len() + n > max {
+                over = true;
+                buf.clear();
+                buf.shrink_to_fit();
+            } else {
+                buf.extend_from_slice(&avail[..n]);
+            }
+        }
+        reader.consume(n);
+        if done {
+            return Ok(if over {
+                StdioLine::TooLong
+            } else {
+                StdioLine::Line
+            });
+        }
     }
 }
 
@@ -2498,6 +2595,73 @@ done"#,
             deadline("initialize", REQUEST_TIMEOUT, Duration::from_secs(7)),
             REQUEST_TIMEOUT
         );
+    }
+
+    /// A server writing a huge or newline-free blob to stdout had it held
+    /// in memory whole. Past the cap the line is dropped, read to its end,
+    /// and the next line is read normally.
+    #[tokio::test]
+    async fn stdio_lines_over_the_cap_are_dropped() {
+        let input: &[u8] =
+            b"{\"a\":1}\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n{\"b\":2}\ntail";
+        // A small buffer, so lines span several fills.
+        let mut reader = tokio::io::BufReader::with_capacity(4, input);
+        let mut buf = Vec::new();
+        let mut lines = Vec::new();
+        loop {
+            match read_line_capped(&mut reader, &mut buf, 16).await.unwrap() {
+                StdioLine::Eof => break,
+                StdioLine::Line => lines.push(String::from_utf8(buf.clone()).unwrap()),
+                StdioLine::TooLong => {
+                    assert!(buf.capacity() <= 16, "{}", buf.capacity());
+                    lines.push("<dropped>".into());
+                }
+            }
+        }
+        assert_eq!(lines, ["{\"a\":1}\n", "<dropped>", "{\"b\":2}\n", "tail"]);
+    }
+
+    /// A stdio server that ignores stdin EOF (stuck at startup, waiting on
+    /// a login) kept running after its transport was dropped: the reap task
+    /// owned the child, so `kill_on_drop` never fired.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_ignoring_eof_is_killed_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let (cmd, args) = sh_server(&format!(
+            "echo $$ > '{}'; while :; do sleep 0.1; done",
+            pid_file.display()
+        ));
+        let t = StdioTransport::connect(&cmd, &args, &HashMap::new(), dir.path())
+            .await
+            .unwrap();
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && pid.ends_with('\n')
+            {
+                break pid.trim().to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive());
+        drop(t);
+        let deadline = tokio::time::Instant::now() + STDIO_EXIT_GRACE + Duration::from_secs(10);
+        while alive() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server {pid} still running"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// A stray non-UTF-8 line (a print() under a cp1252 locale) ended the
