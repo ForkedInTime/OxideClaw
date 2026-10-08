@@ -5,7 +5,7 @@
 
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -87,9 +87,13 @@ pub enum WatchEvent {
     MarkerFound { marker: Marker },
 }
 
-/// The paths of one notify event worth reporting: files outside `.git` that
-/// match `pattern_exts` (`*.EXT` patterns; empty passes all), each at most
-/// once per `rate_limit`.
+/// The paths of one notify event worth reporting: files that match
+/// `pattern_exts` (`*.EXT` patterns; empty passes all), outside hidden and
+/// build/vendor directories below their watch root, each at most once per
+/// `rate_limit`.
+///
+/// The directory filter is the indexer's: without it an `npm install` or a
+/// `cargo build` posted one chat line per generated file, and read each one.
 ///
 /// The limit is per path and applied after filtering. A single global window
 /// taken before filtering let an editor's swap or write-probe file (vim's
@@ -97,6 +101,7 @@ pub enum WatchEvent {
 /// so the source-file save that followed was silently dropped.
 fn paths_to_report(
     paths: &[PathBuf],
+    roots: &[PathBuf],
     pattern_exts: &[String],
     rate_limit: Duration,
     last_trigger: &mut HashMap<PathBuf, Instant>,
@@ -105,7 +110,7 @@ fn paths_to_report(
     last_trigger.retain(|_, t| now.duration_since(*t) < rate_limit);
     let mut out = Vec::new();
     for path in paths {
-        if !path.is_file() || path.components().any(|c| c.as_os_str() == ".git") {
+        if in_skipped_dir(path, roots) || !path.is_file() {
             continue;
         }
         if !pattern_exts.is_empty() && !has_ext(path, pattern_exts) {
@@ -118,6 +123,27 @@ fn paths_to_report(
         out.push(path.clone());
     }
     out
+}
+
+/// Whether a directory between `path`'s watch root and the file is hidden
+/// (`.git`, `.venv`) or one the indexer skips (`target`, `node_modules`).
+/// Only the part below the root counts: a project that itself lives under
+/// a `build/` directory is still watched.
+fn in_skipped_dir(path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(dirs) = roots
+        .iter()
+        .find_map(|r| path.strip_prefix(r).ok())
+        .and_then(Path::parent)
+    else {
+        return false;
+    };
+    dirs.components().any(|c| match c {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            name.starts_with('.') || crate::rag::indexer::SKIP_DIRS.contains(&name.as_ref())
+        }
+        _ => false,
+    })
 }
 
 fn has_ext(path: &Path, exts: &[String]) -> bool {
@@ -144,6 +170,7 @@ pub fn start_watcher(
         .collect();
 
     let mut last_trigger: HashMap<PathBuf, Instant> = HashMap::new();
+    let roots = config.paths.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<NotifyEvent>| {
         let Ok(event) = res else { return };
@@ -156,6 +183,7 @@ pub fn start_watcher(
         let now = Instant::now();
         for path in paths_to_report(
             &event.paths,
+            &roots,
             &pattern_exts,
             rate_limit,
             &mut last_trigger,
@@ -206,6 +234,7 @@ mod tests {
             std::fs::write(p, "// AI: x").unwrap();
         }
         let exts = vec!["rs".to_string()];
+        let roots = vec![dir.path().to_path_buf()];
         let limit = Duration::from_secs(10);
         let mut last = HashMap::new();
         let t0 = Instant::now();
@@ -213,6 +242,7 @@ mod tests {
             let paths: Vec<_> = paths.iter().map(|p| (*p).clone()).collect();
             paths_to_report(
                 &paths,
+                &roots,
                 &exts,
                 limit,
                 &mut last,
@@ -229,5 +259,39 @@ mod tests {
         assert_eq!(report(&[&other], 1), vec![other.clone()]);
         // After the window the file reports again.
         assert_eq!(report(&[&src], 11), vec![src.clone()]);
+    }
+
+    /// Installs and builds write thousands of matching files under vendor
+    /// and build directories; none of them is reported. The filter only
+    /// looks below the watch root, so a root inside `build/` still works.
+    #[test]
+    fn vendor_and_build_dirs_are_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("build/app");
+        let files = [
+            "node_modules/pkg/x.js",
+            "target/debug/build/gen.rs",
+            ".venv/lib/site.py",
+            "pkg/__pycache__/m.py",
+            "src/lib.rs",
+            "src/.eslintrc.js",
+        ];
+        let paths: Vec<_> = files.iter().map(|f| root.join(f)).collect();
+        for p in &paths {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "// AI: x").unwrap();
+        }
+        let reported = paths_to_report(
+            &paths,
+            &[root.clone()],
+            &["rs".into(), "py".into(), "js".into()],
+            Duration::from_secs(10),
+            &mut HashMap::new(),
+            Instant::now(),
+        );
+        assert_eq!(
+            reported,
+            vec![root.join("src/lib.rs"), root.join("src/.eslintrc.js")]
+        );
     }
 }

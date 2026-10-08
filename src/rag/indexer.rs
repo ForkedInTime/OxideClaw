@@ -435,8 +435,8 @@ fn cap_chunk_lines(content: &str) -> String {
 
 // ─── Indexing engine ─────────────────────────────────────────────────────────
 
-/// Directories to always skip during indexing.
-const SKIP_DIRS: &[&str] = &[
+/// Directories to always skip during indexing (and when `/watch` reports).
+pub(crate) const SKIP_DIRS: &[&str] = &[
     "target",
     "node_modules",
     ".git",
