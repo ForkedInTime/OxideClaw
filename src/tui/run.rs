@@ -1343,6 +1343,37 @@ async fn run_loop(
             });
         }
 
+        // ── Prompt hooks finished: send the prompt they held ─────────────────
+        if app
+            .prompt_hooks
+            .as_ref()
+            .is_some_and(|p| p.task.is_finished())
+            && let Some(pending) = app.prompt_hooks.take()
+        {
+            finish_prompt_hooks(
+                pending,
+                KeyCtx {
+                    key: crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    app: &mut app,
+                    messages: &mut messages,
+                    client: &mut client,
+                    tools: &tools,
+                    config: &mut config,
+                    perm_state: &perm_state,
+                    skills: &skills,
+                    system_prompt: &mut system_prompt,
+                    tx: &tx,
+                    todo_state: &todo_state,
+                    session: &mut session,
+                    saved_count: &mut saved_count,
+                    mcp_statuses: &mcp_statuses,
+                    mcp_failed: &mcp_failed,
+                    spawn_registry: &spawn_registry,
+                },
+            )
+            .await?;
+        }
+
         // ── Poll browse progress events ──────────────────────────────────────
         if let Some(mut rx) = app.browse_progress_rx.take() {
             let mut done = false;
@@ -1696,6 +1727,8 @@ async fn run_loop(
                             // turn (or a typed /browse) can start meanwhile; two
                             // runs would share is_loading and stack prompts.
                             if app.is_loading || app.browse_progress_rx.is_some() {
+                                // A replay's hook result is for this run only.
+                                app.prompt_hook_result = None;
                                 app.entries.push(ChatEntry::system(format!(
                                     "/browse (voice) ignored: a turn or browse is already running. Transcript: {goal_str}"
                                 )));
@@ -1706,6 +1739,7 @@ async fn run_loop(
                                 }
                             }
                             if app.cost_tracker.over_budget() {
+                                app.prompt_hook_result = None;
                                 app.entries.push(ChatEntry::system(format!(
                                     "Budget of ${:.2} reached — /browse (voice) not started. Use /budget to raise or clear it. Transcript: {goal_str}",
                                     app.cost_tracker.budget_usd.unwrap_or_default()
@@ -1722,7 +1756,7 @@ async fn run_loop(
                             let typed = format!("/browse {goal_str}");
                             let draft = (app.input.clone(), app.cursor);
                             let Some((gated_goal, hook_note)) = user_prompt_gate(
-                                &mut app, &config, &session.id, &typed, &typed, goal_str.clone(),
+                                &mut app, &config, &session.id, &typed, &typed, goal_str.clone(), Some(&goal_str),
                             ).await else {
                                 if !draft.0.is_empty() {
                                     (app.input, app.cursor) = draft;
@@ -2087,6 +2121,10 @@ async fn run_loop(
             // not a signal, so nothing else stops the detached server and it
             // would outlive us holding the model in (V)RAM.
             crate::voice::stop_xtts_server();
+            // Dropping the task kills the hooks' process groups.
+            if let Some(p) = app.prompt_hooks.take() {
+                p.task.abort();
+            }
             // Quitting mid-turn: keep what the turn did for --continue.
             if let Some(handle) = app.api_task.take() {
                 handle.abort();

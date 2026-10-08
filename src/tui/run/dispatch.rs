@@ -55,7 +55,8 @@ async fn gate_slash_prompt(
     input: &str,
     prompt: String,
 ) -> Option<String> {
-    let (prompt, note) = user_prompt_gate(app, config, session_id, input, input, prompt).await?;
+    let (prompt, note) =
+        user_prompt_gate(app, config, session_id, input, input, prompt, None).await?;
     app.entries.push(ChatEntry::user(input.to_string()));
     if let Some(msg) = note {
         app.entries.push(ChatEntry::system(msg));
@@ -2038,8 +2039,16 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             // The task is the spawned agent's first prompt. The hooks'
             // context (the gate's result for an empty prompt) goes to its
             // system prompt: the task also names its branch and commit.
-            let Some((hook_context, hook_note)) =
-                user_prompt_gate(app, config, &session.id, &input, &input, String::new()).await
+            let Some((hook_context, hook_note)) = user_prompt_gate(
+                app,
+                config,
+                &session.id,
+                &input,
+                &input,
+                String::new(),
+                None,
+            )
+            .await
             else {
                 return Ok(());
             };
@@ -2367,7 +2376,8 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             let max = max_steps.unwrap_or(config.browse_max_steps);
             // The goal is a prompt for the browse agent's model.
             let Some((gated_goal, hook_note)) =
-                user_prompt_gate(app, config, &session.id, &input, &input, goal.clone()).await
+                user_prompt_gate(app, config, &session.id, &input, &input, goal.clone(), None)
+                    .await
             else {
                 return Ok(());
             };
@@ -2712,7 +2722,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
                 }
                 // Gated before anything is shown, so a stop leaves no trace.
                 let Some((prompt, hook_note)) =
-                    user_prompt_gate(app, config, &session.id, &input, &input, prompt).await
+                    user_prompt_gate(app, config, &session.id, &input, &input, prompt, None).await
                 else {
                     return Ok(());
                 };
@@ -3488,11 +3498,11 @@ mod slash_tests {
             input.to_string(),
             KeyCtx {
                 key: crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                app,
+                app: &mut *app,
                 messages: &mut messages,
                 client: &mut client,
                 tools: &[],
-                config,
+                config: &mut *config,
                 perm_state,
                 skills,
                 system_prompt: &mut system_prompt,
@@ -3506,6 +3516,31 @@ mod slash_tests {
         )
         .await
         .unwrap();
+        // What the event loop does once the prompt hooks have finished.
+        if let Some(pending) = app.prompt_hooks.take() {
+            finish_prompt_hooks(
+                pending,
+                KeyCtx {
+                    key: crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    app,
+                    messages: &mut messages,
+                    client: &mut client,
+                    tools: &[],
+                    config,
+                    perm_state,
+                    skills,
+                    system_prompt: &mut system_prompt,
+                    tx: &tx,
+                    todo_state: &todo_state,
+                    session: &mut session,
+                    saved_count: &mut 0,
+                    mcp_statuses: &[],
+                    spawn_registry: &spawn_registry,
+                },
+            )
+            .await
+            .unwrap();
+        }
     }
 
     /// `/memory list` and the other reads created `.claude/memory.db` (and
@@ -3694,19 +3729,30 @@ mod slash_tests {
             ..Config::default()
         };
         let mut app = App::new("claude-sonnet-4-6", dir.path());
-        let (prompt, _) = user_prompt_gate(
-            &mut app,
-            &config,
-            "s",
-            "/deploy",
-            "/deploy",
-            "deploy it".into(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            prompt,
-            "deploy it\n\n<additional_context>branch-main</additional_context>"
-        );
+        // The first call only starts the hooks; the replay takes their result.
+        for replay in [false, true] {
+            let gated = user_prompt_gate(
+                &mut app,
+                &config,
+                "s",
+                "/deploy",
+                "/deploy",
+                "deploy it".into(),
+                None,
+            )
+            .await;
+            if replay {
+                let (prompt, _) = gated.unwrap();
+                assert_eq!(
+                    prompt,
+                    "deploy it\n\n<additional_context>branch-main</additional_context>"
+                );
+            } else {
+                assert!(gated.is_none());
+                let pending = app.prompt_hooks.take().unwrap();
+                let result = pending.task.await.unwrap();
+                app.prompt_hook_result = Some((pending.hook_text, result));
+            }
+        }
     }
 }

@@ -745,6 +745,25 @@ pub struct App {
     /// Receiver for browse approval prompts.
     pub browse_approval_rx:
         Option<tokio::sync::mpsc::Receiver<crate::browser::approval_gate::ApprovalPrompt>>,
+
+    /// userPromptSubmit hooks running for a submitted prompt. Each may take
+    /// up to a minute, so they run off the event loop and the submit is
+    /// replayed when they finish.
+    pub prompt_hooks: Option<PendingPromptHooks>,
+    /// The finished hooks' result for the prompt text they were shown,
+    /// taken by the replayed submit's gate.
+    pub prompt_hook_result: Option<(String, crate::hooks::HookResult)>,
+}
+
+/// A prompt waiting on its userPromptSubmit hooks.
+pub struct PendingPromptHooks {
+    pub task: tokio::task::JoinHandle<crate::hooks::HookResult>,
+    /// What the hooks were shown.
+    pub hook_text: String,
+    /// The line to submit again (and to put back if the prompt is not sent).
+    pub raw: String,
+    /// Set for a voice /browse, which is replayed as one (Pattern policy).
+    pub voice_goal: Option<String>,
 }
 
 /// Format a raw model ID into a human-readable name like "Sonnet 4.6".
@@ -886,6 +905,8 @@ impl App {
             browse_cancel: None,
             browse_progress_rx: None,
             browse_approval_rx: None,
+            prompt_hooks: None,
+            prompt_hook_result: None,
         }
     }
 

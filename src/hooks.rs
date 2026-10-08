@@ -486,6 +486,23 @@ fn hook_shell(login_shell: Option<&str>) -> String {
         .to_string()
 }
 
+#[cfg(unix)]
+struct KillGroupOnDrop(Option<i32>);
+
+#[cfg(unix)]
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: libc::kill with a negative pid signals the whole process
+        // group. Unsafe only because of FFI; the pid is one we spawned and
+        // have not reaped, so it cannot have been reused.
+        if let Some(pgid) = self.0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
     use tokio::process::Command;
 
@@ -543,8 +560,11 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
         Err(e) => return hook_unevaluable(env.event, hook, &format!("failed to start: {e}")),
     };
 
+    // Kills the hook's process group if this future is dropped before the
+    // hook finished (a timeout, or Esc aborting a prompt's hooks):
+    // kill_on_drop alone reaches only the shell, not what it started.
     #[cfg(unix)]
-    let pgid = child.id().map(|id| id as i32);
+    let mut group = KillGroupOnDrop(child.id().map(|id| id as i32));
 
     let Some(mut child_stdout) = child.stdout.take() else {
         return hook_unevaluable(env.event, hook, "produced no stdout pipe");
@@ -575,25 +595,29 @@ async fn execute_hook(hook: &HookEntry, env: HookEnvVars<'_>) -> HookResult {
             read_capped(&mut child_stdout, MAX_HOOK_OUTPUT_BYTES),
             read_capped(&mut child_stderr, MAX_HOOK_OUTPUT_BYTES),
         );
+        // Errors first: once waited on, the pid is free to be reused, so
+        // the group must not be killed after that.
         fed?;
+        let (out, err) = (out?, err?);
         let status = child.wait().await?;
-        Ok::<_, std::io::Error>((status, out?, err?))
+        Ok::<_, std::io::Error>((status, out, err))
     };
 
     let (status, stdout, stderr) = match tokio::time::timeout(HOOK_TIMEOUT, collect).await {
-        Ok(Ok(v)) => v,
+        Ok(Ok(v)) => {
+            // Reaped: the pgid may be reused, and what the hook left running
+            // in the background is its own business.
+            #[cfg(unix)]
+            {
+                group.0 = None;
+            }
+            v
+        }
         Ok(Err(e)) => {
             return hook_unevaluable(env.event, hook, &format!("could not be read: {e}"));
         }
+        // The group is killed as `group` drops.
         Err(_) => {
-            // SAFETY: libc::kill with a negative pid signals the whole process
-            // group. Unsafe only because of FFI; the pid is one we just spawned.
-            #[cfg(unix)]
-            if let Some(pgid) = pgid {
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
             return hook_unevaluable(
                 env.event,
                 hook,

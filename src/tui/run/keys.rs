@@ -435,6 +435,19 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
             ));
             app.scroll_to_bottom();
         }
+        (Esc, _) if app.prompt_hooks.is_some() => {
+            // Aborting drops the hook runs, which kills their process groups.
+            // The prompt is still in the input box.
+            if let Some(p) = app.prompt_hooks.take() {
+                p.task.abort();
+            }
+            app.is_loading = false;
+            app.turn_start = None;
+            app.entries.push(ChatEntry::system(
+                "Prompt not sent — userPromptSubmit hooks cancelled.".to_string(),
+            ));
+            app.scroll_to_bottom();
+        }
         (Esc, _) if app.is_loading => {
             // Stop any active TTS first
             if let Some(stop_tx) = app.tts_stop_tx.take() {
@@ -472,193 +485,28 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
 
         (Enter, _) => {
             let raw = app.take_input();
-            let input = raw.trim().to_string();
-            if input.is_empty() {
-                return Ok(());
-            }
-
-            // Stop any active TTS when the user sends a new message
-            if let Some(stop_tx) = app.tts_stop_tx.take() {
-                let _ = stop_tx.send(());
-            }
-
-            // Slash command dispatch (disabled when --disable-slash-commands)
-            if input.starts_with('/') && !config.disable_slash_commands {
-                return dispatch::run_slash_command(
-                    input,
-                    KeyCtx {
-                        key,
-                        app,
-                        messages,
-                        client,
-                        tools,
-                        config,
-                        perm_state,
-                        skills,
-                        system_prompt,
-                        tx,
-                        todo_state,
-                        session,
-                        saved_count,
-                        mcp_statuses,
-                        mcp_failed,
-                        spawn_registry,
-                    },
-                )
-                .await;
-            }
-
-            // Regular user message → send to Claude, unless the budget is spent.
-            if budget_blocks(app, &raw) {
-                return Ok(());
-            }
-            // btw note and image are only taken once the prompt is allowed, so
-            // a hook that stops the turn leaves them in place for the retry.
-            let final_text = match app.btw_note.as_deref() {
-                Some(note) => format!("(btw: {note})\n\n{input}"),
-                None => input.clone(),
-            };
-            let Some((final_text, hook_note)) = user_prompt_gate(
-                app,
-                config,
-                &session.id,
-                &raw,
-                &final_text,
-                final_text.clone(),
+            return submit_line(
+                raw,
+                KeyCtx {
+                    key,
+                    app,
+                    messages,
+                    client,
+                    tools,
+                    config,
+                    perm_state,
+                    skills,
+                    system_prompt,
+                    tx,
+                    todo_state,
+                    session,
+                    saved_count,
+                    mcp_statuses,
+                    mcp_failed,
+                    spawn_registry,
+                },
             )
-            .await
-            else {
-                return Ok(());
-            };
-            app.show_welcome = false;
-            app.entries.push(ChatEntry::user(input));
-            if let Some(msg) = hook_note {
-                app.entries.push(ChatEntry::system(msg));
-            }
-            app.scroll_to_bottom();
-            app.start_loading();
-            app.btw_note = None;
-            begin_agent_turn(session, config, tools).await;
-
-            // Build message content — text + optional image attachment
-            let mut user_content: Vec<ContentBlock> = Vec::new();
-            if let Some(image_path) = app.pending_image.take() {
-                match attach_image(&image_path) {
-                    Ok(image_block) => {
-                        user_content.push(image_block);
-                    }
-                    Err(e) => {
-                        app.entries
-                            .push(ChatEntry::error(format!("Image attach failed: {e}")));
-                    }
-                }
-            }
-            user_content.push(ContentBlock::Text {
-                text: final_text.clone(),
-            });
-
-            push_prompt_turn(messages, user_content, session).await;
-
-            // Background incremental re-index: pick up any files changed since last index.
-            // Fire-and-forget — doesn't block the user's message from being sent.
-            // Off where startup said so (outside a git repo, $HOME, /).
-            if let Ok(target) = crate::rag::IndexTarget::for_cwd(&config.cwd, true) {
-                tokio::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(db) = target.open() {
-                            let _ = target.index(&db, false);
-                        }
-                    })
-                    .await;
-                });
-            }
-
-            let tvec = tools.to_vec();
-            let msgs = messages.clone();
-            let mut cfg = config.clone();
-
-            // Model routing: phase routing takes priority over complexity routing.
-            // 1. Phase router (if enabled) — research/plan/edit/review → specific model
-            // 2. Complexity router (if enabled) — low/medium/high/super-high → model
-            //    tier on any backend, picked inside the task (the classifier
-            //    may take a model call) and escalated there on failure
-            // 3. Fallback: config.model unchanged
-            let mut router = None;
-            if config.phase_router.enabled
-                && !crate::api::is_ollama_model(&config.model)
-                && !crate::api::is_openai_compat_model(&config.model)
-            {
-                // The phase router never sends `Routed`: a model left from
-                // an earlier complexity-routed turn would stay on screen.
-                app.routed_model = None;
-                let phase = crate::router::detect_phase(&final_text);
-                if phase != crate::router::Phase::Default {
-                    let routed_model = config.phase_router.model_for(phase).to_string();
-                    if routed_model != config.model {
-                        app.entries.push(ChatEntry::system(format!(
-                            "[phase: {} → {}]",
-                            phase,
-                            crate::tui::app::pretty_model_name(&routed_model)
-                        )));
-                        cfg.model = routed_model;
-                    }
-                }
-            } else if app.router.enabled {
-                router = Some(app.router.clone());
-            }
-            let c2 = match routed_client(config, client, &cfg.model) {
-                Ok(c) => c,
-                Err(e) => {
-                    app.entries.push(ChatEntry::error(format!(
-                        "Router: cannot use {}: {e}\n\nThis turn uses {}.",
-                        cfg.model, config.model
-                    )));
-                    cfg.model = config.model.clone();
-                    client.clone()
-                }
-            };
-
-            let tx2 = tx.clone();
-            // Inject brief mode instruction into system prompt if enabled
-            let sp = if app.brief_mode {
-                format!(
-                    "{}\n\nIMPORTANT: The user has enabled brief mode. \
-                     Keep all responses concise and to the point. \
-                     Lead with the answer, skip preamble and filler.",
-                    system_prompt
-                )
-            } else {
-                system_prompt.clone()
-            };
-            let ps = perm_state.clone();
-            let pm = app.plan_mode;
-            let budget_left = app.cost_tracker.remaining();
-
-            let sid2 = session.id.clone();
-            let turn_history = TurnHistory::default();
-            app.turn_history = Some(turn_history.clone());
-            let handle = tokio::spawn(async move {
-                run_api_task(ApiTask {
-                    client: c2,
-                    tools: tvec,
-                    messages: msgs,
-                    config: cfg,
-                    perm_state: ps,
-                    system_prompt: sp,
-                    tx: tx2,
-                    plan_mode: pm,
-                    skill_no_shell: false,
-                    budget_remaining_usd: budget_left,
-                    session_id: sid2,
-                    history: turn_history,
-                    router,
-                    // A routed turn summarises through its route; with
-                    // phase routing on, the complexity router never ran.
-                    compact_router: None,
-                })
-                .await;
-            });
-            app.api_task = Some(handle.abort_handle());
+            .await;
         }
 
         // '?' shows keybindings as an overlay when input is empty — otherwise insert normally
@@ -862,6 +710,218 @@ pub(super) async fn handle_key(ctx: KeyCtx<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Send a submitted input line: a slash command, or a message for a turn.
+/// Also the replay once a prompt's userPromptSubmit hooks have finished.
+async fn submit_line(raw: String, ctx: KeyCtx<'_>) -> Result<()> {
+    let KeyCtx {
+        key,
+        app,
+        messages,
+        client,
+        tools,
+        config,
+        perm_state,
+        skills,
+        system_prompt,
+        tx,
+        todo_state,
+        session,
+        saved_count,
+        mcp_statuses,
+        mcp_failed,
+        spawn_registry,
+    } = ctx;
+    let input = raw.trim().to_string();
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    // Stop any active TTS when the user sends a new message
+    if let Some(stop_tx) = app.tts_stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
+
+    // Slash command dispatch (disabled when --disable-slash-commands)
+    if input.starts_with('/') && !config.disable_slash_commands {
+        return dispatch::run_slash_command(
+            input,
+            KeyCtx {
+                key,
+                app,
+                messages,
+                client,
+                tools,
+                config,
+                perm_state,
+                skills,
+                system_prompt,
+                tx,
+                todo_state,
+                session,
+                saved_count,
+                mcp_statuses,
+                mcp_failed,
+                spawn_registry,
+            },
+        )
+        .await;
+    }
+
+    // Regular user message → send to Claude, unless the budget is spent.
+    if budget_blocks(app, &raw) {
+        return Ok(());
+    }
+    // btw note and image are only taken once the prompt is allowed, so
+    // a hook that stops the turn leaves them in place for the retry.
+    let final_text = match app.btw_note.as_deref() {
+        Some(note) => format!("(btw: {note})\n\n{input}"),
+        None => input.clone(),
+    };
+    let Some((final_text, hook_note)) = user_prompt_gate(
+        app,
+        config,
+        &session.id,
+        &raw,
+        &final_text,
+        final_text.clone(),
+        None,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    app.show_welcome = false;
+    app.entries.push(ChatEntry::user(input));
+    if let Some(msg) = hook_note {
+        app.entries.push(ChatEntry::system(msg));
+    }
+    app.scroll_to_bottom();
+    app.start_loading();
+    app.btw_note = None;
+    begin_agent_turn(session, config, tools).await;
+
+    // Build message content — text + optional image attachment
+    let mut user_content: Vec<ContentBlock> = Vec::new();
+    if let Some(image_path) = app.pending_image.take() {
+        match attach_image(&image_path) {
+            Ok(image_block) => {
+                user_content.push(image_block);
+            }
+            Err(e) => {
+                app.entries
+                    .push(ChatEntry::error(format!("Image attach failed: {e}")));
+            }
+        }
+    }
+    user_content.push(ContentBlock::Text {
+        text: final_text.clone(),
+    });
+
+    push_prompt_turn(messages, user_content, session).await;
+
+    // Background incremental re-index: pick up any files changed since last index.
+    // Fire-and-forget — doesn't block the user's message from being sent.
+    // Off where startup said so (outside a git repo, $HOME, /).
+    if let Ok(target) = crate::rag::IndexTarget::for_cwd(&config.cwd, true) {
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(db) = target.open() {
+                    let _ = target.index(&db, false);
+                }
+            })
+            .await;
+        });
+    }
+
+    let tvec = tools.to_vec();
+    let msgs = messages.clone();
+    let mut cfg = config.clone();
+
+    // Model routing: phase routing takes priority over complexity routing.
+    // 1. Phase router (if enabled) — research/plan/edit/review → specific model
+    // 2. Complexity router (if enabled) — low/medium/high/super-high → model
+    //    tier on any backend, picked inside the task (the classifier
+    //    may take a model call) and escalated there on failure
+    // 3. Fallback: config.model unchanged
+    let mut router = None;
+    if config.phase_router.enabled
+        && !crate::api::is_ollama_model(&config.model)
+        && !crate::api::is_openai_compat_model(&config.model)
+    {
+        // The phase router never sends `Routed`: a model left from
+        // an earlier complexity-routed turn would stay on screen.
+        app.routed_model = None;
+        let phase = crate::router::detect_phase(&final_text);
+        if phase != crate::router::Phase::Default {
+            let routed_model = config.phase_router.model_for(phase).to_string();
+            if routed_model != config.model {
+                app.entries.push(ChatEntry::system(format!(
+                    "[phase: {} → {}]",
+                    phase,
+                    crate::tui::app::pretty_model_name(&routed_model)
+                )));
+                cfg.model = routed_model;
+            }
+        }
+    } else if app.router.enabled {
+        router = Some(app.router.clone());
+    }
+    let c2 = match routed_client(config, client, &cfg.model) {
+        Ok(c) => c,
+        Err(e) => {
+            app.entries.push(ChatEntry::error(format!(
+                "Router: cannot use {}: {e}\n\nThis turn uses {}.",
+                cfg.model, config.model
+            )));
+            cfg.model = config.model.clone();
+            client.clone()
+        }
+    };
+
+    let tx2 = tx.clone();
+    // Inject brief mode instruction into system prompt if enabled
+    let sp = if app.brief_mode {
+        format!(
+            "{}\n\nIMPORTANT: The user has enabled brief mode. \
+             Keep all responses concise and to the point. \
+             Lead with the answer, skip preamble and filler.",
+            system_prompt
+        )
+    } else {
+        system_prompt.clone()
+    };
+    let ps = perm_state.clone();
+    let pm = app.plan_mode;
+    let budget_left = app.cost_tracker.remaining();
+
+    let sid2 = session.id.clone();
+    let turn_history = TurnHistory::default();
+    app.turn_history = Some(turn_history.clone());
+    let handle = tokio::spawn(async move {
+        run_api_task(ApiTask {
+            client: c2,
+            tools: tvec,
+            messages: msgs,
+            config: cfg,
+            perm_state: ps,
+            system_prompt: sp,
+            tx: tx2,
+            plan_mode: pm,
+            skill_no_shell: false,
+            budget_remaining_usd: budget_left,
+            session_id: sid2,
+            history: turn_history,
+            router,
+            // A routed turn summarises through its route; with
+            // phase routing on, the complexity router never ran.
+            compact_router: None,
+        })
+        .await;
+    });
+    app.api_task = Some(handle.abort_handle());
+    Ok(())
+}
+
 /// The session `d`/Delete would remove. Only the sessions picker holds
 /// session ids; in the model, help, voice and undo pickers the selected id is
 /// a model name, voice path or label that must not reach Session::delete.
@@ -891,16 +951,17 @@ fn answer_browse_approval(app: &mut App, approved: bool, label: &str) {
 
 // ── Vim normal-mode key handler ───────────────────────────────────────────────
 
-/// Refuse a model call once /budget is spent, putting `unsent` back in the
-/// input. The Usage-event abort only fires after the first call is billed,
-/// so without this every turn past the cap still cost one full request.
 /// UserPromptSubmit hooks for a prompt about to start a turn: a typed
 /// message, or a slash command, skill or plugin command that sends one.
 /// `hook_text` is what the hook sees (what the user typed), `prompt` what
-/// goes to the model. Exit 2 or `continue: false` stops it: `raw` goes back
-/// into the input box and None is returned, so run it before anything of
-/// the turn is shown. Otherwise returns `prompt` with the hooks' context
-/// and the systemMessage to show.
+/// goes to the model. The hooks run in a task, since each may take a
+/// minute and the event loop would freeze meanwhile: the first call starts
+/// them and returns None, and `finish_prompt_hooks` submits `raw` (or
+/// `voice_goal` as a voice /browse) again, when this returns their result.
+/// Exit 2 or `continue: false` stops it: `raw` goes back into the input box
+/// and None is returned, so run it before anything of the turn is shown.
+/// Otherwise returns `prompt` with the hooks' context and the
+/// systemMessage to show.
 pub(super) async fn user_prompt_gate(
     app: &mut App,
     config: &Config,
@@ -908,12 +969,42 @@ pub(super) async fn user_prompt_gate(
     raw: &str,
     hook_text: &str,
     prompt: String,
+    voice_goal: Option<&str>,
 ) -> Option<(String, Option<String>)> {
     let hook_cfg = match &config.hooks {
-        Some(h) if !config.disable_all_hooks => h,
+        Some(h) if !config.disable_all_hooks && !h.user_prompt_submit.is_empty() => h,
         _ => return Some((prompt, None)),
     };
-    let r = hooks::run_user_prompt_hooks(hook_cfg, hook_text, session_id, &config.cwd).await;
+    let r = match app.prompt_hook_result.take() {
+        Some((text, r)) if text == hook_text => r,
+        _ => {
+            let (hooks, text, sid, cwd) = (
+                hook_cfg.clone(),
+                hook_text.to_string(),
+                session_id.to_string(),
+                config.cwd.clone(),
+            );
+            let task = tokio::spawn(async move {
+                hooks::run_user_prompt_hooks(&hooks, &text, &sid, &cwd).await
+            });
+            app.prompt_hooks = Some(crate::tui::app::PendingPromptHooks {
+                task,
+                hook_text: hook_text.to_string(),
+                raw: raw.to_string(),
+                voice_goal: voice_goal.map(str::to_string),
+            });
+            // Shown while it waits, and left there by Esc to edit.
+            if app.input.is_empty() {
+                app.input = raw.chars().collect();
+                app.cursor = app.input.len();
+            }
+            app.start_loading();
+            if !app.spinner_verb.is_empty() {
+                app.spinner_verb = "Running userPromptSubmit hooks".to_string();
+            }
+            return None;
+        }
+    };
     if !r.should_continue {
         app.input = raw.chars().collect();
         app.cursor = app.input.len();
@@ -931,6 +1022,87 @@ pub(super) async fn user_prompt_gate(
     Some((prompt, r.system_message))
 }
 
+/// The prompt's userPromptSubmit hooks finished (or failed): submit it
+/// again, and this time `user_prompt_gate` takes their result. Waits for
+/// the task, so the event loop calls it once the task is finished.
+pub(super) async fn finish_prompt_hooks(
+    pending: crate::tui::app::PendingPromptHooks,
+    ctx: KeyCtx<'_>,
+) -> Result<()> {
+    let crate::tui::app::PendingPromptHooks {
+        task,
+        hook_text,
+        raw,
+        voice_goal,
+    } = pending;
+    // A hook that cannot be evaluated already fails closed inside the task;
+    // a task that died must not let the prompt through either.
+    let result = task.await.unwrap_or_else(|e| hooks::HookResult {
+        should_continue: false,
+        stop_reason: Some(format!("the hook task failed: {e}")),
+        ..Default::default()
+    });
+    let KeyCtx {
+        key,
+        app,
+        messages,
+        client,
+        tools,
+        config,
+        perm_state,
+        skills,
+        system_prompt,
+        tx,
+        todo_state,
+        session,
+        saved_count,
+        mcp_statuses,
+        mcp_failed,
+        spawn_registry,
+    } = ctx;
+    app.is_loading = false;
+    app.turn_start = None;
+    if app.input.iter().copied().eq(raw.chars()) {
+        app.input.clear();
+        app.cursor = 0;
+    }
+    app.prompt_hook_result = Some((hook_text, result));
+    if let Some(goal) = voice_goal {
+        // Its handler in the event loop runs the gate again.
+        let _ = tx.send(AppEvent::VoiceBrowse(goal));
+        return Ok(());
+    }
+    let r = submit_line(
+        raw,
+        KeyCtx {
+            key,
+            app: &mut *app,
+            messages,
+            client,
+            tools,
+            config,
+            perm_state,
+            skills,
+            system_prompt,
+            tx,
+            todo_state,
+            session,
+            saved_count,
+            mcp_statuses,
+            mcp_failed,
+            spawn_registry,
+        },
+    )
+    .await;
+    // Unused when the replay stopped before the gate (the budget ran out
+    // meanwhile); a later send of the same text must run the hooks again.
+    app.prompt_hook_result = None;
+    r
+}
+
+/// Refuse a model call once /budget is spent, putting `unsent` back in the
+/// input. The Usage-event abort only fires after the first call is billed,
+/// so without this every turn past the cap still cost one full request.
 pub(super) fn budget_blocks(app: &mut App, unsent: &str) -> bool {
     if !app.cost_tracker.over_budget() {
         return false;
@@ -1354,5 +1526,137 @@ mod ctrl_c_tests {
         assert!(!app.should_quit);
         press(&mut app, ctrl_c()).await;
         assert!(app.should_quit);
+    }
+}
+
+#[cfg(test)]
+mod prompt_hook_tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn hooked(dir: &std::path::Path, command: &str) -> Config {
+        Config {
+            cwd: dir.to_path_buf(),
+            hooks: Some(crate::settings::HooksConfig {
+                user_prompt_submit: vec![crate::settings::HookEntry {
+                    matcher: String::new(),
+                    command: command.into(),
+                }],
+                ..Default::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    /// Press `code`, then, with `finish`, do what the event loop does once
+    /// the prompt hooks are done.
+    async fn press(app: &mut App, config: &mut Config, code: KeyCode, finish: bool) {
+        let mut messages = Vec::new();
+        let mut client =
+            ApiBackend::Anthropic(crate::api::ClaudeClient::new("sk-ant-test").unwrap());
+        let perm_state = PermissionState::new(false, &[], &[]);
+        let skills = std::collections::HashMap::new();
+        let mut system_prompt = String::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let todo_state = TodoState::default();
+        let mut session = Session::at_path("current", config.cwd.join("current.jsonl"));
+        let spawn_registry = crate::spawn::new_registry();
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(KeyCtx {
+            key,
+            app: &mut *app,
+            messages: &mut messages,
+            client: &mut client,
+            tools: &[],
+            config: &mut *config,
+            perm_state: &perm_state,
+            skills: &skills,
+            system_prompt: &mut system_prompt,
+            tx: &tx,
+            todo_state: &todo_state,
+            session: &mut session,
+            saved_count: &mut 0,
+            mcp_statuses: &[],
+            spawn_registry: &spawn_registry,
+        })
+        .await
+        .unwrap();
+        if finish && let Some(pending) = app.prompt_hooks.take() {
+            finish_prompt_hooks(
+                pending,
+                KeyCtx {
+                    key,
+                    app,
+                    messages: &mut messages,
+                    client: &mut client,
+                    tools: &[],
+                    config,
+                    perm_state: &perm_state,
+                    skills: &skills,
+                    system_prompt: &mut system_prompt,
+                    tx: &tx,
+                    todo_state: &todo_state,
+                    session: &mut session,
+                    saved_count: &mut 0,
+                    mcp_statuses: &[],
+                    spawn_registry: &spawn_registry,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Enter awaited the hooks inside the key handler, so a slow hook froze
+    /// the screen and Esc for up to a minute per hook. Esc now cancels them,
+    /// including what the hook started in the background.
+    #[tokio::test]
+    async fn slow_prompt_hook_leaves_the_ui_running_and_esc_kills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = hooked(dir.path(), "(sleep 1; touch ran.txt) & wait");
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        app.input = "hello".chars().collect();
+        app.cursor = app.input.len();
+
+        let started = std::time::Instant::now();
+        press(&mut app, &mut config, KeyCode::Enter, false).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(app.prompt_hooks.is_some() && app.is_loading);
+        assert_eq!(app.input.iter().collect::<String>(), "hello");
+        assert!(app.entries.iter().all(|e| e.text != "hello"), "shown early");
+
+        // Let the hook start before cancelling it.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        press(&mut app, &mut config, KeyCode::Esc, false).await;
+        assert!(app.prompt_hooks.is_none() && !app.is_loading);
+        assert_eq!(app.input.iter().collect::<String>(), "hello");
+        assert!(app.entries.last().unwrap().text.contains("hooks cancelled"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!dir.path().join("ran.txt").exists(), "hook outlived Esc");
+    }
+
+    /// The replay after the hooks finish runs them once and applies a stop.
+    #[tokio::test]
+    async fn typed_prompt_is_replayed_with_the_hook_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = hooked(
+            dir.path(),
+            r#"printf '%s\n' "$CLAUDE_MESSAGE" >> seen.txt; echo nope; exit 2"#,
+        );
+        let mut app = App::new("claude-sonnet-4-6", dir.path());
+        app.input = "hello".chars().collect();
+        app.cursor = app.input.len();
+        press(&mut app, &mut config, KeyCode::Enter, true).await;
+        assert!(app.prompt_hooks.is_none() && !app.is_loading);
+        assert!(app.prompt_hook_result.is_none());
+        assert_eq!(app.input.iter().collect::<String>(), "hello");
+        let last = &app.entries.last().unwrap().text;
+        assert!(
+            last.contains("blocked by a userPromptSubmit hook: nope"),
+            "{last}"
+        );
+        let seen = std::fs::read_to_string(dir.path().join("seen.txt")).unwrap();
+        assert_eq!(seen, "hello\n");
     }
 }
