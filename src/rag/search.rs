@@ -160,8 +160,10 @@ pub fn build_context(results: &[SearchResult], max_chars: usize) -> String {
 
     for r in results {
         let chunk = r.as_context();
+        // Skip, not stop: one oversized top hit (a long class or function)
+        // used to leave no context at all, though smaller hits would fit.
         if total_chars + chunk.len() > max_chars {
-            break;
+            continue;
         }
         total_chars += chunk.len();
         parts.push(chunk);
@@ -344,6 +346,27 @@ mod tests {
             .collect();
         let ctx = build_context(&results, 500);
         assert!(ctx.len() < 600); // some overhead from wrapper tags
+    }
+
+    #[test]
+    fn an_oversized_top_hit_does_not_drop_the_rest() {
+        let hit = |name: &str, content: String| SearchResult {
+            file_path: format!("src/{name}.rs"),
+            symbol_name: name.to_string(),
+            symbol_kind: "function".to_string(),
+            language: "rust".to_string(),
+            start_line: 1,
+            end_line: 200,
+            content,
+            rank: -10.0,
+        };
+        let results = vec![
+            hit("huge", "x".repeat(20_000)),
+            hit("small", "fn small() {}".to_string()),
+        ];
+        let ctx = build_context(&results, 12_288);
+        assert!(ctx.contains("fn small() {}"), "{ctx}");
+        assert!(!ctx.contains("huge"));
     }
 
     #[test]
