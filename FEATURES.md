@@ -613,7 +613,7 @@ Skills are looked up in this order; on a name collision the first one wins, and 
 
 Flat `<name>.md` skills from earlier versions still load: plain markdown, `# Title` / description / `---` / prompt, or YAML frontmatter with `params`. `{{ARGS}}` and `{{param}}` placeholders are filled from the arguments; arguments with no placeholder to go in are appended to the prompt.
 
-A skill is only a prompt: frontmatter grants no tools or permissions, so a cloned repository's skills go through the same permission prompts, sandbox and `/trust` rules as anything you type, and `disableSkillShellExecution` removes the shell tools from every skill turn.
+A skill is only a prompt: frontmatter grants no tools or permissions, so a cloned repository's skills go through the same permission prompts, sandbox and `/trust` rules as anything you type, and `disableSkillShellExecution` removes the shell tools from every skill turn. A skill file that is, or links to, a file your `Read(...)` deny rules cover is skipped with a notice, so a repository cannot ship `notes.md -> ../.env` as a skill.
 
 ### .env Files
 

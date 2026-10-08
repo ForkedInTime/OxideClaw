@@ -741,7 +741,8 @@ async fn run_loop(
         &config.permissions_deny,
     )
     .with_cwd(&config.cwd);
-    let loaded_skills = crate::skills::load_skills_in(&config.cwd).await;
+    let loaded_skills =
+        crate::skills::load_skills_in(&config.cwd, &perm_state.read_deny("Read")).await;
     let skills_warning = loaded_skills.warning();
     let skills = loaded_skills.skills;
 

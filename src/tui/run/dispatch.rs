@@ -2559,7 +2559,7 @@ pub(super) async fn run_slash_command(input: String, k: KeyCtx<'_>) -> Result<()
             if let Some((skill_name, args)) = parse_skill_invocation(&input)
                 && let Some(skill) = skills.get(skill_name)
             {
-                let mut prompt = match skill.invoke(args) {
+                let mut prompt = match skill.invoke(args, &perm_state.read_deny("Read")) {
                     Ok(prompt) => prompt,
                     Err(why) => {
                         app.entries.push(ChatEntry::error(format!(

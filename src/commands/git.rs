@@ -720,10 +720,18 @@ mod prompt_command_tests {
         let file = proj.join(".agents/skills/verifier-cli/SKILL.md");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, content).unwrap();
-        let loaded = crate::skills::load_skills_at(&proj, &dir.path().join("cfg"), None).await;
+        let loaded = crate::skills::load_skills_at(
+            &proj,
+            &dir.path().join("cfg"),
+            None,
+            &crate::permissions::ReadDeny::default(),
+        )
+        .await;
         assert!(loaded.invalid.is_empty(), "{:?}", loaded.invalid);
         assert_eq!(loaded.skills["verifier-cli"].description, "Verify the CLI");
-        let body = loaded.skills["verifier-cli"].invoke("").unwrap();
+        let body = loaded.skills["verifier-cli"]
+            .invoke("", &crate::permissions::ReadDeny::default())
+            .unwrap();
         assert!(body.contains("You are a verification executor"), "{body}");
     }
 }

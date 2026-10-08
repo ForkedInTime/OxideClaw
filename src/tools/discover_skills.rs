@@ -28,14 +28,21 @@ impl Tool for DiscoverSkillsTool {
     }
 
     async fn execute(&self, _input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        let loaded = crate::skills::load_skills_in(&ctx.cwd).await;
+        // A skill file a Read deny rule covers is not listed: a plain
+        // markdown skill's first line is its summary here.
+        let deny = ctx
+            .permission_gate
+            .as_ref()
+            .map(|g| g.read_deny("Read"))
+            .unwrap_or_default();
+        let loaded = crate::skills::load_skills_in(&ctx.cwd, &deny).await;
         Ok(ToolOutput::success(render(&loaded)))
     }
 }
 
 /// The listing, then the skipped-skill notice so the model can say why a
 /// skill the user expects is missing.
-fn render(loaded: &crate::skills::LoadedSkills) -> String {
+pub(super) fn render(loaded: &crate::skills::LoadedSkills) -> String {
     let mut out = list_skills(&loaded.skills);
     if let Some(warning) = loaded.warning() {
         out.push_str("\n\n");
@@ -102,9 +109,14 @@ mod tests {
         )
         .unwrap();
 
-        let skills = crate::skills::load_skills_at(&dir.path().join("proj"), &global, None)
-            .await
-            .skills;
+        let skills = crate::skills::load_skills_at(
+            &dir.path().join("proj"),
+            &global,
+            None,
+            &crate::permissions::ReadDeny::default(),
+        )
+        .await
+        .skills;
         let out = list_skills(&skills);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.contains(&"/both — project copy"), "{out}");
@@ -132,7 +144,13 @@ mod tests {
         .unwrap();
         std::fs::write(skills.join("broken/SKILL.md"), "no frontmatter").unwrap();
 
-        let loaded = crate::skills::load_skills_at(&proj, &dir.path().join("cfg"), None).await;
+        let loaded = crate::skills::load_skills_at(
+            &proj,
+            &dir.path().join("cfg"),
+            None,
+            &crate::permissions::ReadDeny::default(),
+        )
+        .await;
         let out = render(&loaded);
         assert!(
             out.lines().any(|l| l == "/release — Cut a release"),

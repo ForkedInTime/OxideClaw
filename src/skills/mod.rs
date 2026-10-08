@@ -13,6 +13,7 @@
 //! but grants nothing: what the prompt makes the model do goes through the
 //! same permission gate, sandbox and `disableSkillShellExecution` as any
 //! other turn, so a cloned repository's skills get no more than its prompt.
+use crate::permissions::ReadDeny;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,13 +54,15 @@ impl Skill {
     /// body is read from its `SKILL.md` now, and the prompt names the skill's
     /// directory so the model can read the files the body refers to. Args
     /// with no placeholder or param to fill are appended, not dropped.
-    pub fn invoke(&self, args: &str) -> std::result::Result<String, String> {
+    /// `deny` is the session's Read deny rules: the file is read again here,
+    /// and it may have become a link to a denied file since it was loaded.
+    pub fn invoke(&self, args: &str, deny: &ReadDeny) -> std::result::Result<String, String> {
         let args = args.trim();
         let loaded;
         let skill = match &self.skill_file {
             None => self,
             Some(file) => {
-                loaded = parse_skill_md(&read_skill_file(file)?)?;
+                loaded = parse_skill_md(&read_skill_file(file, deny)?)?;
                 &loaded
             }
         };
@@ -328,12 +331,14 @@ impl LoadedSkills {
 /// Load the skills for a project rooted at `cwd`: the bundled set plus every
 /// skill directory [`skill_dirs`] names. `/name`, the Skill tool and
 /// DiscoverSkills all go through this, so the model sees exactly the skills
-/// `/name` runs.
-pub async fn load_skills_in(cwd: &Path) -> LoadedSkills {
+/// `/name` runs. Skill files `deny` (the Read deny rules) covers are
+/// skipped as invalid.
+pub async fn load_skills_in(cwd: &Path, deny: &ReadDeny) -> LoadedSkills {
     load_skills_at(
         cwd,
         &crate::config::Config::config_dir(),
         dirs::home_dir().filter(|h| h.is_absolute()).as_deref(),
+        deny,
     )
     .await
 }
@@ -372,6 +377,7 @@ pub(crate) async fn load_skills_at(
     cwd: &Path,
     config_dir: &Path,
     home: Option<&Path>,
+    deny: &ReadDeny,
 ) -> LoadedSkills {
     let mut skills = HashMap::new();
     let mut invalid = Vec::new();
@@ -392,7 +398,7 @@ pub(crate) async fn load_skills_at(
                 if fs::symlink_metadata(&file).await.is_err() {
                     continue;
                 }
-                let skill = read_skill_file(&file)
+                let skill = read_skill_file(&file, deny)
                     .and_then(|c| parse_skill_md(&c))
                     .map(|mut s| {
                         // Progressive disclosure: only name and description
@@ -408,7 +414,7 @@ pub(crate) async fn load_skills_at(
                     .and_then(|s| s.to_str())
                     .unwrap_or("unnamed")
                     .to_string();
-                let skill = read_skill_file(&path).and_then(|c| {
+                let skill = read_skill_file(&path, deny).and_then(|c| {
                     parse_skill_from_content(&c, &fallback)
                         .map_err(|e| format!("malformed frontmatter: {e}"))
                 });
@@ -430,9 +436,14 @@ pub(crate) async fn load_skills_at(
     LoadedSkills { skills, invalid }
 }
 
-/// Read a skill file through Read's deny-list: a skill that links to key
-/// material must not become a prompt.
-fn read_skill_file(path: &Path) -> std::result::Result<String, String> {
+/// Read a skill file through Read's deny-list and the user's Read deny
+/// rules: a skill that is or links to key material or a denied file (a
+/// repo's `notes.md -> ../.env`) must not become a prompt, since the Skill
+/// tool hands it to the model with no permission check of its own.
+fn read_skill_file(path: &Path, deny: &ReadDeny) -> std::result::Result<String, String> {
+    if deny.denies(path) {
+        return Err("refused: blocked by a permissions.deny Read rule".into());
+    }
     if crate::tools::check_sensitive_path_resolved(path, crate::tools::SensitiveOp::Read).is_some()
     {
         return Err("refused: it is or links to a file on the sensitive-file deny-list".into());
@@ -572,6 +583,7 @@ mod frontmatter_tests {
 #[cfg(test)]
 mod tests {
     use super::{load_skills_at, parse_skill_invocation};
+    use crate::permissions::ReadDeny;
     use std::path::{Path, PathBuf};
 
     fn write(path: &Path, content: &str) {
@@ -608,6 +620,7 @@ mod tests {
             &root.join("proj"),
             &at(root, "xdg/oxideclaw"),
             Some(&root.join("home")),
+            &crate::permissions::ReadDeny::default(),
         )
         .await
     }
@@ -673,7 +686,7 @@ mod tests {
             &skill_dir.join("SKILL.md"),
             "---\nname: release\ndescription: Cut a release\n---\nFollow scripts/release.sh v2. {{ARGS}}",
         );
-        let prompt = skill.invoke("1.2.3").unwrap();
+        let prompt = skill.invoke("1.2.3", &ReadDeny::default()).unwrap();
         assert!(
             prompt.contains("Follow scripts/release.sh v2. 1.2.3"),
             "{prompt}"
@@ -695,11 +708,16 @@ mod tests {
             &skill_dir.join("SKILL.md"),
             &skill_md("release", "d", "No slot."),
         );
-        let prompt = skill.invoke("for staging").unwrap();
+        let prompt = skill.invoke("for staging", &ReadDeny::default()).unwrap();
         assert!(prompt.ends_with("No slot.\n\nfor staging"), "{prompt}");
 
         std::fs::remove_file(skill_dir.join("SKILL.md")).unwrap();
-        assert!(skill.invoke("").unwrap_err().contains("unreadable"));
+        assert!(
+            skill
+                .invoke("", &ReadDeny::default())
+                .unwrap_err()
+                .contains("unreadable")
+        );
     }
 
     #[tokio::test]
@@ -721,7 +739,10 @@ mod tests {
         assert_eq!(skills["b"].prompt_template, "Do B");
         assert_eq!(skills["c"].prompt_template, "Run C");
         assert_eq!(skills["d"].prompt_template, "Do D");
-        assert_eq!(skills["b"].invoke("now").unwrap(), "Do B\n\nnow");
+        assert_eq!(
+            skills["b"].invoke("now", &ReadDeny::default()).unwrap(),
+            "Do B\n\nnow"
+        );
     }
 
     /// A cloned repo's SKILL.md that is a FIFO hung startup forever; one
@@ -859,8 +880,13 @@ mod tests {
         );
         let dirs = super::skill_dirs(&dir.path().join("proj"), &home.join(".claude"), Some(&home));
         assert_eq!(dirs.len(), 4, "{dirs:?}");
-        let loaded =
-            load_skills_at(&dir.path().join("proj"), &home.join(".claude"), Some(&home)).await;
+        let loaded = load_skills_at(
+            &dir.path().join("proj"),
+            &home.join(".claude"),
+            Some(&home),
+            &ReadDeny::default(),
+        )
+        .await;
         assert_eq!(loaded.skills["x"].description, "X");
     }
 
@@ -881,7 +907,7 @@ mod tests {
         assert_eq!(paths.len(), 3, "{paths:?}");
         assert_eq!(paths.iter().filter(|d| ***d == shared).count(), 1);
 
-        let loaded = load_skills_at(&home, &config, Some(&home)).await;
+        let loaded = load_skills_at(&home, &config, Some(&home), &ReadDeny::default()).await;
         assert_eq!(loaded.skills["ok"].description, "OK");
         assert_eq!(loaded.invalid.len(), 1, "{:?}", loaded.invalid);
         let warning = loaded.warning().unwrap();
